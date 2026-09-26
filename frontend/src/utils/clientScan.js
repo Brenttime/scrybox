@@ -152,16 +152,19 @@ export async function hydrateResults(results, signal) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), HYDRATE_TIMEOUT_MS);
   const onAbort = () => ctl.abort();
+  if (signal?.aborted) ctl.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
-  let r;
+  let r, j;
   try {
     r = await fetch('/api/cardscan/cards', {
       signal: ctl.signal,
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ results: hits.map(h => ({ number: h.number, scryfallId: h.scryfallId, title: h.title, via: h.via })) }),
     });
+    // The body is part of the request: a stalled stream is still covered by
+    // the deadline and the scan's abort.
+    j = await r.json().catch((e) => { if (e?.name === 'AbortError') throw e; return {}; });
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
-  const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.ok) throw new Error(j.error || 'hydrate failed');
   const byNumber = new Map(j.results.map(x => [x.number, x]));
   for (const h of hits) { const x = byNumber.get(h.number); if (x?.ok && x.card) hydrated.set(h.scryfallId, x); }

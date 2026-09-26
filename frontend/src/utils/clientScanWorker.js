@@ -22,6 +22,7 @@ let ORIGIN = '';
 const BASE = '/scan-assets/';
 const CACHE = 'scrybox-scan-assets';
 let readerPromise = null;
+let pendingReset = false;
 
 async function cachedBytes(cache, url) {
   let res = cache ? await cache.match(url) : null;
@@ -82,10 +83,9 @@ self.onmessage = async (e) => {
     }
     return;
   }
-  if (type === 'reset') {
-    if (readerPromise) readerPromise.then(({ reader }) => reader.reset()).catch(() => {});
-    return;
-  }
+  // Applied at the start of the next read rather than immediately, so a read
+  // still in flight when auto restarts cannot repopulate state afterwards.
+  if (type === 'reset') { pendingReset = true; return; }
   // Phase 1: corners from the 384px copy. When there is no card this is the
   // whole answer, and the main thread never reads back the full frame.
   if (type === 'probe') {
@@ -93,6 +93,7 @@ self.onmessage = async (e) => {
     try {
       if (!readerPromise) throw new Error('reader not loaded');
       const { reader } = await readerPromise;
+      if (pendingReset) { pendingReset = false; reader.reset(); }
       const quad = await reader.probe(new Uint8ClampedArray(small), 4, w, h);
       const out = quad ? null : { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
       self.postMessage({ id, quad, out, small }, [small]);

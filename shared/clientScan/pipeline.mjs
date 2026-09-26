@@ -164,7 +164,9 @@ export function createReader(env) {
     // Tracking ends the moment the card is not plainly in view: a blurred,
     // clipped or moving frame is exactly when one card gets swapped for another
     // with the same art, so nothing proven before it may carry across.
-    if (!cand.eligible || drift > STILL_DRIFT * 4) tracked = null;
+    // Pooled footer reads go with it: votes may only combine across frames of
+    // one uninterrupted presentation.
+    if (!cand.eligible || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
     if (!cand.eligible) return base;
 
     const sig = artSignature(rgba, w, h, m);
