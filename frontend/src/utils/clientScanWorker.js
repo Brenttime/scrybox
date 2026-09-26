@@ -82,6 +82,10 @@ self.onmessage = async (e) => {
     }
     return;
   }
+  if (type === 'reset') {
+    if (readerPromise) readerPromise.then(({ reader }) => reader.reset()).catch(() => {});
+    return;
+  }
   // Phase 1: corners from the 384px copy. When there is no card this is the
   // whole answer, and the main thread never reads back the full frame.
   if (type === 'probe') {

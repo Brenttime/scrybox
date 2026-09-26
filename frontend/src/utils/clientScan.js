@@ -42,8 +42,6 @@ function ensureWorker() {
     const w = waiting.get(e.data.id);
     if (!w) return;
     waiting.delete(e.data.id); clearTimeout(w.timer);
-    if (e.data.frame) spareFrame = e.data.frame;
-    if (e.data.small) spareSmall = e.data.small;
     w.resolve(e.data);
   };
   worker.onerror = (e) => killWorker(e?.message || 'scan worker failed');
@@ -85,26 +83,36 @@ export function loadClientScan() {
 }
 
 let frameCanvas = null, smallCanvas = null;
-let spareFrame = null, spareSmall = null;   // buffers handed back by the worker
 function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }
 function canvas(w, h) {
   if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
   const c = document.createElement('canvas'); c.width = w; c.height = h; return c;
 }
-// Read pixels into a recycled buffer when one of the right size came back from
-// the worker, instead of transferring getImageData's fresh allocation away.
-function pixels(ctx, w, h, spare) {
-  const img = ctx.getImageData(0, 0, w, h);
-  if (spare && spare.byteLength === img.data.byteLength) {
-    new Uint8ClampedArray(spare).set(img.data);
-    return spare;
-  }
-  return img.data.buffer;
+// getImageData allocates every call; its buffer is transferred, never copied.
+function pixels(ctx, w, h) { return ctx.getImageData(0, 0, w, h).data.buffer; }
+
+// One capture -> probe -> read transaction at a time, module-wide. The canvases
+// are shared, so a second scanner instance (remount) or an overlapping call
+// must wait its turn rather than redraw the frame between the two phases.
+let chain = Promise.resolve();
+function serialized(fn) {
+  const run = chain.then(fn, fn);
+  chain = run.catch(() => {});
+  return run;
+}
+
+// Forget the tracked card and pooled footer evidence (auto stop/start).
+export function resetOnDevice() {
+  if (worker) worker.postMessage({ type: 'reset' });
 }
 
 // Read one frame on-device. Returns the pipeline's server-shaped output
 // ({frame, candidates, results:[{ok, scryfallId, ...}]}), or {error}.
-export async function readOnDevice(source, sw, sh, { requireStill = false } = {}) {
+export function readOnDevice(source, sw, sh, opts = {}) {
+  return serialized(() => readOnce(source, sw, sh, opts));
+}
+
+async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   // Re-loads transparently if a crash or deadline tore the last worker down.
   const st = await loadClientScan();
   if (!st.ok) return { error: st.error || 'on-device reader unavailable' };
@@ -116,11 +124,11 @@ export async function readOnDevice(source, sw, sh, { requireStill = false } = {}
   // the pixels they are applied to can never come from different moments.
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
-  const small = pixels(sc, CORN_SIZE, CORN_SIZE, spareSmall); spareSmall = null;
+  const small = pixels(sc, CORN_SIZE, CORN_SIZE);
   const p = await call({ type: 'probe', small, w, h }, [small]);
   if (p.error) return { error: p.error };
   if (!p.quad) return p.out;          // no card: skip the full-frame readback
-  const frame = pixels(fc, w, h, spareFrame); spareFrame = null;
+  const frame = pixels(fc, w, h);
   const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill }, [frame]);
   return r.error ? { error: r.error } : r.out;
 }
@@ -135,14 +143,24 @@ export function lastFrameJpeg() {
 // Turn on-device answers into card_cache rows (prices, image, set) via the
 // backend, so the tray and Send flow see exactly what a server scan returns.
 const hydrated = new Map();   // scryfallId -> hydrated result (auto passes re-see cards)
-export async function hydrateResults(results) {
+const HYDRATE_TIMEOUT_MS = 8000;
+export async function hydrateResults(results, signal) {
   results = results.map(x => (x.ok && hydrated.has(x.scryfallId) ? { ...x, ...hydrated.get(x.scryfallId), number: x.number } : x));
   const hits = results.filter(r => r.ok && r.scryfallId && !r.card);
   if (!hits.length) return results;
-  const r = await fetch('/api/cardscan/cards', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ results: hits.map(h => ({ number: h.number, scryfallId: h.scryfallId, title: h.title, via: h.via })) }),
-  });
+  // Aborted with the scan, and never allowed to hold the scanner busy forever.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), HYDRATE_TIMEOUT_MS);
+  const onAbort = () => ctl.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  let r;
+  try {
+    r = await fetch('/api/cardscan/cards', {
+      signal: ctl.signal,
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results: hits.map(h => ({ number: h.number, scryfallId: h.scryfallId, title: h.title, via: h.via })) }),
+    });
+  } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.ok) throw new Error(j.error || 'hydrate failed');
   const byNumber = new Map(j.results.map(x => [x.number, x]));

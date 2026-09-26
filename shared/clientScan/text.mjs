@@ -307,9 +307,11 @@ export function voteFooter(ix, title, frames) {
   // Drop the printed set total of every "N/T" read before flattening: once
   // separators are stripped, "080/303" becomes "080303" and would let card
   // #303 (or any number hiding in the total) vote for itself.
-  const texts = frames.map(raws => raws.join(' ').toLowerCase()
-    .replace(/(\d{1,4})\s*\/\s*\d{2,4}/g, '$1 ')
-    .replace(/[^a-z0-9]/g, ''));
+  // Kept as separate tokens: concatenating reads ("030" + "030") would mint
+  // numbers no strip ever printed ("030030" contains "300").
+  const texts = frames.map(raws => raws.flatMap(raw => raw.toLowerCase()
+    .replace(/(\d{1,4}[a-z]?)\s*\/\s*\d{2,4}/g, '$1 ')
+    .split(/\s+/).map(tok => tok.replace(/[^a-z0-9]/g, '')).filter(Boolean)));
   const key = (pi) => {
     const n = String(ix.printings[pi][2]).toLowerCase();
     return /^\d+$/.test(n) ? n.padStart(3, '0') : n;
@@ -320,7 +322,7 @@ export function voteFooter(ix, title, frames) {
     if (k.length < 3) continue;
     // "NNN/303": never let the printed set total vote for card #303.
     if (Number(k) === (ix.setMax.get(ix.printings[pi][1]) || -1)) continue;
-    const n = texts.filter(tx => tx.includes(k)).length;
+    const n = texts.filter(toks => toks.some(tok => tok.includes(k))).length;
     if (n) hits.set(pi, n);
   }
   if (hits.size !== 1) return null;

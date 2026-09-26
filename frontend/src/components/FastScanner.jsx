@@ -5,7 +5,7 @@ import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
 import { FRAME_MAX, fitContain, quadPath, zoomPlan } from '../utils/fastScan';
-import { loadClientScan, readOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
+import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
 // sidecar detects, warps and OCRs every card from the same decoded pixels, and
@@ -98,15 +98,21 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   }, []);
   // One-time on-device download, started once the camera is on so opening the
   // tab alone costs nothing. Failure just leaves the server path in charge.
+  // A failed load (flaky network, server restarting) is retried while the
+  // camera stays on; loadClientScan itself spaces the attempts 30 s apart.
   useEffect(() => {
-    if (!cameraOn || onDeviceRef.current) return;
-    let live = true;
-    loadClientScan().then(r => {
+    if (!cameraOn) return;
+    let live = true, timer;
+    const attempt = () => loadClientScan().then(r => {
       if (!live) return;
       onDeviceRef.current = r.ok; setOnDevice(r.ok);
-      if (!r.ok) console.info('[fastscan] on-device reader unavailable:', r.error);
+      if (!r.ok) {
+        console.info('[fastscan] on-device reader unavailable:', r.error);
+        if (r.error !== 'unsupported browser') timer = setTimeout(attempt, 31000);
+      }
     });
-    return () => { live = false; };
+    attempt();
+    return () => { live = false; clearTimeout(timer); };
   }, [cameraOn]);
   useEffect(() => {
     fetch('/api/cardscan/status').then(r => setService(r.ok)).catch(() => setService(false));
@@ -210,8 +216,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     }
   }, []);
 
-  const scan = useCallback(async (source, { autoPass = false } = {}) => {
+  const scan = useCallback(async (source, { autoPass = false, gen = runRef.current } = {}) => {
     if (busyRef.current) return { busy: true };
+    // Results commit only for the run that asked: an auto pass that outlives a
+    // stop (or a stop+restart) must not add rows to the new run's tray.
+    const stale = () => !aliveRef.current || (autoPass && (!autoRef.current || gen !== runRef.current));
     const sw = source.videoWidth || source.naturalWidth || source.width;
     const sh = source.videoHeight || source.naturalHeight || source.height;
     if (!sw || !sh) return { busy: true };
@@ -243,7 +252,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // done. Anything else — unproven card, no card on a shutter press,
         // failure — goes to the server with the same frame.
         if (!needsServer(local, { autoPass })) {
-          out = { ...local, results: await hydrateResults(local.results).catch(() => null) };
+          out = { ...local, results: await hydrateResults(local.results, abort.signal).catch(() => null) };
           if (!out.results) out = null;
         }
       }
@@ -251,7 +260,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       else if (hedged) out = await hedged;
       else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
       // Stopped or navigated away while this was in flight: drop it on the floor.
-      if (!aliveRef.current || (autoPass && !autoRef.current)) return { busy: true };
+      if (stale()) return { busy: true };
       if (out.busy) return out;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);
@@ -288,7 +297,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       }
       return { matched: fresh.length, none: !out.candidates.length };
     } catch (e) {
-      if (e?.name === 'AbortError' || !aliveRef.current) return { busy: true };
+      if (e?.name === 'AbortError' || stale()) return { busy: true };
       setError(e.message || String(e));
       return { error: true };
     } finally {
@@ -315,7 +324,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       return;
     }
     const v = videoRef.current;
-    const r = v && v.readyState >= 2 ? await scanRef.current(v, { autoPass: true }) : { busy: true };
+    const r = v && v.readyState >= 2 ? await scanRef.current(v, { autoPass: true, gen }) : { busy: true };
     if (!autoRef.current || gen !== runRef.current) return;
     const wait = r.backoff ? AUTO_BUSY_MS : r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS;
     timerRef.current = setTimeout(() => autoLoop(gen), wait);
@@ -326,7 +335,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     clearTimeout(timerRef.current);
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
-    seenIdsRef.current.clear(); autoLoop(gen);
+    // A new run proves every card afresh; nothing tracked in the last one carries over.
+    seenIdsRef.current.clear(); resetOnDevice(); autoLoop(gen);
   };
   const toggleMode = () => {
     const next = mode === 'auto' ? 'single' : 'auto';

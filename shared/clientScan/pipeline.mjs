@@ -142,7 +142,7 @@ export function createReader(env) {
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; tracked = null; return base; }
+    if (!quad) { lastQuad = null; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -161,6 +161,10 @@ export function createReader(env) {
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
     cand.eligible = cand.status === 'ready';
+    // Tracking ends the moment the card is not plainly in view: a blurred,
+    // clipped or moving frame is exactly when one card gets swapped for another
+    // with the same art, so nothing proven before it may carry across.
+    if (!cand.eligible || drift > STILL_DRIFT * 4) tracked = null;
     if (!cand.eligible) return base;
 
     const sig = artSignature(rgba, w, h, m);
@@ -259,7 +263,7 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; tracked = null; }
+    if (!quad) { lastQuad = null; tracked = null; evidence = null; }
     return quad;
   }
 

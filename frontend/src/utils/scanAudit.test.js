@@ -15,6 +15,19 @@ test('voteFooter: the printed set total never votes, even when the set runs past
   };
   assert.equal(voteFooter(ix, 'lab', [['080/303'], ['080/303']]), 0);
   assert.notEqual(voteFooter(ix, 'lab', [['080/303'], ['080/303']]), 1);
+  // Suffixed numerators strip their total too.
+  assert.notEqual(voteFooter(ix, 'lab', [['080a/303'], ['080a/303']]), 1);
+});
+
+test('voteFooter: separate reads are never concatenated into a new number', () => {
+  const ix = {
+    byTitle: { lab: [0, 1] },
+    printings: [['a', 'mh2', '30'], ['b', 'mh2', '300']],
+    setLookup: new Set(['mh2']), setLengths: [3], setRank: new Map([['mh2', 0]]),
+    setMax: new Map([['mh2', 492]]),
+  };
+  // "030" + "030" must not read as "030030" and vote for #300.
+  assert.equal(voteFooter(ix, 'lab', [['030/303', '030/303'], ['030/303', '030/303']]), 0);
 });
 
 test('resolveFooter: contradictory exact set+number evidence is ambiguity', () => {
@@ -60,13 +73,16 @@ function fakeReader(titleFor) {
     },
   };
   const index = loadIndex({ names: ['grief'], canon: {}, excluded: [], sets: ['mh2'], printings: [['id-grief', 'mh2', '87']], byTitle: { grief: [0] }, uniqueAlias: {} });
+  let detects = 0;
+  const run = cornelius.run;
+  cornelius.run = async (x) => { detects++; return run(x); };
   const reader = createReader({ ort, cornelius, rec, chars, index });
-  return { reader, setPresent: (v) => { present = v; }, calls: () => calls };
+  return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
 }
 
-function sharpFrame(w = 200, h = 280) {
+function sharpFrame(w = 200, h = 280, blur = false) {
   const d = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0; i < w * h; i++) { const v = ((i % w) + Math.floor(i / w)) % 2 ? 255 : 0; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255; }
+  for (let i = 0; i < w * h; i++) { const v = blur ? 128 : ((i % w) + Math.floor(i / w)) % 2 ? 255 : 0; d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v; d[i * 4 + 3] = 255; }
   return { data: d, width: w, height: h };
 }
 
@@ -87,11 +103,33 @@ test('identity cache does not survive the card leaving the frame', async () => {
   assert.ok(calls() > before);
 });
 
-test('read() accepts corners from probe() and skips a second detection', async () => {
+test('identity cache does not survive a blurred (obscured) frame', async () => {
+  const { reader, calls } = fakeReader(() => 'grief');
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  assert.equal((await reader.read(sharpFrame(), small)).results[0]?.ok, true);
+  const before = calls();
+  const blurred = await reader.read(sharpFrame(200, 280, true), small);
+  assert.equal(blurred.candidates[0].status, 'too blurry');
+  const again = await reader.read(sharpFrame(), small);
+  assert.notEqual(again.results[0]?.cached, true);
+  assert.ok(calls() > before);
+});
+
+test('reset() drops the tracked card', async () => {
   const { reader } = fakeReader(() => 'grief');
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  await reader.read(sharpFrame(), small);
+  reader.reset();
+  assert.notEqual((await reader.read(sharpFrame(), small)).results[0]?.cached, true);
+});
+
+test('read() accepts corners from probe() and skips a second detection', async () => {
+  const { reader, detects } = fakeReader(() => 'grief');
   const f = sharpFrame();
   const quad = await reader.probe(new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), 4, f.width, f.height);
   assert.ok(quad);
+  assert.equal(detects(), 1);
   const out = await reader.read(f, null, { quad });
   assert.equal(out.candidates.length, 1);
+  assert.equal(detects(), 1, 'read with known corners must not run cornelius again');
 });
