@@ -4,69 +4,124 @@
 // server path uploads (FRAME_MAX), because that is the resolution the pipeline
 // was validated at against saved phone frames; the 384x384 copy for cornelius
 // is scaled by the canvas (GPU) rather than in JS.
+//
+// Two phases per frame: corners first from the 384px copy, and only when there
+// is a card does the full frame get read back (~8 MB at 1920x1080). Empty desk
+// and hand-in-motion frames, which are most auto passes, never pay for it.
+//
+// Every worker call has a deadline. A worker that crashes or wedges is torn
+// down and the next call gets a fresh one, so a single bad frame can never
+// leave the scanner "busy" forever.
 import { FRAME_MAX } from './fastScan';
 export { needsServer } from './fastScan';
 import { CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
+import { isNative, getServerUrl } from '../apiBase';
+
+const LOAD_TIMEOUT_MS = 120000;   // first download of ~40 MB on a slow phone
+const READ_TIMEOUT_MS = 8000;     // a normal read is well under 2 s
+const LOAD_RETRY_MS = 30000;      // after a failed load, try again this much later
 
 let worker = null;
 let ready = null;          // Promise<{ok, loadMs, error}>
+let readyFailedAt = 0;
 let nextId = 1;
-const waiting = new Map();
+const waiting = new Map(); // id -> {resolve, timer}
+
+function killWorker(reason) {
+  if (worker) { worker.terminate(); worker = null; }
+  for (const { resolve, timer } of waiting.values()) { clearTimeout(timer); resolve({ error: reason }); }
+  waiting.clear();
+  // The models lived in that worker; the next load must start over.
+  ready = null;
+}
 
 function ensureWorker() {
   if (worker) return worker;
   worker = new Worker(new URL('./clientScanWorker.js', import.meta.url), { type: 'module' });
   worker.onmessage = (e) => {
-    const cb = waiting.get(e.data.id);
-    if (cb) { waiting.delete(e.data.id); cb(e.data); }
+    const w = waiting.get(e.data.id);
+    if (!w) return;
+    waiting.delete(e.data.id); clearTimeout(w.timer);
+    if (e.data.frame) spareFrame = e.data.frame;
+    if (e.data.small) spareSmall = e.data.small;
+    w.resolve(e.data);
   };
-  worker.onerror = (e) => {
-    for (const cb of waiting.values()) cb({ error: e?.message || 'scan worker failed' });
-    waiting.clear();
-  };
+  worker.onerror = (e) => killWorker(e?.message || 'scan worker failed');
   return worker;
 }
 
-function call(msg, transfer = []) {
+function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS) {
   const id = nextId++;
   return new Promise((resolve) => {
-    waiting.set(id, resolve);
+    const timer = setTimeout(() => killWorker('scan worker timed out'), timeoutMs);
+    waiting.set(id, { resolve, timer });
     ensureWorker().postMessage({ ...msg, id }, transfer);
   });
 }
 
+// Where the worker fetches models and the index from. On the web that is this
+// origin; in the native app it is the user's own server — the window.fetch shim
+// in apiBase does not reach into workers, so it has to be passed explicitly.
+function assetBase() {
+  return isNative ? getServerUrl() : '';
+}
+
 // Start the one-time download. Resolves {ok:false} rather than throwing: a
-// phone that cannot run it simply keeps the server scanner.
+// phone that cannot run it simply keeps the server scanner. A failure is
+// retried after LOAD_RETRY_MS instead of being remembered until reload.
 export function loadClientScan() {
+  if (ready && readyFailedAt && Date.now() - readyFailedAt > LOAD_RETRY_MS) ready = null;
   if (!ready) {
+    readyFailedAt = 0;
     const supported = typeof Worker !== 'undefined' && typeof WebAssembly !== 'undefined'
-      && typeof DecompressionStream !== 'undefined';
+      && typeof DecompressionStream !== 'undefined' && (!isNative || !!getServerUrl());
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : call({ type: 'load' }).then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error }));
+      : call({ type: 'load', base: assetBase() }, [], LOAD_TIMEOUT_MS)
+        .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error }));
+    ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
   }
   return ready;
 }
 
 let frameCanvas = null, smallCanvas = null;
+let spareFrame = null, spareSmall = null;   // buffers handed back by the worker
 function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }
 function canvas(w, h) {
   if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
   const c = document.createElement('canvas'); c.width = w; c.height = h; return c;
 }
+// Read pixels into a recycled buffer when one of the right size came back from
+// the worker, instead of transferring getImageData's fresh allocation away.
+function pixels(ctx, w, h, spare) {
+  const img = ctx.getImageData(0, 0, w, h);
+  if (spare && spare.byteLength === img.data.byteLength) {
+    new Uint8ClampedArray(spare).set(img.data);
+    return spare;
+  }
+  return img.data.buffer;
+}
 
 // Read one frame on-device. Returns the pipeline's server-shaped output
 // ({frame, candidates, results:[{ok, scryfallId, ...}]}), or {error}.
 export async function readOnDevice(source, sw, sh, { requireStill = false } = {}) {
+  // Re-loads transparently if a crash or deadline tore the last worker down.
+  const st = await loadClientScan();
+  if (!st.ok) return { error: st.error || 'on-device reader unavailable' };
   const k = Math.min(1, FRAME_MAX / Math.max(sw, sh));
   const w = Math.round(sw * k), h = Math.round(sh * k);
   if (!frameCanvas || frameCanvas.width !== w || frameCanvas.height !== h) frameCanvas = canvas(w, h);
   if (!smallCanvas) smallCanvas = canvas(CORN_SIZE, CORN_SIZE);
+  // Both canvases are drawn from the same video frame now, so the corners and
+  // the pixels they are applied to can never come from different moments.
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
-  const frame = fc.getImageData(0, 0, w, h).data.buffer;
-  const small = sc.getImageData(0, 0, CORN_SIZE, CORN_SIZE).data.buffer;
-  const r = await call({ type: 'read', frame, small, w, h, requireStill }, [frame, small]);
+  const small = pixels(sc, CORN_SIZE, CORN_SIZE, spareSmall); spareSmall = null;
+  const p = await call({ type: 'probe', small, w, h }, [small]);
+  if (p.error) return { error: p.error };
+  if (!p.quad) return p.out;          // no card: skip the full-frame readback
+  const frame = pixels(fc, w, h, spareFrame); spareFrame = null;
+  const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill }, [frame]);
   return r.error ? { error: r.error } : r.out;
 }
 
@@ -92,5 +147,10 @@ export async function hydrateResults(results) {
   if (!r.ok || !j.ok) throw new Error(j.error || 'hydrate failed');
   const byNumber = new Map(j.results.map(x => [x.number, x]));
   for (const h of hits) { const x = byNumber.get(h.number); if (x?.ok && x.card) hydrated.set(h.scryfallId, x); }
-  return results.map(x => (x.ok && byNumber.has(x.number) ? { ...x, ...byNumber.get(x.number) } : x));
+  const out = results.map(x => (x.ok && byNumber.has(x.number) ? { ...x, ...byNumber.get(x.number) } : x));
+  // A card the phone proved but the backend could not turn into a row is not
+  // a result the tray can use. Throw so the caller takes the server path
+  // instead of accepting an answer with nothing in it.
+  if (out.some(x => x.scryfallId && !(x.ok && x.card))) throw new Error('hydrate incomplete');
+  return out;
 }

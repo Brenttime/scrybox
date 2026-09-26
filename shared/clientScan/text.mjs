@@ -276,6 +276,9 @@ export function resolveFooter(ix, title, codes, numbers, setless = numbers) {
     }
   }
   if (exact.size === 1) return [...exact][0];
+  // Contradictory exact set+number evidence is ambiguity, not permission to
+  // fall through to the weaker set-less pass and pick one of them.
+  if (exact.size > 1) return null;
   const global = new Set();
   for (const [number, total] of totals) {
     for (const pi of pool) {
@@ -301,7 +304,12 @@ export function voteFooter(ix, title, frames) {
     const inSet = pool.filter(pi => codes.includes(ix.printings[pi][1]));
     if (inSet.length) pool = inSet;
   }
-  const texts = frames.map(raws => raws.join(' ').toLowerCase().replace(/[^a-z0-9]/g, ''));
+  // Drop the printed set total of every "N/T" read before flattening: once
+  // separators are stripped, "080/303" becomes "080303" and would let card
+  // #303 (or any number hiding in the total) vote for itself.
+  const texts = frames.map(raws => raws.join(' ').toLowerCase()
+    .replace(/(\d{1,4})\s*\/\s*\d{2,4}/g, '$1 ')
+    .replace(/[^a-z0-9]/g, ''));
   const key = (pi) => {
     const n = String(ix.printings[pi][2]).toLowerCase();
     return /^\d+$/.test(n) ? n.padStart(3, '0') : n;

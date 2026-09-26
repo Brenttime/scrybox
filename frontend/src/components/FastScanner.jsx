@@ -20,6 +20,15 @@ import { loadClientScan, readOnDevice, lastFrameJpeg, hydrateResults, needsServe
 
 const AUTO_GAP_MS = 60;
 const AUTO_IDLE_MS = 350;
+const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
+// The tray is capped for render cost, but unsent scans are never dropped to
+// make room: at the cap, auto pauses and asks for a Send instead.
+const TRAY_MAX = 80;
+
+// JSON body or a readable error, never a SyntaxError from a proxy's HTML page.
+async function readJson(r) {
+  try { return await r.json(); } catch { return { ok: false, error: `HTTP ${r.status}` }; }
+}
 
 async function grabJpeg(source, sw, sh, canvasRef) {
   const k = Math.min(1, FRAME_MAX / Math.max(sw, sh));
@@ -47,6 +56,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const busyRef = useRef(false);
   const autoRef = useRef(false);
   const timerRef = useRef(null);
+  const runRef = useRef(0);          // auto-loop generation; a stale loop sees a new number and exits
+  const aliveRef = useRef(true);     // false after unmount: late results must not touch state
+  const scanAbortRef = useRef(null); // in-flight server read, aborted on stop/unmount
+  const resultsRef = useRef([]);
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
 
@@ -104,7 +117,16 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     streamRef.current = null;
     setCameraOn(false); setTorch(false);
   }, []);
-  useEffect(() => () => { autoRef.current = false; clearTimeout(timerRef.current); stopCamera(); }, [stopCamera]);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false; autoRef.current = false;
+      // A generation counter, not a DOM ref: bumping the live value is the point.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      runRef.current++;
+      clearTimeout(timerRef.current); scanAbortRef.current?.abort(); stopCamera();
+    };
+  }, [stopCamera]);
 
   const startCamera = useCallback(async (id = deviceId) => {
     setError('');
@@ -153,7 +175,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (!c) return;
     const dpr = window.devicePixelRatio || 1;
     const W = c.clientWidth, H = c.clientHeight;
-    c.width = W * dpr; c.height = H * dpr;
+    // Assigning width/height reallocates the backing store even when unchanged.
+    const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+    if (c.width !== bw || c.height !== bh) { c.width = bw; c.height = bh; }
     const ctx = c.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
@@ -202,10 +226,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // miss, then a full server read). Auto passes stay sequential so the
       // 60 ms loop does not flood the 2-core sidecar.
       const abort = new AbortController();
+      scanAbortRef.current = abort;
       const serverRead = async (blobP) => {
         const r = await fetch('/api/cardscan/frame', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: await blobP, signal: abort.signal });
-        if (r.status === 429) return { busy: true };
-        const j = await r.json();
+        if (r.status === 429) return { busy: true, backoff: true };
+        const j = await readJson(r);
         if (!r.ok || !j.ok) throw new Error(j.error || t('fastscan.serviceError'));
         return j;
       };
@@ -225,7 +250,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (out) abort.abort();
       else if (hedged) out = await hedged;
       else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
-      if (out.busy) return { busy: true };
+      // Stopped or navigated away while this was in flight: drop it on the floor.
+      if (!aliveRef.current || (autoPass && !autoRef.current)) return { busy: true };
+      if (out.busy) return out;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);
       const byNumber = new Map(out.results.map(x => [x.number ?? x.scene_number, x]));
@@ -255,31 +282,51 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false }));
-        setResults(prev => [...rows, ...prev].slice(0, 80));
+        setResults(prev => [...rows, ...prev]);
       } else if (!autoPass) {
         setLatency({ total: ms, read: ms });
       }
       return { matched: fresh.length, none: !out.candidates.length };
     } catch (e) {
+      if (e?.name === 'AbortError' || !aliveRef.current) return { busy: true };
       setError(e.message || String(e));
       return { error: true };
     } finally {
-      busyRef.current = false; setBusy(false);
+      busyRef.current = false;
+      if (aliveRef.current) setBusy(false);
     }
   }, [drawOverlay, t]);
 
-  const autoLoop = useCallback(async () => {
-    if (!autoRef.current) return;
+  // Latest scan, read through a ref so a running loop never calls a stale one
+  // from the render it started in.
+  const scanRef = useRef(scan);
+  scanRef.current = scan;
+  resultsRef.current = results;
+
+  // One loop per generation. Stopping bumps runRef, so a pass still awaiting
+  // its scan when the user stops (and maybe restarts) sees a different number
+  // and exits instead of scheduling a second loop beside the new one.
+  const autoLoop = useCallback(async (gen) => {
+    if (!autoRef.current || gen !== runRef.current) return;
+    const unsent = resultsRef.current.filter(x => !x.sent).length;
+    if (unsent >= TRAY_MAX) {
+      setHint(t('fastscan.trayFull', { count: TRAY_MAX }));
+      timerRef.current = setTimeout(() => autoLoop(gen), AUTO_IDLE_MS);
+      return;
+    }
     const v = videoRef.current;
-    const r = v && v.readyState >= 2 ? await scan(v, { autoPass: true }) : { busy: true };
-    if (!autoRef.current) return;
-    timerRef.current = setTimeout(autoLoop, r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS);
-  }, [scan]);
+    const r = v && v.readyState >= 2 ? await scanRef.current(v, { autoPass: true }) : { busy: true };
+    if (!autoRef.current || gen !== runRef.current) return;
+    const wait = r.backoff ? AUTO_BUSY_MS : r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS;
+    timerRef.current = setTimeout(() => autoLoop(gen), wait);
+  }, [t]);
 
   const setAutoRunning = (next) => {
     setAuto(next); autoRef.current = next;
     clearTimeout(timerRef.current);
-    if (next) { seenIdsRef.current.clear(); autoLoop(); }
+    const gen = ++runRef.current;
+    if (!next) { scanAbortRef.current?.abort(); return; }
+    seenIdsRef.current.clear(); autoLoop(gen);
   };
   const toggleMode = () => {
     const next = mode === 'auto' ? 'single' : 'auto';
