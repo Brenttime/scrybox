@@ -115,8 +115,9 @@ async function stackSiblings(dbClient, userId, row, entryId) {
     SELECT id, quantity FROM collection
     WHERE user_id = ? AND card_id = ? AND condition = ? AND printing = ?
       AND language = ? AND id != ? AND quantity > 0
+      AND COALESCE(is_proxy, 0) = ?
     ORDER BY id DESC
-  `, [userId, row.card_id, row.condition, row.printing, row.language, entryId]);
+  `, [userId, row.card_id, row.condition, row.printing, row.language, entryId, row.is_proxy ? 1 : 0]);
 }
 
 // Make the number of copies this stack represents equal `target`, keeping the
@@ -140,11 +141,11 @@ async function setStackQuantity(database, userId, entryId, target) {
     await dbClient.run(`
       INSERT INTO collection (
         card_id, user_id, quantity, condition, printing, language, purchase_price,
-        is_trade, favorite
-      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+        is_trade, favorite, is_proxy
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
     `, [
       row.card_id, userId, row.condition, row.printing, row.language, row.purchase_price,
-      row.is_trade, row.favorite
+      row.is_trade, row.favorite, row.is_proxy ? 1 : 0
     ]);
   }
 

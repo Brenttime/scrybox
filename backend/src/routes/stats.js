@@ -1,6 +1,6 @@
 const express = require('express');
 const db = require('../db');
-const { resolveCardPrice, isVintageSet, parseSqliteUtc } = require('../utils/priceHelpers');
+const { resolveCardPrice, isVintageSet, parseSqliteUtc, applyProxyRarity } = require('../utils/priceHelpers');
 
 const router = express.Router();
 
@@ -24,11 +24,13 @@ router.get('/stats', async (req, res) => {
                ROW_NUMBER() OVER (ORDER BY c.added_at DESC, c.id DESC) AS source_order,
                CASE WHEN c.quantity IS NULL OR c.quantity = 0 THEN 1 ELSE c.quantity END AS qty,
                COALESCE(c.purchase_price, 0) AS purchase_price,
-               c.condition, c.added_at, c.printing,
+               c.condition, c.added_at, c.printing, COALESCE(c.is_proxy, 0) AS is_proxy,
                COALESCE(NULLIF(cc.types, ''), '[]') AS types,
                COALESCE(NULLIF(cc.subtypes, ''), '[]') AS subtypes,
-               cc.supertype, cc.rarity, cc.set_name, cc.set_id,
+               cc.supertype, CASE WHEN COALESCE(c.is_proxy, 0) = 1 THEN 'Proxy' ELSE cc.rarity END AS rarity,
+               cc.set_name, cc.set_id,
                CASE
+                 WHEN COALESCE(c.is_proxy, 0) = 1 THEN 0
                  WHEN c.printing = 'Holofoil' AND cc.price_holofoil IS NOT NULL AND cc.price_holofoil > 0 THEN cc.price_holofoil
                  WHEN c.printing = 'Normal' AND cc.price_normal IS NOT NULL AND cc.price_normal > 0 THEN cc.price_normal
                  ELSE COALESCE(cc.price_trend, 0)
@@ -45,9 +47,11 @@ router.get('/stats', async (req, res) => {
         GROUP BY card_id
       ),
       rarity_stats AS (
+        -- From the owned rows, not card_stats: one card can hold both real and
+        -- proxy copies, and the proxies count under their own 'Proxy' rarity.
         SELECT COALESCE(NULLIF(rarity, ''), 'Unknown') AS name, SUM(qty) AS value,
-               MIN(first_order) AS first_order
-        FROM card_stats
+               MIN(source_order) AS first_order
+        FROM owned
         GROUP BY COALESCE(NULLIF(rarity, ''), 'Unknown')
       ),
       set_cards AS MATERIALIZED (
@@ -101,6 +105,7 @@ router.get('/stats', async (req, res) => {
                SUM(CASE WHEN julianday(added_at) <= julianday(?) THEN qty ELSE 0 END) AS qty7,
                SUM(CASE WHEN julianday(added_at) <= julianday(?) THEN qty ELSE 0 END) AS qty30
         FROM owned
+        WHERE is_proxy = 0
         GROUP BY card_id
       ),
       change_prices AS MATERIALIZED (
@@ -158,7 +163,7 @@ router.get('/stats', async (req, res) => {
     const topValuableQuery = `
       SELECT
         c.id AS entry_id,
-        c.quantity, c.condition, c.printing, c.language, c.purchase_price, c.is_trade,
+        c.quantity, c.condition, c.printing, c.language, c.purchase_price, c.is_trade, c.is_proxy,
         cc.id as card_id, cc.name, cc.printed_name, cc.rarity, cc.set_name, cc.set_id, cc.number, cc.image_url,
         cc.supertype, cc.subtypes, cc.types, cc.cmc, cc.color_identity, cc.price_trend,
         cc.price_normal, cc.price_holofoil
@@ -166,6 +171,7 @@ router.get('/stats', async (req, res) => {
       JOIN card_cache cc ON c.card_id = cc.id
       WHERE c.user_id = ?
       ORDER BY CASE
+        WHEN COALESCE(c.is_proxy, 0) = 1 THEN 0
         WHEN c.printing = 'Holofoil' AND cc.price_holofoil IS NOT NULL AND cc.price_holofoil > 0 THEN cc.price_holofoil
         WHEN c.printing = 'Normal' AND cc.price_normal IS NOT NULL AND cc.price_normal > 0 THEN cc.price_normal
         ELSE cc.price_trend
@@ -174,7 +180,7 @@ router.get('/stats', async (req, res) => {
     `;
     const topValuableRows = await db.all(topValuableQuery, [req.user.id]);
     const topValuable = topValuableRows.map(row => ({
-      ...row,
+      ...applyProxyRarity(row),
       price_trend: resolveCardPrice(row)
     }));
 
@@ -213,7 +219,7 @@ router.get('/stats', async (req, res) => {
     // Recently added cards (most useful "what did I just add" glance)
     const recentRows = await db.all(`
       SELECT c.id AS entry_id,
-             c.quantity, c.condition, c.printing, c.language, c.added_at, c.is_trade,
+             c.quantity, c.condition, c.printing, c.language, c.added_at, c.is_trade, c.is_proxy,
              cc.id as card_id, cc.name, cc.printed_name, cc.rarity, cc.set_name, cc.set_id, cc.number, cc.image_url,
              cc.supertype, cc.subtypes, cc.types, cc.cmc, cc.color_identity,
              cc.price_trend, cc.price_normal, cc.price_holofoil
@@ -223,7 +229,7 @@ router.get('/stats', async (req, res) => {
       ORDER BY c.added_at DESC
       LIMIT 6
     `, [req.user.id]);
-    const recentAdditions = recentRows.map(row => ({ ...row, price_trend: resolveCardPrice(row) }));
+    const recentAdditions = recentRows.map(row => ({ ...applyProxyRarity(row), price_trend: resolveCardPrice(row) }));
 
     const gainAbs = totalValue - totalSpent;
     const roi = {
@@ -322,7 +328,7 @@ router.get('/stats/history', async (req, res) => {
       WITH cards AS MATERIALIZED (
         SELECT c.card_id,
                json_group_array(json_array(
-                 c.quantity, c.added_at, c.printing,
+                 c.quantity, c.added_at, c.printing, COALESCE(c.is_proxy, 0),
                  cc.price_trend, cc.price_normal, cc.price_holofoil
                )) AS additions
         FROM collection c
@@ -345,7 +351,7 @@ router.get('/stats/history', async (req, res) => {
 
     for (const card of cards) {
       card.additions = JSON.parse(card.additions || '[]').map(([
-        quantity, added_at, printing, price_trend, price_normal, price_holofoil
+        quantity, added_at, printing, is_proxy, price_trend, price_normal, price_holofoil
       ]) => {
         const time = parseSqliteUtc(added_at).getTime();
         if (!Number.isFinite(time)) return null;
@@ -353,7 +359,7 @@ router.get('/stats/history', async (req, res) => {
           time,
           quantity,
           currentValue: quantity * resolveCardPrice({
-            printing, price_trend, price_normal, price_holofoil
+            printing, is_proxy, price_trend, price_normal, price_holofoil
           })
         };
       }).filter(Boolean);
@@ -415,7 +421,7 @@ router.get('/stats/history', async (req, res) => {
 router.get('/stats/networth', async (req, res) => {
   try {
     const rows = await db.all(`
-      SELECT c.quantity, c.purchase_price, c.printing, cc.price_currency,
+      SELECT c.quantity, c.purchase_price, c.printing, c.is_proxy, cc.price_currency,
              cc.price_trend, cc.price_normal, cc.price_holofoil
       FROM collection c
       JOIN card_cache cc ON c.card_id = cc.id

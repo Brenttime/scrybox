@@ -33,6 +33,7 @@ router.get('/:share_token', async (req, res) => {
         c.language,
         c.added_at,
         c.is_trade,
+        c.is_proxy,
         cc.name,
         -- The name as printed on a non-English card, so a shared Japanese
         -- collection reads the way the cards actually look.

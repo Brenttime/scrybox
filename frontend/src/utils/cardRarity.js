@@ -16,7 +16,18 @@ const BADGE_LABEL = Object.freeze({
   mythic: 'MYTHIC',
   special: 'SPECIAL',
   bonus: 'BONUS',
+  proxy: 'PROXY',
 });
+
+// An owned copy marked as a proxy shows the rarity 'Proxy' in place of its
+// printed one. The server already sends rarity 'Proxy' for such rows; this is
+// the client-side mirror for a row toggled in place before the next refetch.
+export const PROXY_RARITY = 'Proxy';
+export function displayRarity(card) {
+  if (!card) return '';
+  if (card.is_proxy) return PROXY_RARITY;
+  return card.base_rarity !== undefined ? card.base_rarity : card.rarity;
+}
 
 const normalizeRarity = (rarity) => String(rarity || '').trim().toLowerCase();
 
@@ -64,6 +75,7 @@ export function getCardRarityBorder(rarity) {
 }
 
 export function getRarityBadgeStyle(rarity) {
+  if (normalizeRarity(rarity) === 'proxy') return { background: 'rgba(124, 58, 237, 0.85)', color: '#fff' };
   const tier = getRarityTier(rarity);
   const background = tier === 'top' ? '#f59e0b'
     : tier === 'rare' ? '#e2e8f0'

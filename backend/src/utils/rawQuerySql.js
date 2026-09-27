@@ -270,6 +270,7 @@ function compileCollectionQuery({ ast, userId, limit = 60, offset = 0, eligibleO
     c.added_at,
     c.is_trade,
     c.notes,
+    c.is_proxy,
     cc.oracle_id,
     cc.name,
     cc.printed_name,

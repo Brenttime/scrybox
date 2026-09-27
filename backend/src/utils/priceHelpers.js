@@ -12,6 +12,8 @@ function parseSqliteUtc(str) {
 
 function resolveCardPrice(card) {
   if (!card) return 0;
+  // A proxy copy is worth nothing, whatever the real card trades at.
+  if (card.is_proxy) return 0;
   if (card.printing === 'Holofoil' && card.price_holofoil !== null && card.price_holofoil > 0) {
     return card.price_holofoil;
   }
@@ -19,6 +21,16 @@ function resolveCardPrice(card) {
     return card.price_normal;
   }
   return card.price_trend || 0;
+}
+
+// An owned proxy copy reads as its own 'Proxy' rarity. base_rarity keeps the
+// printed rarity so the UI can restore it when the flag is cleared. Rows with
+// no is_proxy column (card_cache-only rows) are returned unchanged.
+const PROXY_RARITY = 'Proxy';
+function applyProxyRarity(row) {
+  if (!row || row.is_proxy === undefined) return row;
+  const base = row.base_rarity !== undefined ? row.base_rarity : row.rarity;
+  return { ...row, is_proxy: row.is_proxy ? 1 : 0, base_rarity: base, rarity: row.is_proxy ? PROXY_RARITY : base };
 }
 
 // Hydrate a raw card_cache row: its array columns are stored as JSON strings,
@@ -29,6 +41,7 @@ function parseCardRow(row) {
   if (!row) return row;
   return {
     ...row,
+    ...applyProxyRarity(row),
     subtypes: JSON.parse(row.subtypes || '[]'),
     types: JSON.parse(row.types || '[]'),
     color_identity: JSON.parse(row.color_identity || '[]'),
@@ -163,6 +176,8 @@ module.exports = {
   PRICE_SWEEP_INTERVAL_MS,
   resolveCardPrice,
   parseCardRow,
+  applyProxyRarity,
+  PROXY_RARITY,
   isVintageSet,
   recordPrice
 };

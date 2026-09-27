@@ -15,6 +15,8 @@ export function usdPrice(card, printing) {
 
 export function resolveCardPrice(card, printing) {
   if (!card) return 0;
+  // A proxy copy is worth $0 regardless of the real card's market price.
+  if (card.is_proxy) return 0;
   if (printing === 'Holofoil' && card.price_holofoil > 0) return card.price_holofoil;
   if (printing === 'Normal' && card.price_normal > 0) return card.price_normal;
   return card.price_trend || 0;

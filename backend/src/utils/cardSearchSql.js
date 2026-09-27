@@ -177,6 +177,7 @@ function ownedByNames(userId, names, { limit = 60, offset = 0 } = {}) {
       c.added_at,
       c.is_trade,
       c.notes,
+      c.is_proxy,
       cc.oracle_id,
       cc.name,
       cc.printed_name,

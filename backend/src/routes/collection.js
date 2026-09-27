@@ -346,6 +346,7 @@ router.get('/collection', async (req, res) => {
         c.added_at,
         c.is_trade,
         c.notes,
+        c.is_proxy,
         cc.name,
         -- The localized name for a non-English printing, so every view that
         -- renders a collection card can show it as the card actually reads.
@@ -608,7 +609,7 @@ router.put('/collection/:id', async (req, res) => {
   const { id } = req.params;
   const {
     quantity, condition, printing, language, purchase_price,
-    is_trade, notes
+    is_trade, notes, is_proxy
   } = req.body;
 
   try {
@@ -635,9 +636,11 @@ router.put('/collection/:id', async (req, res) => {
     if (purchase_price !== undefined) { updates.push('purchase_price = ?'); params.push(purchase_price); }
     if (is_trade !== undefined) { updates.push('is_trade = ?'); params.push(is_trade ? 1 : 0); }
     if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
+    if (is_proxy !== undefined) { updates.push('is_proxy = ?'); params.push(is_proxy ? 1 : 0); }
 
     const touchesPhysicalStack = requestedQty !== null
-      || condition !== undefined || printing !== undefined || language !== undefined;
+      || condition !== undefined || printing !== undefined || language !== undefined
+      || is_proxy !== undefined;
 
     const saveEntry = async () => {
       // The row may have changed while this request was waiting for the shared
@@ -662,14 +665,16 @@ router.put('/collection/:id', async (req, res) => {
         const targetCondition = condition !== undefined ? condition : currentEntry.condition;
         const targetPrinting = printing !== undefined ? printing : currentEntry.printing;
         const targetLanguage = language !== undefined ? language : currentEntry.language;
+        const targetProxy = (is_proxy !== undefined ? is_proxy : currentEntry.is_proxy) ? 1 : 0;
         const targetSiblings = await db.all(`
           SELECT quantity
           FROM collection
           WHERE user_id = ? AND card_id = ? AND condition = ? AND printing = ?
             AND language = ? AND id != ? AND quantity > 0
+            AND COALESCE(is_proxy, 0) = ?
         `, [
           req.user.id, currentEntry.card_id, targetCondition, targetPrinting,
-          targetLanguage, id
+          targetLanguage, id, targetProxy
         ]);
         const projectedStackQty = Math.max(0, Number(currentEntry.quantity) || 0)
           + targetSiblings.reduce(
