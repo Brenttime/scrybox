@@ -38,6 +38,41 @@ export function needsServer(out, { autoPass }) {
   return true;
 }
 
+// Repeat-failure budget for auto mode. A card whose title reads but whose
+// printing never resolves (worn/tiny footer, glare) used to be re-sent every
+// pass — ~870 ms of sidecar OCR each, forever, while the user waited. Now the
+// same unresolved card (same title, about the same place) backs off
+// 1.5 s, 3 s, 6 s, capped at 8 s; any different outcome resets it. Never a
+// guess: it only spaces retries, it does not change what counts as proven.
+export const FAIL_BACKOFF_MS = [0, 1500, 3000, 6000, 8000];
+const SAME_PLACE = 0.08;   // centre move, fraction of frame diagonal
+
+function unresolvedSignature(out) {
+  const res = (out?.results || []).find(r => !r.ok && r.title);
+  if (!res || (out.results || []).some(r => r.ok)) return null;
+  const n = res.number ?? res.scene_number;
+  const cand = (out.candidates || []).find(c => c.number === n) || out.candidates?.[0];
+  const box = cand?.box || res.box;
+  if (!box) return { title: res.title, cx: 0, cy: 0 };
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  return { title: res.title, cx: (box[0] + box[2] / 2) / diag, cy: (box[1] + box[3] / 2) / diag };
+}
+
+// Pure: fold one server outcome into the failure streak.
+export function nextFailStreak(prev, out, now) {
+  const sig = unresolvedSignature(out);
+  if (!sig) return null;
+  const same = prev && prev.title === sig.title
+    && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;
+  const count = same ? prev.count + 1 : 1;
+  return { ...sig, count, until: now + FAIL_BACKOFF_MS[Math.min(count, FAIL_BACKOFF_MS.length - 1)] };
+}
+
+// Pure: may an auto pass send to the server now?
+export function serverAllowed(streak, now) {
+  return !streak || now >= streak.until;
+}
+
 // Small-card rescue. Measured on saved scans: a card whose short side is
 // under ~350 px in the uploaded frame almost never reads (title or collector
 // line), and upscaling that frame rescues nothing — the detail is not there.

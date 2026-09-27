@@ -44,7 +44,12 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // The upper modern sweep (0.76-0.84) proved 2 of 353 cards on-device while
 // costing ~200 ms on every miss; an unproven card goes to the server, whose
 // own sweeps cover it.
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86], 'retro'];
+// 'wide': the same rows read out to x=0.30 for a card the narrow sweep did not
+// prove. FRA-era 4-digit numbers ("U 0298") put the last digit past 0.22, so
+// the narrow strip reads "U 029". Only unresolved cards pay for it.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86], 'wide', 'retro'];
+const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
+const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
 
 // Cornelius input: the frame squashed to 384x384 (fit: fill, like the server's
@@ -250,7 +255,9 @@ export function createReader(env) {
         if (pooledHit) return pooledHit;
         continue;
       }
-      const reads = await recognize(env, stage.map(y => strip([0, 0.22, y, y + 0.025])));
+      const rows = stage === 'wide' ? WIDE_ROWS : stage;
+      const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
+      const reads = await recognize(env, rows.map(y => strip([0, x1, y, y + 0.025])));
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
       if (pi != null) return done(pi, 'title+set+collector', raws, si);

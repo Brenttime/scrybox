@@ -1427,6 +1427,7 @@
   "fastscan.hintNoCard": "Looking for cards…",
   "fastscan.hintAdjust": "Adjust: {reason}",
   "fastscan.hintHold": "Bring closer",
+  "fastscan.hintFooter": "Can't read the set number. Tilt away from glare or add light.",
   "fastscan.trayFull": "Tray full ({count} unsent). Send or clear to keep scanning.",
   "fastscan.quantity": "Quantity",
   "fastscan.qtyLess": "One fewer",

@@ -1,6 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fitContain, quadPath, FRAME_MAX, zoomPlan } from './fastScan.js';
+import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed } from './fastScan.js';
+
+const fail = (title, box = [100, 100, 600, 840]) => ({
+  frame: { width: 1080, height: 1920 },
+  candidates: [{ number: 1, box, eligible: true }],
+  results: [{ scene_number: 1, ok: false, title }],
+});
+
+test('repeat-failure backoff: same unresolved card spaces out, anything else resets', () => {
+  let s = nextFailStreak(null, fail('Fblthp'), 0);
+  assert.equal(s.count, 1); assert.equal(serverAllowed(s, 1000), false); assert.equal(serverAllowed(s, 1500), true);
+  s = nextFailStreak(s, fail('Fblthp', [110, 105, 600, 840]), 2000);
+  assert.equal(s.count, 2); assert.equal(s.until, 5000);
+  for (let i = 0; i < 6; i++) s = nextFailStreak(s, fail('Fblthp'), 10000);
+  assert.equal(s.until, 18000, 'capped at 8 s');
+  // different card, moved card, or a success resets
+  assert.equal(nextFailStreak(s, fail('Draconic Visitor'), 0).count, 1);
+  assert.equal(nextFailStreak(s, fail('Fblthp', [700, 1400, 300, 420]), 0).count, 1);
+  assert.equal(nextFailStreak(s, { candidates: [], results: [{ ok: true, card: {} }] }, 0), null);
+  assert.equal(nextFailStreak(s, { candidates: [], results: [] }, 0), null);
+  assert.equal(serverAllowed(null, 0), true);
+});
 
 test('FRAME_MAX is the measured 1920 ceiling', () => { assert.equal(FRAME_MAX, 1920); });
 

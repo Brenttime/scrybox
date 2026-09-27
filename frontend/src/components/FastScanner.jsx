@@ -4,7 +4,7 @@ import { resolveCardPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
@@ -60,6 +60,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const aliveRef = useRef(true);     // false after unmount: late results must not touch state
   const scanAbortRef = useRef(null); // in-flight server read, aborted on stop/unmount
   const resultsRef = useRef([]);
+  const failStreakRef = useRef(null); // same unresolved card, repeated: back off the server
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
 
@@ -236,8 +237,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // 60 ms loop does not flood the 2-core sidecar.
       const abort = new AbortController();
       scanAbortRef.current = abort;
+      // Why this frame goes to the server, logged by the sidecar next to its
+      // answer so a slow or failing session can be diagnosed from the logs.
+      let why = onDeviceRef.current ? (autoPass ? 'unproven' : 'hedge') : 'no-device';
       const serverRead = async (blobP) => {
-        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: await blobP, signal: abort.signal });
+        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'}` };
+        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body: await blobP, signal: abort.signal });
         if (r.status === 429) return { busy: true, backoff: true };
         const j = await readJson(r);
         if (!r.ok || !j.ok) throw new Error(j.error || t('fastscan.serviceError'));
@@ -247,7 +252,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       hedged?.catch(() => {});
       if (onDeviceRef.current) {
         const local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
-        if (local?.error) console.warn('[fastscan] on-device read failed:', local.error);
+        if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
+        else if (!local?.candidates?.length) why = 'no-card';
+        else if (!local.candidates[0].eligible) why = String(local.candidates[0].status || 'ineligible').replace(/\s+/g, '-');
         // Proven on the phone (or an auto pass the stillness gate held back):
         // done. Anything else — unproven card, no card on a shutter press,
         // failure — goes to the server with the same frame.
@@ -258,10 +265,18 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       }
       if (out) abort.abort();
       else if (hedged) out = await hedged;
-      else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
+      else if (autoPass && !serverAllowed(failStreakRef.current, Date.now())) {
+        // Same card, same unresolved footer as the last few passes: don't pay
+        // another ~0.9 s of sidecar OCR for the same answer. Keep telling the
+        // user what would help instead.
+        if (!stale()) setHint(t('fastscan.hintFooter'));
+        return { held: true };
+      } else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
       // Stopped or navigated away while this was in flight: drop it on the floor.
       if (stale()) return { busy: true };
       if (out.busy) return out;
+      const streak = nextFailStreak(failStreakRef.current, out, Date.now());
+      failStreakRef.current = streak;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);
       const byNumber = new Map(out.results.map(x => [x.number ?? x.scene_number, x]));
@@ -274,6 +289,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (!out.candidates.length) setHint(t('fastscan.hintNoCard'));
       else if (!eligible) setHint(t('fastscan.hintAdjust', { reason: out.candidates[0].status }));
       else if (plan.tooSmall.length && hits.length < eligible) setHint(t('fastscan.hintCloser', { count: plan.tooSmall.length }));
+      else if (!hits.length && streak && streak.count >= 2) setHint(t('fastscan.hintFooter'));
       else if (!hits.length) setHint(t('fastscan.hintHold'));
       else setHint('');
 
@@ -336,7 +352,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); resetOnDevice(); autoLoop(gen);
+    seenIdsRef.current.clear(); failStreakRef.current = null; resetOnDevice(); autoLoop(gen);
   };
   const toggleMode = () => {
     const next = mode === 'auto' ? 'single' : 'auto';
