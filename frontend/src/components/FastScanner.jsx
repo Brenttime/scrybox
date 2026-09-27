@@ -256,7 +256,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (onDeviceRef.current) {
         local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
-        else if (!local?.candidates?.length) why = 'no-card';
+        else if (!local?.candidates?.length) { why = 'no-card'; failStreakRef.current = null; }
         else if (!local.candidates[0].eligible) why = String(local.candidates[0].status || 'ineligible').replace(/\s+/g, '-');
         // Proven on the phone (or an auto pass the stillness gate held back):
         // done. Anything else — unproven card, no card on a shutter press,

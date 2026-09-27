@@ -12,15 +12,16 @@ test('repeat-failure backoff: same unresolved card spaces out, anything else res
   let s = nextFailStreak(null, fail('Fblthp'), 0);
   // Backoff needs the phone to see the SAME card now; no local evidence -> allowed.
   const local = (title, box = [100, 100, 600, 840]) => ({ frame: { width: 1080, height: 1920 }, candidates: [{ box }], results: [{ title }] });
-  assert.equal(s.count, 1); assert.equal(serverAllowed(s, 1000, local('fblthp')), false); assert.equal(serverAllowed(s, 1500, local('Fblthp')), true);
-  assert.equal(serverAllowed(s, 1000), true, 'no on-device read: never block');
-  assert.equal(serverAllowed(s, 1000, local('Draconic Visitor')), true, 'different card: never block');
-  assert.equal(serverAllowed(s, 1000, local('Fblthp', [700, 1400, 300, 420])), true, 'moved: never block');
-  assert.equal(serverAllowed(s, 1000, { frame: { width: 1080, height: 1920 }, candidates: [{ box: [100, 100, 600, 840] }], results: [] }), true, 'no title read: never block');
+  assert.equal(s.count, 1); assert.equal(serverAllowed(s, 500, local('fblthp')), false); assert.equal(serverAllowed(s, 1000, local('Fblthp')), true);
+  assert.equal(serverAllowed(s, 500), true, 'no on-device read: never block');
+  assert.equal(serverAllowed(s, 500, local('Draconic Visitor')), true, 'different card: never block');
+  assert.equal(serverAllowed(s, 500, local('Fblthp', [700, 1400, 300, 420])), true, 'moved: never block');
+  assert.equal(serverAllowed(s, 500, { frame: { width: 1080, height: 1920 }, candidates: [{ box: [100, 100, 600, 840] }], results: [] }), true, 'no title read: never block');
+  assert.equal(serverAllowed(s, 500, { frame: { width: 1080, height: 1920 }, candidates: [], results: [] }), true, 'card lifted: never block');
   s = nextFailStreak(s, fail('Fblthp', [110, 105, 600, 840]), 2000);
-  assert.equal(s.count, 2); assert.equal(s.until, 5000);
+  assert.equal(s.count, 2); assert.equal(s.until, 4000);
   for (let i = 0; i < 6; i++) s = nextFailStreak(s, fail('Fblthp'), 10000);
-  assert.equal(s.until, 18000, 'capped at 8 s');
+  assert.equal(s.until, 13000, 'capped at 3 s: a delay, never a block');
   // different card, moved card, or a success resets
   assert.equal(nextFailStreak(s, fail('Draconic Visitor'), 0).count, 1);
   assert.equal(nextFailStreak(s, fail('Fblthp', [700, 1400, 300, 420]), 0).count, 1);

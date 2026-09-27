@@ -77,7 +77,17 @@ function fakeReader(titleFor) {
   const run = cornelius.run;
   cornelius.run = async (x) => { detects++; return run(x); };
   const reader = createReader({ ort, cornelius, rec, chars, index });
+  reader.__env = { ort, cornelius, rec, chars };
   return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
+}
+
+// Like fakeReader, but the title has two printings, so identity needs the footer.
+function fakeReaderIx(textFor) {
+  const f = fakeReader(textFor);
+  const index = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
+    printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '117']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const env = f.reader.__env;
+  return { ...f, reader: createReader({ ...env, index }) };
 }
 
 function sharpFrame(w = 200, h = 280, blur = false) {
@@ -121,6 +131,18 @@ test('reset() drops the tracked card', async () => {
   await reader.read(sharpFrame(), small);
   reader.reset();
   assert.notEqual((await reader.read(sharpFrame(), small)).results[0]?.cached, true);
+});
+
+test('a footer-proven printing is never carried by art alone', async () => {
+  const { reader, calls } = fakeReaderIx((n) => (n % 3 === 1 ? 'bolt' : 'lea 161'));
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  const a = await reader.read(sharpFrame(), small);
+  assert.equal(a.results[0]?.ok, true);
+  assert.notEqual(a.results[0]?.via, 'unique physical printing');
+  const before = calls();
+  const b = await reader.read(sharpFrame(), small);   // same art, same spot
+  assert.notEqual(b.results[0]?.cached, true, 'footer-proven: re-read every frame');
+  assert.ok(calls() > before);
 });
 
 test('read() accepts corners from probe() and skips a second detection', async () => {

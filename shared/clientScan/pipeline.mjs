@@ -23,6 +23,7 @@ import {
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
+const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 const CORNER_GATE = 0.02;           // cornelius "sharpness" head: below = no card
@@ -186,7 +187,10 @@ export function createReader(env) {
     const result = await readCard(rgba, w, h, m, timings, prior);
     timings.total_ms = Math.round(now() - t0);
     base.results.push(result);
-    if (result.ok) { evidence = null; tracked = { sig, result }; }
+    // Only a title-proven answer is carried: a card swapped for a same-art
+    // reprint between two frames at the same spot is invisible to tracking,
+    // so a printing that needed its footer is re-read every time.
+    if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, result } : null; }
     else if (result.title && result.footer_ocr?.length) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0 };

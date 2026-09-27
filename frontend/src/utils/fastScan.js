@@ -44,7 +44,10 @@ export function needsServer(out, { autoPass }) {
 // same unresolved card (same title, about the same place) backs off
 // 1.5 s, 3 s, 6 s, capped at 8 s; any different outcome resets it. Never a
 // guess: it only spaces retries, it does not change what counts as proven.
-export const FAIL_BACKOFF_MS = [0, 1500, 3000, 6000, 8000];
+// A delay, never a block: a same-title reprint swapped in at the same spot
+// looks identical until its footer is read, so the cap stays short (3 s), and
+// lifting the card (a no-card frame) ends the streak at once.
+export const FAIL_BACKOFF_MS = [0, 1000, 2000, 3000];
 const SAME_PLACE = 0.08;   // centre move, fraction of frame diagonal
 
 function unresolvedSignature(out) {
@@ -75,6 +78,7 @@ export function nextFailStreak(prev, out, now) {
 // is always allowed — backoff must never hold back a new card.
 export function serverAllowed(streak, now, local = null) {
   if (!streak || now >= streak.until) return true;
+  if (local && !local.error && !local.candidates?.length) return true;
   const res = (local?.results || []).find(r => r.title);
   const cand = local?.candidates?.[0];
   if (!res || !cand?.box || !local.frame) return true;
