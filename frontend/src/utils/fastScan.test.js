@@ -10,7 +10,13 @@ const fail = (title, box = [100, 100, 600, 840]) => ({
 
 test('repeat-failure backoff: same unresolved card spaces out, anything else resets', () => {
   let s = nextFailStreak(null, fail('Fblthp'), 0);
-  assert.equal(s.count, 1); assert.equal(serverAllowed(s, 1000), false); assert.equal(serverAllowed(s, 1500), true);
+  // Backoff needs the phone to see the SAME card now; no local evidence -> allowed.
+  const local = (title, box = [100, 100, 600, 840]) => ({ frame: { width: 1080, height: 1920 }, candidates: [{ box }], results: [{ title }] });
+  assert.equal(s.count, 1); assert.equal(serverAllowed(s, 1000, local('fblthp')), false); assert.equal(serverAllowed(s, 1500, local('Fblthp')), true);
+  assert.equal(serverAllowed(s, 1000), true, 'no on-device read: never block');
+  assert.equal(serverAllowed(s, 1000, local('Draconic Visitor')), true, 'different card: never block');
+  assert.equal(serverAllowed(s, 1000, local('Fblthp', [700, 1400, 300, 420])), true, 'moved: never block');
+  assert.equal(serverAllowed(s, 1000, { frame: { width: 1080, height: 1920 }, candidates: [{ box: [100, 100, 600, 840] }], results: [] }), true, 'no title read: never block');
   s = nextFailStreak(s, fail('Fblthp', [110, 105, 600, 840]), 2000);
   assert.equal(s.count, 2); assert.equal(s.until, 5000);
   for (let i = 0; i < 6; i++) s = nextFailStreak(s, fail('Fblthp'), 10000);

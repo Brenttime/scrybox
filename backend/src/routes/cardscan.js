@@ -67,16 +67,24 @@ router.post('/frame', express.raw({ type: ['image/jpeg', 'application/octet-stre
     const t0 = Date.now();
     // A phone that gives up (auto stopped, tab closed) cancels the sidecar read
     // too, instead of leaving the 2-core OCR box busy on a frame nobody wants.
+    // res 'close' before the response is written = the client went away.
+    // (req 'close' also fires when the upload body simply finishes.)
     const ctl = new AbortController();
     const cancel = () => { if (!res.writableEnded) ctl.abort(); };
-    req.on('close', cancel);
+    res.on('close', cancel);
     // Why the phone sent this frame (on-device state + fallback reason), passed
     // through so the sidecar's scan log shows it next to the result.
     const via = String(req.get('x-scan-client') || '').slice(0, 120).replace(/[^\w .:=,/-]/g, '');
+    // Camera session id: scopes the sidecar's identity cache to this scanner.
+    const session = String(req.get('x-scan-session') || '').slice(0, 40).replace(/[^\w-]/g, '');
     const r = await http.post('/api/scan-frame', req.body, {
-      headers: { 'Content-Type': 'image/jpeg', ...(via ? { 'X-Scan-Client': via } : {}) },
+      headers: {
+        'Content-Type': 'image/jpeg',
+        ...(via ? { 'X-Scan-Client': via } : {}),
+        ...(session ? { 'X-Scan-Session': `${req.user?.id ?? 'u'}-${session}` } : {}),
+      },
       signal: ctl.signal,
-    }).finally(() => req.off('close', cancel));
+    }).finally(() => res.off('close', cancel));
     if (r.status !== 200 || !r.data?.ok) return res.status(r.status === 200 ? 422 : r.status).json(r.data);
     const results = await Promise.all((r.data.results || []).map(async (x) => ({ ...(await hydrate(x)), cached: !!x.cached })));
     res.json({

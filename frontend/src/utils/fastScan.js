@@ -62,16 +62,29 @@ function unresolvedSignature(out) {
 export function nextFailStreak(prev, out, now) {
   const sig = unresolvedSignature(out);
   if (!sig) return null;
-  const same = prev && prev.title === sig.title
+  const same = prev && normTitle(prev.title) === normTitle(sig.title)
     && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;
   const count = same ? prev.count + 1 : 1;
   return { ...sig, count, until: now + FAIL_BACKOFF_MS[Math.min(count, FAIL_BACKOFF_MS.length - 1)] };
 }
 
-// Pure: may an auto pass send to the server now?
-export function serverAllowed(streak, now) {
-  return !streak || now >= streak.until;
+// Pure: may an auto pass send to the server now? Backoff applies only when
+// the CURRENT observation shows the same card: the on-device read of this very
+// frame found a card with the same title, at the same place. With no local
+// evidence (no on-device reader, no title, a different card, moved) the server
+// is always allowed — backoff must never hold back a new card.
+export function serverAllowed(streak, now, local = null) {
+  if (!streak || now >= streak.until) return true;
+  const res = (local?.results || []).find(r => r.title);
+  const cand = local?.candidates?.[0];
+  if (!res || !cand?.box || !local.frame) return true;
+  if (normTitle(res.title) !== normTitle(streak.title)) return true;
+  const diag = Math.hypot(local.frame.width || 1, local.frame.height || 1);
+  const [x, y, w, h] = cand.box;
+  const cx = (x + w / 2) / diag, cy = (y + h / 2) / diag;
+  return Math.hypot(cx - streak.cx, cy - streak.cy) > SAME_PLACE;
 }
+function normTitle(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 
 // Small-card rescue. Measured on saved scans: a card whose short side is
 // under ~350 px in the uploaded frame almost never reads (title or collector

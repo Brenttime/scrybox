@@ -61,6 +61,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const scanAbortRef = useRef(null); // in-flight server read, aborted on stop/unmount
   const resultsRef = useRef([]);
   const failStreakRef = useRef(null); // same unresolved card, repeated: back off the server
+  // One id per camera session: the sidecar scopes its identity cache to it.
+  const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
 
@@ -241,7 +243,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // answer so a slow or failing session can be diagnosed from the logs.
       let why = onDeviceRef.current ? (autoPass ? 'unproven' : 'hedge') : 'no-device';
       const serverRead = async (blobP) => {
-        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'}` };
+        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Session': sessionRef.current, 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'}` };
         const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body: await blobP, signal: abort.signal });
         if (r.status === 429) return { busy: true, backoff: true };
         const j = await readJson(r);
@@ -250,8 +252,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       };
       const hedged = onDeviceRef.current && !autoPass ? serverRead(grabJpeg(source, sw, sh, canvasRef)) : null;
       hedged?.catch(() => {});
+      let local = null;
       if (onDeviceRef.current) {
-        const local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
+        local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
         else if (!local?.candidates?.length) why = 'no-card';
         else if (!local.candidates[0].eligible) why = String(local.candidates[0].status || 'ineligible').replace(/\s+/g, '-');
@@ -265,7 +268,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       }
       if (out) abort.abort();
       else if (hedged) out = await hedged;
-      else if (autoPass && !serverAllowed(failStreakRef.current, Date.now())) {
+      else if (autoPass && !serverAllowed(failStreakRef.current, Date.now(), local)) {
         // Same card, same unresolved footer as the last few passes: don't pay
         // another ~0.9 s of sidecar OCR for the same answer. Keep telling the
         // user what would help instead.
@@ -352,7 +355,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; resetOnDevice(); autoLoop(gen);
+    seenIdsRef.current.clear(); failStreakRef.current = null; resetOnDevice();
+    sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
+    autoLoop(gen);
   };
   const toggleMode = () => {
     const next = mode === 'auto' ? 'single' : 'auto';
