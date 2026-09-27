@@ -186,9 +186,14 @@ function lanczosWeights(inN, outN) {
   }
   return ws;
 }
+// Weights and the intermediate buffer depend only on the dimensions, which are
+// fixed for a camera session: computed once, reused (same values, same order).
+const lzCache = new Map();
 export function resizeLanczos3(src, W, H, ch, w, h) {
-  const wx = lanczosWeights(W, w), wy = lanczosWeights(H, h);
-  const tmp = new Float32Array(H * w * 3);
+  const key = `${W}x${H}>${w}x${h}`;
+  let c = lzCache.get(key);
+  if (!c) { if (lzCache.size > 4) lzCache.clear(); c = { wx: lanczosWeights(W, w), wy: lanczosWeights(H, h), tmp: new Float32Array(H * w * 3) }; lzCache.set(key, c); }
+  const { wx, wy, tmp } = c;
   for (let y = 0; y < H; y++) for (let x = 0; x < w; x++) {
     const { lo, w: k } = wx[x]; let r = 0, g = 0, b = 0;
     for (let t = 0; t < k.length; t++) { const p = (y * W + lo + t) * ch; r += src[p] * k[t]; g += src[p + 1] * k[t]; b += src[p + 2] * k[t]; }

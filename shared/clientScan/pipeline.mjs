@@ -15,7 +15,7 @@
 // server's job; the caller falls back to it for anything this returns as
 // unresolved.
 import {
-  REC_H, portraitQuad, padQuad, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
+  REC_H, CARD_W, CARD_H, portraitQuad, padQuad, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
@@ -28,6 +28,18 @@ const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 const CORNER_GATE = 0.02;           // cornelius "sharpness" head: below = no card
 const EDGE_FRAC = 0.01;             // server: touches frame edge within 1%
+// Near-edge admission. A card whose top sits 6-8 px below a 1080-high frame
+// edge is fully visible, but the 1% band (10.8 px) vetoed it indefinitely:
+// 161 of 788 desktop passes, and the 8.0 s / 5.6 s / 5.2 s worst adds of the
+// 63-card session. Inside the band a card is admitted only when the quad is a
+// plausible, near-front-facing card (side-length aspect, opposing sides
+// alike), it clears a tight margin (0.2%, >= 2 px), and every OCR strip it is
+// about to read projects inside the frame (padQuad reaches past the outline,
+// and sampleStrip clamps off-frame pixels into repeated edge rows). Such a
+// frame gets a fresh read only: no tracked identity or pooled evidence.
+const EDGE_TIGHT_FRAC = 0.002;
+const NEAR_EDGE_ASPECT = [0.60, 0.85];   // short/long side, a card is 0.716
+const NEAR_EDGE_SIDE_RATIO = 0.85;       // min/max of opposing sides
 // Laplacian variance of the sampled title band. Replay of 506 saved phone
 // frames: every proven card scored >= 2161; below 500 no title was ever read,
 // so reading those only burned ~370 ms before failing. Auto waits for a
@@ -43,6 +55,12 @@ const STILL_DRIFT = 0.012;          // mean corner move / frame diagonal
 // the frame after it.
 const STILL_OBS = 3;
 const STILL_GAP_MS = 400;
+// A settle window spans real time, not loop iterations: an observation less
+// than STILL_MIN_SEP_MS after the last counted one (a fast desktop loop, or
+// the same decoded video frame twice) does not advance it. At the old 60 ms
+// loop every pass was >= ~100 ms apart, so this keeps the window measured on
+// the 63-card session unchanged when the loop runs faster.
+const STILL_MIN_SEP_MS = 90;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
@@ -84,6 +102,30 @@ export function corneliusTensor(ort, rgb, channels = 3) {
     t[2 * PLANE + i] = l2[rgb[j + 2]];
   }
   return new ort.Tensor('float32', t, [1, 3, CORN_SIZE, CORN_SIZE]);
+}
+
+// A near-front-facing card outline: side-length aspect near 0.716 and
+// opposing sides alike. Anything else keeps the conservative 1% edge band.
+function plausibleCard(q) {
+  const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const top = d(q[0], q[1]), bot = d(q[3], q[2]), lef = d(q[0], q[3]), rig = d(q[1], q[2]);
+  if (!(top > 0 && bot > 0 && lef > 0 && rig > 0)) return false;
+  if (Math.min(top, bot) / Math.max(top, bot) < NEAR_EDGE_SIDE_RATIO) return false;
+  if (Math.min(lef, rig) / Math.max(lef, rig) < NEAR_EDGE_SIDE_RATIO) return false;
+  const a = Math.min(top + bot, lef + rig) / Math.max(top + bot, lef + rig);
+  return a >= NEAR_EDGE_ASPECT[0] && a <= NEAR_EDGE_ASPECT[1];
+}
+
+// Every corner of card-space strip r ([x0,x1,y0,y1] fractions) projects at
+// least 1 px inside the frame, so no sample is a clamped edge pixel.
+function stripInFrame(m, r, w, h) {
+  const y1 = Math.min(0.99, r[3]);
+  for (const [fx, fy] of [[r[0], r[2]], [r[1], r[2]], [r[1], y1], [r[0], y1]]) {
+    const x = fx * CARD_W, y = fy * CARD_H, den = m[6] * x + m[7] * y + 1;
+    const px = (m[0] * x + m[1] * y + m[2]) / den, py = (m[3] * x + m[4] * y + m[5]) / den;
+    if (!(px >= 1 && px <= w - 2 && py >= 1 && py <= h - 2)) return false;
+  }
+  return true;
 }
 
 // RapidOCR TextRecognizer: sort by aspect, batches of 6, each padded (zeros,
@@ -173,20 +215,24 @@ export function createReader(env) {
     base.candidates.push(cand);
 
     const ex = Math.max(2, EDGE_FRAC * w), ey = Math.max(2, EDGE_FRAC * h);
-    const clipped = xs.some(x => x <= ex || x >= w - ex) || ys.some(y => y <= ey || y >= h - ey);
+    const tx = Math.max(2, EDGE_TIGHT_FRAC * w), ty = Math.max(2, EDGE_TIGHT_FRAC * h);
+    const inside = (q, mx, my) => q.every(p => p.x > mx && p.x < w - mx && p.y > my && p.y < h - my);
+    const nearEdge = !inside(quad, ex, ey) && inside(quad, tx, ty) && plausibleCard(quad);
+    const clipped = !inside(quad, ex, ey) && !nearEdge;
+    if (nearEdge) cand.near_edge = true;
     const diag = Math.hypot(w, h);
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
-    const tNow = now();
+    const tNow = env.clock ? env.clock() : now();
     // A long gap right after an OCR read may not vouch for the frame after it
     // (the card could have moved and come back), so it counts at most as the
     // start of a new window; a gap with no read in it (slow camera or device)
     // is plain slow sampling and counts normally, so a slow cadence can never
     // wedge Auto.
-    if (drift > STILL_DRIFT) stillRun = 1;
-    else if (tNow - lastAt > STILL_GAP_MS && readSince) stillRun = Math.min(stillRun + 1, STILL_OBS - 1);
-    else stillRun++;
-    lastAt = tNow; readSince = false;
+    if (drift > STILL_DRIFT) { stillRun = 1; lastAt = tNow; }
+    else if (tNow - lastAt > STILL_GAP_MS && readSince) { stillRun = Math.min(stillRun + 1, STILL_OBS - 1); lastAt = tNow; }
+    else if (tNow - lastAt >= STILL_MIN_SEP_MS || stillRun === 0) { stillRun++; lastAt = tNow; }
+    readSince = false;
     cand.still = stillRun;
     let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
@@ -206,7 +252,7 @@ export function createReader(env) {
     // one uninterrupted presentation.
     // 'settling' is a still card waiting out its window: nothing about it
     // suggests a swap, so tracking and pooled evidence survive it.
-    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
+    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; evidence = null; }
     if (!cand.eligible) return base;
 
     // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
@@ -232,7 +278,7 @@ export function createReader(env) {
       const tr = now();
       const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
       const move = fine ? fine.reduce((s, p, i) => s + Math.hypot(p.x - quad[i].x, p.y - quad[i].y), 0) / 4 / diag : Infinity;
-      const fineClipped = fine && fine.some(p => p.x <= ex || p.x >= w - ex || p.y <= ey || p.y >= h - ey);
+      const fineClipped = fine && !inside(fine, ex, ey) && !(nearEdge && inside(fine, tx, ty) && plausibleCard(fine));
       if (fine && move <= REFINE_MAX_MOVE && !fineClipped) {
         const mf = cardToFrame(padQuad(fine));
         if (titleSharpness(rgba, w, h, mf) >= TITLE_SHARP_FLOOR) { m = mf; cand.quad = fine.map(p => [p.x, p.y]); timings.refined = 1; }
@@ -244,7 +290,7 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     readSince = true;
     const recBefore = env.stats.recCalls;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -253,7 +299,8 @@ export function createReader(env) {
     // Only a title-proven answer is carried: a card swapped for a same-art
     // reprint between two frames at the same spot is invisible to tracking,
     // so a printing that needed its footer is re-read every time.
-    if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
+    if (nearEdge) { evidence = null; tracked = null; }
+    else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred) };
@@ -261,28 +308,34 @@ export function createReader(env) {
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false) {
     const tA = now();
+    // Near the frame edge, a strip that reaches off-frame would be read from
+    // clamped, repeated edge pixels: it is dropped (never extrapolated), and a
+    // card left without its title or footer strips simply fails this frame.
+    const fits = (r) => !nearEdge || stripInFrame(m, r, w, h);
     const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
+    const strips = (rs) => rs.filter(fits).map(strip);
     const cands = [];
     // Every title read, accepted or not, for scan telemetry: a failed title
     // otherwise leaves no trace of what the recognizer actually saw.
     const titleRaw = [];
-    const consider = (reads) => {
+    const consider = (reads, batch) => {
       for (const r of reads) {
-        if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100]);
+        if (!r) continue;
+        if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, batch]);
         if (!r.text || r.conf < TITLE_CONF) continue;
         const found = findCardByOcr(env.index, r.text);
         if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
     };
-    consider(await recognize(env, TITLE_FIRST.map(strip)));
+    consider(await recognize(env, strips(TITLE_FIRST)), 1);
     // The tighter crops rescue weak or partial reads. An exact, high-confidence
     // match of a full index name needs no rescue: skip the second recognizer
     // call. This only selects the TITLE; printings still need their proof.
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
-      consider(await recognize(env, TITLE_TIGHT.map(strip)));
+      consider(await recognize(env, strips(TITLE_TIGHT)), 2);
     }
     timings.title_ms = Math.round(now() - tA);
     const titleReads = cands.map(c => c.raw);
@@ -319,7 +372,7 @@ export function createReader(env) {
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
       if (stage === 'retro') {
-        const reads = await recognize(env, RETRO_ROWS.map(y => strip([0.35, 0.95, y, y + 0.025])));
+        const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025])));
         const nums = [];
         for (const r of reads) {
           if (!r.text || r.conf < RETRO_CONF) continue;
@@ -337,7 +390,7 @@ export function createReader(env) {
       }
       const rows = stage === 'wide' ? WIDE_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const reads = await recognize(env, rows.map(y => strip([0, x1, y, y + 0.025])));
+      const reads = await recognize(env, strips(rows.map(y => [0, x1, y, y + 0.025])));
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
       if (pi != null) return done(pi, 'title+set+collector', raws, si);

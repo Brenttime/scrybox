@@ -20,6 +20,11 @@ import { scanTelemetry } from '../utils/scanTelemetry';
 // prove, or a device that cannot load it, uses the server path unchanged.
 
 const AUTO_GAP_MS = 60;
+// After a pass the gate rejected (moving, settling, near the edge, blurry)
+// no OCR ran, so the CPU is mostly idle: on a desktop-class device look again
+// sooner. The settle window is time-guarded in the pipeline, so this cannot
+// shorten it; it only removes idle time between observations.
+const AUTO_GATE_MS = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 8) ? 25 : AUTO_GAP_MS;
 const AUTO_IDLE_MS = 350;
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
 // The tray is capped for render cost, but unsent scans are never dropped to
@@ -342,7 +347,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       } else if (!autoPass) {
         setLatency({ total: ms, read: ms });
       }
-      return { matched: fresh.length, none: !out.candidates.length };
+      return { matched: fresh.length, none: !out.candidates.length, gated: out.candidates.length > 0 && !eligible && tel.get('answered_by') === 'client' };
     } catch (e) {
       tel.end({ outcome: e?.name === 'AbortError' ? 'aborted' : 'error', error: e?.message || String(e) });
       if (e?.name === 'AbortError' || stale()) return { busy: true };
@@ -374,7 +379,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const v = videoRef.current;
     const r = v && v.readyState >= 2 ? await scanRef.current(v, { autoPass: true, gen }) : { busy: true };
     if (!autoRef.current || gen !== runRef.current) return;
-    const wait = r.backoff ? AUTO_BUSY_MS : r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS;
+    const wait = r.backoff ? AUTO_BUSY_MS : r.none || r.error ? AUTO_IDLE_MS : r.gated ? AUTO_GATE_MS : AUTO_GAP_MS;
     timerRef.current = setTimeout(() => autoLoop(gen), wait);
   }, [t]);
 

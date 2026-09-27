@@ -55,9 +55,10 @@ test('corneliusTensor reuses its buffer and matches the reference normalisation'
 function fakeReader(titleFor, opts = {}) {
   const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
   let present = true;
+  const corners = opts.corners || [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9];
   const cornelius = {
     run: async () => ({
-      corners: { data: present ? [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] : [0, 0, 0, 0, 0, 0, 0, 0] },
+      corners: { data: present ? corners : [0, 0, 0, 0, 0, 0, 0, 0] },
       sharpness: { data: [present ? 0.9 : 0] },
     }),
   };
@@ -77,8 +78,10 @@ function fakeReader(titleFor, opts = {}) {
   let detects = 0;
   const run = cornelius.run;
   cornelius.run = async (x) => { detects++; return run(x); };
-  const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false });
-  reader.__env = { ort, cornelius, rec, chars, refineCorners: opts.refine ?? false };
+  // Each observation 100 ms after the last (the settle window is time-based).
+  let tick = 0; const clock = opts.clock || (() => (tick += 100));
+  const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock });
+  reader.__env = { ort, cornelius, rec, chars, refineCorners: opts.refine ?? false, clock };
   return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
 }
 
@@ -242,4 +245,42 @@ test('corner refinement: a far-off or edge-touching refined quad is ignored (gat
   assert.equal(n, 2);
   assert.notEqual(out.timings.refined, 1, 'refined quad touching the edge / far away must be rejected');
   assert.equal(out.candidates[0].quad[0][0], 0.2 * 200);
+});
+
+// 1000x1000 frame; card corners as fractions. The frame helper is square, so a
+// 0.716 card is ~0.358 wide per 0.5 tall.
+const nearTop = (y0) => [0.32, y0, 0.68, y0, 0.68, y0 + 0.5, 0.32, y0 + 0.5];
+
+test('near-edge: a plausible fully visible card inside the 1% band is read (fresh, not tracked)', async () => {
+  const { reader, calls } = fakeReader(() => 'grief', { corners: nearTop(0.006) });
+  const f = sharpFrame(1000, 1000);
+  const out = await reader.read(f, new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(out.candidates[0].near_edge, true);
+  assert.equal(out.candidates[0].status, 'ready');
+  // Title strips reaching above the frame are dropped, not read from clamped
+  // rows: the ones that fit are still read.
+  assert.ok(calls() >= 1);
+  const again = await reader.read(f, new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.notEqual(again.results[0]?.cached, true, 'near-edge answers are never carried by tracking');
+});
+
+test('near-edge: a card at the very edge, or an implausible outline, is still vetoed', async () => {
+  for (const corners of [nearTop(0.001), [0.25, 0.006, 0.75, 0.006, 0.75, 0.5, 0.25, 0.5], [0.32, 0.006, 0.68, 0.006, 0.60, 0.5, 0.40, 0.5]]) {
+    const { reader, calls } = fakeReader(() => 'grief', { corners });
+    const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+    assert.equal(out.candidates[0].status, 'touches frame edge', JSON.stringify(corners));
+    assert.equal(calls(), 0);
+  }
+});
+
+test('settle window counts real time: a faster loop does not shorten it', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  const f = sharpFrame();
+  for (let i = 0; i < 6; i++) { t += 30; await reader.read(f, small, { requireStill: true }); }
+  // 6 passes 30 ms apart = 150 ms: only 2 observations >= 90 ms apart.
+  assert.equal(calls(), 0, 'no OCR before 3 real-time-separated observations');
+  t += 100; await reader.read(f, small, { requireStill: true });
+  assert.ok(calls() > 0, 'third separated observation settles');
 });
