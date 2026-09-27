@@ -52,7 +52,7 @@ test('corneliusTensor reuses its buffer and matches the reference normalisation'
 
 // A reader whose detector always finds the same full-frame card and whose
 // recognizer returns scripted text, so identity-cache behaviour is observable.
-function fakeReader(titleFor) {
+function fakeReader(titleFor, opts = {}) {
   const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
   let present = true;
   const cornelius = {
@@ -77,8 +77,8 @@ function fakeReader(titleFor) {
   let detects = 0;
   const run = cornelius.run;
   cornelius.run = async (x) => { detects++; return run(x); };
-  const reader = createReader({ ort, cornelius, rec, chars, index });
-  reader.__env = { ort, cornelius, rec, chars };
+  const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false });
+  reader.__env = { ort, cornelius, rec, chars, refineCorners: opts.refine ?? false };
   return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
 }
 
@@ -215,4 +215,16 @@ test('auto: deferral never repeats back to back (bounded), and blurred frames re
   const s = await r2.read(sharpFrame(), small, { requireStill: true });
   assert.notEqual(s.candidates[0].status, 'ready', 'first clear frame after blur must not inherit settling history');
   assert.ok(calls() >= 0);
+});
+
+test('corner refinement: one extra detection only for frames that get OCR', async () => {
+  const { reader, detects } = fakeReader(() => 'grief', { refine: true });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  await reader.read(sharpFrame(200, 280, true), small);          // blurry: gated, no OCR
+  assert.equal(detects(), 1, 'gated frame: no refinement');
+  const f = sharpFrame();
+  const quad = await reader.probe(small, 4, f.width, f.height);
+  const out = await reader.read(f, null, { quad });
+  assert.equal(out.results[0]?.ok, true);
+  assert.equal(detects(), 3, 'probe + one refinement on the Lanczos copy');
 });

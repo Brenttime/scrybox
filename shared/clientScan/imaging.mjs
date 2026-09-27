@@ -169,3 +169,35 @@ export function titleSharpness(rgba, w, h, m) {
   }
   return s / n;
 }
+
+// Separable Lanczos-3 resize (RGBA or RGB in, RGB out), matching sharp's
+// default filter. The corner model was validated on sharp-resized 384px
+// inputs; the browser's canvas drawImage downscale (bilinear, sparse) moves
+// the predicted corners a few px, which on the 61 saved Windows frames cost
+// 7 of 11 proven printings (sharp 11, canvas-equivalent bilinear 4, this 11).
+function lanczosWeights(inN, outN) {
+  const scale = inN / outN, support = 3 * Math.max(1, scale), ws = [];
+  const L = (x) => { if (x === 0) return 1; if (Math.abs(x) >= 3) return 0; const px = Math.PI * x; return 3 * Math.sin(px) * Math.sin(px / 3) / (px * px); };
+  for (let i = 0; i < outN; i++) {
+    const c = (i + 0.5) * scale - 0.5, lo = Math.max(0, Math.ceil(c - support)), hi = Math.min(inN - 1, Math.floor(c + support));
+    const w = []; let sum = 0;
+    for (let j = lo; j <= hi; j++) { const v = L((j - c) / Math.max(1, scale)); w.push(v); sum += v; }
+    ws.push({ lo, w: Float32Array.from(w, v => v / sum) });
+  }
+  return ws;
+}
+export function resizeLanczos3(src, W, H, ch, w, h) {
+  const wx = lanczosWeights(W, w), wy = lanczosWeights(H, h);
+  const tmp = new Float32Array(H * w * 3);
+  for (let y = 0; y < H; y++) for (let x = 0; x < w; x++) {
+    const { lo, w: k } = wx[x]; let r = 0, g = 0, b = 0;
+    for (let t = 0; t < k.length; t++) { const p = (y * W + lo + t) * ch; r += src[p] * k[t]; g += src[p + 1] * k[t]; b += src[p + 2] * k[t]; }
+    const o = (y * w + x) * 3; tmp[o] = r; tmp[o + 1] = g; tmp[o + 2] = b;
+  }
+  const out = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) { const { lo, w: k } = wy[y];
+    for (let x = 0; x < w; x++) { let r = 0, g = 0, b = 0;
+      for (let t = 0; t < k.length; t++) { const p = ((lo + t) * w + x) * 3; r += tmp[p] * k[t]; g += tmp[p + 1] * k[t]; b += tmp[p + 2] * k[t]; }
+      const o = (y * w + x) * 3; out[o] = Math.max(0, Math.min(255, Math.round(r))); out[o + 1] = Math.max(0, Math.min(255, Math.round(g))); out[o + 2] = Math.max(0, Math.min(255, Math.round(b))); } }
+  return out;
+}

@@ -15,7 +15,7 @@
 // server's job; the caller falls back to it for anything this returns as
 // unresolved.
 import {
-  REC_H, portraitQuad, padQuad, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness,
+  REC_H, portraitQuad, padQuad, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
@@ -154,7 +154,8 @@ export function createReader(env) {
   //   requireStill: auto mode — only read once the card has stopped moving.
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
-  async function read(frame, small, { smallChannels = 4, requireStill = false, quad: known } = {}) {
+  async function read(frame, small, opts = {}) {
+    const { smallChannels = 4, requireStill = false, quad: known } = opts;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
@@ -184,7 +185,7 @@ export function createReader(env) {
     else stillRun++;
     lastAt = tNow; readSince = false;
     cand.still = stillRun;
-    const m = cardToFrame(padQuad(quad));
+    let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
     // Blurred or clipped observations are not part of a settled window.
@@ -214,6 +215,18 @@ export function createReader(env) {
     }
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
+    // Before OCR, re-find the corners on a Lanczos-resized copy of THIS frame
+    // (the corner model's validated input): the caller's 384px copy comes from
+    // a cheap canvas downscale, whose corners are a few px off. Saved Windows
+    // frames through a canvas-equivalent downscale: 4 of 11 printings proven
+    // without this, 11 of 11 with it (identical to the Node/sharp replay).
+    // ~60-100 ms, paid only by frames that are about to be OCR'd.
+    if (env.refineCorners !== false && !opts.refined) {
+      const tr = now();
+      const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
+      if (fine) { m = cardToFrame(padQuad(fine)); cand.quad = fine.map(p => [p.x, p.y]); }
+      timings.refine_ms = Math.round(now() - tr);
+    }
     readSince = true;
     const recBefore = env.stats.recCalls;
     const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred);
