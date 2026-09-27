@@ -1,50 +1,68 @@
 {
+  "id": "/",
   "name": "Scrybox",
   "short_name": "Scrybox",
+  "description": "Your Magic: The Gathering collection, decks and lists.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
   "background_color": "#121417",
   "theme_color": "#121417",
   "icons": [
     {
-      "src": "../icons/icon-48.webp",
+      "src": "/icons/icon-48.png?v=2",
       "type": "image/png",
       "sizes": "48x48",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-72.webp",
+      "src": "/icons/icon-72.png?v=2",
       "type": "image/png",
       "sizes": "72x72",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-96.webp",
+      "src": "/icons/icon-96.png?v=2",
       "type": "image/png",
       "sizes": "96x96",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-128.webp",
+      "src": "/icons/icon-128.png?v=2",
       "type": "image/png",
       "sizes": "128x128",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-192.webp",
+      "src": "/icons/icon-192.png?v=2",
       "type": "image/png",
       "sizes": "192x192",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-256.webp",
+      "src": "/icons/icon-256.png?v=2",
       "type": "image/png",
       "sizes": "256x256",
-      "purpose": "any maskable"
+      "purpose": "any"
     },
     {
-      "src": "../icons/icon-512.webp",
+      "src": "/icons/icon-512.png?v=2",
       "type": "image/png",
       "sizes": "512x512",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-192.png?v=2",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon-512.png?v=2",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
     }
   ]
 }

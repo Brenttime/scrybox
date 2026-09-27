@@ -637,3 +637,174 @@
 }
 :root[data-theme="manabox"] .deck-tile-missing { color: #ff8c8c !important; }
 :root[data-theme="manabox"] .deck-tile-owned { color: #5de09a !important; }
+
+/* ---------------------------------------------------------------- modal close
+   Every modal's X. Frosted glass: translucent dark fill + blur so it sits on
+   any panel or card art, a hairline light ring so it never reads as an empty
+   bubble, a bold white glyph, and the ManaBox orange on hover/focus. 44px tap
+   target (Apple HIG). !important beats the per-button inline styles. */
+:root[data-theme="manabox"] .modal-close {
+  width: 44px !important;
+  height: 44px !important;
+  min-width: 44px;
+  padding: 0 !important;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50% !important;
+  background: rgba(18, 20, 23, 0.45) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  backdrop-filter: blur(10px) saturate(140%);
+  color: rgba(255, 255, 255, 0.92) !important;
+  border: 1px solid rgba(255, 255, 255, 0.22) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  z-index: 20;
+  flex-shrink: 0;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+:root[data-theme="manabox"] .modal-close svg {
+  width: 20px;
+  height: 20px;
+  stroke-width: 2.5;
+  color: inherit;
+}
+:root[data-theme="manabox"] .modal-close:hover,
+:root[data-theme="manabox"] .modal-close:focus-visible,
+:root[data-theme="manabox"] .modal-close:active {
+  background: var(--mb-accent-soft) !important;
+  border-color: var(--mb-accent) !important;
+  color: var(--mb-accent-2) !important;
+  transform: none;
+}
+:root[data-theme="manabox"] .modal-close:focus-visible {
+  outline: 2px solid var(--mb-accent);
+  outline-offset: 2px;
+}
+:root[data-theme="manabox"] .modal-close:disabled { opacity: 0.4; }
+
+/* ---------------------------------------------------------------- zoom actions
+   Copy / Share pills under the full-screen card. Same frosted glass as the
+   modal close so the viewer reads as one set of controls. */
+:root[data-theme="manabox"] .zoom-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  cursor: default;
+}
+:root[data-theme="manabox"] .zoom-actions {
+  display: flex;
+  gap: 0.6rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+:root[data-theme="manabox"] .zoom-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 44px;
+  padding: 0 1.1rem;
+  border-radius: 999px;
+  background: rgba(18, 20, 23, 0.45);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  backdrop-filter: blur(10px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+:root[data-theme="manabox"] .zoom-action:hover,
+:root[data-theme="manabox"] .zoom-action:focus-visible,
+:root[data-theme="manabox"] .zoom-action:active {
+  background: var(--mb-accent-soft, rgba(255, 122, 26, 0.13));
+  border-color: var(--mb-accent, #ff7a1a);
+  color: var(--mb-accent-2, #ffa45c);
+}
+:root[data-theme="manabox"] .zoom-action:disabled { opacity: 0.6; cursor: progress; }
+
+/* Details view: pills sit under the card on the panel, not over black. */
+:root[data-theme="manabox"] .zoom-actions-compact { margin-top: 0.75rem; }
+:root[data-theme="manabox"] .zoom-actions-compact .zoom-action {
+  background: rgba(255, 255, 255, 0.06);
+  min-height: 40px;
+  font-size: 0.85rem;
+}
+
+/* ---------------------------------------------------------------- pull to refresh */
+:root[data-theme="manabox"] .ptr-indicator {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  left: 50%;
+  z-index: 2000;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(18, 20, 23, 0.7);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.75);
+  pointer-events: none;
+}
+:root[data-theme="manabox"] .ptr-indicator.ptr-ready { color: var(--mb-accent, #ff7a1a); border-color: var(--mb-accent, #ff7a1a); }
+:root[data-theme="manabox"] .ptr-indicator.ptr-spinning svg { animation: ptr-spin 0.7s linear infinite; }
+
+/* ---------------------------------------------------------------- keywords */
+:root[data-theme="manabox"] .kw-chips { display: flex; gap: 0.4rem; margin-top: 0.6rem; flex-wrap: wrap; }
+:root[data-theme="manabox"] .kw-chip {
+  min-height: 32px; padding: 0 0.85rem; border-radius: 999px; font: inherit; font-size: 0.8rem; font-weight: 600;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-glass); color: var(--text-primary); cursor: pointer;
+}
+:root[data-theme="manabox"] .kw-chip.active { background: var(--mb-accent-soft); border-color: var(--mb-accent); color: var(--mb-accent-2); }
+:root[data-theme="manabox"] .kw-row { border-bottom: 1px solid var(--border-glass); }
+:root[data-theme="manabox"] .kw-row:last-child { border-bottom: 0; }
+:root[data-theme="manabox"] .kw-head {
+  display: flex; align-items: center; gap: 0.75rem; width: 100%; text-align: left; padding: 0.8rem 1rem;
+  background: none; border: 0; color: var(--text-primary); cursor: pointer; font: inherit;
+}
+:root[data-theme="manabox"] .kw-name { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; color: var(--text-strong); }
+:root[data-theme="manabox"] .kw-tag {
+  font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 0.1rem 0.45rem; border-radius: 999px; background: rgba(255, 255, 255, 0.07); color: var(--text-muted);
+}
+:root[data-theme="manabox"] .kw-reminder { display: block; margin-top: 0.2rem; color: var(--text-muted); font-size: 0.85rem; font-style: italic; line-height: 1.4; }
+:root[data-theme="manabox"] .kw-caret { color: var(--text-muted); flex-shrink: 0; transition: transform 0.15s ease; }
+:root[data-theme="manabox"] .kw-row.open .kw-caret { transform: rotate(180deg); color: var(--mb-accent); }
+:root[data-theme="manabox"] .kw-body { padding: 0 1rem 1rem; font-size: 0.85rem; line-height: 1.5; }
+:root[data-theme="manabox"] .kw-summary { margin: 0 0 0.6rem; color: var(--text-primary); }
+:root[data-theme="manabox"] .kw-rules { list-style: none; margin: 0 0 0.75rem; padding: 0; display: grid; gap: 0.45rem; color: var(--text-primary); }
+:root[data-theme="manabox"] .kw-rule-id { color: var(--mb-accent-2); font-weight: 600; font-variant-numeric: tabular-nums; margin-right: 0.25rem; }
+:root[data-theme="manabox"] .kw-link { color: var(--mb-accent-2); font-size: 0.8rem; font-weight: 600; text-decoration: none; }
+
+/* ---------------------------------------------------------------- mtg filters */
+:root[data-theme="manabox"] .search-field { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+:root[data-theme="manabox"] .search-field > span { font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); }
+:root[data-theme="manabox"] .filter-section-title {
+  font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted);
+}
+:root[data-theme="manabox"] .filter-count {
+  background: var(--mb-accent); color: #fff; font-size: 0.65rem; font-weight: 900; border-radius: 999px; padding: 1px 7px; min-width: 18px; text-align: center;
+}
+:root[data-theme="manabox"] .mtg-color-row { display: flex; gap: 1rem 1.5rem; flex-wrap: wrap; }
+:root[data-theme="manabox"] .mtg-color-picker { display: flex; flex-direction: column; gap: 0.45rem; }
+:root[data-theme="manabox"] .mtg-pips { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+:root[data-theme="manabox"] .mtg-pip {
+  width: 38px; height: 38px; border-radius: 50%; font: inherit; font-weight: 800; font-size: 0.85rem; cursor: pointer;
+  border: 2px solid transparent; opacity: 0.4; filter: saturate(0.5); transition: opacity 0.12s ease, transform 0.12s ease, border-color 0.12s ease;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+:root[data-theme="manabox"] .mtg-pip.on { opacity: 1; filter: none; border-color: var(--mb-accent); transform: scale(1.06); }
+:root[data-theme="manabox"] .mtg-pip:focus-visible { outline: 2px solid var(--mb-accent); outline-offset: 2px; }
+:root[data-theme="manabox"] .mtg-pip-W { background: #f8f3d8; color: #3a3524; }
+:root[data-theme="manabox"] .mtg-pip-U { background: #a9d6f2; color: #0f3552; }
+:root[data-theme="manabox"] .mtg-pip-B { background: #b7aca8; color: #1c1616; }
+:root[data-theme="manabox"] .mtg-pip-R { background: #f2a58c; color: #551a0b; }
+:root[data-theme="manabox"] .mtg-pip-G { background: #9fd3a7; color: #0d3a1b; }
+:root[data-theme="manabox"] .mtg-pip-C { background: #cfcccb; color: #2c2a2a; }
+:root[data-theme="manabox"] .mtg-mode { display: flex; gap: 0.35rem; }

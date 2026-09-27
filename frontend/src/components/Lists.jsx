@@ -760,7 +760,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         {showCreate && (
           <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
             <div className="glass-panel" style={{ maxWidth: '460px', width: '100%', maxHeight: '90vh', overflowY: 'auto', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
-              <button className="btn btn-secondary btn-icon-only" onClick={() => setShowCreate(false)}
+              <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowCreate(false)}
                 style={{ position: 'absolute', top: '0.75rem', right: '0.75rem' }}><X size={16} /></button>
               <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-strong)', margin: '0 0 1rem' }}>{t('lists.newList')}</h3>
               <form onSubmit={handleCreate} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
@@ -1002,7 +1002,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
       {showEdit && (
         <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
           <div className="glass-panel" style={{ maxWidth: '420px', width: '100%', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
-            <button className="btn btn-secondary btn-icon-only" onClick={() => setShowEdit(false)}
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowEdit(false)}
               style={{ position: 'absolute', top: '0.75rem', right: '0.75rem' }}><X size={16} /></button>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-strong)', margin: '0 0 1rem' }}>{t('lists.editList')}</h3>
             <form onSubmit={handleUpdate} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
@@ -1039,7 +1039,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowBuy(false); }}
           style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
           <div className="glass-panel" style={{ maxWidth: '520px', width: '100%', maxHeight: '90vh', overflowY: 'auto', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
-            <button className="btn btn-secondary btn-icon-only" onClick={() => setShowBuy(false)}
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowBuy(false)}
               aria-label={t('common.close')} title={t('common.close')}
               style={{ position: 'absolute', top: '0.75rem', right: '0.75rem', zIndex: 1 }}><X size={16} /></button>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-strong)', margin: '0 0 0.35rem', paddingRight: '2.25rem' }}>{t('lists.buyList')}</h3>
@@ -1094,7 +1094,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowCopy(false); }}
           style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
           <div className="glass-panel" style={{ maxWidth: '520px', width: '100%', maxHeight: '90vh', overflowY: 'auto', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
-            <button className="btn btn-secondary btn-icon-only" onClick={() => setShowCopy(false)}
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowCopy(false)}
               style={{ position: 'absolute', top: '0.75rem', right: '0.75rem' }}><X size={16} /></button>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-strong)', margin: '0 0 0.35rem' }}>{t('lists.copyListModal')}</h3>
             <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{activeList.name}</div>

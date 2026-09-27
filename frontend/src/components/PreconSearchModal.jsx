@@ -112,7 +112,7 @@ export default function PreconSearchModal({ open, onClose, onImported, showToast
     >
       <div ref={dialogRef} className="glass-panel" tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="precon-search-title" aria-describedby="precon-search-subtitle precon-fast-path-body" style={{ width: '100%', maxWidth: '680px', maxHeight: '88vh', display: 'flex', flexDirection: 'column', padding: '1.5rem', position: 'relative' }}>
         <button
-          className="btn btn-secondary btn-icon-only"
+          className="btn btn-secondary btn-icon-only modal-close"
           onClick={onClose}
           disabled={Boolean(importing)}
           style={{ position: 'absolute', top: '0.9rem', right: '0.9rem', borderRadius: '50%', opacity: importing ? 0.4 : 1 }}

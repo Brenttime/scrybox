@@ -48,6 +48,9 @@ import AddToDeckSelect from './AddToDeckSelect';
 import PackPriceSplitter from './PackPriceSplitter';
 import CardImage from './CardImage';
 import MultiSelectDropdown from './MultiSelectDropdown';
+import ColorPicker from './ColorPicker';
+import { getScrollTop, getViewportHeight, getScrollHeight, offsetInScroller, scrollToTop } from '../utils/scrollRoot';
+import { CARD_TYPES, SUPERTYPES, MANA_VALUES, mvBucket, cardTypes, cardSupertypes, cardSubtypes, uniqueSorted, sortRarities, matchMtgFilters } from '../utils/mtgFilters';
 
 const labelStyle = { fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.03em' };
 const BACKGROUND_PAGE_SIZE = 2000;
@@ -133,8 +136,12 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   const [conditionFilter, setConditionFilter] = useState([]);
   const [printingFilter, setPrintingFilter] = useState([]);
   const [setFilter, setSetFilter] = useState([]);
+  const [colorFilter, setColorFilter] = useState([]);
+  const [colorMode, setColorMode] = useState('any');
+  const [identityFilter, setIdentityFilter] = useState([]);
   const [typeFilter, setTypeFilter] = useState([]);
   const [supertypeFilter, setSupertypeFilter] = useState([]);
+  const [subtypeFilter, setSubtypeFilter] = useState([]);
   const [cmcFilter, setCmcFilter] = useState([]);
   const [languageFilter, setLanguageFilter] = useState([]);
   const [minPriceFilter, setMinPriceFilter] = useState('');
@@ -445,33 +452,35 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
 
   // Extract unique filter values from the loaded collection.
   const uniqueRarities = useMemo(
-    () => Array.from(new Set(collection.map(item => item.rarity).filter(Boolean))).sort(),
+    () => sortRarities(Array.from(new Set(collection.map(item => item.rarity).filter(Boolean)))),
     [collection]
   );
   const uniqueSets = useMemo(
     () => Array.from(new Set(collection.map(item => item.set_name).filter(Boolean))).sort(),
     [collection]
   );
+  // Magic facets (see utils/mtgFilters): only offer values the binder has.
   const uniqueTypes = useMemo(
-    () => Array.from(new Set(collection.flatMap(item => item.types || []).filter(Boolean))).sort(),
+    () => CARD_TYPES.filter(ty => collection.some(item => cardTypes(item).includes(ty))),
     [collection]
   );
   const uniqueSupertypes = useMemo(
-    () => Array.from(new Set(collection.map(item => item.supertype).filter(Boolean))).sort(),
+    () => SUPERTYPES.filter(st => collection.some(item => cardSupertypes(item).includes(st))),
     [collection]
   );
+  const uniqueSubtypes = useMemo(() => uniqueSorted(collection, cardSubtypes), [collection]);
   const uniqueLanguages = useMemo(
     () => Array.from(new Set(collection.map(item => item.language).filter(Boolean))).sort(),
     [collection]
   );
   const uniqueCmcs = useMemo(
-    () => Array.from(new Set(collection.map(item => item.cmc).filter(v => v !== null && v !== undefined))).sort((a, b) => a - b),
+    () => MANA_VALUES.filter(b => collection.some(item => mvBucket(item.cmc) === b)),
     [collection]
   );
 
   const activeFilterCount =
     [rarityFilter, conditionFilter, printingFilter,
-    setFilter, typeFilter, supertypeFilter, cmcFilter, languageFilter]
+    setFilter, colorFilter, identityFilter, typeFilter, supertypeFilter, subtypeFilter, cmcFilter, languageFilter]
       .filter(v => v.length > 0).length
     + (searchFilter.trim() ? 1 : 0)
     + (minPriceFilter !== '' ? 1 : 0)
@@ -483,6 +492,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     setSearchFilter('');
     setRarityFilter([]); setConditionFilter([]);
     setPrintingFilter([]); setSetFilter([]); setTypeFilter([]); setSupertypeFilter([]);
+    setColorFilter([]); setColorMode('any'); setIdentityFilter([]); setSubtypeFilter([]);
     setCmcFilter([]); setLanguageFilter([]);
     setMinPriceFilter(''); setMaxPriceFilter(''); setAddedFromFilter(''); setAddedToFilter('');
     setTradeOnly(false);
@@ -727,13 +737,14 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         (item.set_name || '').toLowerCase().includes(searchLower) ||
         (item.number || '').includes(searchFilter);
       const matchesScryfall = scryfallPredicate.mode === 'local' ? scryfallPredicate.test(item) : true;
-      const matchesRarity = rarityFilter.length === 0 ? true : rarityFilter.includes(item.rarity);
+      const matchesMtg = matchMtgFilters(item, {
+        colors: colorFilter, colorMode, identity: identityFilter,
+        cardTypes: typeFilter, supertypes: supertypeFilter, subtypes: subtypeFilter,
+        manaValues: cmcFilter, rarities: rarityFilter,
+      });
       const matchesCondition = conditionFilter.length === 0 ? true : conditionFilter.includes(item.condition);
       const matchesPrinting = printingFilter.length === 0 ? true : printingFilter.includes(item.printing);
       const matchesSet = setFilter.length === 0 ? true : setFilter.includes(item.set_name);
-      const matchesType = typeFilter.length === 0 ? true : typeFilter.some(t => (item.types || []).includes(t));
-      const matchesSupertype = supertypeFilter.length === 0 ? true : supertypeFilter.includes(item.supertype);
-      const matchesCmc = cmcFilter.length === 0 ? true : cmcFilter.includes(String(item.cmc));
       const matchesLanguage = languageFilter.length === 0 ? true : languageFilter.includes(item.language);
 
       const price = item.price_trend || 0;
@@ -741,9 +752,9 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       const matchesMinPrice = minPriceFilter === '' ? true : price >= parseFloat(minPriceFilter);
       const matchesMaxPrice = maxPriceFilter === '' ? true : price <= parseFloat(maxPriceFilter);
 
-      return matchesSearch && matchesScryfall && matchesRarity && matchesCondition &&
-             matchesPrinting && matchesSet && matchesType && matchesSupertype &&
-             matchesCmc && matchesLanguage && matchesMinPrice && matchesMaxPrice && matchesAdded;
+      return matchesSearch && matchesScryfall && matchesMtg && matchesCondition &&
+             matchesPrinting && matchesSet && matchesLanguage &&
+             matchesMinPrice && matchesMaxPrice && matchesAdded;
     });
 
     if (sortBy === 'qty-desc') {
@@ -754,7 +765,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       sortCardsByOrder(result, SORT_CRITERIA[sortBy] || SORT_CRITERIA['added-newest'], undefined, setsList);
     }
     return result;
-  }, [baseCollection, searchFilter, scryfallPredicate, rarityFilter, conditionFilter, printingFilter, setFilter, typeFilter, supertypeFilter, cmcFilter, languageFilter, minPriceFilter, maxPriceFilter, addedFromFilter, addedToFilter, sortBy, setsList]);
+  }, [baseCollection, searchFilter, scryfallPredicate, rarityFilter, conditionFilter, printingFilter, setFilter, colorFilter, colorMode, identityFilter, typeFilter, supertypeFilter, subtypeFilter, cmcFilter, languageFilter, minPriceFilter, maxPriceFilter, addedFromFilter, addedToFilter, sortBy, setsList]);
 
   // Group duplicate cards if stack option is active. Printing is baked into the
   // shared stack key, so foils and non-foils of one card always stay separate.
@@ -800,13 +811,13 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       const width = root.clientWidth;
       const gallery = viewMode === 'gallery';
       const geometry = computeVirtualGeometry(displayCards.length, width, window.innerWidth, gallery);
-      const rootTop = root.getBoundingClientRect().top + window.scrollY;
-      const localScrollTop = Math.max(0, window.scrollY - rootTop);
+      const rootTop = offsetInScroller(root);
+      const localScrollTop = Math.max(0, getScrollTop() - rootTop);
       const next = buildVirtualWindow(
         displayCards.length,
         geometry,
         localScrollTop,
-        window.innerHeight,
+        getViewportHeight(),
       );
 
       setVirtualWindow(previous => (
@@ -830,13 +841,13 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       ? null
       : new ResizeObserver(scheduleVirtualUpdate);
     resizeObserver?.observe(root);
-    window.addEventListener('scroll', scheduleVirtualUpdate, { passive: true });
+    window.addEventListener('scroll', scheduleVirtualUpdate, { passive: true, capture: true });
     window.addEventListener('resize', scheduleVirtualUpdate);
     scheduleVirtualUpdate();
 
     return () => {
       resizeObserver?.disconnect();
-      window.removeEventListener('scroll', scheduleVirtualUpdate);
+      window.removeEventListener('scroll', scheduleVirtualUpdate, { capture: true });
       window.removeEventListener('resize', scheduleVirtualUpdate);
       if (virtualFrameRef.current != null) {
         window.cancelAnimationFrame(virtualFrameRef.current);
@@ -853,7 +864,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   }, []);
 
   // A gallery row and a list row represent very different amounts of the
-  // collection. Keeping window.scrollY unchanged when switching views therefore
+  // collection. Keeping getScrollTop() unchanged when switching views therefore
   // jumps to a different card. Capture the first visible card and its viewport
   // offset, then put that same card back after the new layout mounts. For a row
   // clipped above the viewport, switchViewMode translates the offset by row
@@ -887,10 +898,10 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       anchor.sourceViewportOffset,
       anchor.sourceEntryHeight,
       Math.max(0, geometry.rowStride - geometry.gap),
-      window.innerHeight,
+      getViewportHeight(),
       window.devicePixelRatio,
     );
-    const rootTop = root.getBoundingClientRect().top + window.scrollY;
+    const rootTop = offsetInScroller(root);
     const seedScrollTop = Math.max(
       0,
       rootTop + anchorRow * geometry.rowStride - seedViewportOffset,
@@ -899,7 +910,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       displayCards.length,
       geometry,
       Math.max(0, seedScrollTop - rootTop),
-      window.innerHeight,
+      getViewportHeight(),
     );
 
     // State equality here is also a DOM-commit barrier: a layout effect sees
@@ -928,20 +939,20 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       anchor.sourceViewportOffset,
       anchor.sourceEntryHeight,
       destinationRect.height,
-      window.innerHeight,
+      getViewportHeight(),
       window.devicePixelRatio,
     );
     const maximumScrollTop = Math.max(
       0,
-      document.documentElement.scrollHeight - window.innerHeight,
+      getScrollHeight() - getViewportHeight(),
     );
     const targetScrollTop = measuredAnchorScrollTarget(
-      window.scrollY,
+      getScrollTop(),
       destinationRect.top,
       desiredViewportOffset,
       maximumScrollTop,
     );
-    window.scrollTo(window.scrollX, targetScrollTop);
+    scrollToTop(targetScrollTop);
 
     // Keep this exact anchor alive beyond the synchronous correction. The
     // scroll event can commit a recentered virtual window after this layout
@@ -973,35 +984,34 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
           anchor.sourceViewportOffset,
           anchor.sourceEntryHeight,
           currentRect.height,
-          window.innerHeight,
+          getViewportHeight(),
           window.devicePixelRatio,
         );
         const currentMaximumScrollTop = Math.max(
           0,
-          document.documentElement.scrollHeight - window.innerHeight,
+          getScrollHeight() - getViewportHeight(),
         );
         const correctedScrollTop = measuredAnchorScrollTarget(
-          window.scrollY,
+          getScrollTop(),
           currentRect.top,
           currentDesiredOffset,
           currentMaximumScrollTop,
         );
         const tolerance = 1 / Math.max(1, window.devicePixelRatio || 1);
-        const corrected = Math.abs(window.scrollY - correctedScrollTop) > tolerance;
-        if (corrected) window.scrollTo(window.scrollX, correctedScrollTop);
+        const corrected = Math.abs(getScrollTop() - correctedScrollTop) > tolerance;
+        if (corrected) scrollToTop(correctedScrollTop);
 
         const paintedRect = currentElement.getBoundingClientRect();
-        const rootRect = currentRoot.getBoundingClientRect();
-        const scrollHeight = document.documentElement.scrollHeight;
+        const scrollHeight = getScrollHeight();
         anchor.convergence = advanceAnchorConvergence(anchor.convergence, {
           scrollHeight,
-          maximumScrollTop: Math.max(0, scrollHeight - window.innerHeight),
-          rootDocumentTop: rootRect.top + window.scrollY,
+          maximumScrollTop: Math.max(0, scrollHeight - getViewportHeight()),
+          rootDocumentTop: offsetInScroller(root),
           anchorViewportTop: paintedRect.top,
-          scrollTop: window.scrollY,
+          scrollTop: getScrollTop(),
           corrected,
           hasPositiveIntersection: paintedRect.bottom > 0
-            && paintedRect.top < window.innerHeight,
+            && paintedRect.top < getViewportHeight(),
         }, tolerance);
 
         if (anchorConvergenceFinished(anchor.convergence)) {
@@ -1025,16 +1035,16 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     }
 
     const root = virtualRootRef.current;
-    const scrollTop = window.scrollY;
-    const rootTop = root ? root.getBoundingClientRect().top + scrollTop : 0;
+    const scrollTop = getScrollTop();
+    const rootTop = root ? offsetInScroller(root) : 0;
     const rootBottom = rootTop + virtualWindow.totalSize;
     const collectionIsVisible = root
       && displayCards.length > 0
       && scrollTop < rootBottom
-      && scrollTop + window.innerHeight > rootTop;
+      && scrollTop + getViewportHeight() > rootTop;
 
     if (collectionIsVisible) {
-      const measuredAnchor = findVisibleCollectionAnchor(root, window.innerHeight);
+      const measuredAnchor = findVisibleCollectionAnchor(root, getViewportHeight());
       const localScrollTop = Math.max(0, scrollTop - rootTop);
       const fallbackRow = Math.min(
         Math.max(0, virtualWindow.rowCount - 1),
@@ -1062,7 +1072,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         sourceViewportOffset,
         sourceEntryHeight,
         Math.max(0, nextGeometry.rowStride - nextGeometry.gap),
-        window.innerHeight,
+        getViewportHeight(),
         window.devicePixelRatio,
       );
       const nextLocalScrollTop = Math.max(
@@ -1085,7 +1095,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         displayCards.length,
         nextGeometry,
         nextLocalScrollTop,
-        window.innerHeight,
+        getViewportHeight(),
       ));
     } else {
       pendingViewAnchorRef.current = null;
@@ -1216,103 +1226,71 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
 
         {showFilters && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1rem', paddingTop: '1rem', borderTop: '1px solid var(--border-glass)' }}>
-            {/* Selector filters grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '0.75rem' }}>
-
-              <Field label={t('collection.fSet')}>
-                <MultiSelectDropdown
-                  label={t('collection.fSet')}
-                  allLabel={t('collection.allSets')}
-                  value={setFilter}
-                  onChange={setSetFilter}
-                  options={uniqueSets.map(s => ({ value: s, label: s }))}
-                />
+            {/* Card: what the card IS (Magic facets). */}
+            <div className="filter-section-title">{t('mtg.sectionCard')}</div>
+            <div className="mtg-color-row">
+              <Field label={t('mtg.color')}>
+                <ColorPicker label={t('mtg.color')} value={colorFilter} onChange={setColorFilter} mode={colorMode} onModeChange={setColorMode} />
               </Field>
-
-              <Field label={t('collection.fSupertype')}>
-                <MultiSelectDropdown
-                  label={t('collection.fSupertype')}
-                  allLabel={t('collection.allSupertypes')}
-                  value={supertypeFilter}
-                  onChange={setSupertypeFilter}
-                  options={uniqueSupertypes.map(s => ({ value: s, label: s }))}
-                />
+              <Field label={t('mtg.identity')}>
+                <ColorPicker label={t('mtg.identity')} value={identityFilter} onChange={setIdentityFilter} withColorless={false} />
               </Field>
-
-              <Field label={t('collection.fType')}>
-                <MultiSelectDropdown
-                  label={t('collection.fType')}
-                  allLabel={t('collection.allTypes')}
-                  value={typeFilter}
-                  onChange={setTypeFilter}
-                  options={uniqueTypes.map(t => ({value: t, label: t}))}
-                />
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
+              <Field label={t('mtg.cardType')}>
+                <MultiSelectDropdown label={t('mtg.cardType')} allLabel={t('collection.allTypes')} value={typeFilter} onChange={setTypeFilter}
+                  options={uniqueTypes.map(v => ({ value: v, label: v }))} />
               </Field>
-
-              <Field label={t('collection.fRarity')}>
-                <MultiSelectDropdown
-                  label={t('collection.fRarity')}
-                  allLabel={t('collection.allRarities')}
-                  value={rarityFilter}
-                  onChange={setRarityFilter}
-                  options={uniqueRarities.map(r => ({value: r, label: r}))}
-                />
+              <Field label={t('mtg.subtype')}>
+                <MultiSelectDropdown label={t('mtg.subtype')} allLabel={t('mtg.allSubtypes')} value={subtypeFilter} onChange={setSubtypeFilter}
+                  options={uniqueSubtypes.map(v => ({ value: v, label: v }))} />
               </Field>
-
-              <Field label={t('card.condition')}>
-                <MultiSelectDropdown
-                  label={t('card.condition')}
-                  allLabel={t('collection.allConditions')}
-                  value={conditionFilter}
-                  onChange={setConditionFilter}
-                  options={CONDITIONS.map(c => ({value: c, label: c}))}
-                />
-              </Field>
-
-              <Field label={t('card.printing')}>
-                <MultiSelectDropdown
-                  label={t('card.printing')}
-                  allLabel={t('collection.allPrintings')}
-                  value={printingFilter}
-                  onChange={setPrintingFilter}
-                  options={PRINTING_OPTIONS}
-                />
-              </Field>
-
-              {uniqueCmcs.length > 0 && (
-                <Field label={t('collection.fManaValue')}>
-                  <MultiSelectDropdown
-                    label={t('collection.fManaValue')}
-                    allLabel={t('collection.allManaValues')}
-                    value={cmcFilter}
-                    onChange={setCmcFilter}
-                    options={uniqueCmcs.map(c => ({ value: String(c), label: String(c) }))}
-                  />
+              {uniqueSupertypes.length > 0 && (
+                <Field label={t('collection.fSupertype')}>
+                  <MultiSelectDropdown label={t('collection.fSupertype')} allLabel={t('collection.allSupertypes')} value={supertypeFilter} onChange={setSupertypeFilter}
+                    options={uniqueSupertypes.map(v => ({ value: v, label: v }))} />
                 </Field>
               )}
-
-              <Field label={t('card.language')}>
-                <MultiSelectDropdown
-                  label={t('card.language')}
-                  allLabel={t('collection.allLanguages')}
-                  value={languageFilter}
-                  onChange={setLanguageFilter}
-                  options={uniqueLanguages.map(l => ({ value: l, label: l }))}
-                />
+              {uniqueCmcs.length > 0 && (
+                <Field label={t('collection.fManaValue')}>
+                  <MultiSelectDropdown label={t('collection.fManaValue')} allLabel={t('collection.allManaValues')} value={cmcFilter} onChange={setCmcFilter}
+                    options={uniqueCmcs.map(c => ({ value: c, label: c }))} />
+                </Field>
+              )}
+              <Field label={t('collection.fRarity')}>
+                <MultiSelectDropdown label={t('collection.fRarity')} allLabel={t('collection.allRarities')} value={rarityFilter} onChange={setRarityFilter}
+                  options={uniqueRarities.map(r => ({ value: r, label: r }))} />
               </Field>
+              <Field label={t('collection.fSet')}>
+                <MultiSelectDropdown label={t('collection.fSet')} allLabel={t('collection.allSets')} value={setFilter} onChange={setSetFilter}
+                  options={uniqueSets.map(v => ({ value: v, label: v }))} />
+              </Field>
+            </div>
 
+            {/* Copy: the physical copy you own. */}
+            <div className="filter-section-title">{t('mtg.sectionCopy')}</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
+              <Field label={t('card.condition')}>
+                <MultiSelectDropdown label={t('card.condition')} allLabel={t('collection.allConditions')} value={conditionFilter} onChange={setConditionFilter}
+                  options={CONDITIONS.map(c => ({ value: c, label: c }))} />
+              </Field>
+              <Field label={t('card.printing')}>
+                <MultiSelectDropdown label={t('card.printing')} allLabel={t('collection.allPrintings')} value={printingFilter} onChange={setPrintingFilter}
+                  options={PRINTING_OPTIONS} />
+              </Field>
+              <Field label={t('card.language')}>
+                <MultiSelectDropdown label={t('card.language')} allLabel={t('collection.allLanguages')} value={languageFilter} onChange={setLanguageFilter}
+                  options={uniqueLanguages.map(l => ({ value: l, label: l }))} />
+              </Field>
               <Field label={t('collection.fMinPrice')}>
                 <input type="number" className="input-control" placeholder={t('collection.minPricePlaceholder')} value={minPriceFilter} onChange={(e) => setMinPriceFilter(e.target.value)} />
               </Field>
-
               <Field label={t('collection.fMaxPrice')}>
                 <input type="number" className="input-control" placeholder={t('collection.maxPricePlaceholder')} value={maxPriceFilter} onChange={(e) => setMaxPriceFilter(e.target.value)} />
               </Field>
-
               <Field label={t('collection.fAddedFrom')}>
                 <input type="date" className="input-control" aria-label={t('collection.fAddedFrom')} value={addedFromFilter} max={addedToFilter || undefined} onChange={(e) => setAddedFromFilter(e.target.value)} />
               </Field>
-
               <Field label={t('collection.fAddedTo')}>
                 <input type="date" className="input-control" aria-label={t('collection.fAddedTo')} value={addedToFilter} min={addedFromFilter || undefined} onChange={(e) => setAddedToFilter(e.target.value)} />
               </Field>

@@ -8,6 +8,7 @@ import { getPrintingLabel } from '../utils/cardPrinting';
 import { tcgplayerUrl, cardmarketUrl, searchUrl, priceSource, noLinkReason } from '../utils/marketplaceLinks';
 import CardImage from './CardImage';
 import CardImageZoom from './CardImageZoom';
+import CardImageActions from './CardImageActions';
 import CardEntryFields from './CardEntryFields';
 import PriceHistoryChart from './PriceHistoryChart';
 import CardArtEditor from './CardArtEditor';
@@ -166,7 +167,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
       zIndex: 999
     }} onClick={handleClose}>
       <div className="glass-panel card-inspector" onClick={(e) => e.stopPropagation()}>
-        <button type="button" className="btn btn-secondary btn-icon-only" onClick={handleClose} aria-label={t('common.close')} title={t('common.close')} style={{
+        <button type="button" className="btn btn-secondary btn-icon-only modal-close" onClick={handleClose} aria-label={t('common.close')} title={t('common.close')} style={{
           position: 'absolute',
           top: '1rem',
           right: '1rem',
@@ -221,6 +222,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               <span>{t('inspector.fullScreen')}</span>
             </div>
           </div>
+          <CardImageActions card={card} compact getSrc={() => document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
           <CardArtEditor
             card={card}
             hasProviderArt={!!card.image_url}

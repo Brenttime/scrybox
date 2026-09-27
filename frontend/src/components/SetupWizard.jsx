@@ -316,7 +316,7 @@ export default function SetupWizard({ user, onClose, showToast }) {
               {t(`setup.step.${STEPS[step]}`)} · {t('setup.stepCount', { step: step + 1, total: STEPS.length })}
             </span>
           </div>
-          <button type="button" onClick={onClose} aria-label={t('common.close')}
+          <button className="modal-close" type="button" onClick={onClose} aria-label={t('common.close')}
             style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer' }}>
             <X size={18} />
           </button>

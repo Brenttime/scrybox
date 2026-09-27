@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, LogOut, Plus, Swords, ListChecks } from 'lucide-react';
 import Login from './components/Login';
 import Logo from './components/Logo';
+import PullToRefresh from './components/PullToRefresh';
+import { scrollToTop } from './utils/scrollRoot';
 import { pushBackGuard } from './utils/useBackGuard';
 import { getRememberedTab, rememberView, clearRememberedView, forgetOpenSubviews } from './utils/viewMemory';
 import { useT } from './utils/i18n';
@@ -47,6 +49,7 @@ const DeckBuilder = lazyView(() => import('./components/DeckBuilder'));
 const Lists = lazyView(() => import('./components/Lists'));
 const LimitedLands = lazyView(() => import('./components/LimitedLands'));
 const Rules = lazyView(() => import('./components/Rules'));
+const Keywords = lazyView(() => import('./components/Keywords'));
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -163,7 +166,7 @@ function App() {
     if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
   }, []);
   useEffect(() => {
-    window.scrollTo(0, 0);
+    scrollToTop(0);
   }, [activeTab]);
 
   // Navigate tabs through here so each change pushes a history entry: a back
@@ -388,6 +391,8 @@ function App() {
         return <LimitedLands showToast={showToast} onNavigate={goTab} />;
       case 'rules':
         return <Rules onNavigate={goTab} />;
+      case 'keywords':
+        return <Keywords onNavigate={goTab} />;
       case 'settings':
         return <Settings user={user} onUpdateUser={handleUpdateUser} showToast={showToast} target={settingsTarget} />;
       default:
@@ -397,6 +402,7 @@ function App() {
 
   return (
     <div className="app-container">
+      <PullToRefresh />
       {showSetup && (
         <Suspense fallback={null}>
           <SetupWizard user={user} showToast={showToast} onClose={() => setShowSetup(false)} />

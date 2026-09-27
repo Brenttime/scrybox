@@ -406,7 +406,7 @@ function SharedCollection({ shareToken }) {
           display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999, padding: '1rem'
         }} onClick={() => setActiveCard(null)}>
           <div className="glass-panel" style={{ maxWidth: '680px', width: '100%', maxHeight: '90vh', overflowY: 'auto', overscrollBehavior: 'contain', padding: '2rem', display: 'flex', flexWrap: 'wrap', gap: '2rem', position: 'relative' }} onClick={(e) => e.stopPropagation()}>
-            <button className="btn btn-secondary btn-icon-only" onClick={() => setActiveCard(null)} style={{ position: 'absolute', top: '1rem', right: '1rem', borderRadius: '50%' }}>
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setActiveCard(null)} style={{ position: 'absolute', top: '1rem', right: '1rem', borderRadius: '50%' }}>
               <X size={16} />
             </button>
             <div style={{ flex: '1 1 240px', display: 'flex', justifyContent: 'center' }}>

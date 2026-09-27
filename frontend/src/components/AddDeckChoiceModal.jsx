@@ -58,7 +58,7 @@ export default function AddDeckChoiceModal({ open, onClose, onCustom, onPrecon, 
         aria-describedby="add-deck-description"
       >
         <button
-          className="btn btn-secondary btn-icon-only add-deck-chooser-close"
+          className="btn btn-secondary btn-icon-only modal-close add-deck-chooser-close"
           onClick={onClose}
           aria-label={t('common.close')}
         >

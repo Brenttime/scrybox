@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, ChevronLeft, ChevronRight, Search, X } from 'lucide-react';
 import { useT } from '../utils/i18n';
+import LoadMore from './LoadMore';
 
 // ManaBox-style rules book: browse a table of contents
 // (chapter -> section -> rules), or search across everything. Rule references
@@ -191,9 +192,9 @@ export default function Rules({ onNavigate }) {
           ))}
           {!results.length && <p style={{ color: 'var(--text-muted)', padding: '0 1rem' }}>{t('rules.none')}</p>}
           {results.length > shown && (
-            <button type="button" className="btn btn-secondary" style={{ display: 'block', margin: '1rem auto' }} onClick={() => setShown(s => s + 300)}>
+            <LoadMore style={{ margin: '1rem 0' }} onLoad={() => setShown(s => s + 300)}>
               {t('rules.more', { count: results.length - shown })}
-            </button>
+            </LoadMore>
           )}
         </div>
       )}

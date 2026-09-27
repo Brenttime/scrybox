@@ -1,5 +1,8 @@
+import { useRef } from 'react';
 import { X } from 'lucide-react';
+import CardImageActions from './CardImageActions';
 import CardImage from './CardImage';
+import { useT } from '../utils/i18n';
 
 // Full-screen card art viewer, shared by the collection inspector and the
 // Search & Add quick-add drawer so "tap the art to enlarge" works the same
@@ -12,6 +15,9 @@ import CardImage from './CardImage';
 // click handler dismisses the popup, so without it, closing the zoom would
 // dismiss the popup underneath as well.
 export default function CardImageZoom({ card, onClose }) {
+  const { t } = useT();
+  const wrapRef = useRef(null);
+
   return (
     <div
       className="modal-overlay"
@@ -30,7 +36,8 @@ export default function CardImageZoom({ card, onClose }) {
       onClick={(e) => { e.stopPropagation(); onClose(); }}
     >
       <button
-        className="btn btn-secondary btn-icon-only"
+        className="modal-close btn btn-secondary btn-icon-only"
+        aria-label={t('common.close')}
         onClick={(e) => { e.stopPropagation(); onClose(); }}
         style={{
           position: 'absolute',
@@ -44,11 +51,16 @@ export default function CardImageZoom({ card, onClose }) {
       >
         <X size={20} />
       </button>
+      <div
+        className="zoom-stage"
+        ref={wrapRef}
+        onClick={(e) => e.stopPropagation()}
+      >
       <CardImage
         card={card}
-        onClick={(e) => e.stopPropagation()}
+        crossOrigin="anonymous"
         style={{
-          maxHeight: '88vh',
+          maxHeight: '78vh',
           maxWidth: '88vw',
           objectFit: 'contain',
           /* No border-radius: the card art already has its own rounded
@@ -57,6 +69,8 @@ export default function CardImageZoom({ card, onClose }) {
           filter: 'drop-shadow(0 20px 60px rgba(0,0,0,0.8))'
         }}
       />
+      <CardImageActions card={card} getSrc={() => wrapRef.current?.querySelector('img')?.currentSrc} />
+      </div>
     </div>
   );
 }
