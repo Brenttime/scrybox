@@ -15,7 +15,7 @@
 // server's job; the caller falls back to it for anything this returns as
 // unresolved.
 import {
-  REC_H, CARD_W, CARD_H, portraitQuad, padQuad, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
+  REC_H, CARD_W, CARD_H, portraitQuad, padQuad, SERVER_PAD, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
@@ -72,6 +72,16 @@ const TITLE_EXACT_CONF = 0.90;
 // A same-frame correction, never more than the stillness tolerance: a
 // refined quad further than a still card may drift is not the same region.
 const REFINE_MAX_MOVE = STILL_DRIFT;
+// Near the edge, the server-style padding (3.6% above, 7.9% below the true
+// outline) can push a stage's strips past the frame while the card itself is
+// fully visible (Roiling Canopy: title strip at y=-1.6; Solarium Sentry:
+// footer rows at y=1079-1100 in a 1080 frame), and the whole stage then
+// abstained on every frame. Such a stage is re-projected with that side's
+// padding shrunk toward the true outline, whole: every strip of the stage is
+// read from the same homography, none is dropped. Only near-edge frames that
+// would otherwise abstain use it; everywhere else the padding is unchanged
+// (removing it globally lost Winter, Team Player's footer).
+const PAD_SHRINK = [0.75, 0.5, 0.25, 0];
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
@@ -319,7 +329,8 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     readSince = true;
     const recBefore = env.stats.recCalls;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge);
+    const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -337,16 +348,39 @@ export function createReader(env) {
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null) {
     const tA = now();
     // Near the frame edge, a strip that reaches off-frame would be read from
-    // clamped, repeated edge pixels: it is dropped (never extrapolated), and a
-    // card left without its title or footer strips simply fails this frame.
+    // clamped, repeated edge pixels. The stage is re-projected with the
+    // offending side's padding shrunk (PAD_SHRINK) until every strip fits;
+    // if none does, the whole stage is skipped (never a partial stage) and
+    // the card fails this frame. The FIRST skipped stage is reported.
     let truncated = false;
-    const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
+    const fitted = [];
+    const stripsIn = (mm, rs) => rs.every(r => stripInFrame(mm, r, w, h));
     const strips = (rs, stage) => {
-      if (nearEdge && !rs.every(r => stripInFrame(m, r, w, h))) { truncated = { stage, off: rs.map((r, i) => (stripInFrame(m, r, w, h) ? -1 : i)).filter(i => i >= 0) }; return []; }
-      return rs.map(strip);
+      let mm = m;
+      if (nearEdge && !stripsIn(mm, rs)) {
+        const off = rs.map((r, i) => (stripInFrame(m, r, w, h) ? -1 : i)).filter(i => i >= 0);
+        mm = null;
+        if (quad) {
+          // One side first (the one at the edge), then both; mildest first.
+          const P = SERVER_PAD;
+          outer: for (const k of PAD_SHRINK) {
+            for (const [pad, side] of [[{ ...P, t: P.t * k }, 't'], [{ ...P, b: P.b * k }, 'b'], [{ ...P, t: P.t * k, b: P.b * k }, 'tb'],
+              [{ ...P, l: P.l * k, r: P.r * k }, 'lr'], [{ l: P.l * k, r: P.r * k, t: P.t * k, b: P.b * k }, 'all']]) {
+              const c = cardToFrame(padQuad(quad, pad));
+              if (stripsIn(c, rs)) { mm = c; fitted.push([stage, side, k]); timings.pad_fit = fitted; break outer; }
+            }
+          }
+        }
+        if (!mm) {
+          if (!truncated) truncated = { stage, off };
+          else (truncated.also ||= []).push(stage);
+          return [];
+        }
+      }
+      return rs.map(r => sampleStrip(rgba, w, h, mm, r[0], r[1], r[2], r[3]));
     };
     const cands = [];
     // Every title read, accepted or not, for scan telemetry: a failed title

@@ -299,18 +299,36 @@ test('near-edge: collapsed, crossed or skewed outlines are rejected before OCR (
   }
 });
 
-test('near-edge: a footer stage with a strip outside the frame never proves a printing (review B1)', async () => {
-  // Bottom-edge card: padded footer rows 0.92/0.94 cross the frame edge.
-  // Rows that fit say lea 161, the dropped ones would say 2x2 117: the
-  // complete stage is ambiguous, so the truncated one must not resolve.
+test('near-edge: a footer stage past the frame is re-projected WHOLE, never read partially (review B1)', async () => {
+  // Bottom-edge card: padded footer rows cross the frame edge. The stage is
+  // re-projected with less bottom padding and read in full (6 strips, one
+  // batch). A complete read sees both printings (ambiguous -> null); a
+  // partial stage (fewer strips) would see only lea 161 and resolve wrongly.
   const corners = [0.32, 0.494, 0.68, 0.494, 0.68, 0.994, 0.32, 0.994];
-  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : n >= 5 ? 'lea 161' : 'lea 161'), { corners });
+  const seen = [];
+  // (The fake decoder collapses repeated glyphs, so no doubled digits here.)
+  const f = fakeReader((calls, n) => { seen.push(n); return calls === 1 ? 'bolt' : n === 5 ? 'lea 161' : '161 147'; }, { corners });
+  const index = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
+    printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const reader = createReader({ ...f.reader.__env, index });
   const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
   const r = out.results[0];
   assert.equal(out.candidates[0].near_edge, true, 'fixture must exercise the near-edge path');
-  assert.equal(r.ok, false, 'a truncated footer stage must not prove a printing');
-  assert.equal(r.near_edge_partial.stage, 'footer0', 'whole first footer stage skipped');
-  assert.ok(r.near_edge_partial.off.length > 0);
+  assert.equal(r.ok, false, 'the complete stage is ambiguous: no printing');
+  assert.ok(seen.includes(6), 'whole first footer stage read in one batch');
+  assert.ok(!seen.includes(5), 'never a 5-strip (partial) first stage');
+  assert.ok(out.timings.pad_fit?.some(([st]) => st === 'footer0'), 'stage re-projected with shrunk padding');
+});
+
+test('near-edge: a title stage past the top edge is re-projected and read (Roiling Canopy)', async () => {
+  // Card top 8 px below a 1000 px frame: padded title strip reaches y<0,
+  // the old code skipped both title stages and never read the card.
+  const { reader, calls } = fakeReader(() => 'grief', { corners: nearTop(0.004) });
+  const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(out.candidates[0].near_edge, true);
+  assert.equal(out.results[0].ok, true, JSON.stringify(out.results[0]));
+  assert.equal(calls(), 1);
+  assert.ok(out.timings.pad_fit?.some(([st, side]) => st === 'title1' && side === 't'));
 });
 
 test('near-edge: an inward refinement must pass the geometry check too (review B3)', async () => {
