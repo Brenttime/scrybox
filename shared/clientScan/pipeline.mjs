@@ -46,6 +46,7 @@ const STILL_GAP_MS = 400;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
+const REFINE_MAX_MOVE = 0.02;       // mean corner move / frame diagonal (~44 px at 1080p)
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
@@ -206,6 +207,27 @@ export function createReader(env) {
     if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
     if (!cand.eligible) return base;
 
+    // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
+    // model's validated input): the caller's 384px copy comes from a cheap
+    // canvas downscale, whose corners are a few px off. Saved Windows frames
+    // through a canvas-equivalent downscale: 4 of 11 printings proven without
+    // this, 11 of 11 with it (identical to the Node/sharp replay).
+    // The refined quad is only a small correction of the gated one: it must
+    // stay close (REFINE_MAX_MOVE), off the frame edge and sharp, or the
+    // gated quad is used unchanged. The art signature is taken AFTER, so
+    // tracking and pooled evidence always refer to the region OCR reads.
+    // ~140-170 ms in the browser; only frames about to be OCR'd pay for it.
+    if (env.refineCorners !== false) {
+      const tr = now();
+      const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
+      const move = fine ? fine.reduce((s, p, i) => s + Math.hypot(p.x - quad[i].x, p.y - quad[i].y), 0) / 4 / diag : Infinity;
+      const fineClipped = fine && fine.some(p => p.x <= ex || p.x >= w - ex || p.y <= ey || p.y >= h - ey);
+      if (fine && move <= REFINE_MAX_MOVE && !fineClipped) {
+        const mf = cardToFrame(padQuad(fine));
+        if (titleSharpness(rgba, w, h, mf) >= TITLE_SHARP_FLOOR) { m = mf; cand.quad = fine.map(p => [p.x, p.y]); timings.refined = 1; }
+      }
+      timings.refine_ms = Math.round(now() - tr);
+    }
     const sig = artSignature(rgba, w, h, m);
     if (tracked && cosine(tracked.sig, sig) < 0.97) tracked = null;
     if (tracked) {
@@ -215,18 +237,6 @@ export function createReader(env) {
     }
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
-    // Before OCR, re-find the corners on a Lanczos-resized copy of THIS frame
-    // (the corner model's validated input): the caller's 384px copy comes from
-    // a cheap canvas downscale, whose corners are a few px off. Saved Windows
-    // frames through a canvas-equivalent downscale: 4 of 11 printings proven
-    // without this, 11 of 11 with it (identical to the Node/sharp replay).
-    // ~60-100 ms, paid only by frames that are about to be OCR'd.
-    if (env.refineCorners !== false && !opts.refined) {
-      const tr = now();
-      const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
-      if (fine) { m = cardToFrame(padQuad(fine)); cand.quad = fine.map(p => [p.x, p.y]); }
-      timings.refine_ms = Math.round(now() - tr);
-    }
     readSince = true;
     const recBefore = env.stats.recCalls;
     const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred);

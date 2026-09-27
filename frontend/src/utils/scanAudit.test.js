@@ -228,3 +228,18 @@ test('corner refinement: one extra detection only for frames that get OCR', asyn
   assert.equal(out.results[0]?.ok, true);
   assert.equal(detects(), 3, 'probe + one refinement on the Lanczos copy');
 });
+
+test('corner refinement: a far-off or edge-touching refined quad is ignored (gated quad used)', async () => {
+  let n = 0;
+  const f = fakeReader(() => 'grief', { refine: true });
+  const env = f.reader.__env;
+  const cornelius = { run: async () => { n++; return n === 1
+    ? { corners: { data: [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] }, sharpness: { data: [0.9] } }
+    : { corners: { data: [0, 0, 0.5, 0, 0.5, 0.5, 0, 0.5] }, sharpness: { data: [0.9] } }; } };
+  const index = loadIndex({ names: ['grief'], canon: {}, excluded: [], sets: ['mh2'], printings: [['id-grief', 'mh2', '87']], byTitle: { grief: [0] }, uniqueAlias: {} });
+  const reader = createReader({ ...env, cornelius, index, refineCorners: true });
+  const out = await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(n, 2);
+  assert.notEqual(out.timings.refined, 1, 'refined quad touching the edge / far away must be rejected');
+  assert.equal(out.candidates[0].quad[0][0], 0.2 * 200);
+});
