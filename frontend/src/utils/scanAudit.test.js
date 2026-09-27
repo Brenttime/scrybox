@@ -360,7 +360,7 @@ test('footer: the first modern batch reads the 0.84 row (FRA collector line, Kon
   assert.equal(r.footer_stage, 0, 'resolved by the first batch, one recognizer call');
 });
 
-test('settle window: a faster cadence never admits later than a slower one (65 vs 105 ms)', async () => {
+test('settle window: 65 ms cadence no longer admits later than 105 ms (aliasing removed)', async () => {
   const admitAt = async (step) => {
     let t = 0;
     const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });

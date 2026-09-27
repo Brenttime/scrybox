@@ -70,8 +70,10 @@ const STILL_MIN_SEP_MS = 90;
 // STILL_WINDOW_MS of real time, instead of counting only observations
 // >= 90 ms apart. The counting rule aliased with the loop cadence: at 65 ms
 // passes, every other observation fell short and admission took 260 ms, vs
-// 210 ms at 105 ms passes. A faster loop now admits no later (and never
-// sooner) than 2 x 90 ms after the first still observation.
+// 210 ms at 105 ms passes. This removes that observation-spacing aliasing
+// (65 ms now admits at 195 ms); admission is still quantised to the loop
+// cadence, so it is not monotonic across every cadence, and it is never
+// sooner than 2 x 90 ms after the first still observation.
 const STILL_WINDOW_MS = (STILL_OBS - 1) * STILL_MIN_SEP_MS;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
@@ -94,8 +96,8 @@ const REFINE_MAX_MOVE = STILL_DRIFT;
 // synthetic card read unrelated text box digits and proved the wrong
 // printing). A re-projection is used only if the stage still covers,
 // on the real card (outline = [0,1]), everything the padded stage covered,
-// within COVER_TOL of the card: no on-card evidence is lost, only reads of
-// the mat beyond the outline. Otherwise the stage abstains, as before.
+// within COVER_TOL (0.6% of the card): at most that sliver of on-card rows
+// is lost, otherwise only reads of the mat beyond the outline. Otherwise the stage abstains, as before.
 const PAD_SHRINK = [0.75, 0.5, 0.25, 0];
 const COVER_TOL = 0.006;
 // Padded-card fraction -> true-card fraction along one axis.
