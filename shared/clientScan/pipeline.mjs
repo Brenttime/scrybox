@@ -189,6 +189,7 @@ export function createReader(env) {
     cand.sharpness = Math.round(sharp * 10) / 10;
     // Blurred or clipped observations are not part of a settled window.
     if (clipped || sharp < TITLE_SHARP_FLOOR) stillRun = 0;
+    cand.still = stillRun;
     if (clipped) cand.status = 'touches frame edge';
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
