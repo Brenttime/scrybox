@@ -123,6 +123,8 @@ export function createReader(env) {
   env.stats = { recCalls: 0, recStrips: 0 };
   let lastQuad = null;
   let stillRun = 0, lastAt = 0;   // consecutive low-drift observations
+  let readSince = false;          // OCR ran since the last observation
+  let lastDeferred = false;       // previous read deferred its deep footer stages
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
   // alone does not prove a printing — reprints share art and differ only in
   // the footer — so a signature match is trusted only while the same physical
@@ -159,7 +161,7 @@ export function createReader(env) {
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; tracked = null; evidence = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -172,12 +174,21 @@ export function createReader(env) {
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
     const tNow = now();
-    stillRun = drift <= STILL_DRIFT && tNow - lastAt <= STILL_GAP_MS ? stillRun + 1 : 1;
-    lastAt = tNow;
+    // A long gap right after an OCR read may not vouch for the frame after it
+    // (the card could have moved and come back), so it counts at most as the
+    // start of a new window; a gap with no read in it (slow camera or device)
+    // is plain slow sampling and counts normally, so a slow cadence can never
+    // wedge Auto.
+    if (drift > STILL_DRIFT) stillRun = 1;
+    else if (tNow - lastAt > STILL_GAP_MS && readSince) stillRun = Math.min(stillRun + 1, STILL_OBS - 1);
+    else stillRun++;
+    lastAt = tNow; readSince = false;
     cand.still = stillRun;
     const m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
+    // Blurred or clipped observations are not part of a settled window.
+    if (clipped || sharp < TITLE_SHARP_FLOOR) stillRun = 0;
     if (clipped) cand.status = 'touches frame edge';
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
@@ -202,8 +213,10 @@ export function createReader(env) {
     }
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
+    readSince = true;
     const recBefore = env.stats.recCalls;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred);
+    lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
     if (prior) timings.pooled_frames = prior.frames.length;
@@ -214,7 +227,7 @@ export function createReader(env) {
     if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
-      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0 };
+      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred) };
     }
     return base;
   }
@@ -238,7 +251,7 @@ export function createReader(env) {
     // The tighter crops rescue weak or partial reads. An exact, high-confidence
     // match of a full index name needs no rescue: skip the second recognizer
     // call. This only selects the TITLE; printings still need their proof.
-    const exact = cands.some(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF);
+    const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, TITLE_TIGHT.map(strip)));
     }
@@ -262,8 +275,13 @@ export function createReader(env) {
 
     const raws = [];
     const pooled = prior && prior.name === name ? prior.frames : null;
+    // Evidence pooled from a deferred frame only saw the first footer batch.
+    // Pooling it must not settle the printing before this frame has run the
+    // stages that frame skipped (wide can disambiguate what narrow misread).
+    const lastStage = (env.footerStages || FOOTER_STAGES).length - 1;
     const tryPooled = (si) => {
       if (!pooled || !raws.length) return null;
+      if (prior.deferred && si < lastStage) return null;
       const frames = [...pooled, raws];
       const all = frames.flat();
       let p = resolveFooter(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));

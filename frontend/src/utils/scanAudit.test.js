@@ -199,3 +199,20 @@ test('needsServer: auto skips the server for unreadable titles (bounded) and def
   assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', title: 'x' }), { autoPass: true }), true);
   assert.equal(needsServer({ error: 'worker died' }, { autoPass: true }), true);
 });
+
+test('auto: deferral never repeats back to back (bounded), and blurred frames reset the settle window', async () => {
+  const { reader, calls } = fakeReaderIx((_, batch) => (batch === 2 ? 'bolt' : 'zz'));
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+  const outs = [];
+  for (let i = 0; i < 4; i++) outs.push((await reader.read(sharpFrame(), small, { requireStill: true })).results[0]);
+  for (let i = 1; i < outs.length; i++) assert.ok(!(outs[i].deferred && outs[i - 1].deferred), 'two deferrals in a row');
+  assert.ok(outs.some(o => o && !o.deferred), 'full stages ran');
+  // blur resets
+  const { reader: r2 } = fakeReader(() => 'grief');
+  await r2.read(sharpFrame(200, 280, true), small, { requireStill: true });
+  await r2.read(sharpFrame(200, 280, true), small, { requireStill: true });
+  const s = await r2.read(sharpFrame(), small, { requireStill: true });
+  assert.notEqual(s.candidates[0].status, 'ready', 'first clear frame after blur must not inherit settling history');
+  assert.ok(calls() >= 0);
+});

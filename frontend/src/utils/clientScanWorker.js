@@ -16,16 +16,14 @@ import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 ort.env.wasm.wasmPaths = '/ort/';
 // Threads need cross-origin isolation (COEP credentialless + COOP, set by the
 // backend). Replay on saved frames: 2 threads cut matched-read p50 ~30% on a
-// 4-core host; 4 was no better there, but desktops with 8+ cores get 4.
-// Phones stay at 2 at most (thermal/battery). localStorage 'scan.threads'
-// (passed in the load message) overrides for A/B tests.
+// 4-core host and 4 was no better, so every device defaults to 2 (a phone in
+// desktop-site mode cannot be told from a desktop by its UA). localStorage
+// 'scan.threads' (passed in the load message) overrides for A/B tests.
 function pickThreads(override) {
   if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1;
   const n = Number(override);
   if (n >= 1 && n <= 8) return Math.floor(n);
   const cores = self.navigator?.hardwareConcurrency || 1;
-  const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(self.navigator?.userAgent || '');
-  if (cores >= 8 && !mobile) return 4;
   return cores >= 4 ? 2 : 1;
 }
 ort.env.wasm.numThreads = 1;
