@@ -23,6 +23,7 @@ import {
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
+const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
 const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 const CORNER_GATE = 0.02;           // cornelius "sharpness" head: below = no card
@@ -44,18 +45,30 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // The upper modern sweep (0.76-0.84) proved 2 of 353 cards on-device while
 // costing ~200 ms on every miss; an unproven card goes to the server, whose
 // own sweeps cover it.
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86], 'retro'];
+// 'wide': the same rows read out to x=0.30 for a card the narrow sweep did not
+// prove. FRA-era 4-digit numbers ("U 0298") put the last digit past 0.22, so
+// the narrow strip reads "U 029". Only unresolved cards pay for it.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86], 'wide', 'retro'];
+const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
+const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
 
 // Cornelius input: the frame squashed to 384x384 (fit: fill, like the server's
 // cvScan), ImageNet-normalised, NCHW.
+// One buffer and per-channel lookup tables, reused every frame: detection runs
+// several times a second and a fresh 1.7 MB Float32Array plus two divides per
+// channel per pixel is pure garbage-collector and ALU churn. Safe to reuse
+// because the reader awaits each run before building the next tensor.
+const PLANE = CORN_SIZE * CORN_SIZE;
+let tensorBuf = null;
+const LUT = [0, 1, 2].map(ch => Float32Array.from({ length: 256 }, (_, v) => (v / 255 - MEAN[ch]) / STD[ch]));
 export function corneliusTensor(ort, rgb, channels = 3) {
-  const plane = CORN_SIZE * CORN_SIZE;
-  const t = new Float32Array(3 * plane);
-  for (let i = 0, j = 0; i < plane; i++, j += channels) {
-    t[i] = (rgb[j] / 255 - MEAN[0]) / STD[0];
-    t[plane + i] = (rgb[j + 1] / 255 - MEAN[1]) / STD[1];
-    t[2 * plane + i] = (rgb[j + 2] / 255 - MEAN[2]) / STD[2];
+  const t = tensorBuf || (tensorBuf = new Float32Array(3 * PLANE));
+  const [l0, l1, l2] = LUT;
+  for (let i = 0, j = 0; i < PLANE; i++, j += channels) {
+    t[i] = l0[rgb[j]];
+    t[PLANE + i] = l1[rgb[j + 1]];
+    t[2 * PLANE + i] = l2[rgb[j + 2]];
   }
   return new ort.Tensor('float32', t, [1, 3, CORN_SIZE, CORN_SIZE]);
 }
@@ -99,7 +112,12 @@ export function createReader(env) {
   // env: { ort, cornelius, rec, chars, index }
   env.stats = { recCalls: 0, recStrips: 0 };
   let lastQuad = null;
-  const cache = [];     // [{sig, result}] identity cache, like the sidecar's
+  // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
+  // alone does not prove a printing — reprints share art and differ only in
+  // the footer — so a signature match is trusted only while the same physical
+  // card has stayed in view since it was proven. Any frame without a card
+  // drops it, and the next card is re-proven from its own title + footer.
+  let tracked = null;   // {sig, result}
   // Cross-frame footer evidence. A still card is read on consecutive frames;
   // each frame's footer OCR is noisy in different places, so an unresolved
   // card's footer reads are kept and pooled with the next frame's IF it is the
@@ -121,14 +139,16 @@ export function createReader(env) {
   // One frame. `frame` = {data: RGBA, width, height}; `small` = 384x384 pixels
   // of the same frame (RGBA or RGB, `smallChannels`). Options:
   //   requireStill: auto mode — only read once the card has stopped moving.
-  async function read(frame, small, { smallChannels = 4, requireStill = false } = {}) {
+  //   quad: corners already found by probe() for this same frame, so the
+  //         caller can skip reading back the full frame when there is no card.
+  async function read(frame, small, { smallChannels = 4, requireStill = false, quad: known } = {}) {
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
-    const quad = await detect(small, smallChannels, w, h);
+    const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; return base; }
+    if (!quad) { lastQuad = null; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -147,12 +167,18 @@ export function createReader(env) {
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
     cand.eligible = cand.status === 'ready';
+    // Tracking ends the moment the card is not plainly in view: a blurred,
+    // clipped or moving frame is exactly when one card gets swapped for another
+    // with the same art, so nothing proven before it may carry across.
+    // Pooled footer reads go with it: votes may only combine across frames of
+    // one uninterrupted presentation.
+    if (!cand.eligible || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
     if (!cand.eligible) return base;
 
     const sig = artSignature(rgba, w, h, m);
-    const hit = cache.find(e => cosine(e.sig, sig) >= 0.97);
-    if (hit) {
-      base.results.push({ ...hit.result, number: 1, cached: true });
+    if (tracked && cosine(tracked.sig, sig) < 0.97) tracked = null;
+    if (tracked) {
+      base.results.push({ ...tracked.result, number: 1, cached: true });
       timings.total_ms = Math.round(now() - t0);
       return base;
     }
@@ -161,7 +187,10 @@ export function createReader(env) {
     const result = await readCard(rgba, w, h, m, timings, prior);
     timings.total_ms = Math.round(now() - t0);
     base.results.push(result);
-    if (result.ok) { evidence = null; cache.push({ sig, result }); if (cache.length > 64) cache.shift(); }
+    // Only a title-proven answer is carried: a card swapped for a same-art
+    // reprint between two frames at the same spot is invisible to tracking,
+    // so a printing that needed its footer is re-read every time.
+    if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, result } : null; }
     else if (result.title && result.footer_ocr?.length) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0 };
@@ -230,7 +259,9 @@ export function createReader(env) {
         if (pooledHit) return pooledHit;
         continue;
       }
-      const reads = await recognize(env, stage.map(y => strip([0, 0.22, y, y + 0.025])));
+      const rows = stage === 'wide' ? WIDE_ROWS : stage;
+      const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
+      const reads = await recognize(env, rows.map(y => strip([0, x1, y, y + 0.025])));
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
@@ -241,7 +272,15 @@ export function createReader(env) {
     return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, footer_ocr: raws };
   }
 
-  return { read, stats: env.stats, reset() { lastQuad = null; cache.length = 0; evidence = null; }, resetCache() { cache.length = 0; } };
+  // Corners only, from the 384px copy. A null here is a definite "no card" and
+  // ends tracking exactly as a full read would.
+  async function probe(small, smallChannels, w, h) {
+    const quad = await detect(small, smallChannels, w, h);
+    if (!quad) { lastQuad = null; tracked = null; evidence = null; }
+    return quad;
+  }
+
+  return { read, probe, stats: env.stats, reset() { lastQuad = null; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };
