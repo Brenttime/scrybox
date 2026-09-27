@@ -87,19 +87,21 @@ function unresolvedSignature(out) {
   return { title: res.title, cx: (box[0] + box[2] / 2) / diag, cy: (box[1] + box[3] / 2) / diag };
 }
 
-// Pure: fold one pass's outcome into the failure streak. Only a hit or a
-// lifted card (no candidate) ends it; a pass that proves nothing either way
-// (settling, moving, blurred, near-edge with no title) keeps it, or the next
-// still frame of the same card would re-send at once (Konstrari Charm: a
-// settling pass between two failed fallbacks cleared the backoff). A
-// different title or place still starts a new streak, and serverAllowed
-// only ever applies it to the same title in the same place.
-export function nextFailStreak(prev, out, now) {
-  const sig = unresolvedSignature(out);
-  if (!sig) {
-    const resolved = (out?.results || []).some(r => r.ok);
-    return !resolved && out?.candidates?.length ? (prev || null) : null;
-  }
+// Pure: fold one pass's outcome into the failure streak. Only a real server
+// attempt (fromServer) can start or extend it; an on-device outcome never
+// renews the deadline (review R1-B2: local deferred reads kept pushing it
+// out, so the server was never asked again). A hit or a lifted card (no
+// candidate) ends it; any other pass (settling, moving, blurred, a local
+// miss, near-edge with no title) keeps it unchanged, so the next still frame
+// of the same card does not re-send at once (Konstrari Charm: a settling
+// pass between two failed fallbacks cleared the backoff), while the fixed
+// deadline still expires on time. serverAllowed only ever applies it to the
+// same title in the same place.
+export function nextFailStreak(prev, out, now, { fromServer = true } = {}) {
+  const resolved = (out?.results || []).some(r => r.ok);
+  if (resolved || !out?.candidates?.length) return null;
+  const sig = fromServer ? unresolvedSignature(out) : null;
+  if (!sig) return prev || null;
   const same = prev && normTitle(prev.title) === normTitle(sig.title)
     && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;
   const count = same ? prev.count + 1 : 1;

@@ -88,7 +88,37 @@ const REFINE_MAX_MOVE = STILL_DRIFT;
 // read from the same homography, none is dropped. Only near-edge frames that
 // would otherwise abstain use it; everywhere else the padding is unchanged
 // (removing it globally lost Winter, Team Player's footer).
+// Fitting in the frame is not enough: shrinking a side's padding moves every
+// strip of the stage in TRUE-card coordinates, and could slide the footer
+// rows up off the collector line onto the text box (Astra review R1-B1: a
+// synthetic card read unrelated text box digits and proved the wrong
+// printing). A re-projection is used only if the stage still covers,
+// on the real card (outline = [0,1]), everything the padded stage covered,
+// within COVER_TOL of the card: no on-card evidence is lost, only reads of
+// the mat beyond the outline. Otherwise the stage abstains, as before.
 const PAD_SHRINK = [0.75, 0.5, 0.25, 0];
+const COVER_TOL = 0.006;
+// Padded-card fraction -> true-card fraction along one axis.
+const toTrue = (f, lo, hi) => f * (1 + lo + hi) - lo;
+function coversStage(rs, pad) {
+  const P = SERVER_PAD;
+  for (const [a, b, lo, hi] of [[2, 3, 't', 'b'], [0, 1, 'l', 'r']]) {
+    // Union of the new strips, on the true card.
+    const got = rs.map(r => [toTrue(r[a], pad[lo], pad[hi]), toTrue(r[b], pad[lo], pad[hi])]).sort((x, y) => x[0] - y[0]);
+    const union = [];
+    for (const [x0, x1] of got) {
+      const last = union[union.length - 1];
+      if (last && x0 <= last[1] + COVER_TOL) last[1] = Math.max(last[1], x1); else union.push([x0, x1]);
+    }
+    // Every on-card part of every original strip must lie inside it.
+    for (const r of rs) {
+      const oa = Math.max(0, toTrue(r[a], P[lo], P[hi])), ob = Math.min(1, toTrue(r[b], P[lo], P[hi]));
+      if (ob <= oa) continue;
+      if (!union.some(([u0, u1]) => u0 <= oa + COVER_TOL && u1 >= ob - COVER_TOL)) return false;
+    }
+  }
+  return true;
+}
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
@@ -386,6 +416,7 @@ export function createReader(env) {
           outer: for (const k of env.padShrink || PAD_SHRINK) {
             for (const [pad, side] of [[{ ...P, t: P.t * k }, 't'], [{ ...P, b: P.b * k }, 'b'], [{ ...P, t: P.t * k, b: P.b * k }, 'tb'],
               [{ ...P, l: P.l * k, r: P.r * k }, 'lr'], [{ l: P.l * k, r: P.r * k, t: P.t * k, b: P.b * k }, 'all']]) {
+              if (!coversStage(rs, pad)) continue;
               const c = cardToFrame(padQuad(quad, pad));
               if (stripsIn(c, rs)) { mm = c; fitted.push([stage, side, k]); timings.pad_fit = fitted; break outer; }
             }

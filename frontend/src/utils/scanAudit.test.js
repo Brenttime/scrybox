@@ -388,3 +388,16 @@ test('settle window: a geometric abstention (0 recognizer calls) does not demote
   const o = await reader.read(f, small, { requireStill: true });
   assert.equal(o.candidates[0].status, 'ready', `still card stays admitted after a no-OCR gap (${seen})`);
 });
+
+test('near-edge re-projection never slides a stage off on-card rows (review R1-B1)', async () => {
+  // Card bottom 6 px above a 1000 px frame edge. The only fitting bottom
+  // padding (<= 25%) would move the footer rows up onto the text box and off
+  // the true collector line: the stage must abstain, not re-project.
+  const corners = [0.32, 0.4975, 0.68, 0.4975, 0.68, 0.9975, 0.32, 0.9975];
+  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : 'lea 161'), { corners });
+  const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  const r = out.results[0];
+  assert.equal(out.candidates[0].near_edge, true);
+  assert.equal(r.ok, false, 'no printing from a stage that lost on-card rows');
+  assert.equal(r.near_edge_partial?.stage, 'footer0');
+});

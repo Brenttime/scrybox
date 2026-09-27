@@ -289,8 +289,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const r0 = local?.results?.[0];
         if (autoPass && r0 && !r0.ok && r0.error === 'no confident card title') noTitleRunRef.current++;
         else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') noTitleRunRef.current = 0;
-        // Gate passes (settling/moving) say nothing new about the edge: keep the run.
-        if (!(local?.candidates?.[0] && !local.candidates[0].eligible && ['settling', 'moving'].includes(local.candidates[0].status))) edgeRunRef.current = nextEdgeRun(edgeRunRef.current, local);
+        // A settling pass says nothing new about the edge: keep the run. Any
+        // other outcome (moving included) goes through nextEdgeRun and resets it.
+        if (local?.candidates?.[0]?.status !== 'settling') edgeRunRef.current = nextEdgeRun(edgeRunRef.current, local);
         if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0 })) {
           out = { ...local, results: await hydrateResults(local.results, abort.signal).catch((e) => { tel.set({ hydrate_error: e?.message || String(e) }); return null; }) };
           tel.mark('hydrate_ms', takeHydrateMs());
@@ -312,7 +313,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
       if (!tel.get('answered_by')) tel.set({ answered_by: 'server' });
-      const streak = nextFailStreak(failStreakRef.current, out, Date.now());
+      const streak = nextFailStreak(failStreakRef.current, out, Date.now(), { fromServer: tel.get('answered_by') === 'server' });
       failStreakRef.current = streak;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);

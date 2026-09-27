@@ -93,3 +93,21 @@ test('near-edge partials take a typed path: no server until a bounded escape, re
   assert.equal(needsServer(edge(undefined, 'solarium sentry'), { autoPass: true, edgeRun: 1 }), false, 'title read, footer off-frame: still local');
   assert.equal(needsServer(edge(), { autoPass: false }), true, 'shutter press still asks the server');
 });
+
+test('backoff: on-device outcomes never renew the deadline (review R1-B2)', () => {
+  const s1 = nextFailStreak(null, fail('Konstrari Charm'), 0);
+  const until = s1.until;
+  let s = s1;
+  for (let t = 100; t < 20000; t += 600) s = nextFailStreak(s, fail('Konstrari Charm'), t, { fromServer: false });
+  assert.equal(s.until, until, 'local deferred/unresolved reads keep the original deadline');
+  const local = { frame: { width: 1080, height: 1920 }, candidates: [{ box: [100, 100, 600, 840] }], results: [{ title: 'Konstrari Charm' }] };
+  assert.equal(serverAllowed(s, until, local), true, 'server is asked again once the deadline passes');
+  assert.equal(nextFailStreak(null, fail('Konstrari Charm'), 0, { fromServer: false }), null, 'a local miss alone never starts a streak');
+});
+
+test('edge run: a moving pass between partials resets it (review R1-S1)', () => {
+  const edge = { frame: { width: 1920, height: 1080 }, candidates: [{ number: 1, box: [100, 4, 600, 840], eligible: true }], results: [{ number: 1, ok: false, near_edge_partial: { stage: 'title1', off: [0] } }] };
+  let run = null;
+  for (let i = 0; i < 7; i++) run = nextEdgeRun(run, edge);
+  assert.equal(nextEdgeRun(run, { frame: edge.frame, candidates: [{ number: 1, box: [900, 200, 600, 840], eligible: false, status: 'moving' }], results: [] }), null);
+});
