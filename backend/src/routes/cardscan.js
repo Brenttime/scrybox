@@ -113,6 +113,30 @@ router.post('/cards', async (req, res) => {
   res.json({ ok: true, results });
 });
 
+// Client scan telemetry (frontend/src/utils/scanTelemetry.js): per-pass
+// timings and OCR text, no images. Appended as JSON lines to
+// <SCAN_TELEMETRY_DIR>/YYYY-MM-DD.jsonl, capped per day so a runaway client
+// cannot fill the disk. Off with SCAN_TELEMETRY=0.
+const fs = require('fs');
+const path = require('path');
+const TELEMETRY_DIR = process.env.SCAN_TELEMETRY_DIR || path.join(__dirname, '..', '..', '..', 'database', 'scan-telemetry');
+const TELEMETRY_DAY_MAX = 50 * 1024 * 1024;
+router.post('/telemetry', express.json({ limit: '512kb', type: ['application/json', 'text/plain'] }), (req, res) => {
+  if (process.env.SCAN_TELEMETRY === '0') return res.status(204).end();
+  const b = req.body || {};
+  const records = Array.isArray(b.records) ? b.records.slice(0, 200) : [];
+  if (!records.length) return res.status(400).json({ ok: false, error: 'No records' });
+  const day = new Date().toISOString().slice(0, 10);
+  const file = path.join(TELEMETRY_DIR, `${day}.jsonl`);
+  const meta = { user: req.user?.id ?? null, session: String(b.session || '').slice(0, 20), platform: b.platform, device: b.device, ua: String(req.get('user-agent') || '').slice(0, 200) };
+  const lines = records.map(r => JSON.stringify({ ...meta, ...r, recv: new Date().toISOString() })).join('\n') + '\n';
+  fs.promises.mkdir(TELEMETRY_DIR, { recursive: true })
+    .then(() => fs.promises.stat(file).then(s => s.size).catch(() => 0))
+    .then(size => (size + lines.length > TELEMETRY_DAY_MAX ? null : fs.promises.appendFile(file, lines)))
+    .then(() => res.status(204).end())
+    .catch(() => res.status(500).json({ ok: false }));
+});
+
 router.post('/scan', async (req, res) => {
   const cards = req.body?.cards;
   if (!Array.isArray(cards) || cards.length < 1 || cards.length > 8) return res.status(400).json({ ok: false, error: 'Expected 1-8 cards' });

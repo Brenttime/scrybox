@@ -5,7 +5,8 @@ import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
 import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed } from '../utils/fastScan';
-import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
+import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs } from '../utils/clientScan';
+import { scanTelemetry } from '../utils/scanTelemetry';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
 // sidecar detects, warps and OCRs every card from the same decoded pixels, and
@@ -109,6 +110,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const attempt = () => loadClientScan().then(r => {
       if (!live) return;
       onDeviceRef.current = r.ok; setOnDevice(r.ok);
+      scanTelemetry.device({ ok: r.ok, loadMs: r.loadMs, error: r.error, ...(r.info || {}) });
       if (!r.ok) {
         console.info('[fastscan] on-device reader unavailable:', r.error);
         if (r.error !== 'unsupported browser') timer = setTimeout(attempt, 31000);
@@ -230,6 +232,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     busyRef.current = true; setBusy(true);
     if (!autoPass) setError('');
     const t0 = performance.now();
+    // One telemetry record per pass (see utils/scanTelemetry.js). The id also
+    // rides in X-Scan-Client so the sidecar's [scan] line can be joined to it.
+    const tel = scanTelemetry.begin({ mode: autoPass ? 'auto' : 'shutter', sw, sh });
     try {
       let out = null;
       // Shutter press: hedge. The server read starts now, alongside the
@@ -243,10 +248,17 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // answer so a slow or failing session can be diagnosed from the logs.
       let why = onDeviceRef.current ? (autoPass ? 'unproven' : 'hedge') : 'no-device';
       const serverRead = async (blobP) => {
-        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Session': sessionRef.current, 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'}` };
-        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body: await blobP, signal: abort.signal });
-        if (r.status === 429) return { busy: true, backoff: true };
+        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Session': sessionRef.current, 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'} id=${tel.id}` };
+        const ts = performance.now();
+        const body = await blobP;
+        tel.mark('jpeg_ms', performance.now() - ts);
+        tel.set({ upload_bytes: body?.size, why });
+        const tr = performance.now();
+        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body, signal: abort.signal });
+        if (r.status === 429) { tel.set({ server_status: 429 }); return { busy: true, backoff: true }; }
         const j = await readJson(r);
+        tel.mark('server_rtt_ms', performance.now() - tr);
+        tel.server(j);
         if (!r.ok || !j.ok) throw new Error(j.error || t('fastscan.serviceError'));
         return j;
       };
@@ -254,7 +266,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       hedged?.catch(() => {});
       let local = null;
       if (onDeviceRef.current) {
+        const tl = performance.now();
         local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
+        tel.mark('local_ms', performance.now() - tl);
+        tel.local(local);
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
         else if (!local?.candidates?.length) { why = 'no-card'; failStreakRef.current = null; }
         else if (!local.candidates[0].eligible) why = String(local.candidates[0].status || 'ineligible').replace(/\s+/g, '-');
@@ -262,8 +277,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // done. Anything else — unproven card, no card on a shutter press,
         // failure — goes to the server with the same frame.
         if (!needsServer(local, { autoPass })) {
-          out = { ...local, results: await hydrateResults(local.results, abort.signal).catch(() => null) };
-          if (!out.results) out = null;
+          out = { ...local, results: await hydrateResults(local.results, abort.signal).catch((e) => { tel.set({ hydrate_error: e?.message || String(e) }); return null; }) };
+          tel.mark('hydrate_ms', takeHydrateMs());
+          if (!out.results) { out = null; why = 'hydrate-failed'; }
+          else tel.set({ answered_by: 'client' });
         }
       }
       if (out) abort.abort();
@@ -273,11 +290,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // another ~0.9 s of sidecar OCR for the same answer. Keep telling the
         // user what would help instead.
         if (!stale()) setHint(t('fastscan.hintFooter'));
+        tel.end({ outcome: 'held' });
         return { held: true };
       } else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
       // Stopped or navigated away while this was in flight: drop it on the floor.
-      if (stale()) return { busy: true };
-      if (out.busy) return out;
+      if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
+      if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
+      if (!tel.get('answered_by')) tel.set({ answered_by: 'server' });
       const streak = nextFailStreak(failStreakRef.current, out, Date.now());
       failStreakRef.current = streak;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
@@ -305,6 +324,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       });
       for (const h of hits) seenIdsRef.current.set(h.card.id, now);
       if (hits.length) firstSeenRef.current = null;
+      tel.end({
+        outcome: hits.length ? (fresh.length ? 'added' : 'repeat') : (out.candidates.length ? 'miss' : 'no-card'),
+        hits: hits.map(h => `${h.card.name}[${h.card.set} ${h.card.collector_number ?? h.card.num ?? ''}]`).slice(0, 8),
+        total_ms: ms, waited_ms: waited,
+      });
       if (fresh.length) {
         setLatency({ total: waited, read: ms });
         setFlash(f => f + 1);
@@ -316,6 +340,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       }
       return { matched: fresh.length, none: !out.candidates.length };
     } catch (e) {
+      tel.end({ outcome: e?.name === 'AbortError' ? 'aborted' : 'error', error: e?.message || String(e) });
       if (e?.name === 'AbortError' || stale()) return { busy: true };
       setError(e.message || String(e));
       return { error: true };

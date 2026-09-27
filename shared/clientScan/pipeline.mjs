@@ -184,8 +184,11 @@ export function createReader(env) {
     }
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
+    const recBefore = env.stats.recCalls;
     const result = await readCard(rgba, w, h, m, timings, prior);
     timings.total_ms = Math.round(now() - t0);
+    timings.rec_calls = env.stats.recCalls - recBefore;
+    if (prior) timings.pooled_frames = prior.frames.length;
     base.results.push(result);
     // Only a title-proven answer is carried: a card swapped for a same-art
     // reprint between two frames at the same spot is invisible to tracking,
@@ -202,8 +205,12 @@ export function createReader(env) {
     const tA = now();
     const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
     const cands = [];
+    // Every title read, accepted or not, for scan telemetry: a failed title
+    // otherwise leaves no trace of what the recognizer actually saw.
+    const titleRaw = [];
     const consider = (reads) => {
       for (const r of reads) {
+        if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100]);
         if (!r.text || r.conf < TITLE_CONF) continue;
         const found = findCardByOcr(env.index, r.text);
         if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
@@ -216,7 +223,7 @@ export function createReader(env) {
     timings.title_ms = Math.round(now() - tA);
     const titleReads = cands.map(c => c.raw);
     if (!cands.length) {
-      return { number: 1, ok: false, retry: true, error: 'no confident card title', title: null, ocr: titleReads };
+      return { number: 1, ok: false, retry: true, error: 'no confident card title', title: null, ocr: titleReads, title_raw: titleRaw };
     }
     cands.sort((a, b) => b.score - a.score || b.conf - a.conf || (a.name < b.name ? 1 : -1));
     const { name, raw, score } = cands[0];
@@ -224,7 +231,7 @@ export function createReader(env) {
     const done = (pi, via, footer, stage = -1) => {
       const p = ix.printings[pi];
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer };
+      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw };
     };
     let pi = uniqueTitlePrinting(ix, name);
     if (pi != null) return done(pi, 'unique physical printing', []);
@@ -269,7 +276,7 @@ export function createReader(env) {
       if (pooledHit) return pooledHit;
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, footer_ocr: raws };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and

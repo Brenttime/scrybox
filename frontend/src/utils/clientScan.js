@@ -76,7 +76,7 @@ export function loadClientScan() {
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
       : call({ type: 'load', base: assetBase() }, [], LOAD_TIMEOUT_MS)
-        .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error }));
+        .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
     ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
   }
   return ready;
@@ -114,23 +114,31 @@ export function readOnDevice(source, sw, sh, opts = {}) {
 
 async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   // Re-loads transparently if a crash or deadline tore the last worker down.
+  const tq = performance.now();
   const st = await loadClientScan();
   if (!st.ok) return { error: st.error || 'on-device reader unavailable' };
+  const span = { wait_ms: Math.round(performance.now() - tq) };
   const k = Math.min(1, FRAME_MAX / Math.max(sw, sh));
   const w = Math.round(sw * k), h = Math.round(sh * k);
   if (!frameCanvas || frameCanvas.width !== w || frameCanvas.height !== h) frameCanvas = canvas(w, h);
   if (!smallCanvas) smallCanvas = canvas(CORN_SIZE, CORN_SIZE);
   // Both canvases are drawn from the same video frame now, so the corners and
   // the pixels they are applied to can never come from different moments.
+  let t = performance.now();
+  const lap = (k) => { const n = performance.now(); span[k] = Math.round(n - t); t = n; };
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
   const small = pixels(sc, CORN_SIZE, CORN_SIZE);
+  lap('draw_ms');
   const p = await call({ type: 'probe', small, w, h }, [small]);
-  if (p.error) return { error: p.error };
-  if (!p.quad) return p.out;          // no card: skip the full-frame readback
+  lap('probe_ms');
+  if (p.error) return { error: p.error, span };
+  if (!p.quad) return { ...p.out, span };          // no card: skip the full-frame readback
   const frame = pixels(fc, w, h);
+  lap('readback_ms');
   const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill }, [frame]);
-  return r.error ? { error: r.error } : r.out;
+  lap('worker_read_ms');
+  return r.error ? { error: r.error, span } : { ...r.out, span };
 }
 
 // Server fallback wants a JPEG of the same frame the client just looked at.
@@ -142,7 +150,11 @@ export function lastFrameJpeg() {
 
 // Turn on-device answers into card_cache rows (prices, image, set) via the
 // backend, so the tray and Send flow see exactly what a server scan returns.
-const hydrated = new Map();   // scryfallId -> hydrated result (auto passes re-see cards)
+const hydrated = new Map();
+// Duration of the last /cards round trip (0 when every hit was cached), read by
+// scan telemetry right after hydrateResults resolves.
+let lastHydrateMs = 0;
+export function takeHydrateMs() { const v = lastHydrateMs; lastHydrateMs = 0; return v; }   // scryfallId -> hydrated result (auto passes re-see cards)
 const HYDRATE_TIMEOUT_MS = 8000;
 export async function hydrateResults(results, signal) {
   results = results.map(x => (x.ok && hydrated.has(x.scryfallId) ? { ...x, ...hydrated.get(x.scryfallId), number: x.number } : x));
@@ -155,6 +167,7 @@ export async function hydrateResults(results, signal) {
   if (signal?.aborted) ctl.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
   let r, j;
+  const th = performance.now();
   try {
     r = await fetch('/api/cardscan/cards', {
       signal: ctl.signal,
@@ -165,6 +178,7 @@ export async function hydrateResults(results, signal) {
     // the deadline and the scan's abort.
     j = await r.json().catch((e) => { if (e?.name === 'AbortError') throw e; return {}; });
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
+  lastHydrateMs = Math.round(performance.now() - th);
   if (!r.ok || !j.ok) throw new Error(j.error || 'hydrate failed');
   const byNumber = new Map(j.results.map(x => [x.number, x]));
   for (const h of hits) { const x = byNumber.get(h.number); if (x?.ok && x.card) hydrated.set(h.scryfallId, x); }

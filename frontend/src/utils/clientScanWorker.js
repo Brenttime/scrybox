@@ -66,7 +66,10 @@ async function load() {
   const index = loadIndex(JSON.parse(await gunzip(indexGz)));
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
   const reader = createReader({ ort, cornelius, rec, chars, index });
-  return { reader, loadMs: Math.round(performance.now() - t0) };
+  // Which assets this worker actually runs, for scan telemetry: rules out a
+  // stale cached index/model when live and replay disagree.
+  const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, simd: ort.env.wasm.simd !== false };
+  return { reader, info, loadMs: Math.round(performance.now() - t0) };
 }
 
 self.onmessage = async (e) => {
@@ -75,8 +78,8 @@ self.onmessage = async (e) => {
     ORIGIN = e.data.base || '';
     readerPromise ||= load();
     try {
-      const { loadMs } = await readerPromise;
-      self.postMessage({ id, ready: true, loadMs });
+      const { loadMs, info } = await readerPromise;
+      self.postMessage({ id, ready: true, loadMs, info });
     } catch (err) {
       readerPromise = null;
       self.postMessage({ id, ready: false, error: err?.message || String(err) });
