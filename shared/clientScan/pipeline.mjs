@@ -46,7 +46,9 @@ const STILL_GAP_MS = 400;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
-const REFINE_MAX_MOVE = 0.02;       // mean corner move / frame diagonal (~44 px at 1080p)
+// A same-frame correction, never more than the stillness tolerance: a
+// refined quad further than a still card may drift is not the same region.
+const REFINE_MAX_MOVE = STILL_DRIFT;
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
@@ -217,6 +219,15 @@ export function createReader(env) {
     // gated quad is used unchanged. The art signature is taken AFTER, so
     // tracking and pooled evidence always refer to the region OCR reads.
     // ~140-170 ms in the browser; only frames about to be OCR'd pay for it.
+    // A tracked, title-proven card still in view skips refinement and OCR:
+    // it is matched on the signature of the gated quad, as it was stored.
+    const coarseSig = artSignature(rgba, w, h, m);
+    if (tracked && cosine(tracked.coarse, coarseSig) < 0.97) tracked = null;
+    if (tracked) {
+      base.results.push({ ...tracked.result, number: 1, cached: true });
+      timings.total_ms = Math.round(now() - t0);
+      return base;
+    }
     if (env.refineCorners !== false) {
       const tr = now();
       const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
@@ -228,13 +239,7 @@ export function createReader(env) {
       }
       timings.refine_ms = Math.round(now() - tr);
     }
-    const sig = artSignature(rgba, w, h, m);
-    if (tracked && cosine(tracked.sig, sig) < 0.97) tracked = null;
-    if (tracked) {
-      base.results.push({ ...tracked.result, number: 1, cached: true });
-      timings.total_ms = Math.round(now() - t0);
-      return base;
-    }
+    const sig = timings.refined ? artSignature(rgba, w, h, m) : coarseSig;
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     readSince = true;
@@ -248,7 +253,7 @@ export function createReader(env) {
     // Only a title-proven answer is carried: a card swapped for a same-art
     // reprint between two frames at the same spot is invisible to tracking,
     // so a printing that needed its footer is re-read every time.
-    if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, result } : null; }
+    if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred) };
