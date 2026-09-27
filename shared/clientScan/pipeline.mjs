@@ -299,7 +299,9 @@ export function createReader(env) {
       const tr = now();
       const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
       const move = fine ? fine.reduce((s, p, i) => s + Math.hypot(p.x - quad[i].x, p.y - quad[i].y), 0) / 4 / diag : Infinity;
-      const fineClipped = fine && !inside(fine, ex, ey) && !(nearEdge && inside(fine, tx, ty) && plausibleCard(fine));
+      // A near-edge card's refinement must pass the same geometry check as
+      // its coarse outline wherever it lands, inward included.
+      const fineClipped = fine && (nearEdge ? !(inside(fine, tx, ty) && plausibleCard(fine)) : !inside(fine, ex, ey));
       if (fine && move <= REFINE_MAX_MOVE && !fineClipped) {
         const mf = cardToFrame(padQuad(fine));
         if (titleSharpness(rgba, w, h, mf) >= TITLE_SHARP_FLOOR) { m = mf; cand.quad = fine.map(p => [p.x, p.y]); timings.refined = 1; }
@@ -336,8 +338,8 @@ export function createReader(env) {
     // card left without its title or footer strips simply fails this frame.
     let truncated = false;
     const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
-    const strips = (rs) => {
-      if (nearEdge && !rs.every(r => stripInFrame(m, r, w, h))) { truncated = true; return []; }
+    const strips = (rs, stage) => {
+      if (nearEdge && !rs.every(r => stripInFrame(m, r, w, h))) { truncated = { stage, off: rs.map((r, i) => (stripInFrame(m, r, w, h) ? -1 : i)).filter(i => i >= 0) }; return []; }
       return rs.map(strip);
     };
     const cands = [];
@@ -353,17 +355,17 @@ export function createReader(env) {
         if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
     };
-    consider(await recognize(env, strips(TITLE_FIRST)), 1);
+    consider(await recognize(env, strips(TITLE_FIRST, 'title1')), 1);
     // The tighter crops rescue weak or partial reads. An exact, high-confidence
     // match of a full index name needs no rescue: skip the second recognizer
     // call. This only selects the TITLE; printings still need their proof.
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
-      consider(await recognize(env, strips(TITLE_TIGHT)), 2);
+      consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
     timings.title_ms = Math.round(now() - tA);
     const titleReads = cands.map(c => c.raw);
-    const partial = (extra = {}) => ({ number: 1, ok: false, retry: true, error: 'card too close to the frame edge', near_edge_partial: true, title: null, ocr: titleReads, title_raw: titleRaw, ...extra });
+    const partial = (extra = {}) => ({ number: 1, ok: false, retry: true, error: 'card too close to the frame edge', near_edge_partial: truncated, title: null, ocr: titleReads, title_raw: titleRaw, ...extra });
     if (truncated) return partial();
     if (!cands.length) {
       return { number: 1, ok: false, retry: true, error: 'no confident card title', title: null, ocr: titleReads, title_raw: titleRaw };
@@ -398,7 +400,7 @@ export function createReader(env) {
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
       if (stage === 'retro') {
-        const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025])));
+        const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025]), 'retro'));
         if (truncated) return partial({ title: name, footer_ocr: raws });
         const nums = [];
         for (const r of reads) {
@@ -417,7 +419,7 @@ export function createReader(env) {
       }
       const rows = stage === 'wide' ? WIDE_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const reads = await recognize(env, strips(rows.map(y => [0, x1, y, y + 0.025])));
+      const reads = await recognize(env, strips(rows.map(y => [0, x1, y, y + 0.025]), `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));

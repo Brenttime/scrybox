@@ -257,9 +257,9 @@ test('near-edge: a plausible fully visible card inside the 1% band is read (fres
   const out = await reader.read(f, new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
   assert.equal(out.candidates[0].near_edge, true);
   assert.equal(out.candidates[0].status, 'ready');
-  // Title strips reaching above the frame are dropped, not read from clamped
-  // rows: the ones that fit are still read.
-  assert.ok(calls() >= 1);
+  // Both first title strips fit this outline: read as one batch, tagged 1.
+  assert.equal(calls(), 1);
+  assert.deepEqual(out.results[0].title_raw.map(t => t[2]), [1, 1]);
   const again = await reader.read(f, new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
   assert.notEqual(again.results[0]?.cached, true, 'near-edge answers are never carried by tracking');
 });
@@ -309,5 +309,24 @@ test('near-edge: a footer stage with a strip outside the frame never proves a pr
   const r = out.results[0];
   assert.equal(out.candidates[0].near_edge, true, 'fixture must exercise the near-edge path');
   assert.equal(r.ok, false, 'a truncated footer stage must not prove a printing');
-  assert.equal(r.near_edge_partial, true);
+  assert.equal(r.near_edge_partial.stage, 'footer0', 'whole first footer stage skipped');
+  assert.ok(r.near_edge_partial.off.length > 0);
+});
+
+test('near-edge: an inward refinement must pass the geometry check too (review B3)', async () => {
+  // Astra's repro: valid small coarse card at the top edge, refined outline
+  // collapsed but inside the 1% band and within the correction limit.
+  let n = 0;
+  const f = fakeReader(() => 'grief', { refine: true });
+  const env = f.reader.__env;
+  const S = 1000;
+  const coarse = [320, 6, 334.4, 6, 334.4, 26, 320, 26].map(v => v / S);
+  const fine = [320, 11, 334.4, 11, 354.4, 12, 340, 12].map(v => v / S);
+  const cornelius = { run: async () => { n++; return { corners: { data: n % 2 ? coarse : fine }, sharpness: { data: [0.9] } }; } };
+  const index = loadIndex({ names: ['grief'], canon: {}, excluded: [], sets: ['mh2'], printings: [['id-grief', 'mh2', '87']], byTitle: { grief: [0] }, uniqueAlias: {} });
+  const reader = createReader({ ...env, cornelius, index, refineCorners: true });
+  const out = await reader.read(sharpFrame(S, S), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(n, 2, 'coarse + refinement ran');
+  assert.notEqual(out.timings.refined, 1, 'collapsed refinement must not be adopted');
+  assert.equal(out.candidates[0].quad[3][1], 26, 'coarse geometry kept');
 });
