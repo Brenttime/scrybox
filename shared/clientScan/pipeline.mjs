@@ -66,6 +66,13 @@ const STILL_GAP_MS = 400;
 // loop every pass was >= ~100 ms apart, so this keeps the window measured on
 // the 63-card session unchanged when the loop runs faster.
 const STILL_MIN_SEP_MS = 90;
+// Admission is an ELAPSED window: STILL_OBS observations spanning at least
+// STILL_WINDOW_MS of real time, instead of counting only observations
+// >= 90 ms apart. The counting rule aliased with the loop cadence: at 65 ms
+// passes, every other observation fell short and admission took 260 ms, vs
+// 210 ms at 105 ms passes. A faster loop now admits no later (and never
+// sooner) than 2 x 90 ms after the first still observation.
+const STILL_WINDOW_MS = (STILL_OBS - 1) * STILL_MIN_SEP_MS;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
@@ -205,6 +212,7 @@ export function createReader(env) {
   env.stats = { recCalls: 0, recStrips: 0 };
   let lastQuad = null;
   let stillRun = 0, lastAt = 0;   // consecutive low-drift observations
+  let stillSince = 0;             // real time the current still window began
   let readSince = false;          // OCR ran since the last observation
   let lastDeferred = false;       // previous read deferred its deep footer stages
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
@@ -266,10 +274,19 @@ export function createReader(env) {
     // start of a new window; a gap with no read in it (slow camera or device)
     // is plain slow sampling and counts normally, so a slow cadence can never
     // wedge Auto.
-    if (drift > STILL_DRIFT) { stillRun = 1; lastAt = tNow; }
-    else if (tNow - lastAt > STILL_GAP_MS && readSince) { stillRun = Math.min(stillRun + 1, STILL_OBS - 1); lastAt = tNow; }
-    else if (tNow - lastAt >= STILL_MIN_SEP_MS || stillRun === 0) { stillRun++; lastAt = tNow; }
+    // Only a read that actually ran the recognizer counts as a gap "after an
+    // OCR read": a geometric abstention (zero rec calls) is as quick as a gate
+    // pass and must not force a fresh settle cycle.
+    if (drift > STILL_DRIFT || stillRun === 0) { stillRun = 1; stillSince = tNow; }
+    else if (tNow - lastAt > STILL_GAP_MS && readSince) {
+      // The window continues but needs one more observation, and at least
+      // STILL_MIN_SEP_MS more of it, after this gap.
+      stillRun = Math.min(stillRun + 1, STILL_OBS - 1);
+      stillSince = Math.max(stillSince, tNow - STILL_WINDOW_MS + STILL_MIN_SEP_MS);
+    } else stillRun++;
+    lastAt = tNow;
     readSince = false;
+    const settled = stillRun >= STILL_OBS && tNow - stillSince >= STILL_WINDOW_MS;
     cand.still = stillRun;
     let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
@@ -280,7 +297,7 @@ export function createReader(env) {
     if (clipped) cand.status = 'touches frame edge';
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
-    else if (requireStill && stillRun < STILL_OBS) cand.status = 'settling';
+    else if (requireStill && (stillRun === 0 || !settled)) cand.status = 'settling';
     cand.eligible = cand.status === 'ready';
     // Tracking ends the moment the card is not plainly in view: a blurred,
     // clipped or moving frame is exactly when one card gets swapped for another
@@ -327,13 +344,13 @@ export function createReader(env) {
     const sig = timings.refined ? artSignature(rgba, w, h, m) : coarseSig;
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
-    readSince = true;
     const recBefore = env.stats.recCalls;
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
     const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
+    readSince = timings.rec_calls > 0;
     if (prior) timings.pooled_frames = prior.frames.length;
     base.results.push(result);
     // Only a title-proven answer is carried: a card swapped for a same-art
@@ -366,7 +383,7 @@ export function createReader(env) {
         if (quad) {
           // One side first (the one at the edge), then both; mildest first.
           const P = SERVER_PAD;
-          outer: for (const k of PAD_SHRINK) {
+          outer: for (const k of env.padShrink || PAD_SHRINK) {
             for (const [pad, side] of [[{ ...P, t: P.t * k }, 't'], [{ ...P, b: P.b * k }, 'b'], [{ ...P, t: P.t * k, b: P.b * k }, 'tb'],
               [{ ...P, l: P.l * k, r: P.r * k }, 'lr'], [{ l: P.l * k, r: P.r * k, t: P.t * k, b: P.b * k }, 'all']]) {
               const c = cardToFrame(padQuad(quad, pad));

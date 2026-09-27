@@ -81,7 +81,7 @@ function fakeReader(titleFor, opts = {}) {
   // Each observation 100 ms after the last (the settle window is time-based).
   let tick = 0; const clock = opts.clock || (() => (tick += 100));
   const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock });
-  reader.__env = { ort, cornelius, rec, chars, refineCorners: opts.refine ?? false, clock };
+  reader.__env = { ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock };
   return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
 }
 
@@ -358,4 +358,33 @@ test('footer: the first modern batch reads the 0.84 row (FRA collector line, Kon
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.scryfallId, 'id-lea');
   assert.equal(r.footer_stage, 0, 'resolved by the first batch, one recognizer call');
+});
+
+test('settle window: a faster cadence never admits later than a slower one (65 vs 105 ms)', async () => {
+  const admitAt = async (step) => {
+    let t = 0;
+    const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+    const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+    for (let i = 0; i < 20; i++) { await reader.read(f, small, { requireStill: true }); if (calls()) return t; t += step; }
+    return Infinity;
+  };
+  const fast = await admitAt(65), slow = await admitAt(105);
+  assert.ok(fast <= slow, `65 ms cadence admitted at ${fast}, 105 ms at ${slow}`);
+  assert.ok(fast >= 180, 'never shorter than the 2 x 90 ms window');
+});
+
+test('settle window: a geometric abstention (0 recognizer calls) does not demote the next window', async () => {
+  // Near-edge card whose title stage cannot fit even unpadded: zero OCR.
+  let t = 0;
+  // padShrink [] disables the re-projection, so the title stage abstains.
+  const f0 = fakeReader(() => 'grief', { clock: () => t, corners: nearTop(0.004) });
+  const reader = createReader({ ...f0.reader.__env, padShrink: [] });
+  const calls = f0.calls;
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame(1000, 1000);
+  const seen = [];
+  for (let i = 0; i < 4; i++) { const o = await reader.read(f, small, { requireStill: true }); seen.push(o.candidates[0].status); t += 100; }
+  assert.equal(calls(), 0, 'fixture: no recognizer call');
+  t += 500;   // long pause (e.g. a server fallback) after the abstention
+  const o = await reader.read(f, small, { requireStill: true });
+  assert.equal(o.candidates[0].status, 'ready', `still card stays admitted after a no-OCR gap (${seen})`);
 });
