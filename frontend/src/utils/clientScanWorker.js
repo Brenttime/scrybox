@@ -16,14 +16,18 @@ import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 ort.env.wasm.wasmPaths = '/ort/';
 ort.env.wasm.numThreads = 1;
 
+// Set from the load message: '' on the web (same origin), the user's server URL
+// in the native app, where relative paths would resolve inside the app bundle.
+let ORIGIN = '';
 const BASE = '/scan-assets/';
 const CACHE = 'scrybox-scan-assets';
 let readerPromise = null;
+let pendingReset = false;
 
 async function cachedBytes(cache, url) {
   let res = cache ? await cache.match(url) : null;
   if (!res) {
-    res = await fetch(url);
+    res = await fetch(ORIGIN + url);
     const type = res.headers.get('content-type') || '';
     if (!res.ok || type.includes('text/html')) throw new Error(`${url} not served (${res.status})`);
     if (cache) await cache.put(url, res.clone()).catch(() => {});
@@ -39,7 +43,9 @@ async function gunzip(bytes) {
 
 async function load() {
   const t0 = performance.now();
-  const manifest = await (await fetch(`${BASE}manifest.json`, { cache: 'no-cache' })).json();
+  // Revalidated, not refetched: a returning phone gets a 304 and then reads
+  // every asset from the Cache API.
+  const manifest = await (await fetch(`${ORIGIN}${BASE}manifest.json`, { cache: 'no-cache' })).json();
   const urls = [manifest.index, manifest.rec, manifest.dict].map(n => BASE + n);
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
   if (cache) {
@@ -66,6 +72,7 @@ async function load() {
 self.onmessage = async (e) => {
   const { type, id } = e.data;
   if (type === 'load') {
+    ORIGIN = e.data.base || '';
     readerPromise ||= load();
     try {
       const { loadMs } = await readerPromise;
@@ -76,16 +83,37 @@ self.onmessage = async (e) => {
     }
     return;
   }
-  if (type === 'read') {
-    const { frame, w, h, small, requireStill } = e.data;
+  // Applied at the start of the next read rather than immediately, so a read
+  // still in flight when auto restarts cannot repopulate state afterwards.
+  if (type === 'reset') { pendingReset = true; return; }
+  // Phase 1: corners from the 384px copy. When there is no card this is the
+  // whole answer, and the main thread never reads back the full frame.
+  if (type === 'probe') {
+    const { small, w, h } = e.data;
     try {
+      if (!readerPromise) throw new Error('reader not loaded');
+      const { reader } = await readerPromise;
+      if (pendingReset) { pendingReset = false; reader.reset(); }
+      const quad = await reader.probe(new Uint8ClampedArray(small), 4, w, h);
+      const out = quad ? null : { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
+      self.postMessage({ id, quad, out, small }, [small]);
+    } catch (err) {
+      self.postMessage({ id, error: err?.message || String(err), small }, [small]);
+    }
+    return;
+  }
+  // Phase 2: the full read, reusing the corners phase 1 found for this frame.
+  if (type === 'read') {
+    const { frame, w, h, quad, requireStill } = e.data;
+    try {
+      if (!readerPromise) throw new Error('reader not loaded');
       const { reader } = await readerPromise;
       const out = await reader.read(
         { data: new Uint8ClampedArray(frame), width: w, height: h },
-        new Uint8ClampedArray(small), { smallChannels: 4, requireStill });
-      self.postMessage({ id, out, frame, small }, [frame, small]);
+        null, { requireStill, quad });
+      self.postMessage({ id, out, frame }, [frame]);
     } catch (err) {
-      self.postMessage({ id, error: err?.message || String(err), frame, small }, [frame, small]);
+      self.postMessage({ id, error: err?.message || String(err), frame }, [frame]);
     }
   }
 };

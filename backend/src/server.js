@@ -162,6 +162,10 @@ const PRIVATE_ORIGIN = /^https?:\/\/(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.
 function isAllowedOrigin(origin) {
   if (!origin) return true; // same-origin / non-browser client
   if (PRIVATE_ORIGIN.test(origin)) return true; // localhost + private LAN, always
+  // The iOS app's WebView origin. Its scan worker fetches /models and
+  // /scan-assets directly (workers bypass CapacitorHttp), so those must answer
+  // it. No credentials are allowed cross-origin, and /api stays token-gated.
+  if (origin === 'capacitor://localhost') return true;
   return explicitOrigins.includes(origin);
 }
 

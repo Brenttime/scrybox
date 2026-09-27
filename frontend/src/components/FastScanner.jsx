@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Zap, ZapOff, ScanLine, Check, X, SwitchCamera, Camera, Sparkles, Trash2, Send, Undo2, Minus, Plus } from 'lucide-react';
-import { resolveCardPrice } from '../utils/resolveCardPrice';
+import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan } from '../utils/fastScan';
-import { loadClientScan, readOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed } from '../utils/fastScan';
+import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer } from '../utils/clientScan';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
 // sidecar detects, warps and OCRs every card from the same decoded pixels, and
@@ -20,6 +20,15 @@ import { loadClientScan, readOnDevice, lastFrameJpeg, hydrateResults, needsServe
 
 const AUTO_GAP_MS = 60;
 const AUTO_IDLE_MS = 350;
+const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
+// The tray is capped for render cost, but unsent scans are never dropped to
+// make room: at the cap, auto pauses and asks for a Send instead.
+const TRAY_MAX = 80;
+
+// JSON body or a readable error, never a SyntaxError from a proxy's HTML page.
+async function readJson(r) {
+  try { return await r.json(); } catch { return { ok: false, error: `HTTP ${r.status}` }; }
+}
 
 async function grabJpeg(source, sw, sh, canvasRef) {
   const k = Math.min(1, FRAME_MAX / Math.max(sw, sh));
@@ -47,6 +56,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const busyRef = useRef(false);
   const autoRef = useRef(false);
   const timerRef = useRef(null);
+  const runRef = useRef(0);          // auto-loop generation; a stale loop sees a new number and exits
+  const aliveRef = useRef(true);     // false after unmount: late results must not touch state
+  const scanAbortRef = useRef(null); // in-flight server read, aborted on stop/unmount
+  const resultsRef = useRef([]);
+  const failStreakRef = useRef(null); // same unresolved card, repeated: back off the server
+  // One id per camera session: the sidecar scopes its identity cache to it.
+  const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
 
@@ -85,15 +101,21 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   }, []);
   // One-time on-device download, started once the camera is on so opening the
   // tab alone costs nothing. Failure just leaves the server path in charge.
+  // A failed load (flaky network, server restarting) is retried while the
+  // camera stays on; loadClientScan itself spaces the attempts 30 s apart.
   useEffect(() => {
-    if (!cameraOn || onDeviceRef.current) return;
-    let live = true;
-    loadClientScan().then(r => {
+    if (!cameraOn) return;
+    let live = true, timer;
+    const attempt = () => loadClientScan().then(r => {
       if (!live) return;
       onDeviceRef.current = r.ok; setOnDevice(r.ok);
-      if (!r.ok) console.info('[fastscan] on-device reader unavailable:', r.error);
+      if (!r.ok) {
+        console.info('[fastscan] on-device reader unavailable:', r.error);
+        if (r.error !== 'unsupported browser') timer = setTimeout(attempt, 31000);
+      }
     });
-    return () => { live = false; };
+    attempt();
+    return () => { live = false; clearTimeout(timer); };
   }, [cameraOn]);
   useEffect(() => {
     fetch('/api/cardscan/status').then(r => setService(r.ok)).catch(() => setService(false));
@@ -104,7 +126,16 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     streamRef.current = null;
     setCameraOn(false); setTorch(false);
   }, []);
-  useEffect(() => () => { autoRef.current = false; clearTimeout(timerRef.current); stopCamera(); }, [stopCamera]);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false; autoRef.current = false;
+      // A generation counter, not a DOM ref: bumping the live value is the point.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      runRef.current++;
+      clearTimeout(timerRef.current); scanAbortRef.current?.abort(); stopCamera();
+    };
+  }, [stopCamera]);
 
   const startCamera = useCallback(async (id = deviceId) => {
     setError('');
@@ -153,7 +184,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (!c) return;
     const dpr = window.devicePixelRatio || 1;
     const W = c.clientWidth, H = c.clientHeight;
-    c.width = W * dpr; c.height = H * dpr;
+    // Assigning width/height reallocates the backing store even when unchanged.
+    const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+    if (c.width !== bw || c.height !== bh) { c.width = bw; c.height = bh; }
     const ctx = c.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
@@ -186,8 +219,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     }
   }, []);
 
-  const scan = useCallback(async (source, { autoPass = false } = {}) => {
+  const scan = useCallback(async (source, { autoPass = false, gen = runRef.current } = {}) => {
     if (busyRef.current) return { busy: true };
+    // Results commit only for the run that asked: an auto pass that outlives a
+    // stop (or a stop+restart) must not add rows to the new run's tray.
+    const stale = () => !aliveRef.current || (autoPass && (!autoRef.current || gen !== runRef.current));
     const sw = source.videoWidth || source.naturalWidth || source.width;
     const sh = source.videoHeight || source.naturalHeight || source.height;
     if (!sw || !sh) return { busy: true };
@@ -202,30 +238,48 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // miss, then a full server read). Auto passes stay sequential so the
       // 60 ms loop does not flood the 2-core sidecar.
       const abort = new AbortController();
+      scanAbortRef.current = abort;
+      // Why this frame goes to the server, logged by the sidecar next to its
+      // answer so a slow or failing session can be diagnosed from the logs.
+      let why = onDeviceRef.current ? (autoPass ? 'unproven' : 'hedge') : 'no-device';
       const serverRead = async (blobP) => {
-        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: await blobP, signal: abort.signal });
-        if (r.status === 429) return { busy: true };
-        const j = await r.json();
+        const headers = { 'Content-Type': 'image/jpeg', 'X-Scan-Session': sessionRef.current, 'X-Scan-Client': `od=${onDeviceRef.current ? 1 : 0} why=${why} mode=${autoPass ? 'auto' : 'shutter'}` };
+        const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body: await blobP, signal: abort.signal });
+        if (r.status === 429) return { busy: true, backoff: true };
+        const j = await readJson(r);
         if (!r.ok || !j.ok) throw new Error(j.error || t('fastscan.serviceError'));
         return j;
       };
       const hedged = onDeviceRef.current && !autoPass ? serverRead(grabJpeg(source, sw, sh, canvasRef)) : null;
       hedged?.catch(() => {});
+      let local = null;
       if (onDeviceRef.current) {
-        const local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
-        if (local?.error) console.warn('[fastscan] on-device read failed:', local.error);
+        local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
+        if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
+        else if (!local?.candidates?.length) { why = 'no-card'; failStreakRef.current = null; }
+        else if (!local.candidates[0].eligible) why = String(local.candidates[0].status || 'ineligible').replace(/\s+/g, '-');
         // Proven on the phone (or an auto pass the stillness gate held back):
         // done. Anything else — unproven card, no card on a shutter press,
         // failure — goes to the server with the same frame.
         if (!needsServer(local, { autoPass })) {
-          out = { ...local, results: await hydrateResults(local.results).catch(() => null) };
+          out = { ...local, results: await hydrateResults(local.results, abort.signal).catch(() => null) };
           if (!out.results) out = null;
         }
       }
       if (out) abort.abort();
       else if (hedged) out = await hedged;
-      else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
-      if (out.busy) return { busy: true };
+      else if (autoPass && !serverAllowed(failStreakRef.current, Date.now(), local)) {
+        // Same card, same unresolved footer as the last few passes: don't pay
+        // another ~0.9 s of sidecar OCR for the same answer. Keep telling the
+        // user what would help instead.
+        if (!stale()) setHint(t('fastscan.hintFooter'));
+        return { held: true };
+      } else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
+      // Stopped or navigated away while this was in flight: drop it on the floor.
+      if (stale()) return { busy: true };
+      if (out.busy) return out;
+      const streak = nextFailStreak(failStreakRef.current, out, Date.now());
+      failStreakRef.current = streak;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);
       const byNumber = new Map(out.results.map(x => [x.number ?? x.scene_number, x]));
@@ -238,6 +292,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (!out.candidates.length) setHint(t('fastscan.hintNoCard'));
       else if (!eligible) setHint(t('fastscan.hintAdjust', { reason: out.candidates[0].status }));
       else if (plan.tooSmall.length && hits.length < eligible) setHint(t('fastscan.hintCloser', { count: plan.tooSmall.length }));
+      else if (!hits.length && streak && streak.count >= 2) setHint(t('fastscan.hintFooter'));
       else if (!hits.length) setHint(t('fastscan.hintHold'));
       else setHint('');
 
@@ -255,31 +310,54 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false }));
-        setResults(prev => [...rows, ...prev].slice(0, 80));
+        setResults(prev => [...rows, ...prev]);
       } else if (!autoPass) {
         setLatency({ total: ms, read: ms });
       }
       return { matched: fresh.length, none: !out.candidates.length };
     } catch (e) {
+      if (e?.name === 'AbortError' || stale()) return { busy: true };
       setError(e.message || String(e));
       return { error: true };
     } finally {
-      busyRef.current = false; setBusy(false);
+      busyRef.current = false;
+      if (aliveRef.current) setBusy(false);
     }
   }, [drawOverlay, t]);
 
-  const autoLoop = useCallback(async () => {
-    if (!autoRef.current) return;
+  // Latest scan, read through a ref so a running loop never calls a stale one
+  // from the render it started in.
+  const scanRef = useRef(scan);
+  scanRef.current = scan;
+  resultsRef.current = results;
+
+  // One loop per generation. Stopping bumps runRef, so a pass still awaiting
+  // its scan when the user stops (and maybe restarts) sees a different number
+  // and exits instead of scheduling a second loop beside the new one.
+  const autoLoop = useCallback(async (gen) => {
+    if (!autoRef.current || gen !== runRef.current) return;
+    const unsent = resultsRef.current.filter(x => !x.sent).length;
+    if (unsent >= TRAY_MAX) {
+      setHint(t('fastscan.trayFull', { count: TRAY_MAX }));
+      timerRef.current = setTimeout(() => autoLoop(gen), AUTO_IDLE_MS);
+      return;
+    }
     const v = videoRef.current;
-    const r = v && v.readyState >= 2 ? await scan(v, { autoPass: true }) : { busy: true };
-    if (!autoRef.current) return;
-    timerRef.current = setTimeout(autoLoop, r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS);
-  }, [scan]);
+    const r = v && v.readyState >= 2 ? await scanRef.current(v, { autoPass: true, gen }) : { busy: true };
+    if (!autoRef.current || gen !== runRef.current) return;
+    const wait = r.backoff ? AUTO_BUSY_MS : r.none || r.error ? AUTO_IDLE_MS : AUTO_GAP_MS;
+    timerRef.current = setTimeout(() => autoLoop(gen), wait);
+  }, [t]);
 
   const setAutoRunning = (next) => {
     setAuto(next); autoRef.current = next;
     clearTimeout(timerRef.current);
-    if (next) { seenIdsRef.current.clear(); autoLoop(); }
+    const gen = ++runRef.current;
+    if (!next) { scanAbortRef.current?.abort(); return; }
+    // A new run proves every card afresh; nothing tracked in the last one carries over.
+    seenIdsRef.current.clear(); failStreakRef.current = null; resetOnDevice();
+    sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
+    autoLoop(gen);
   };
   const toggleMode = () => {
     const next = mode === 'auto' ? 'single' : 'auto';
@@ -398,10 +476,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   }
 
   const pending = results.filter(r => !r.sent).length;
-  const priceOf = (card, printing = 'Normal') => Number(resolveCardPrice(card, printing)) || 0;
-  const rowPrice = (row) => priceOf(row.card, printingOf(row)) * qtyOf(row);
-  const total = results.reduce((sum, r) => sum + rowPrice(r), 0);
-  const currency = results[0]?.card?.price_currency;
+  // Scanner shows USD only. A printing with no USD quote (Scryfall fell back
+  // to EUR) shows no price at all rather than a euro figure or a mixed total.
+  const priceOf = (card, printing = 'Normal') => usdPrice(card, printing);
+  const rowPrice = (row) => { const p = priceOf(row.card, printingOf(row)); return p == null ? null : p * qtyOf(row); };
+  const total = results.reduce((sum, r) => sum + (rowPrice(r) || 0), 0);
+  const anyPriced = results.some(r => rowPrice(r) != null);
   const destValid = dest === 'collection' || lists.some(l => String(l.id) === dest);
 
   return (
@@ -412,7 +492,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div key={flash} className={flash ? 'fs-flash' : ''} />
 
         <div className="fs-topbar">
-          {results.length > 0 && <span className="fs-pill fs-pill-value">{priceText(total, currency)} · {results.length}</span>}
+          {results.length > 0 && <span className="fs-pill fs-pill-value">{anyPriced ? `${priceText(total, 'USD')} · ` : ''}{results.length}</span>}
           {latency != null && <span className="fs-pill" title={t('fastscan.latencyHint', { read: latency.read })}><Sparkles size={12} /> {latency.total >= 1000 ? `${(latency.total / 1000).toFixed(1)} s` : `${latency.total} ms`}</span>}
           {auto && <span className="fs-pill fs-pill-live"><span className="fs-dot" /> {t('fastscan.autoOn')}</span>}
           {onDevice && <span className="fs-pill" title={t('fastscan.onDeviceHint')}>{t('fastscan.onDevice')}</span>}
@@ -460,7 +540,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div className="fs-tray-head">
           <div>
             <div className="fs-tray-title">{t('fastscan.results', { count: results.length })}</div>
-            <div className="fs-tray-total">{priceText(total, currency)}</div>
+            {anyPriced && <div className="fs-tray-total">{priceText(total, 'USD')}</div>}
           </div>
           {results.length > 0 && (
             <button type="button" className="fs-ghost" onClick={() => setResults([])} aria-label={t('fastscan.clear')}><Trash2 size={14} /></button>
@@ -478,7 +558,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                     <button type="button" className="fs-card-edit" onClick={() => openPrintings(row)} aria-label={t('fastscan.changePrinting')} />
                   )}
                   <button type="button" className="fs-card-x" onClick={() => setResults(prev => prev.filter(r => r.key !== row.key))} aria-label={t('fastscan.dismiss')}><X size={12} /></button>
-                  <span className="fs-card-price">{priceText(rowPrice(row), row.card.price_currency)}</span>
+                  {rowPrice(row) != null && <span className="fs-card-price">{priceText(rowPrice(row), 'USD')}</span>}
                   {row.sent && <span className="fs-card-badge"><Check size={14} /></span>}
                 </div>
                 <div className="fs-card-name">{displayName(row.card)}</div>
@@ -522,7 +602,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                       <button type="button" className="fs-print" onClick={() => choosePrinting(c)} aria-pressed={c.id === editing.card.id}>
                         <div className="fs-card-art">
                           {c.image_url ? <img src={c.image_url} alt="" loading="lazy" /> : null}
-                          <span className="fs-card-price">{priceText(priceOf(c), c.price_currency)}</span>
+                          {priceOf(c) != null && <span className="fs-card-price">{priceText(priceOf(c), 'USD')}</span>}
                           {c.id === editing.card.id && <span className="fs-card-badge"><Check size={14} /></span>}
                         </div>
                         <div className="fs-card-name">{c.set_name || String(c.set_id || '').toUpperCase()}</div>
