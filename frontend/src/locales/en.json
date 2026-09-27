@@ -564,6 +564,8 @@
   "zoom.share": "Share",
   "inspector.fullScreen": "Full Screen",
   "inspector.forTrade": "For Trade",
+  "inspector.markProxy": "Mark as proxy",
+  "inspector.unmarkProxy": "Unmark proxy",
   "inspector.colorless": "Colorless",
   "inspector.listedInTrade": "Listed in Trade Binder",
   "inspector.notesPlaceholder": "Provenance, condition details, trade plans...",

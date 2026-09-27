@@ -5,6 +5,7 @@ import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { resolveCardPrice } from '../utils/resolveCardPrice';
 import { getPrintingLabel } from '../utils/cardPrinting';
+import { displayRarity } from '../utils/cardRarity';
 import { tcgplayerUrl, cardmarketUrl, searchUrl, priceSource, noLinkReason } from '../utils/marketplaceLinks';
 import CardImage from './CardImage';
 import CardImageZoom from './CardImageZoom';
@@ -57,6 +58,8 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   useBackGuard(isFullScreen, () => setIsFullScreen(false));
 
   const targetEntryId = card?.entry_id || card?.id;
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [, setProxyTick] = useState(0);
 
   useEffect(() => {
     if (!card) return;
@@ -142,6 +145,37 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
     } catch (err) {
       console.error(err);
       showToast && showToast(t('common.errBackend'));
+    }
+  };
+
+  // Flip this copy between real and proxy. A proxy is valued at $0 and shows
+  // rarity 'Proxy'; the stored prices and purchase price are untouched.
+  const toggleProxy = async () => {
+    if (!targetEntryId || proxyBusy) return;
+    const next = card.is_proxy ? 0 : 1;
+    setProxyBusy(true);
+    try {
+      const res = await fetch(`/api/collection/${targetEntryId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_proxy: next })
+      });
+      if (res.ok) {
+        if (card.base_rarity === undefined) card.base_rarity = card.rarity;
+        card.is_proxy = next;
+        card.rarity = displayRarity(card);
+        card.price_trend = resolveCardPrice(card, card.printing);
+        setProxyTick(n => n + 1);
+        onUpdate && onUpdate();
+      } else {
+        const body = await res.json().catch(() => null);
+        showToast && showToast(body?.error || t('inspector.errUpdate'));
+      }
+    } catch (err) {
+      console.error(err);
+      showToast && showToast(t('common.errBackend'));
+    } finally {
+      setProxyBusy(false);
     }
   };
 
@@ -261,7 +295,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {!isEnglish(card.language) && setCode(card) && (
                 <span style={{ fontFamily: 'monospace', color: 'var(--text-muted)' }}> ({setCode(card)})</span>
               )}
-              {cardNumber ? ` • #${cardNumber}` : ''}{card.rarity ? ` • ${card.rarity}` : ''} • {t('inspector.owned', { count: card.quantity ?? 1 })}
+              {cardNumber ? ` • #${cardNumber}` : ''}{displayRarity(card) ? ` • ${displayRarity(card)}` : ''} • {t('inspector.owned', { count: card.quantity ?? 1 })}
             </p>
 
             {/* MTG cards: show color pips + type line. */}
@@ -435,6 +469,17 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem', alignItems: 'center', flexWrap: 'wrap' }}>
                 <button className="btn btn-primary ci-edit-btn" style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }} onClick={() => setMode('edit')}>
                   {t('inspector.editCard')}
+                </button>
+
+                <button
+                  type="button"
+                  className={`btn ${card.is_proxy ? 'btn-primary' : 'btn-secondary'} ci-proxy-btn`}
+                  style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }}
+                  aria-pressed={!!card.is_proxy}
+                  disabled={proxyBusy}
+                  onClick={toggleProxy}
+                >
+                  {card.is_proxy ? t('inspector.unmarkProxy') : t('inspector.markProxy')}
                 </button>
 
                 <button

@@ -133,6 +133,7 @@ router.get('/users', async (req, res) => {
       const stats = await db.get(`
         SELECT COUNT(c.id) as unique_cards, SUM(c.quantity) as total_cards,
           SUM(c.quantity * CASE
+            WHEN COALESCE(c.is_proxy, 0) = 1 THEN 0
             WHEN c.printing = 'Holofoil' AND cc.price_holofoil IS NOT NULL AND cc.price_holofoil > 0 THEN cc.price_holofoil
             WHEN c.printing = 'Normal' AND cc.price_normal IS NOT NULL AND cc.price_normal > 0 THEN cc.price_normal
             ELSE cc.price_trend

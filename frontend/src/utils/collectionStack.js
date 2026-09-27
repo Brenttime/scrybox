@@ -34,7 +34,8 @@ const quantityOf = (item) => {
 // `${card_id}-${printing}` string could be collided by a value that itself
 // contains the separator.
 export function stackKey(item, { byCondition = false } = {}) {
-  return JSON.stringify([item.card_id, printingOf(item), byCondition ? item.condition ?? null : null]);
+  // A proxy is never interchangeable with a real copy, so it stacks apart.
+  return JSON.stringify([item.card_id, printingOf(item), byCondition ? item.condition ?? null : null, item.is_proxy ? 1 : 0]);
 }
 
 // Group stacked rows, keeping the FIRST row of each group as the representative

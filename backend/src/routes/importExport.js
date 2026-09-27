@@ -20,6 +20,7 @@ router.get('/export', async (req, res) => {
         c.language,
         c.purchase_price,
         c.added_at,
+        c.is_proxy,
         cc.id as card_id,
         cc.name as name,
         cc.supertype,

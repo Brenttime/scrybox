@@ -635,6 +635,12 @@ async function initDb() {
   if (!collectionCols.some(c => c.name === 'source')) {
     await run(`ALTER TABLE collection ADD COLUMN source TEXT`);
   }
+  // A proxy copy (a stand-in, not the real card): valued at $0 and shown with
+  // rarity 'Proxy'. Zeroed at read time; card_cache prices and purchase_price
+  // are untouched.
+  if (!collectionCols.some(c => c.name === 'is_proxy')) {
+    await run(`ALTER TABLE collection ADD COLUMN is_proxy INTEGER DEFAULT 0`);
+  }
   const listCols = await all(`PRAGMA table_info(card_lists)`);
   if (listCols.length && !listCols.some(c => c.name === 'source')) {
     await run(`ALTER TABLE card_lists ADD COLUMN source TEXT`);
@@ -791,17 +797,18 @@ async function initDb() {
             notes TEXT DEFAULT '',
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
             source TEXT,
+            is_proxy INTEGER DEFAULT 0,
             FOREIGN KEY(card_id) REFERENCES card_cache(id)
           )
         `);
         await run(`
           INSERT INTO collection_new
             (id, card_id, quantity, condition, printing, language, purchase_price,
-             favorite, is_trade, list_type, added_at, notes, user_id, source)
+             favorite, is_trade, list_type, added_at, notes, user_id, source, is_proxy)
           SELECT id, card_id, quantity, condition,
                  CASE WHEN printing = 'Holofoil' THEN 'Holofoil' ELSE 'Normal' END,
                  language, purchase_price, favorite, is_trade, list_type,
-                 added_at, notes, user_id, source
+                 added_at, notes, user_id, source, COALESCE(is_proxy, 0)
           FROM collection
         `);
         await run(`DROP TABLE collection`);
@@ -939,6 +946,7 @@ async function initDb() {
               notes TEXT DEFAULT '',
               user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
               source TEXT,
+              is_proxy INTEGER DEFAULT 0,
               FOREIGN KEY(card_id) REFERENCES card_cache(id)
             )
           `);
