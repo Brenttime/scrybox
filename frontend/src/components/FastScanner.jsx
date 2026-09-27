@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Zap, ZapOff, ScanLine, Check, X, SwitchCamera, Camera, Sparkles, Trash2, Send, Undo2, Minus, Plus } from 'lucide-react';
-import { resolveCardPrice } from '../utils/resolveCardPrice';
+import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
@@ -476,10 +476,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   }
 
   const pending = results.filter(r => !r.sent).length;
-  const priceOf = (card, printing = 'Normal') => Number(resolveCardPrice(card, printing)) || 0;
-  const rowPrice = (row) => priceOf(row.card, printingOf(row)) * qtyOf(row);
-  const total = results.reduce((sum, r) => sum + rowPrice(r), 0);
-  const currency = results[0]?.card?.price_currency;
+  // Scanner shows USD only. A printing with no USD quote (Scryfall fell back
+  // to EUR) shows no price at all rather than a euro figure or a mixed total.
+  const priceOf = (card, printing = 'Normal') => usdPrice(card, printing);
+  const rowPrice = (row) => { const p = priceOf(row.card, printingOf(row)); return p == null ? null : p * qtyOf(row); };
+  const total = results.reduce((sum, r) => sum + (rowPrice(r) || 0), 0);
+  const anyPriced = results.some(r => rowPrice(r) != null);
   const destValid = dest === 'collection' || lists.some(l => String(l.id) === dest);
 
   return (
@@ -490,7 +492,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div key={flash} className={flash ? 'fs-flash' : ''} />
 
         <div className="fs-topbar">
-          {results.length > 0 && <span className="fs-pill fs-pill-value">{priceText(total, currency)} · {results.length}</span>}
+          {results.length > 0 && <span className="fs-pill fs-pill-value">{anyPriced ? `${priceText(total, 'USD')} · ` : ''}{results.length}</span>}
           {latency != null && <span className="fs-pill" title={t('fastscan.latencyHint', { read: latency.read })}><Sparkles size={12} /> {latency.total >= 1000 ? `${(latency.total / 1000).toFixed(1)} s` : `${latency.total} ms`}</span>}
           {auto && <span className="fs-pill fs-pill-live"><span className="fs-dot" /> {t('fastscan.autoOn')}</span>}
           {onDevice && <span className="fs-pill" title={t('fastscan.onDeviceHint')}>{t('fastscan.onDevice')}</span>}
@@ -538,7 +540,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div className="fs-tray-head">
           <div>
             <div className="fs-tray-title">{t('fastscan.results', { count: results.length })}</div>
-            <div className="fs-tray-total">{priceText(total, currency)}</div>
+            {anyPriced && <div className="fs-tray-total">{priceText(total, 'USD')}</div>}
           </div>
           {results.length > 0 && (
             <button type="button" className="fs-ghost" onClick={() => setResults([])} aria-label={t('fastscan.clear')}><Trash2 size={14} /></button>
@@ -556,7 +558,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                     <button type="button" className="fs-card-edit" onClick={() => openPrintings(row)} aria-label={t('fastscan.changePrinting')} />
                   )}
                   <button type="button" className="fs-card-x" onClick={() => setResults(prev => prev.filter(r => r.key !== row.key))} aria-label={t('fastscan.dismiss')}><X size={12} /></button>
-                  <span className="fs-card-price">{priceText(rowPrice(row), row.card.price_currency)}</span>
+                  {rowPrice(row) != null && <span className="fs-card-price">{priceText(rowPrice(row), 'USD')}</span>}
                   {row.sent && <span className="fs-card-badge"><Check size={14} /></span>}
                 </div>
                 <div className="fs-card-name">{displayName(row.card)}</div>
@@ -600,7 +602,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                       <button type="button" className="fs-print" onClick={() => choosePrinting(c)} aria-pressed={c.id === editing.card.id}>
                         <div className="fs-card-art">
                           {c.image_url ? <img src={c.image_url} alt="" loading="lazy" /> : null}
-                          <span className="fs-card-price">{priceText(priceOf(c), c.price_currency)}</span>
+                          {priceOf(c) != null && <span className="fs-card-price">{priceText(priceOf(c), 'USD')}</span>}
                           {c.id === editing.card.id && <span className="fs-card-badge"><Check size={14} /></span>}
                         </div>
                         <div className="fs-card-name">{c.set_name || String(c.set_id || '').toUpperCase()}</div>
