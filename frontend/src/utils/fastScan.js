@@ -37,14 +37,27 @@ export function quadPath(cand, { s, ox, oy }) {
 //     its strips miss).
 //   - auto pass whose footer was deferred to the next frame: no, the next
 //     still frame continues the read on-device with the pooled evidence.
+//   - auto pass that stopped because an OCR stage would read past the frame
+//     edge (near_edge_partial): no. Telemetry: Roiling Canopy / Heartstring
+//     Puller sent 7-10 of these, the server read nothing on them (same
+//     clipped pixels), ~0.4 s each. The user is told to move the card in
+//     instead; after EDGE_ESCAPE such passes at about the same place the
+//     server still gets one try (bounded rescue), and a moved card or a
+//     different outcome starts over (nextEdgeRun).
 export const NO_TITLE_ESCAPE = 4;
-export function needsServer(out, { autoPass, noTitleRun = 0 }) {
+export const EDGE_ESCAPE = 8;
+export function isEdgePartial(out) {
+  const res = out?.results?.[0];
+  return !!(res && !res.ok && res.near_edge_partial);
+}
+export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
   if (!out || out.error) return true;
   const cand = out.candidates?.[0];
   const res = out.results?.[0];
   if (res && !res.ok && autoPass) {
     if (res.deferred) return false;
     if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
+    if (res.near_edge_partial && edgeRun < EDGE_ESCAPE) return false;
   }
   if (res) return !res.ok;
   if (!cand || !cand.eligible) return !autoPass;
@@ -74,10 +87,19 @@ function unresolvedSignature(out) {
   return { title: res.title, cx: (box[0] + box[2] / 2) / diag, cy: (box[1] + box[3] / 2) / diag };
 }
 
-// Pure: fold one server outcome into the failure streak.
+// Pure: fold one pass's outcome into the failure streak. Only a hit or a
+// lifted card (no candidate) ends it; a pass that proves nothing either way
+// (settling, moving, blurred, near-edge with no title) keeps it, or the next
+// still frame of the same card would re-send at once (Konstrari Charm: a
+// settling pass between two failed fallbacks cleared the backoff). A
+// different title or place still starts a new streak, and serverAllowed
+// only ever applies it to the same title in the same place.
 export function nextFailStreak(prev, out, now) {
   const sig = unresolvedSignature(out);
-  if (!sig) return null;
+  if (!sig) {
+    const resolved = (out?.results || []).some(r => r.ok);
+    return !resolved && out?.candidates?.length ? (prev || null) : null;
+  }
   const same = prev && normTitle(prev.title) === normTitle(sig.title)
     && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;
   const count = same ? prev.count + 1 : 1;
@@ -100,6 +122,17 @@ export function serverAllowed(streak, now, local = null) {
   const [x, y, w, h] = cand.box;
   const cx = (x + w / 2) / diag, cy = (y + h / 2) / diag;
   return Math.hypot(cx - streak.cx, cy - streak.cy) > SAME_PLACE;
+}
+// Pure: consecutive near-edge partials of about the same outline. Anything
+// else (a read, a hit, no card, a moved card) resets the run, so a card that
+// is pulled in from the edge is read on its very next frame.
+export function nextEdgeRun(prev, out) {
+  if (!isEdgePartial(out)) return null;
+  const box = out.candidates?.[0]?.box;
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  const cx = box ? (box[0] + box[2] / 2) / diag : 0, cy = box ? (box[1] + box[3] / 2) / diag : 0;
+  const same = prev && Math.hypot(prev.cx - cx, prev.cy - cy) <= SAME_PLACE;
+  return { cx, cy, count: same ? prev.count + 1 : 1 };
 }
 function normTitle(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 

@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -74,6 +74,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
+  const edgeRunRef = useRef(null);   // consecutive near-edge partials, same place
   const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
 
   const [service, setService] = useState(null);
@@ -288,7 +289,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const r0 = local?.results?.[0];
         if (autoPass && r0 && !r0.ok && r0.error === 'no confident card title') noTitleRunRef.current++;
         else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') noTitleRunRef.current = 0;
-        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current })) {
+        // Gate passes (settling/moving) say nothing new about the edge: keep the run.
+        if (!(local?.candidates?.[0] && !local.candidates[0].eligible && ['settling', 'moving'].includes(local.candidates[0].status))) edgeRunRef.current = nextEdgeRun(edgeRunRef.current, local);
+        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0 })) {
           out = { ...local, results: await hydrateResults(local.results, abort.signal).catch((e) => { tel.set({ hydrate_error: e?.message || String(e) }); return null; }) };
           tel.mark('hydrate_ms', takeHydrateMs());
           if (!out.results) { out = null; why = 'hydrate-failed'; }
@@ -304,7 +307,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!stale()) setHint(t('fastscan.hintFooter'));
         tel.end({ outcome: 'held' });
         return { held: true };
-      } else { noTitleRunRef.current = 0; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
+      } else { noTitleRunRef.current = 0; edgeRunRef.current = null; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
       // Stopped or navigated away while this was in flight: drop it on the floor.
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
@@ -322,6 +325,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const waited = autoPass && firstSeenRef.current != null ? Math.round(performance.now() - firstSeenRef.current) : ms;
       if (!out.candidates.length) setHint(t('fastscan.hintNoCard'));
       else if (!eligible) setHint(t('fastscan.hintAdjust', { reason: out.candidates[0].status }));
+      else if (!hits.length && isEdgePartial(out)) setHint(t('fastscan.hintEdge'));
       else if (plan.tooSmall.length && hits.length < eligible) setHint(t('fastscan.hintCloser', { count: plan.tooSmall.length }));
       else if (!hits.length && streak && streak.count >= 2) setHint(t('fastscan.hintFooter'));
       else if (!hits.length) setHint(t('fastscan.hintHold'));
@@ -392,7 +396,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };

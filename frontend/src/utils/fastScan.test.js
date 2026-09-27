@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed } from './fastScan.js';
+import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE } from './fastScan.js';
 
 const fail = (title, box = [100, 100, 600, 840]) => ({
   frame: { width: 1080, height: 1920 },
@@ -65,4 +65,31 @@ test('zoomPlan crops small failed cards from the native frame', () => {
   const capped = zoomPlan({ candidates, results, frame, sw: 1920, sh: 1080 });
   assert.equal(capped.crops.length, 0, 'no native gain: no zoom');
   assert.deepEqual(capped.tooSmall, [1], 'reported for a move-closer hint');
+});
+
+test('backoff survives settling / no-result passes (Konstrari Charm: settle between fallbacks)', () => {
+  const s1 = nextFailStreak(null, fail('Konstrari Charm'), 0);
+  const settling = { frame: { width: 1080, height: 1920 }, candidates: [{ number: 1, box: [100, 100, 600, 840], eligible: false, status: 'settling' }], results: [] };
+  const s2 = nextFailStreak(s1, settling, 100);
+  assert.deepEqual(s2, s1, 'a settling pass proves nothing: streak kept');
+  const local = { frame: { width: 1080, height: 1920 }, candidates: [{ box: [100, 100, 600, 840] }], results: [{ title: 'Konstrari Charm' }] };
+  assert.equal(serverAllowed(s2, 200, local), false, 'next still frame of the same card stays backed off');
+  const edge = { frame: { width: 1080, height: 1920 }, candidates: [{ number: 1, box: [100, 100, 600, 840], eligible: true }], results: [{ number: 1, ok: false, near_edge_partial: { stage: 'title1', off: [0] }, title: null }] };
+  assert.deepEqual(nextFailStreak(s1, edge, 100), s1, 'title-less edge partial keeps it too');
+  assert.equal(nextFailStreak(s1, { candidates: [], results: [] }, 0), null, 'lifted card ends it');
+  assert.equal(nextFailStreak(s1, { candidates: [{ box: [1, 1, 2, 2] }], results: [{ ok: true, card: {} }] }, 0), null, 'a hit ends it');
+});
+
+test('near-edge partials take a typed path: no server until a bounded escape, reset on move', () => {
+  const edge = (box = [100, 4, 600, 840], title = null) => ({ frame: { width: 1920, height: 1080 }, candidates: [{ number: 1, box, eligible: true }], results: [{ number: 1, ok: false, retry: true, error: 'card too close to the frame edge', near_edge_partial: { stage: 'title1', off: [0] }, title }] });
+  assert.equal(isEdgePartial(edge()), true);
+  let run = null;
+  for (let i = 1; i < EDGE_ESCAPE; i++) { run = nextEdgeRun(run, edge()); assert.equal(needsServer(edge(), { autoPass: true, edgeRun: run.count }), false, `pass ${i} stays local`); }
+  run = nextEdgeRun(run, edge());
+  assert.equal(run.count, EDGE_ESCAPE);
+  assert.equal(needsServer(edge(), { autoPass: true, edgeRun: run.count }), true, 'bounded server rescue');
+  assert.equal(nextEdgeRun(run, edge([600, 4, 600, 840])).count, 1, 'moved card starts over');
+  assert.equal(nextEdgeRun(run, fail('Grief')), null, 'any other outcome resets');
+  assert.equal(needsServer(edge(undefined, 'solarium sentry'), { autoPass: true, edgeRun: 1 }), false, 'title read, footer off-frame: still local');
+  assert.equal(needsServer(edge(), { autoPass: false }), true, 'shutter press still asks the server');
 });
