@@ -86,8 +86,8 @@ function fakeReader(titleFor, opts = {}) {
 }
 
 // Like fakeReader, but the title has two printings, so identity needs the footer.
-function fakeReaderIx(textFor) {
-  const f = fakeReader(textFor);
+function fakeReaderIx(textFor, opts = {}) {
+  const f = fakeReader(textFor, opts);
   const index = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
     printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '117']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
   const env = f.reader.__env;
@@ -283,4 +283,31 @@ test('settle window counts real time: a faster loop does not shorten it', async 
   assert.equal(calls(), 0, 'no OCR before 3 real-time-separated observations');
   t += 100; await reader.read(f, small, { requireStill: true });
   assert.ok(calls() > 0, 'third separated observation settles');
+});
+
+test('near-edge: collapsed, crossed or skewed outlines are rejected before OCR (review B2)', async () => {
+  const f = 1000;
+  const cases = [
+    [100, 6, 460, 6, 959, 7, 599, 7],            // sides match, area ~0: collapsed
+    [320, 6, 680, 6, 900, 400, 540, 400],        // strongly sheared
+  ].map(q => q.map(v => v / f));
+  for (const corners of cases) {
+    const { reader, calls } = fakeReader(() => 'grief', { corners });
+    const out = await reader.read(sharpFrame(f, f), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+    assert.equal(out.candidates[0].eligible, false, JSON.stringify(corners));
+    assert.equal(calls(), 0, 'no OCR for ' + JSON.stringify(corners));
+  }
+});
+
+test('near-edge: a footer stage with a strip outside the frame never proves a printing (review B1)', async () => {
+  // Bottom-edge card: padded footer rows 0.92/0.94 cross the frame edge.
+  // Rows that fit say lea 161, the dropped ones would say 2x2 117: the
+  // complete stage is ambiguous, so the truncated one must not resolve.
+  const corners = [0.32, 0.494, 0.68, 0.494, 0.68, 0.994, 0.32, 0.994];
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : n >= 5 ? 'lea 161' : 'lea 161'), { corners });
+  const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  const r = out.results[0];
+  assert.equal(out.candidates[0].near_edge, true, 'fixture must exercise the near-edge path');
+  assert.equal(r.ok, false, 'a truncated footer stage must not prove a printing');
+  assert.equal(r.near_edge_partial, true);
 });

@@ -40,6 +40,11 @@ const EDGE_FRAC = 0.01;             // server: touches frame edge within 1%
 const EDGE_TIGHT_FRAC = 0.002;
 const NEAR_EDGE_ASPECT = [0.60, 0.85];   // short/long side, a card is 0.716
 const NEAR_EDGE_SIDE_RATIO = 0.85;       // min/max of opposing sides
+const NEAR_EDGE_MAX_COS = Math.cos(70 * Math.PI / 180);   // corners 70-110 deg
+// Near the edge, every strip a stage would read must fit, or the frame is
+// unresolved: dropping a strip can drop exactly the competing identity (or
+// title) that would have made the answer ambiguous, so a partial stage is
+// never allowed to prove anything. A fresh frame further in will be read.
 // Laplacian variance of the sampled title band. Replay of 506 saved phone
 // frames: every proven card scored >= 2161; below 500 no title was ever read,
 // so reading those only burned ~370 ms before failing. Auto waits for a
@@ -107,7 +112,23 @@ export function corneliusTensor(ort, rgb, channels = 3) {
 // A near-front-facing card outline: side-length aspect near 0.716 and
 // opposing sides alike. Anything else keeps the conservative 1% edge band.
 function plausibleCard(q) {
+  if (!q.every(p => Number.isFinite(p.x) && Number.isFinite(p.y))) return false;
   const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  // Convex, consistently wound, every interior angle 70-110 degrees: rules out
+  // collapsed, crossed and strongly skewed outlines (whose homography would
+  // stretch the OCR strips), not just mismatched side lengths.
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = q[(i + 3) % 4], b = q[i], c = q[(i + 1) % 4];
+    const ux = a.x - b.x, uy = a.y - b.y, vx = c.x - b.x, vy = c.y - b.y;
+    const cross = ux * vy - uy * vx, nu = Math.hypot(ux, uy), nv = Math.hypot(vx, vy);
+    if (!(nu > 0 && nv > 0) || cross === 0) return false;
+    const s = Math.sign(cross);
+    if (sign && s !== sign) return false;
+    sign = s;
+    const cos = (ux * vx + uy * vy) / (nu * nv);
+    if (Math.abs(cos) > NEAR_EDGE_MAX_COS) return false;
+  }
   const top = d(q[0], q[1]), bot = d(q[3], q[2]), lef = d(q[0], q[3]), rig = d(q[1], q[2]);
   if (!(top > 0 && bot > 0 && lef > 0 && rig > 0)) return false;
   if (Math.min(top, bot) / Math.max(top, bot) < NEAR_EDGE_SIDE_RATIO) return false;
@@ -313,9 +334,12 @@ export function createReader(env) {
     // Near the frame edge, a strip that reaches off-frame would be read from
     // clamped, repeated edge pixels: it is dropped (never extrapolated), and a
     // card left without its title or footer strips simply fails this frame.
-    const fits = (r) => !nearEdge || stripInFrame(m, r, w, h);
+    let truncated = false;
     const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
-    const strips = (rs) => rs.filter(fits).map(strip);
+    const strips = (rs) => {
+      if (nearEdge && !rs.every(r => stripInFrame(m, r, w, h))) { truncated = true; return []; }
+      return rs.map(strip);
+    };
     const cands = [];
     // Every title read, accepted or not, for scan telemetry: a failed title
     // otherwise leaves no trace of what the recognizer actually saw.
@@ -339,6 +363,8 @@ export function createReader(env) {
     }
     timings.title_ms = Math.round(now() - tA);
     const titleReads = cands.map(c => c.raw);
+    const partial = (extra = {}) => ({ number: 1, ok: false, retry: true, error: 'card too close to the frame edge', near_edge_partial: true, title: null, ocr: titleReads, title_raw: titleRaw, ...extra });
+    if (truncated) return partial();
     if (!cands.length) {
       return { number: 1, ok: false, retry: true, error: 'no confident card title', title: null, ocr: titleReads, title_raw: titleRaw };
     }
@@ -373,6 +399,7 @@ export function createReader(env) {
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
       if (stage === 'retro') {
         const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025])));
+        if (truncated) return partial({ title: name, footer_ocr: raws });
         const nums = [];
         for (const r of reads) {
           if (!r.text || r.conf < RETRO_CONF) continue;
@@ -391,6 +418,7 @@ export function createReader(env) {
       const rows = stage === 'wide' ? WIDE_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
       const reads = await recognize(env, strips(rows.map(y => [0, x1, y, y + 0.025])));
+      if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
