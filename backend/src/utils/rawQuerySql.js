@@ -1,169 +1,171 @@
-// Compile a Scryfall-syntax query (the LOCAL subset — operators the stored
-// card_cache rows can answer) into a single SQLite predicate over card_cache.
+// Compile a Scryfall-syntax query (the LOCAL subset — terms the stored
+// card_cache rows can answer, plus otag: via the local Oracle Tags index) into a
+// single SQLite predicate over card_cache.
 //
-// Why this exists: a raw query like "is:land color:g set:lea rarity:rare" used
-// to always hit Scryfall (2/sec, 175-card pages, 60s timeout) even though every
-// operator here is answerable from rows this install already holds. Answering
-// it in the database is instant and never burns the rate limit.
+// The AST comes from shared/scryfallQuery.js analyze(), the single source of
+// truth for what the syntax MEANS; this file only translates it, so the SQL path
+// and the browser's JS evaluator cannot drift.
 //
-// The AST comes from shared/scryfallQuery.js analyze(), which is the single
-// source of truth for what the syntax MEANS. This file only does the
-// AST -> SQL translation; target resolution (color codes, rarity aliases,
-// language names) is imported from the shared module so the SQL path and the
-// browser's JS evaluator (CollectionList's local filter) can never drift.
-//
-// Operators translated (all in shared/scryfallQuery.js KNOWN_OPERATORS):
-//   word / "phrase" / name:x   partial name match (name or printed_name)
-//   is:x / type:x              type-line match (supertype + subtypes)
-//   color:x / c:x              color_identity (colorless = empty identity)
-//   rarity:x / r:x             rarity (letter alias or word, word-boundary)
-//   set:x                      set code
-//   number:x                   collector number (leading-zero tolerant)
-//   lang:x / language:x        language
-//   m:x / cmc:x                converted mana cost
-//   -x / -(a b) / or / (a b)   negation, OR, grouping
-//
-// Anything outside this subset is a CATALOG query (otag:, availability:, t:,
-// artist:, ...) and is NOT handled here — the caller routes it to the live
-// Scryfall path instead.
+// Translated here:
+//   word / "phrase" / name:x / !exact   name or printed_name
+//   is:<type> / type:x / t=x            type line (subtypes array)
+//   c: color (types column) / id: identity (color_identity) with : = != < <= > >=,
+//   color counts (c=2), multicolor (c:m), guild/shard names
+//   r: rarity with comparators (r>=rare)
+//   s: set, cn: collector number (comparators), lang:, mv:/cmc: (comparators, even/odd)
+//   otag:x                              local Oracle Tags (parent tags include children)
+//   include:/unique:/order:/...         display directives — no filter
+//   -x / -(a b) / or / and / (a b)      negation, OR, AND, grouping
 const {
-  resolveColorTarget,
   resolveRarityTarget,
   resolveLanguageTarget,
+  parseColorValue,
+  rarityIndex,
+  RARITY_ORDER,
+  COLOR_BIT,
+  DIRECTIVES,
 } = require('../../../shared/scryfallQuery.js');
 
-// JSON array columns (subtypes, color_identity) are stored as strings.
-// json_each() is the JSON1 accessor; SQLite here is built with JSON1.
-const JT = 'cc.subtypes';   // subtypes JSON array
-const CI = 'cc.color_identity'; // color_identity JSON array
+const JT = 'cc.subtypes';
 
-// One parameter value per placeholder. `p` is the params array being filled.
 function push(p, value) {
   p.push(value);
   return '?';
 }
 
-// The subtypes of a row, lowercased, joined with single spaces: "basic land".
-// A correlated scalar subquery over json_each. An empty/NULL array yields ''
-// (group_concat over zero rows is NULL — coalesce it, or the whole type line
-// below goes NULL and nothing matches).
 function subtypesLine() {
   return `COALESCE((SELECT group_concat(LOWER(je.value), ' ') FROM json_each(${JT}) je), '')`;
 }
 
-// A full type line (supertype + subtypes) for type:. Mirrors the JS evaluator,
-// which joins supertype + subtypes with single spaces.
-function typeLine() {
-  return `LOWER(COALESCE(cc.supertype, '') || ' ' || ${subtypesLine()})`;
+function negateIf(sql, cmp) {
+  return cmp === '!=' ? `NOT (${sql})` : sql;
 }
 
-// name: / bare word / quoted phrase -> partial match on either name column.
-// The value is already lowercase for bare words and phrases (parseTerm
-// lowers them); LIKE is ASCII-case-insensitive, matching the JS
-// includes()-on-lowercase semantics.
-function nameMatch(p, value) {
+function nameMatch(p, value, exact) {
+  if (exact) {
+    const a = push(p, value);
+    const b = push(p, value);
+    const c = push(p, `${value} // %`);
+    const d = push(p, `% // ${value}`);
+    return `(LOWER(cc.name) = ${a} OR LOWER(COALESCE(cc.printed_name, '')) = ${b} OR LOWER(cc.name) LIKE ${c} OR LOWER(cc.name) LIKE ${d})`;
+  }
   const a = push(p, `%${value}%`);
   const b = push(p, `%${value}%`);
-  return `(cc.name LIKE ${a} OR cc.printed_name LIKE ${b})`;
+  return `(cc.name LIKE ${a} OR COALESCE(cc.printed_name, '') LIKE ${b})`;
 }
 
 function isMatch(p, rawValue) {
-  // is:basic-land -> "basic land" as it reads in the type line.
   const val = String(rawValue).replace(/-/g, ' ').toLowerCase();
-  const supEq = push(p, val);
-  const subEq = push(p, val);
-  const subSub = push(p, `%${val}%`);
-  return `(` +
-    `LOWER(COALESCE(cc.supertype, '')) = ${supEq} ` +
-    `OR EXISTS (SELECT 1 FROM json_each(${JT}) je WHERE LOWER(je.value) = ${subEq}) ` +
-    `OR ${subtypesLine()} LIKE ${subSub}` +
-    `)`;
+  if (val.includes(' ')) return `(' ' || ${subtypesLine()} || ' ') LIKE ${push(p, `% ${val} %`)}`;
+  return `EXISTS (SELECT 1 FROM json_each(${JT}) je WHERE LOWER(je.value) = ${push(p, val)})`;
 }
 
 function typeMatch(p, rawValue) {
-  const val = String(rawValue).trim().toLowerCase();
-  const ph = push(p, `%${val}%`);
-  return `${typeLine()} LIKE ${ph}`;
+  return `${subtypesLine()} LIKE ${push(p, `%${String(rawValue).trim().toLowerCase()}%`)}`;
 }
 
-function colorMatch(p, rawValue) {
-  const target = resolveColorTarget(rawValue);
-  // The identity column is a JSON array string; a NULL column would make
-  // json_each() error, so null becomes '[]' (no colors = colorless).
-  const json = `CASE WHEN ${CI} IS NULL THEN '[]' ELSE ${CI} END`;
-  if (target === 'colorless') {
-    // No colors at all: the identity array is empty.
-    return `(SELECT count(*) FROM json_each(${json}) ci) = 0`;
+// Bitmask of a JSON array of color display names ('["Red","Blue"]').
+function maskExpr(column) {
+  const names = { white: COLOR_BIT.w, blue: COLOR_BIT.u, black: COLOR_BIT.b, red: COLOR_BIT.r, green: COLOR_BIT.g };
+  const cases = Object.entries(names).map(([n, bit]) => `WHEN '${n}' THEN ${bit}`).join(' ');
+  return `COALESCE((SELECT SUM(DISTINCT CASE LOWER(x.value) ${cases} ELSE 0 END) FROM json_each(CASE WHEN ${column} IS NULL OR ${column} = '' THEN '[]' ELSE ${column} END) x), 0)`;
+}
+
+function popcountExpr(m) {
+  return `((${m} & 1) + ((${m} >> 1) & 1) + ((${m} >> 2) & 1) + ((${m} >> 3) & 1) + ((${m} >> 4) & 1))`;
+}
+
+function sqlCompare(expr, cmp, ph) {
+  const op = { ':': '=', '=': '=', '!=': '<>', '<': '<', '<=': '<=', '>': '>', '>=': '>=' }[cmp];
+  return `${expr} ${op} ${ph}`;
+}
+
+function colorMatch(p, leaf, column, defaultCmp) {
+  const parsed = leaf.color || parseColorValue(leaf.value);
+  const m = maskExpr(column);
+  if (parsed.kind === 'multi') return negateIf(`${popcountExpr(m)} >= 2`, leaf.cmp);
+  if (parsed.kind === 'count') return sqlCompare(popcountExpr(m), leaf.cmp === ':' ? '=' : leaf.cmp, push(p, parsed.n));
+  const q = parsed.mask;
+  const op = leaf.cmp === ':' ? (q === 0 ? '=' : defaultCmp) : leaf.cmp;
+  const superset = `((${m}) & ${q}) = ${q}`;
+  const subset = `((${m}) | ${q}) = ${q}`;
+  switch (op) {
+    case '=': return `(${m}) = ${q}`;
+    case '!=': return `(${m}) <> ${q}`;
+    case '>=': return superset;
+    case '>': return `(${superset} AND (${m}) <> ${q})`;
+    case '<=': return subset;
+    case '<': return `(${subset} AND (${m}) <> ${q})`;
+    default: return '0';
   }
-  const ph = push(p, target.toLowerCase());
-  return `EXISTS (SELECT 1 FROM json_each(${json}) ci WHERE LOWER(ci.value) = ${ph})`;
 }
 
-function rarityMatch(p, rawValue) {
-  const target = resolveRarityTarget(rawValue);
-  const stored = `LOWER(REPLACE(COALESCE(cc.rarity, ''), '_', ' '))`;
-  if (target.length === 1) {
-    // Letter alias: stored rarity begins with that letter ('r' -> rare).
-    const ph = push(p, `${target}%`);
-    return `${stored} LIKE ${ph}`;
+function rarityRankExpr() {
+  const stored = `' ' || LOWER(REPLACE(COALESCE(cc.rarity, ''), '_', ' ')) || ' '`;
+  const cases = RARITY_ORDER.map((w, i) => `WHEN ${stored} LIKE '% ${w} %' THEN ${i}`).join(' ');
+  return `(CASE ${cases} ELSE -1 END)`;
+}
+
+function rarityMatch(p, leaf) {
+  const target = resolveRarityTarget(leaf.value);
+  const ti = rarityIndex(target);
+  if (ti < 0) {
+    const padded = `' ' || LOWER(REPLACE(COALESCE(cc.rarity, ''), '_', ' ')) || ' '`;
+    return negateIf(`${padded} LIKE ${push(p, `% ${target} %`)}`, leaf.cmp);
   }
-  // Word-level: the stored rarity (one or more words) contains the word.
-  const padded = `' ' || ${stored} || ' '`;
-  const ph = push(p, ` ${target} `);
-  return `${padded} LIKE ${ph}`;
+  const rank = rarityRankExpr();
+  const cmp = leaf.cmp === ':' ? '=' : leaf.cmp;
+  if (cmp === '!=') return `${rank} <> ${push(p, ti)}`;
+  return `(${rank} >= 0 AND ${sqlCompare(rank, cmp, push(p, ti))})`;
 }
 
-function setMatch(p, rawValue) {
-  const ph = push(p, String(rawValue).trim().toLowerCase());
-  return `LOWER(COALESCE(cc.set_id, '')) = ${ph}`;
+function setMatch(p, leaf) {
+  return negateIf(`LOWER(COALESCE(cc.set_id, '')) = ${push(p, String(leaf.value).trim().toLowerCase())}`, leaf.cmp);
 }
 
-// "Is this string made only of digits, non-empty?" — a REPLACE chain (SQLite
-// has no built-in REGEXP). Only used where a CAST would otherwise over-match.
 function allDigitsExpr(expr) {
   let stripped = expr;
   for (const d of '0123456789') stripped = `REPLACE(${stripped}, '${d}', '')`;
   return `LENGTH(${expr}) > 0 AND LENGTH(${expr}) = LENGTH(${stripped})`;
 }
 
-function numberMatch(p, rawValue) {
-  const v = String(rawValue).trim();
+function numberMatch(p, leaf) {
+  const v = String(leaf.value).trim();
   const stored = `TRIM(COALESCE(cc.number, ''))`;
-  const exact = push(p, v);
-  const ors = [`${stored} = ${exact}`];
-  // "085" finds a stored "85" (and vice versa) — but only when BOTH forms are
-  // purely numeric. A bare CAST is the dangerous half: SQLite casts any
-  // non-numeric string to 0 (CAST('TG12') = CAST('SV49') = 0), so "8" would
-  // match every letter-numbered promo, and CAST('8a') = 8 would match a
-  // "8a". The all-digits gate keeps the CAST to exactly the cases the JS
-  // evaluator accepts (/^\d+$/ on both sides) — the same tolerance the
-  // field-search SQL path uses.
-  if (/^\d+$/.test(v)) {
-    const pv = push(p, v);
-    ors.push(`(${allDigitsExpr('cc.number')} AND CAST(cc.number AS INTEGER) = CAST(${pv} AS INTEGER))`);
+  if (leaf.cmp === ':' || leaf.cmp === '=' || leaf.cmp === '!=') {
+    const ors = [`LOWER(${stored}) = ${push(p, v.toLowerCase())}`];
+    if (/^\d+$/.test(v)) {
+      ors.push(`(${allDigitsExpr('cc.number')} AND CAST(cc.number AS INTEGER) = ${push(p, parseInt(v, 10))})`);
+    }
+    return negateIf(`(${ors.join(' OR ')})`, leaf.cmp);
   }
-  return `(${ors.join(' OR ')})`;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return '0';
+  // Numeric prefix of the collector number ("123a" -> 123), like the JS parseInt.
+  return `(CAST(${stored} AS INTEGER) > 0 OR ${stored} GLOB '0*') AND ${sqlCompare(`CAST(${stored} AS INTEGER)`, leaf.cmp, push(p, n))}`;
 }
 
-function langMatch(p, rawValue) {
-  const target = resolveLanguageTarget(rawValue);
-  if (!target) return `0`; // unknown language names no row (JS returns false)
-  const ph = push(p, target.toLowerCase());
-  return `LOWER(COALESCE(cc.language, '')) = ${ph}`;
+function langMatch(p, leaf) {
+  const v = String(leaf.value).trim().toLowerCase();
+  if (v === 'any') return leaf.cmp === '!=' ? '0' : '1';
+  const target = resolveLanguageTarget(v);
+  if (!target) return leaf.cmp === '!=' ? '1' : '0';
+  return negateIf(`LOWER(COALESCE(cc.language, '')) = ${push(p, target.toLowerCase())}`, leaf.cmp);
 }
 
-function cmcMatch(p, rawValue) {
-  const num = Number(rawValue);
-  if (!Number.isFinite(num)) return `0`; // m:abc matches nothing (JS: false)
-  const ph = push(p, num);
-  return `cc.cmc IS NOT NULL AND CAST(cc.cmc AS REAL) = ${ph}`;
+function mvMatch(p, leaf) {
+  const v = String(leaf.value).trim().toLowerCase();
+  if (v === 'even' || v === 'odd') {
+    const sql = `cc.cmc IS NOT NULL AND CAST(cc.cmc AS REAL) = CAST(cc.cmc AS INTEGER) AND CAST(cc.cmc AS INTEGER) % 2 = ${v === 'even' ? 0 : 1}`;
+    return leaf.cmp === '!=' ? `(cc.cmc IS NOT NULL AND NOT (${sql}))` : `(${sql})`;
+  }
+  const num = Number(v);
+  if (!Number.isFinite(num)) return '0';
+  return `(cc.cmc IS NOT NULL AND ${sqlCompare('CAST(cc.cmc AS REAL)', leaf.cmp === ':' ? '=' : leaf.cmp, push(p, num))})`;
 }
 
 function oracleTagMatch(p, rawValue) {
   const alias = push(p, String(rawValue).trim().toLowerCase());
-  // Slugs and aliases resolve to the tag's stable UUID. The precomputed closure
-  // includes the tag itself plus every descendant, matching Scryfall's parent
-  // tag semantics while assignments remain direct-only in storage.
   return `EXISTS (
     SELECT 1
     FROM oracle_tag_generations otg
@@ -180,26 +182,21 @@ function oracleTagMatch(p, rawValue) {
 }
 
 function leafToSql(node, p) {
-  if (node.kind === 'name') return nameMatch(p, node.value);
+  if (node.kind === 'name') return nameMatch(p, node.value, node.exact);
   switch (node.op) {
-    case 'name': return nameMatch(p, node.value);
-    case 'is': return isMatch(p, node.value);
-    case 'type': return typeMatch(p, node.value);
-    case 'color':
-    case 'c': return colorMatch(p, node.value);
-    case 'rarity':
-    case 'r': return rarityMatch(p, node.value);
-    case 'set': return setMatch(p, node.value);
-    case 'number': return numberMatch(p, node.value);
-    case 'lang':
-    case 'language': return langMatch(p, node.value);
-    case 'm':
-    case 'cmc': return cmcMatch(p, node.value);
-    case 'otag': return oracleTagMatch(p, node.value);
+    case 'name': return negateIf(nameMatch(p, String(node.value).toLowerCase(), false), node.cmp);
+    case 'is': return negateIf(isMatch(p, node.value), node.cmp);
+    case 'type': return negateIf(typeMatch(p, node.value), node.cmp);
+    case 'color': return colorMatch(p, node, 'cc.types', '>=');
+    case 'identity': return colorMatch(p, node, 'cc.color_identity', '<=');
+    case 'rarity': return rarityMatch(p, node);
+    case 'set': return setMatch(p, node);
+    case 'number': return numberMatch(p, node);
+    case 'lang': return langMatch(p, node);
+    case 'mv': return mvMatch(p, node);
+    case 'otag': return negateIf(oracleTagMatch(p, node.value), node.cmp);
     default:
-      // Unreachable for a local-mode query (analyze() already rejected unknown
-      // operators as catalog-mode). Fail loudly if this is ever called with
-      // one anyway rather than silently matching everything.
+      if (DIRECTIVES.has(node.op)) return '1';
       throw new Error(`rawQuerySql: unhandled operator "${node.op}:"`);
   }
 }
@@ -256,12 +253,12 @@ function compileRawQuery({ ast, language, limit = 60, offset = 0 }) {
 // this returns physical owned rows and therefore orders by the collection's
 // stable newest-first key. EXISTS-based tag matching cannot duplicate a row
 // even when an oracle card is tagged by several descendants.
-function compileCollectionQuery({ ast, userId, limit = 60, offset = 0 }) {
+function compileCollectionQuery({ ast, userId, limit = 60, offset = 0, eligibleOnly = true }) {
   const { whereSql, params } = compileWhere(ast);
   const base = `FROM collection c
     JOIN card_cache cc ON cc.id = c.card_id
-    WHERE c.user_id = ? AND c.quantity > 0
-      AND cc.scryfall_search_eligible = 1`;
+    WHERE c.user_id = ? AND c.quantity > 0${eligibleOnly ? `
+      AND cc.scryfall_search_eligible = 1` : ''}`;
   const projection = `
     c.id AS entry_id,
     c.card_id,

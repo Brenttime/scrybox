@@ -32,7 +32,8 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
 const LOCAL_OPERATORS = new Set([
   // Keep in lockstep with backend/oracleTags.js. Operators that can make
   // Scryfall implicitly include extras must use the live path.
-  'color', 'c', 'rarity', 'r', 'lang', 'language', 'm', 'cmc',
+  'color', 'identity', 'rarity', 'lang', 'mv',
+  'include', 'unique', 'order', 'sort', 'direction', 'prefer', 'display',
 ]);
 
 export function catalogDebounceMs(operators = []) {

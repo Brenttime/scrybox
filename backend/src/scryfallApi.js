@@ -505,62 +505,58 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
   // whole operator string.
   if (cleanRaw) {
     if (scope === 'collection') return [];
-    const { analyze, QuerySyntaxError } = require('../../shared/scryfallQuery.js');
+    const { analyze, toScryfall, QuerySyntaxError } = require('../../shared/scryfallQuery.js');
     let parsed;
     try {
       parsed = analyze(cleanRaw);
     } catch (err) {
-      // A genuine syntax error (unbalanced paren, empty group, bare "or") is a
+      // A genuine syntax error (unbalanced paren, unknown keyword, bad color) is a
       // fixable query, not a down API. Name it exactly like the upstream 400.
       if (err instanceof QuerySyntaxError) throw new Error('INVALID_QUERY');
       throw err;
     }
-    // LOCAL mode + a language the cache actually holds -> answer from the rows.
-    // An empty/uncached language falls through to Scryfall (the cache has
-    // nothing to answer with there, and the API is the source of truth).
-    //
-    // This mirrors the field-search contract: the local card_cache is the source
-    // of truth for operators the rows can answer (is:, color:, set:, rarity:...).
-    // It is instant and never touches the 2/sec rate limit. Only CATALOG
-    // operators (otag:, availability:, artist:, t:, ...) — which need data the
-    // rows do not carry — go live, and those are backed by the raw-page cache
-    // above so a repeat is instant. The result is `X-Source: cache|scryfall`.
-    if (parsed.mode === 'local') {
-      const langName = languages.toName(lang);
+    const langName = languages.toName(lang);
+    // Answer from the local card_cache. Used first for `database` scope when every
+    // term is data-backed, and as the fallback when Scryfall is unreachable.
+    const answerLocally = async () => {
+      const rawSql = require('./utils/rawQuerySql');
+      const { sql, params, countSql, countParams } = rawSql.compileRawQuery({
+        ast: parsed.ast, language: langName, limit, offset,
+      });
+      const rows = await db.all(sql, params);
+      const count = await db.get(countSql, countParams);
+      meta.total = count ? count.n : null;
+      meta.source = 'cache';
+      const stale = rows.filter(r => (Date.now() - new Date(r.last_updated).getTime()) > CACHE_AGE_LIMIT_MS);
+      if (stale.length > 0) {
+        (async () => {
+          try {
+            const { cards: fresh } = await bulkFetchByIdentifier(stale);
+            if (fresh.length) await cacheCards(fresh);
+          } catch (e) {
+            console.error('MTG raw-query background refresh failed:', e.message);
+          }
+        })();
+      }
+      return rows.map(parseCardRow);
+    };
+    // `database` scope + data-backed terms + a language the cache holds -> local.
+    // `internet` scope (Add Cards) is authoritative: the local cache holds only
+    // the printings this install has seen, so t:elf c:g answered locally would
+    // silently drop most elves. Internet scope always asks Scryfall.
+    if (parsed.mode === 'local' && scope !== 'internet') {
       const cachedLang = await db.get(
         `SELECT COUNT(*) AS n FROM card_cache WHERE language = ?`, [langName]
       );
-      if (cachedLang && cachedLang.n > 0) {
-        const rawSql = require('./utils/rawQuerySql');
-        const { sql, params, countSql, countParams } = rawSql.compileRawQuery({
-          ast: parsed.ast, language: langName, limit, offset,
-        });
-        const rows = await db.all(sql, params);
-        const count = await db.get(countSql, countParams);
-        meta.total = count ? count.n : null;
-        meta.source = 'cache';
-        // Warm the prices in the background, exactly like the field path does
-        // for its local-cache hits — the answer itself is returned instantly.
-        const stale = rows.filter(r => (Date.now() - new Date(r.last_updated).getTime()) > CACHE_AGE_LIMIT_MS);
-        if (stale.length > 0) {
-          (async () => {
-            try {
-              const { cards: fresh } = await bulkFetchByIdentifier(stale);
-              if (fresh.length) await cacheCards(fresh);
-            } catch (e) {
-              console.error('MTG raw-query background refresh failed:', e.message);
-            }
-          })();
-        }
-        return rows.map(parseCardRow);
-      }
+      if (cachedLang && cachedLang.n > 0) return answerLocally();
     }
-    // CATALOG mode, or local mode with no cached language: go straight to the
-    // API. The results are cached on the way home like any other search.
+    // Upstream gets the query re-serialized from the AST: Scrybox extensions
+    // (is:land -> t:land) become real Scryfall syntax; everything else is verbatim.
+    const upstream = toScryfall(parsed.ast);
     try {
       const rawWithLanguageScope = languages.resolve(lang).scryfall === 'en'
-        ? cleanRaw
-        : `(${cleanRaw})`;
+        ? upstream
+        : `(${upstream})`;
       const { cards: hit, total } = await fetchWindow(rawWithLanguageScope, lang, offset, limit);
       if (total != null) meta.total = total;
       meta.source = 'scryfall';
@@ -571,11 +567,10 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
       // 404 = the query matched nothing — that is an answer, not a failure.
       // 422 = a page past the end of the results — also an answer.
       if (err.response && (err.response.status === 404 || err.response.status === 422)) return [];
-      // 400 = Scryfall could not parse the query itself ("All of your terms
-      // were ignored"). That is fixable by the user, so name it instead of
-      // reporting the API as down.
       if (err.response && err.response.status === 400) throw new Error('INVALID_QUERY');
       console.error('Scryfall raw query failed:', err.message);
+      // Upstream down: a data-backed query can still be answered from the cache.
+      if (parsed.mode === 'local') return answerLocally();
       if (err.response && err.response.status === 429) throw new Error('RATE_LIMIT_EXCEEDED');
       throw new Error('UPSTREAM_UNAVAILABLE');
     }
@@ -986,8 +981,11 @@ function cqcScope(scoped, lang) {
   return { scoped, langCode: languages.toCode(lang) };
 }
 
-async function fetchCollectionNames(scoped, lang, limit) {
-  const { scoped: q, langCode } = cqcScope(scoped, lang);
+async function fetchCollectionNames(scoped, lang, limit, byPrinting = false) {
+  const { scoped: base, langCode } = cqcScope(scoped, lang);
+  // The persisted key carries the walk shape so a by-printing id list is never
+  // read back as a by-name list (or vice versa).
+  const q = byPrinting ? `${base} unique:prints` : base;
   const key = `${q}\u0000${langCode}`;
   const now = Date.now();
   let hit = collectionQueryCache.get(key);
@@ -1023,7 +1021,7 @@ async function fetchCollectionNames(scoped, lang, limit) {
     // in-flight map, paced by the global Scryfall limiter); a concurrent
     // request finds that map entry and serves the cache instead of joining.
     if (age > CQC_SWR_MAX_AGE_MS && !inflightCollectionNames.has(key)) {
-      startRevalidation(q, lang, langCode, key, limit);
+      startRevalidation(q, lang, langCode, key, limit, byPrinting);
     }
     return {
       entry: hit,
@@ -1035,7 +1033,7 @@ async function fetchCollectionNames(scoped, lang, limit) {
   // walk is required before the request can answer. Concurrent callers share it.
   if (inflightCollectionNames.has(key)) return inflightCollectionNames.get(key);
   const p = (async () => {
-    const { entry, fetched } = await runWalk(q, lang, langCode, key, limit);
+    const { entry, fetched } = await runWalk(q, lang, langCode, key, limit, byPrinting);
     return { entry, fetched, status: 'resolved' };
   })();
   inflightCollectionNames.set(key, p);
@@ -1046,7 +1044,7 @@ async function fetchCollectionNames(scoped, lang, limit) {
 // The walk itself: page Scryfall by game card, build the name set, update the
 // in-memory map, persist. Throws on upstream failure — the caller decides
 // (a failed walk must never evict a still-usable cached entry).
-async function runWalk(q, lang, langCode, key, limit) {
+async function runWalk(q, lang, langCode, key, limit, byPrinting = false) {
   // Walk by GAME CARD, not by printing: the answer is a set of names, and
   // hundreds of printings per card would otherwise inflate the walk ~4x
   // (otag:ramp is 2,287 cards but 9,231 printings → 13 pages instead of
@@ -1056,7 +1054,7 @@ async function runWalk(q, lang, langCode, key, limit) {
   let hasMore;
   let total;
   try {
-    ({ cards: fetched, hasMore, total } = await fetchWindow(`${q} unique:cards`, lang, 0, limit));
+    ({ cards: fetched, hasMore, total } = await fetchWindow(byPrinting ? q : `${q} unique:cards`, lang, 0, limit));
   } catch (error) {
     // A syntactically valid query with no matches is a complete, durable empty
     // membership. Caching it prevents every repeat from paying for the same 404.
@@ -1070,6 +1068,10 @@ async function runWalk(q, lang, langCode, key, limit) {
   }
   const names = new Set();
   for (const raw of fetched) {
+    if (byPrinting) {
+      if (raw.id) names.add(`mtg-${raw.id}`);
+      continue;
+    }
     const full = String(raw.name || '').trim().toLowerCase();
     if (!full) continue;
     names.add(full);
@@ -1127,9 +1129,9 @@ async function runWalk(q, lang, langCode, key, limit) {
 // request that noticed the staleness already answered from the cache, so a
 // failure here is logged and the NEXT request simply re-triggers it. The
 // in-flight map makes concurrent requests collapse into this single walk.
-function startRevalidation(q, lang, langCode, key, limit) {
+function startRevalidation(q, lang, langCode, key, limit, byPrinting = false) {
   const p = (async () => {
-    const { entry } = await runWalk(q, lang, langCode, key, limit);
+    const { entry } = await runWalk(q, lang, langCode, key, limit, byPrinting);
     return { entry, fetched: null, status: 'stale-refreshed' };
   })();
   inflightCollectionNames.set(key, p);
@@ -1192,7 +1194,7 @@ async function resolveCollectionQuery({
   // becomes a single SQLite SELECT as soon as a complete local tag generation
   // and oracle-id backfill are available. Unsupported operators retain the
   // existing Scryfall/SWR path below.
-  const { analyze, QuerySyntaxError } = require('../../shared/scryfallQuery.js');
+  const { analyze, toScryfall, stripDirectives, QuerySyntaxError } = require('../../shared/scryfallQuery.js');
   const oracleTags = require('./oracleTags');
   let parsed;
   try {
@@ -1200,6 +1202,27 @@ async function resolveCollectionQuery({
   } catch (error) {
     if (error instanceof QuerySyntaxError) throw new Error('INVALID_QUERY');
     throw error;
+  }
+  // Every term is data-backed: the owned rows ARE the answer — no API, no tag
+  // index, no eligibility gate (the user asked about cards they own).
+  if (parsed.mode === 'local') {
+    return db.withDedicatedReadTransaction(async (readDb) => {
+      const snapshot = await readCatalogSnapshot(readDb, 'rows', 0, expectedSnapshot);
+      const rawSql = require('./utils/rawQuerySql');
+      const compiled = rawSql.compileCollectionQuery({
+        ast: parsed.ast, userId, limit: rowLimit, offset: rowOffset, eligibleOnly: false,
+      });
+      const rows = await readDb.all(compiled.sql, compiled.params);
+      const count = includeTotal ? await readDb.get(compiled.countSql, compiled.countParams) : null;
+      return {
+        cards: rows.map(row => ({ ...parseCardRow(row), price_trend: resolveCardPrice(row) })),
+        total: includeTotal ? (Number(count && count.n) || 0) : null,
+        complete: true,
+        upstreamTotal: null,
+        cacheStatus: 'local',
+        snapshot,
+      };
+    });
   }
   if (oracleTags.supportsLocalCollectionQuery(parsed)) {
     const local = await db.withDedicatedReadTransaction(async (readDb) => {
@@ -1235,12 +1258,20 @@ async function resolveCollectionQuery({
     });
     if (local) return local;
   }
+  // Printing-level terms (set, artist, art tag, price, frame, ...) must be
+  // intersected by exact printing: owning a Bolt from M10 does not make it match
+  // a:"christopher rush". Game-card terms (oracle text, formats, otag) keep the
+  // cheaper by-name walk.
+  const byPrinting = !!parsed.printing;
+  const filterAst = stripDirectives(parsed.ast);
+  // Directives (unique:, order:) are stripped: the walk picks its own shape.
+  const upstream = toScryfall(filterAst);
   const rawWithLanguageScope = languages.resolve(lang).scryfall === 'en'
-    ? cleanRaw
-    : `(${cleanRaw})`;
+    ? upstream
+    : `(${upstream})`;
   let result;
   try {
-    result = await fetchCollectionNames(rawWithLanguageScope, lang, walkLimit);
+    result = await fetchCollectionNames(rawWithLanguageScope, lang, walkLimit, byPrinting);
   } catch (err) {
     // A 404 is a valid empty membership and is already cached by runWalk.
     // 400/422 are fixable query errors; throttling and transport failures remain
@@ -1290,9 +1321,9 @@ async function resolveCollectionQuery({
       .catch(e => console.error('Scryfall collection query caching failed:', e.message));
   }
 
-  const { sql, params, countSql, countParams } = cardSearchSql.ownedByNames(
-    userId, [...names], { limit: rowLimit, offset: rowOffset },
-  );
+  const { sql, params, countSql, countParams } = byPrinting
+    ? cardSearchSql.ownedByCardIds(userId, [...names], { limit: rowLimit, offset: rowOffset })
+    : cardSearchSql.ownedByNames(userId, [...names], { limit: rowLimit, offset: rowOffset });
   return db.withDedicatedReadTransaction(async (readDb) => {
     const snapshot = await readCatalogSnapshot(
       readDb, 'remote', membershipVersion, expectedSnapshot,

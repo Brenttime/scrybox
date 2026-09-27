@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { looksLikeSyntax } from '../utils/scryfallSyntax';
 import {
   Plus, Trash2, X, ChevronLeft, Search, ListChecks, Copy, Pencil,
   Layers, Minus, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
@@ -383,7 +384,8 @@ function Lists({ showToast, handoff, onHandoffDone }) {
     let cards = [];
     try {
       setSearching(true);
-      const res = await fetch(`/api/search?name=${encodeURIComponent(normalized)}&limit=24`);
+      const field = looksLikeSyntax(normalized) ? 'q' : 'name';
+      const res = await fetch(`/api/search?${field}=${encodeURIComponent(normalized)}&limit=24${field === 'q' ? '&scope=internet' : ''}`);
       if (request !== searchRequestRef.current) return cards;
       if (res.ok) {
         const found = await res.json();

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
+import { looksLikeSyntax } from '../utils/scryfallSyntax';
 import { Plus, Trash2, X, ChevronLeft, Play, BarChart2, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Filter, Layers, ListChecks, Copy, Gamepad2, SlidersHorizontal, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ExternalLink, ShoppingCart } from 'lucide-react';
 import { ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip } from 'recharts';
 import { shuffleArray } from '../utils/shuffle';
@@ -393,6 +394,14 @@ function DeckBuilder({ showToast, onNavigate }) {
     }
   };
 
+  // Collection rows (one per owned copy) -> the search-result shape the picker
+  // renders: printing id as `id`, owned_qty summed per game card.
+  const ownedRowsToSearchCards = (rows) => {
+    const totals = new Map();
+    for (const row of rows) totals.set(cardKey(row), (totals.get(cardKey(row)) || 0) + (Number(row.quantity) || 0));
+    return rows.map(row => ({ ...row, id: row.card_id || row.id, owned_qty: totals.get(cardKey(row)) || 0 }));
+  };
+
   const handleSearchCards = async (e) => {
     if (e) e.preventDefault();
     // "Browse Collection" used to sit beside the search box and dumped every card
@@ -401,9 +410,17 @@ function DeckBuilder({ showToast, onNavigate }) {
     if (!searchQuery.trim()) return;
     try {
       setSearching(true);
-      const response = await fetch(`/api/search?name=${encodeURIComponent(searchQuery)}&scope=collection`);
+      // Scryfall syntax (t:elf c:g, otag:ramp, o:"draw a card") searches the
+      // collection through the same resolver as the Collection tab; a plain
+      // string stays a name search.
+      const text = searchQuery.trim();
+      const isSyntax = looksLikeSyntax(text);
+      const response = await fetch(isSyntax
+        ? `/api/search?q=${encodeURIComponent(text)}&scope=collection`
+        : `/api/search?name=${encodeURIComponent(text)}&scope=collection`);
       if (response.ok) {
-        const data = await response.json();
+        let data = await response.json();
+        if (isSyntax) data = ownedRowsToSearchCards(data);
         // Search returns each owned printing for art/collection display. A deck
         // picker collapses those to one logical card; owned_qty is already the
         // all-printings total on every row.

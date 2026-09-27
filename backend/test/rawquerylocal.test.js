@@ -77,7 +77,7 @@ async function main() {
 
   // 1. A data-backed query is answered from the cache — zero provider calls.
   scryCalls = 0;
-  let r = await scryfallApi.searchCards({ q: 'set:lea is:creature', scope: 'internet', lang: 'en', page: 1, limit: 60 });
+  let r = await scryfallApi.searchCards({ q: 'set:lea is:creature', scope: 'database', lang: 'en', page: 1, limit: 60 });
   assert.strictEqual(scryCalls, 0, 'local raw query must not call Scryfall');
   assert.strictEqual(r.source, 'cache', 'answer is flagged cache');
   assert.deepStrictEqual(r.cards.map(c => c.name).sort(), ['Llanowar Elves', "Sage's Cursed Statue"]);
@@ -90,7 +90,14 @@ async function main() {
     'set:lea is:land',
     'set:lea colorless',
     'set:lea number:85',
-    'set:lea m:1',
+    'set:lea mv:1',
+    'set:lea cmc>=1',
+    'set:lea c:g',
+    'set:lea id<=g',
+    'set:lea r>=uncommon',
+    '!"lightning bolt"',
+    'set:lea cn>100',
+    'set:lea unique:prints order:name',
     'set:lea rarity:m',
     'set:lea type:artifact',
     'set:lea t:artifact',        // Scryfall's short form for type: — must route local too
@@ -101,7 +108,7 @@ async function main() {
   ];
   for (const q of BATTERY) {
     scryCalls = 0;
-    const local = await scryfallApi.searchCards({ q, scope: 'internet', lang: 'en', page: 1, limit: 60 });
+    const local = await scryfallApi.searchCards({ q, scope: 'database', lang: 'en', page: 1, limit: 60 });
     assert.strictEqual(scryCalls, 0, `${q}: must not call Scryfall`);
     assert.deepStrictEqual(
       local.cards.map(c => c.name).sort(),
@@ -123,7 +130,7 @@ async function main() {
   );
 
   // 3. Paging a local query walks the offset with no provider traffic.
-  r = await scryfallApi.searchCards({ q: 'set:lea', scope: 'internet', lang: 'en', page: 2, limit: 3 });
+  r = await scryfallApi.searchCards({ q: 'set:lea', scope: 'database', lang: 'en', page: 2, limit: 3 });
   assert.strictEqual(scryCalls, 0);
   assert.strictEqual(r.cards.length, 2, 'page 2 of 5 seeded lea rows');
   assert.strictEqual(r.total, 5);

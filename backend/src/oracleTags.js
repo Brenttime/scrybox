@@ -21,7 +21,10 @@ const LOCAL_COLLECTION_OPERATORS = new Set([
   // types, sets, collector numbers, or `is:` categories. Our local index stores
   // only default-search eligibility, not enough metadata to reproduce that
   // inference exactly, so those combinations must retain live fallback.
-  'color', 'c', 'rarity', 'r', 'lang', 'language', 'm', 'cmc', 'otag',
+  // Canonical names (shared/scryfallQuery.js folds c:/id:/r:/cmc: into these).
+  'color', 'identity', 'rarity', 'lang', 'mv', 'otag',
+  // Display directives never filter a row.
+  'include', 'unique', 'order', 'sort', 'direction', 'prefer', 'display',
 ]);
 
 let maintenancePromise = null;

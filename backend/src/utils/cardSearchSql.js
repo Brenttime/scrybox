@@ -210,4 +210,20 @@ function ownedByNames(userId, names, { limit = 60, offset = 0 } = {}) {
   };
 }
 
-module.exports = { collectionQuery, localCacheQuery, ownedByNames, nameClause, numberClause };
+// Same projection as ownedByNames, keyed on exact printing ids (`mtg-<uuid>`).
+// Printing-level catalog terms (artist, set, art tag, price) intersect here.
+function ownedByCardIds(userId, ids, opts = {}) {
+  const built = ownedByNames(userId, ['x'], opts);
+  if (!ids.length) return { sql: null, params: [], countSql: null, countParams: [] };
+  const swap = (sql) => sql.replace(/AND LOWER\(TRIM\(COALESCE\(cc\.name, ''\)\)\) IN \(SELECT value FROM json_each\(\?\)\)/, 'AND c.card_id IN (SELECT value FROM json_each(?))');
+  const membership = JSON.stringify([...new Set(ids)]);
+  const replaceParam = (params) => params.map((v, i) => (i === 1 ? membership : v));
+  return {
+    sql: swap(built.sql),
+    params: replaceParam(built.params),
+    countSql: swap(built.countSql),
+    countParams: replaceParam(built.countParams),
+  };
+}
+
+module.exports = { collectionQuery, localCacheQuery, ownedByNames, ownedByCardIds, nameClause, numberClause };

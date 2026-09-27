@@ -57,7 +57,8 @@ assert.deepStrictEqual(new Set(names('color:c')), only('Foret|English', 'Folio|E
 
 // --- rarity: (letter aliases + full words, incl. mythic/secret two-word rarities)
 assert.deepStrictEqual(new Set(names('r:m')), only('The Legend of Yangchen // Avatar Yangchen|English'), 'r:m = mythic, not a prefix game');
-assert.deepStrictEqual(new Set(names('rarity:rare')), only('The Legend of Yangchen // Avatar Yangchen|English', 'Xyzzy|English'), 'word match reaches the two-word rarities too');
+assert.deepStrictEqual(new Set(names('rarity:rare')), only('Xyzzy|English'), 'r:rare is exactly rare (Scryfall: mythics excluded); secret rare ranks as rare');
+assert.deepStrictEqual(new Set(names('r>=rare')), only('The Legend of Yangchen // Avatar Yangchen|English', 'Xyzzy|English'), 'rarity comparators');
 assert.deepStrictEqual(new Set(names('rarity:secret')), only('Xyzzy|English'), 'secret rare matches rarity:secret');
 assert.deepStrictEqual(new Set(names('r:c')), only('Lightning Bolt|English', 'Lightning Bolt|Japanese', 'Folio|English'));
 
@@ -72,10 +73,10 @@ assert.deepStrictEqual(new Set(names('lang:ja')), only('Lightning Bolt|Japanese'
 assert.deepStrictEqual(new Set(names('language:japanese')), only('Lightning Bolt|Japanese'), 'name form');
 assert.deepStrictEqual(new Set(names('lang:zhs')), new Set(), 'unknown-language spelling parses fine, matches nothing');
 
-// --- m: / cmc:
-assert.deepStrictEqual(new Set(names('m:1')), only('Lightning Bolt|English', 'Lightning Bolt|Japanese'));
+// --- mv: / cmc: (m: is Scryfall's MANA COST operator and routes to the catalog)
+assert.deepStrictEqual(new Set(names('mv:1')), only('Lightning Bolt|English', 'Lightning Bolt|Japanese'));
 assert.deepStrictEqual(new Set(names('cmc:0')), only('Folio|English'));
-assert.deepStrictEqual(new Set(names('m:null')), new Set([]), 'cards without cmc never match');
+assert.deepStrictEqual(new Set(names('cmc>=1')), only('Lightning Bolt|English', 'Lightning Bolt|Japanese', 'The Legend of Yangchen // Avatar Yangchen|English', 'Xyzzy|English'), 'cards without cmc never match; comparators work');
 
 // --- composition: implicit AND, or, negation, groups
 assert.deepStrictEqual(new Set(names('is:land rarity:basic')), only('Foret|English'));

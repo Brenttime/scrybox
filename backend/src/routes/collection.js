@@ -110,7 +110,10 @@ async function searchCards(req, res) {
         }
         throw e;
       }
-      if (mode === 'catalog') {
+      // Local-mode queries are answered from the owned rows in SQLite (no API);
+      // catalog-mode ones resolve on Scryfall / the Oracle Tags index. Either way
+      // the response is the user's own collection rows.
+      if (mode === 'catalog' || mode === 'local') {
         const includeTotal = query.count !== '0';
         const { cards, total, complete, upstreamTotal, cacheStatus, snapshot } = await scryfallApi.resolveCollectionQuery({
           q, userId: req.user.id, lang,
