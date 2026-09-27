@@ -29,7 +29,10 @@ const AUTO_IDLE_MS = 350;
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
 // The tray is capped for render cost, but unsent scans are never dropped to
 // make room: at the cap, auto pauses and asks for a Send instead.
-const TRAY_MAX = 80;
+const TRAY_MAX = 10000;
+// Server bulk endpoints accept 1-250 entries; larger trays are sent in chunks.
+const SEND_CHUNK = 250;
+const chunks = (a, n = SEND_CHUNK) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, i * n + n));
 
 // JSON body or a readable error, never a SyntaxError from a proxy's HTML page.
 async function readJson(r) {
@@ -429,35 +432,42 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (!rows.length || sending) return;
     setSending(true);
     try {
-      let r;
-      if (dest === 'collection') {
-        r = await fetch('/api/collection/bulk-add', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            card_ids: rows.map(row => ({ card_id: row.card.id, quantity: qtyOf(row), printing: printingOf(row), purchase_price: resolveCardPrice(row.card, printingOf(row)) })),
-            quantity: 1, condition: 'Near Mint', printing: 'Normal', language: 'English',
-          }),
-        });
-      } else {
-        r = await fetch(`/api/lists/${encodeURIComponent(dest)}/cards/bulk`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cards: rows.map(row => ({ card_id: row.card.id, quantity: qtyOf(row) })) }),
-        });
+      // Chunks go one at a time; a failed chunk stays in the tray for retry.
+      const sentRows = [], entries = [];
+      let chunkError = null;
+      for (const part of chunks(rows)) {
+        let r;
+        if (dest === 'collection') {
+          r = await fetch('/api/collection/bulk-add', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              card_ids: part.map(row => ({ card_id: row.card.id, quantity: qtyOf(row), printing: printingOf(row), purchase_price: resolveCardPrice(row.card, printingOf(row)) })),
+              quantity: 1, condition: 'Near Mint', printing: 'Normal', language: 'English',
+            }),
+          });
+        } else {
+          r = await fetch(`/api/lists/${encodeURIComponent(dest)}/cards/bulk`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cards: part.map(row => ({ card_id: row.card.id, quantity: qtyOf(row) })) }),
+          });
+        }
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { chunkError = new Error(j.error || 'send failed'); break; }
+        const failed = new Set((j.failed || []).map(f => (typeof f === 'object' ? f.card_id : f)));
+        sentRows.push(...part.filter(row => !failed.has(row.card.id)));
+        entries.push(...(j.entries || []));
       }
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || 'send failed');
-      const failed = new Set((j.failed || []).map(f => (typeof f === 'object' ? f.card_id : f)));
-      const sentRows = rows.filter(row => !failed.has(row.card.id));
+      if (chunkError && !sentRows.length) throw chunkError;
       const keys = new Set(sentRows.map(row => row.key));
       // Sent cards leave the tray; failures stay so they can be retried.
       setResults(prev => prev.filter(x => !keys.has(x.key)));
       const where = dest === 'collection' ? t('fastscan.destCollection') : (lists.find(l => String(l.id) === dest)?.name || t('fastscan.destList'));
       clearTimeout(undoTimer.current);
       if (sentRows.length) {
-        setUndo({ rows: sentRows, dest, where, entryIds: dest === 'collection' ? (j.entries || []).flatMap(e => (e.ids?.length ? e.ids : [e.id])).filter(Boolean) : null });
+        setUndo({ rows: sentRows, dest, where, entryIds: dest === 'collection' ? entries.flatMap(e => (e.ids?.length ? e.ids : [e.id])).filter(Boolean) : null });
         undoTimer.current = setTimeout(() => setUndo(null), 15000);
       }
-      showToast?.(t('fastscan.sent', { count: keys.size, where }));
+      showToast?.(chunkError ? t('fastscan.sendFailed') : t('fastscan.sent', { count: keys.size, where }));
       if (dest === 'collection') onAddSuccess?.();
     } catch (e) {
       showToast?.(t('fastscan.sendFailed'));
@@ -488,15 +498,21 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     clearTimeout(undoTimer.current); setUndo(null); setSending(true);
     try {
       if (u.dest === 'collection') {
-        const res = await Promise.all(u.entryIds.map(id => fetch(`/api/collection/${id}`, { method: 'DELETE' }).then(r => r.ok)));
-        if (res.some(ok => !ok)) throw new Error('undo partial');
+        let bad = false;
+        for (const part of chunks(u.entryIds, 20)) {
+          const res = await Promise.all(part.map(id => fetch(`/api/collection/${id}`, { method: 'DELETE' }).then(r => r.ok)));
+          if (res.some(ok => !ok)) bad = true;
+        }
+        if (bad) throw new Error('undo partial');
         onAddSuccess?.();
       } else {
-        const r = await fetch(`/api/lists/${encodeURIComponent(u.dest)}/cards/bulk-remove`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cards: u.rows.map(row => ({ card_id: row.card.id, quantity: qtyOf(row) })) }),
-        });
-        if (!r.ok) throw new Error('undo failed');
+        for (const part of chunks(u.rows)) {
+          const r = await fetch(`/api/lists/${encodeURIComponent(u.dest)}/cards/bulk-remove`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cards: part.map(row => ({ card_id: row.card.id, quantity: qtyOf(row) })) }),
+          });
+          if (!r.ok) throw new Error('undo failed');
+        }
       }
       setResults(prev => [...u.rows.map(row => ({ ...row, sent: false })), ...prev]);
       showToast?.(t('fastscan.undone', { where: u.where }));
