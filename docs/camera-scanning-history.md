@@ -1,7 +1,7 @@
 # Scrybox camera scanning: history, results, lessons
 
-Last updated: 2026-09-27. Live image: `scrybox:8a84d94-scansettle`
-(branch `perf/scan-settle`, not merged to main).
+Last updated: 2026-09-27. Live image: `scrybox:4196f28-scanfix`
+(branch `perf/scan-speedups`, PR open).
 
 ## Goal and rules
 - Scan a card in under 1 s from placing it to adding it.
@@ -138,6 +138,57 @@ Last updated: 2026-09-27. Live image: `scrybox:8a84d94-scansettle`
   title crop selection by yield, quality-aware 2-obs settle, thread
   benchmark 2/4/8 on desktop, speculative footer worker, WebGPU EP for
   rec (+13 MB wasm, lazy), hydration off the commit path.
+
+
+## Slow-card fixes (scanfix build, 2026-09-27)
+Live image `scrybox:4196f28-scanfix` (branch `perf/scan-speedups`, on top
+of the proxy work). Driven by Astra's blind investigation of the 4-8 s
+cards (`.hermes/audits/astra-slowscan-0927.md`): the waits were crop
+geometry and repeated failed reads, not inference or thread count.
+
+What shipped:
+1. First modern footer batch reads y=0.84 too (6 strips, still one
+   recognizer call). FRA collector lines ("U 0138") sit there on loose
+   outlines; neither narrow nor wide sweep read it (Konstrari Charm,
+   Marwyn, Last Gasp).
+2. Auto backoff: only a real server attempt starts/extends the failure
+   streak; settling and local misses keep it unchanged (a settling pass
+   used to clear it, so failed fallbacks repeated). Near-edge partials
+   (a stage would read past the frame) stay on-device with a new
+   `fastscan.hintEdge` hint; after 8 same-place partials the server gets
+   one try; movement or any other outcome resets the run.
+3. Near-edge stage geometry: when a stage's padded strips leave the frame
+   the WHOLE stage is re-projected with that side's padding shrunk
+   (0.75/0.5/0.25/0), accepted only if the new strips still cover every
+   on-card part of every original strip (tolerance 0.6% of the card).
+   Otherwise the stage abstains as before. Never a partial stage.
+   The first skipped stage is the one reported.
+4. Settle window is elapsed time: 3 still observations spanning >= 180 ms
+   real time (was: 3 observations each >= 90 ms apart, which aliased a
+   65 ms loop to 260 ms). A read with zero recognizer calls no longer
+   counts as OCR for the post-read gap rule.
+
+Replay (Node, same assets as live):
+- Astra's 71 fallback frames: client matches 3 -> 49, agree with server
+  10, wrong 0, title conflicts 0, lost 0. All 39 client-only printings
+  equal what the live session eventually added.
+- 1281 saved debug frames: 462 -> 564 matches, 0 lost, 0 changed; wrong
+  stays at the 2 pre-existing Flicker/Garruk frames (unchanged).
+- Slow cards on their saved frames, before -> after: Roiling Canopy 0/4 ->
+  4/4 (title re-projected), Solarium Sentry 0/7 -> 7/7 (footer
+  re-projected), Heartstring Puller 0/10 -> 10/10, Konstrari Charm 0/2 ->
+  2/2 (0.84 row). Live-browser worker: 8/8 correct.
+
+Rejected in review: re-projection without a coverage check (Astra R1:
+synthetic card slid the footer rows onto text-box digits and proved the
+wrong printing); local deferrals renewing the backoff (server never
+asked again); moving passes preserving the edge run.
+
+Next: a Windows scan round to measure waited_ms on the new build; then
+the Flicker/Garruk wrong-title frames, OCR confusions (Icy Reception).
+Reviews: `.hermes/audits/astra-scanfix-r1.md`, `astra-scanfix-r2.md`.
+Rollback:
+`cd ~/projects/bindarr-host && cp docker-compose.yml.bak-scanfix docker-compose.yml && docker compose up -d bindarr`
 
 ## Known open items
 - Measure the new build on the PC and a phone (target < 1 s).
