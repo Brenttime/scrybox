@@ -106,6 +106,14 @@ app.use(helmet({
   // helmet's default (on) for every other deployment, including a reverse proxy
   // with a real certificate.
   hsts: !selfSignedTls(),
+  // Cross-origin isolation, so the on-device scanner can run onnxruntime-web
+  // with worker threads (SharedArrayBuffer). 'credentialless' rather than
+  // 'require-corp': Scryfall card images and Google Fonts still load (without
+  // cookies) with no CORP headers from those hosts. Browsers without
+  // credentialless support (Safari) are simply not isolated and keep the
+  // single-thread scanner. COOP same-origin is already helmet's default.
+  // Off with SCAN_ISOLATION=0.
+  crossOriginEmbedderPolicy: process.env.SCAN_ISOLATION === '0' ? false : { policy: 'credentialless' },
   contentSecurityPolicy: {
     reportOnly: true,
     directives: {

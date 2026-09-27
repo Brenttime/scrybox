@@ -66,6 +66,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> last seen ms (auto de-dupe)
   const onDeviceRef = useRef(false);
+  const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
 
   const [service, setService] = useState(null);
   const [devices, setDevices] = useState([]);
@@ -276,7 +277,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // Proven on the phone (or an auto pass the stillness gate held back):
         // done. Anything else — unproven card, no card on a shutter press,
         // failure — goes to the server with the same frame.
-        if (!needsServer(local, { autoPass })) {
+        const r0 = local?.results?.[0];
+        if (autoPass && r0 && !r0.ok && r0.error === 'no confident card title') noTitleRunRef.current++;
+        else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') noTitleRunRef.current = 0;
+        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current })) {
           out = { ...local, results: await hydrateResults(local.results, abort.signal).catch((e) => { tel.set({ hydrate_error: e?.message || String(e) }); return null; }) };
           tel.mark('hydrate_ms', takeHydrateMs());
           if (!out.results) { out = null; why = 'hydrate-failed'; }
@@ -292,7 +296,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!stale()) setHint(t('fastscan.hintFooter'));
         tel.end({ outcome: 'held' });
         return { held: true };
-      } else out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))());
+      } else { noTitleRunRef.current = 0; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
       // Stopped or navigated away while this was in flight: drop it on the floor.
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
@@ -326,7 +330,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (hits.length) firstSeenRef.current = null;
       tel.end({
         outcome: hits.length ? (fresh.length ? 'added' : 'repeat') : (out.candidates.length ? 'miss' : 'no-card'),
-        hits: hits.map(h => `${h.card.name}[${h.card.set} ${h.card.collector_number ?? h.card.num ?? ''}]`).slice(0, 8),
+        hits: hits.map(h => `${h.card.name}[${h.card.set_id} ${h.card.number}]`).slice(0, 8),
         total_ms: ms, waited_ms: waited,
       });
       if (fresh.length) {

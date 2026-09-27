@@ -14,6 +14,20 @@ import { createReader } from '../../../shared/clientScan/pipeline.mjs';
 import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 
 ort.env.wasm.wasmPaths = '/ort/';
+// Threads need cross-origin isolation (COEP credentialless + COOP, set by the
+// backend). Replay on saved frames: 2 threads cut matched-read p50 ~30% on a
+// 4-core host; 4 was no better there, but desktops with 8+ cores get 4.
+// Phones stay at 2 at most (thermal/battery). localStorage 'scan.threads'
+// (passed in the load message) overrides for A/B tests.
+function pickThreads(override) {
+  if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1;
+  const n = Number(override);
+  if (n >= 1 && n <= 8) return Math.floor(n);
+  const cores = self.navigator?.hardwareConcurrency || 1;
+  const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(self.navigator?.userAgent || '');
+  if (cores >= 8 && !mobile) return 4;
+  return cores >= 4 ? 2 : 1;
+}
 ort.env.wasm.numThreads = 1;
 
 // Set from the load message: '' on the web (same origin), the user's server URL
@@ -68,7 +82,7 @@ async function load() {
   const reader = createReader({ ort, cornelius, rec, chars, index });
   // Which assets this worker actually runs, for scan telemetry: rules out a
   // stale cached index/model when live and replay disagree.
-  const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, simd: ort.env.wasm.simd !== false };
+  const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false };
   return { reader, info, loadMs: Math.round(performance.now() - t0) };
 }
 
@@ -76,6 +90,7 @@ self.onmessage = async (e) => {
   const { type, id } = e.data;
   if (type === 'load') {
     ORIGIN = e.data.base || '';
+    if (!readerPromise) ort.env.wasm.numThreads = pickThreads(e.data.threads);
     readerPromise ||= load();
     try {
       const { loadMs, info } = await readerPromise;

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIndex, voteFooter, resolveFooter } from '../../../shared/clientScan/text.mjs';
+import { needsServer, NO_TITLE_ESCAPE } from './fastScan.js';
 import { createReader, corneliusTensor, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 
 // Regressions from the 2026-09 scanner audit.
@@ -66,7 +67,7 @@ function fakeReader(titleFor) {
     inputNames: ['x'], outputNames: ['y'],
     run: async ({ x }) => {
       calls++;
-      const n = x.dims[0], text = titleFor(calls), steps = text.length, classes = chars.length;
+      const n = x.dims[0], text = titleFor(calls, n), steps = text.length, classes = chars.length;
       const data = new Float32Array(n * steps * classes);
       for (let b = 0; b < n; b++) for (let s = 0; s < steps; s++) data[(b * steps + s) * classes + chars.indexOf(text[s])] = 1;
       return { y: { data, dims: [n, steps, classes] } };
@@ -154,4 +155,47 @@ test('read() accepts corners from probe() and skips a second detection', async (
   const out = await reader.read(f, null, { quad });
   assert.equal(out.candidates.length, 1);
   assert.equal(detects(), 1, 'read with known corners must not run cornelius again');
+});
+
+test('auto: a still card needs a settled window before OCR; one stable pair is not enough', async () => {
+  const { reader, calls } = fakeReader(() => 'grief');
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  const a = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(a.candidates[0].status, 'moving');          // first sighting: no history
+  const b = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(b.candidates[0].status, 'settling');        // one stable pair
+  assert.equal(calls(), 0, 'no OCR before the window is complete');
+  const c = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(c.results[0]?.ok, true);
+  // Non-auto (shutter) reads immediately.
+  const { reader: r2 } = fakeReader(() => 'grief');
+  assert.equal((await r2.read(sharpFrame(), small)).results[0]?.ok, true);
+});
+
+test('auto: a first unresolved footer defers deep stages, next frame continues and never guesses', async () => {
+  // Title 'bolt' (two printings); footer never readable.
+  const { reader, calls } = fakeReaderIx((_, batch) => (batch === 2 ? 'bolt' : 'zz'));
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+  const c0 = calls();
+  const a = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(a.results[0].ok, false);
+  assert.equal(a.results[0].deferred, true);
+  assert.equal(calls() - c0, 2, 'one title call (exact, confident: tight crops skipped) + first footer batch only');
+  const c1 = calls();
+  const b = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(b.results[0].ok, false);
+  assert.notEqual(b.results[0].deferred, true, 'second frame runs every stage');
+  assert.ok(calls() - c1 > 2);
+});
+
+test('needsServer: auto skips the server for unreadable titles (bounded) and deferred footers', () => {
+  const out = (res) => ({ candidates: [{ eligible: true }], results: [res] });
+  const noTitle = out({ ok: false, error: 'no confident card title' });
+  assert.equal(needsServer(noTitle, { autoPass: true, noTitleRun: 1 }), false);
+  assert.equal(needsServer(noTitle, { autoPass: true, noTitleRun: NO_TITLE_ESCAPE }), true, 'escape hatch');
+  assert.equal(needsServer(noTitle, { autoPass: false }), true, 'shutter always may');
+  assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', deferred: true }), { autoPass: true }), false);
+  assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', title: 'x' }), { autoPass: true }), true);
+  assert.equal(needsServer({ error: 'worker died' }, { autoPass: true }), true);
 });

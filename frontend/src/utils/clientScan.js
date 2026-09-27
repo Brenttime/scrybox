@@ -60,6 +60,9 @@ function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS) {
 // Where the worker fetches models and the index from. On the web that is this
 // origin; in the native app it is the user's own server — the window.fetch shim
 // in apiBase does not reach into workers, so it has to be passed explicitly.
+function threadOverride() {
+  try { return localStorage.getItem('scan.threads') || null; } catch { return null; }
+}
 function assetBase() {
   return isNative ? getServerUrl() : '';
 }
@@ -75,7 +78,7 @@ export function loadClientScan() {
       && typeof DecompressionStream !== 'undefined' && (!isNative || !!getServerUrl());
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : call({ type: 'load', base: assetBase() }, [], LOAD_TIMEOUT_MS)
+      : call({ type: 'load', base: assetBase(), threads: threadOverride() }, [], LOAD_TIMEOUT_MS)
         .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
     ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
   }

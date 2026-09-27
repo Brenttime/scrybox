@@ -29,10 +29,23 @@ export function quadPath(cand, { s, ox, oy }) {
 //     single-card detector does not handle).
 //   - auto pass with no card, or a moving/clipped/blurred one: no — that is
 //     the stillness gate doing its job; the next pass retries.
-export function needsServer(out, { autoPass }) {
+//   - auto pass whose title OCR was unreadable: no. Windows telemetry: 12 of
+//     12 such fallbacks failed on the server too (same smeared pixels), each
+//     costing ~0.35 s before the next frame could be read. After
+//     NO_TITLE_ESCAPE of them in a row the server gets one try anyway, for
+//     what the on-device reader cannot handle (multi-card spreads, layouts
+//     its strips miss).
+//   - auto pass whose footer was deferred to the next frame: no, the next
+//     still frame continues the read on-device with the pooled evidence.
+export const NO_TITLE_ESCAPE = 4;
+export function needsServer(out, { autoPass, noTitleRun = 0 }) {
   if (!out || out.error) return true;
   const cand = out.candidates?.[0];
   const res = out.results?.[0];
+  if (res && !res.ok && autoPass) {
+    if (res.deferred) return false;
+    if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
+  }
   if (res) return !res.ok;
   if (!cand || !cand.eligible) return !autoPass;
   return true;

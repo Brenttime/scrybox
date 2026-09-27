@@ -34,8 +34,18 @@ const EDGE_FRAC = 0.01;             // server: touches frame edge within 1%
 // sharper frame instead.
 const TITLE_SHARP_FLOOR = 500;
 const STILL_DRIFT = 0.012;          // mean corner move / frame diagonal
+// Auto admits a card for OCR only after a short stable WINDOW, not one pair of
+// frames: Windows telemetry (23 cards) showed the first frame that passed a
+// single-pair check was usually still smeared (title OCR garbage, ~0.5 s
+// local + ~0.35 s server wasted per card). STILL_OBS consecutive
+// observations, each within STILL_DRIFT of the previous and no more than
+// STILL_GAP_MS apart, so a sample taken before a long read cannot vouch for
+// the frame after it.
+const STILL_OBS = 3;
+const STILL_GAP_MS = 400;
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
+const TITLE_EXACT_CONF = 0.90;
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
@@ -112,6 +122,7 @@ export function createReader(env) {
   // env: { ort, cornelius, rec, chars, index }
   env.stats = { recCalls: 0, recStrips: 0 };
   let lastQuad = null;
+  let stillRun = 0, lastAt = 0;   // consecutive low-drift observations
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
   // alone does not prove a printing — reprints share art and differ only in
   // the footer — so a signature match is trusted only while the same physical
@@ -148,7 +159,7 @@ export function createReader(env) {
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; tracked = null; evidence = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -160,19 +171,26 @@ export function createReader(env) {
     const diag = Math.hypot(w, h);
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
+    const tNow = now();
+    stillRun = drift <= STILL_DRIFT && tNow - lastAt <= STILL_GAP_MS ? stillRun + 1 : 1;
+    lastAt = tNow;
+    cand.still = stillRun;
     const m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
     if (clipped) cand.status = 'touches frame edge';
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
     else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
+    else if (requireStill && stillRun < STILL_OBS) cand.status = 'settling';
     cand.eligible = cand.status === 'ready';
     // Tracking ends the moment the card is not plainly in view: a blurred,
     // clipped or moving frame is exactly when one card gets swapped for another
     // with the same art, so nothing proven before it may carry across.
     // Pooled footer reads go with it: votes may only combine across frames of
     // one uninterrupted presentation.
-    if (!cand.eligible || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
+    // 'settling' is a still card waiting out its window: nothing about it
+    // suggests a swap, so tracking and pooled evidence survive it.
+    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4) { tracked = null; evidence = null; }
     if (!cand.eligible) return base;
 
     const sig = artSignature(rgba, w, h, m);
@@ -185,7 +203,7 @@ export function createReader(env) {
     if (evidence && ++evidence.age > EVIDENCE_FRAMES) evidence = null;
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     const recBefore = env.stats.recCalls;
-    const result = await readCard(rgba, w, h, m, timings, prior);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill);
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
     if (prior) timings.pooled_frames = prior.frames.length;
@@ -194,14 +212,14 @@ export function createReader(env) {
     // reprint between two frames at the same spot is invisible to tracking,
     // so a printing that needed its footer is re-read every time.
     if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, result } : null; }
-    else if (result.title && result.footer_ocr?.length) {
+    else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0 };
     }
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false) {
     const tA = now();
     const strip = (r) => sampleStrip(rgba, w, h, m, r[0], r[1], r[2], r[3]);
     const cands = [];
@@ -217,7 +235,11 @@ export function createReader(env) {
       }
     };
     consider(await recognize(env, TITLE_FIRST.map(strip)));
-    if (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12) {
+    // The tighter crops rescue weak or partial reads. An exact, high-confidence
+    // match of a full index name needs no rescue: skip the second recognizer
+    // call. This only selects the TITLE; printings still need their proof.
+    const exact = cands.some(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF);
+    if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, TITLE_TIGHT.map(strip)));
     }
     timings.title_ms = Math.round(now() - tA);
@@ -274,6 +296,15 @@ export function createReader(env) {
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
+      // Auto, first look at this card: the deep stages (wide, retro) cost
+      // ~0.9 s and on a frame this fresh usually fail too (Windows telemetry:
+      // Refute Destiny, Marwyn). Stop here; this frame's footer reads are
+      // pooled, and the next still frame of the same card continues with them
+      // and runs every stage.
+      if (auto && !pooled && si === 0) {
+        timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
+      }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
     return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
@@ -283,11 +314,11 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; tracked = null; evidence = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }
     return quad;
   }
 
-  return { read, probe, stats: env.stats, reset() { lastQuad = null; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
+  return { read, probe, stats: env.stats, reset() { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };

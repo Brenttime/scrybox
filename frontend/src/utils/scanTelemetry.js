@@ -86,6 +86,8 @@ export const scanTelemetry = {
           frame: out.frame ? [out.frame.width, out.frame.height] : undefined,
           status: c ? c.status : 'no card',
           sharp: c?.sharpness,
+          still: c?.still,
+          deferred: r?.deferred || undefined,
           box: c?.box,
           timings: out.timings,
           ok: r ? !!r.ok : undefined,
@@ -106,7 +108,7 @@ export const scanTelemetry = {
           ok: !!j.ok, error: j.ok ? undefined : String(j.error || '').slice(0, 120),
           cards: j.candidates?.length,
           statuses: j.candidates?.map(c => c.status),
-          results: j.results?.map(r => (r.ok && r.card ? `${r.card.name}[${r.card.set} ${r.card.collector_number ?? ''}]` : `x:${r.error || '?'}${r.title ? `(${r.title})` : ''}`)),
+          results: j.results?.map(r => (r.ok && r.card ? `${r.card.name}[${r.card.set_id} ${r.card.number}]` : `x:${r.error || '?'}${r.title ? `(${r.title})` : ''}`)),
           timings: j.timings,
         };
       },
