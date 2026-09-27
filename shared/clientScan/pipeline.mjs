@@ -75,7 +75,7 @@ const REFINE_MAX_MOVE = STILL_DRIFT;
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
-// One modern batch first: 5 strips cost about the same as 2 on the recognizer
+// One modern batch first: 6 strips cost about the same as 2 on the recognizer
 // (one ONNX run either way), and 0.86-0.94 is where modern footers resolve.
 // Replay: same matches, p50 matched read -29%, 2.3 vs 3.3 recognizer calls.
 // The upper modern sweep (0.76-0.84) proved 2 of 353 cards on-device while
@@ -84,7 +84,13 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // 'wide': the same rows read out to x=0.30 for a card the narrow sweep did not
 // prove. FRA-era 4-digit numbers ("U 0298") put the last digit past 0.22, so
 // the narrow strip reads "U 029". Only unresolved cards pay for it.
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86], 'wide', 'retro'];
+// 0.84 rides in the first batch: on FRA-era frames with a loose (padded)
+// outline the collector line sits there ("U 0138"), and neither the narrow
+// nor the wide sweep read it, so Konstrari Charm-style cards burned two
+// failed server fallbacks each. Replay of 71 saved fallback frames: client
+// matches 3 -> 16, 0 printing or title conflicts, 0 baseline hits lost.
+// Still one recognizer call (6 strips = REC_BATCH).
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'retro'];
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];

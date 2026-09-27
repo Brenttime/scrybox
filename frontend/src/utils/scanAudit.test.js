@@ -330,3 +330,14 @@ test('near-edge: an inward refinement must pass the geometry check too (review B
   assert.notEqual(out.timings.refined, 1, 'collapsed refinement must not be adopted');
   assert.equal(out.candidates[0].quad[3][1], 26, 'coarse geometry kept');
 });
+
+test('footer: the first modern batch reads the 0.84 row (FRA collector line, Konstrari Charm)', async () => {
+  // Only a 6-strip batch (0.84 included) sees the number; the old 5-row
+  // batch, the 4-row wide stage and the 2-row retro stage never do.
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : n === 6 ? 'lea 161' : 'lea'));
+  const out = await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  const r = out.results[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.equal(r.footer_stage, 0, 'resolved by the first batch, one recognizer call');
+});
