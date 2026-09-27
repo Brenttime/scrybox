@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { Search, Plus, X, ShieldAlert, Check, MousePointerClick, Zap, Undo2, Maximize2, Braces } from 'lucide-react';
+import { Search, Plus, X, ShieldAlert, Check, MousePointerClick, Zap, Undo2, Maximize2, Braces, SlidersHorizontal } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { priceText } from '../utils/formatPrice';
 import { resolveCardPrice } from '../utils/resolveCardPrice';
@@ -11,6 +11,10 @@ import { useMultiSelect } from '../utils/useMultiSelect';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
 import { LANGUAGES, langName, isEnglish, displayName, translatedName, setReference, setCode } from '../utils/languages';
 import CardImage from './CardImage';
+import LoadMore from './LoadMore';
+import MultiSelectDropdown from './MultiSelectDropdown';
+import ColorPicker from './ColorPicker';
+import { CARD_TYPES, SUPERTYPES, MANA_VALUES, RARITY_ORDER, mvBucket, cardTypes, cardSupertypes, cardSubtypes, uniqueSorted, sortRarities, matchMtgFilters } from '../utils/mtgFilters';
 import { useT } from '../utils/i18n';
 import { adjustOwnedQuantityByName, cardKey } from '../utils/cardIdentity';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
@@ -73,9 +77,15 @@ function CardSearch({ onAddSuccess, showToast }) {
   const rapidInputRef = useRef(null);
 
   // Filter states
-  const [filterRarity, setFilterRarity] = useState('');
-  const [filterType, setFilterType] = useState('');
-  const [filterSupertype, setFilterSupertype] = useState('');
+  const [filterRarity, setFilterRarity] = useState([]);
+  const [filterType, setFilterType] = useState([]);
+  const [filterSubtype, setFilterSubtype] = useState([]);
+  const [filterSupertype, setFilterSupertype] = useState([]);
+  const [filterColors, setFilterColors] = useState([]);
+  const [colorMode, setColorMode] = useState('any');
+  const [filterIdentity, setFilterIdentity] = useState([]);
+  const [filterMv, setFilterMv] = useState([]);
+  const [showFilters, setShowFilters] = useState(false);
   const [sortBy, setSortBy] = useState('relevance');
 
   // Drawer states
@@ -124,9 +134,7 @@ function CardSearch({ onAddSuccess, showToast }) {
     setSearchError(null);
     if (!append) {
       setSearching(true);
-      setFilterType('');
-      setFilterRarity('');
-      setFilterSupertype('');
+      clearFilters();
       setSortBy('relevance');
       clearSelection();
       setTotal(null);
@@ -266,43 +274,27 @@ function CardSearch({ onAddSuccess, showToast }) {
     if (searching) runSearch(1, size);
   };
 
-  // Dynamically compute filters from search results
-  const uniqueRarities = useMemo(() => {
-    const set = new Set();
-    cards.forEach(c => { if (c.rarity) set.add(c.rarity); });
-    return Array.from(set).sort();
-  }, [cards]);
+  // Magic facets, offered only for values present in the loaded results.
+  const uniqueRarities = useMemo(() => sortRarities(Array.from(new Set(cards.map(c => c.rarity).filter(Boolean)))), [cards]);
+  const uniqueTypes = useMemo(() => CARD_TYPES.filter(ty => cards.some(c => cardTypes(c).includes(ty))), [cards]);
+  const uniqueSupertypes = useMemo(() => SUPERTYPES.filter(st => cards.some(c => cardSupertypes(c).includes(st))), [cards]);
+  const uniqueSubtypes = useMemo(() => uniqueSorted(cards, cardSubtypes), [cards]);
+  const uniqueMvs = useMemo(() => MANA_VALUES.filter(b => cards.some(c => mvBucket(c.cmc) === b)), [cards]);
 
-  const uniqueSupertypes = useMemo(() => {
-    const set = new Set();
-    cards.forEach(c => { if (c.supertype) set.add(c.supertype); });
-    return Array.from(set).sort();
-  }, [cards]);
-
-  const uniqueTypes = useMemo(() => {
-    const set = new Set();
-    cards.forEach(c => {
-      if (c.types) {
-        c.types.forEach(t => set.add(t));
-      }
-    });
-    return Array.from(set).sort();
-  }, [cards]);
+  const activeFilterCount = [filterColors, filterIdentity, filterType, filterSubtype, filterSupertype, filterMv, filterRarity]
+    .filter(v => v.length > 0).length;
+  function clearFilters() {
+    setFilterColors([]); setColorMode('any'); setFilterIdentity([]);
+    setFilterType([]); setFilterSubtype([]); setFilterSupertype([]); setFilterMv([]); setFilterRarity([]);
+  }
 
   // Apply filters and sorting
   const filteredAndSortedCards = useMemo(() => {
-    let result = [...cards];
-
-    // Apply filters
-    if (filterRarity) {
-      result = result.filter(c => c.rarity === filterRarity);
-    }
-    if (filterSupertype) {
-      result = result.filter(c => c.supertype === filterSupertype);
-    }
-    if (filterType) {
-      result = result.filter(c => c.types && c.types.includes(filterType));
-    }
+    let result = cards.filter(c => matchMtgFilters(c, {
+      colors: filterColors, colorMode, identity: filterIdentity,
+      cardTypes: filterType, subtypes: filterSubtype, supertypes: filterSupertype,
+      manaValues: filterMv, rarities: filterRarity,
+    }));
 
     // Apply sorting
     if (sortBy === 'name-asc') {
@@ -320,6 +312,12 @@ function CardSearch({ onAddSuccess, showToast }) {
         if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
         return a.number.localeCompare(b.number);
       });
+    } else if (sortBy === 'mv-asc') {
+      result.sort((a, b) => (a.cmc ?? 99) - (b.cmc ?? 99) || a.name.localeCompare(b.name));
+    } else if (sortBy === 'mv-desc') {
+      result.sort((a, b) => (b.cmc ?? -1) - (a.cmc ?? -1) || a.name.localeCompare(b.name));
+    } else if (sortBy === 'rarity-desc') {
+      result.sort((a, b) => RARITY_ORDER.indexOf(b.rarity) - RARITY_ORDER.indexOf(a.rarity) || a.name.localeCompare(b.name));
     } else if (sortBy === 'number-desc') {
       result.sort((a, b) => {
         const numA = parseInt(a.number, 10);
@@ -330,7 +328,7 @@ function CardSearch({ onAddSuccess, showToast }) {
     }
 
     return result;
-  }, [cards, filterRarity, filterSupertype, filterType, sortBy]);
+  }, [cards, filterColors, colorMode, filterIdentity, filterType, filterSubtype, filterSupertype, filterMv, filterRarity, sortBy]);
 
   // Tap: swallowed if a long-press just armed selection; otherwise toggle (in
   // select mode) or open Quick Add. Mirrors CollectionList.activateCard.
@@ -761,46 +759,78 @@ function CardSearch({ onAddSuccess, showToast }) {
       {/* Filters and Sorting Panel */}
       {!loading && cards.length > 0 && (
         <div className="glass-panel" style={{ marginBottom: '1.5rem', padding: '1rem' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.75rem', alignItems: 'end' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-              <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t('search.filterType')}</label>
-              <select className="select-control" value={filterType} onChange={e => setFilterType(e.target.value)}>
-                <option value="">{t('collection.allTypes')}</option>
-                {uniqueTypes.map(type => <option key={type} value={type}>{type}</option>)}
-              </select>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-              <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t('search.filterRarity')}</label>
-              <select className="select-control" value={filterRarity} onChange={e => setFilterRarity(e.target.value)}>
-                <option value="">{t('collection.allRarities')}</option>
-                {uniqueRarities.map(r => <option key={r} value={r}>{r}</option>)}
-              </select>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-              <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t('search.filterSupertype')}</label>
-              <select className="select-control" value={filterSupertype} onChange={e => setFilterSupertype(e.target.value)}>
-                <option value="">{t('collection.allSupertypes')}</option>
-                {uniqueSupertypes.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-              <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t('search.sortBy')}</label>
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <div className="search-field" style={{ flex: '1 1 150px' }}>
+              <span>{t('search.sortBy')}</span>
               <select className="select-control" value={sortBy} onChange={e => setSortBy(e.target.value)}>
-                {['relevance', 'name-asc', 'name-desc', 'price-asc', 'price-desc', 'number-asc', 'number-desc']
+                {['relevance', 'name-asc', 'name-desc', 'price-desc', 'price-asc', 'mv-asc', 'mv-desc', 'rarity-desc', 'number-asc', 'number-desc']
                   .map(key => <option key={key} value={key}>{t(`search.sort.${key}`)}</option>)}
               </select>
             </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-              <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t('search.cardsPerPage')}</label>
+            <div className="search-field" style={{ flex: '0 1 110px' }}>
+              <span>{t('search.cardsPerPage')}</span>
               <select className="select-control" value={pageSize} onChange={e => changePageSize(parseInt(e.target.value, 10))}>
                 {[30, 60, 120, 250].map(n => <option key={n} value={n}>{n}</option>)}
               </select>
             </div>
+            <button
+              type="button"
+              className={`btn ${showFilters ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setShowFilters(v => !v)}
+              aria-expanded={showFilters}
+              style={{ height: '40px', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}
+            >
+              <SlidersHorizontal size={15} /> {t('collection.filters')}
+              {activeFilterCount > 0 && <span className="filter-count">{activeFilterCount}</span>}
+            </button>
           </div>
+
+          {showFilters && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-glass)' }}>
+              <div className="mtg-color-row">
+                <div className="search-field">
+                  <span>{t('mtg.color')}</span>
+                  <ColorPicker label={t('mtg.color')} value={filterColors} onChange={setFilterColors} mode={colorMode} onModeChange={setColorMode} />
+                </div>
+                <div className="search-field">
+                  <span>{t('mtg.identity')}</span>
+                  <ColorPicker label={t('mtg.identity')} value={filterIdentity} onChange={setFilterIdentity} withColorless={false} />
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
+                <div className="search-field"><span>{t('mtg.cardType')}</span>
+                  <MultiSelectDropdown label={t('mtg.cardType')} allLabel={t('collection.allTypes')} value={filterType} onChange={setFilterType}
+                    options={uniqueTypes.map(v => ({ value: v, label: v }))} />
+                </div>
+                <div className="search-field"><span>{t('mtg.subtype')}</span>
+                  <MultiSelectDropdown label={t('mtg.subtype')} allLabel={t('mtg.allSubtypes')} value={filterSubtype} onChange={setFilterSubtype}
+                    options={uniqueSubtypes.map(v => ({ value: v, label: v }))} />
+                </div>
+                {uniqueSupertypes.length > 0 && (
+                  <div className="search-field"><span>{t('collection.fSupertype')}</span>
+                    <MultiSelectDropdown label={t('collection.fSupertype')} allLabel={t('collection.allSupertypes')} value={filterSupertype} onChange={setFilterSupertype}
+                      options={uniqueSupertypes.map(v => ({ value: v, label: v }))} />
+                  </div>
+                )}
+                <div className="search-field"><span>{t('collection.fManaValue')}</span>
+                  <MultiSelectDropdown label={t('collection.fManaValue')} allLabel={t('collection.allManaValues')} value={filterMv} onChange={setFilterMv}
+                    options={uniqueMvs.map(v => ({ value: v, label: v }))} />
+                </div>
+                <div className="search-field"><span>{t('collection.fRarity')}</span>
+                  <MultiSelectDropdown label={t('collection.fRarity')} allLabel={t('collection.allRarities')} value={filterRarity} onChange={setFilterRarity}
+                    options={uniqueRarities.map(v => ({ value: v, label: v }))} />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{t('mtg.loadedOnly')}</span>
+                {activeFilterCount > 0 && (
+                  <button type="button" className="btn btn-secondary" onClick={clearFilters} style={{ fontSize: '0.72rem', padding: '0.3rem 0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                    <X size={13} /> {t('collection.clearFilters')}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           <div style={{ marginTop: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
             <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
               {source && (
@@ -934,16 +964,9 @@ function CardSearch({ onAddSuccess, showToast }) {
 
       {/* Load More */}
       {!loading && hasMore && cards.length > 0 && (
-        <div style={{ display: 'flex', justifyContent: 'center', margin: '1.5rem 0' }}>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            disabled={loadingMore}
-            onClick={() => runSearch(page + 1)}
-          >
-            {loadingMore ? 'Loading...' : `Load ${pageSize} more`}
-          </button>
-        </div>
+        <LoadMore busy={loadingMore} onLoad={() => runSearch(page + 1)}>
+          {loadingMore ? t('common.loading') : t('search.loadMore', { count: pageSize })}
+        </LoadMore>
       )}
 
       {/* Filtered Empty State */}
@@ -979,7 +1002,7 @@ function CardSearch({ onAddSuccess, showToast }) {
                   {' • '}#{selectedCard.number})
                 </p>
               </div>
-              <button className="btn btn-secondary btn-icon-only" onClick={closeDrawer} style={{ borderRadius: '50%' }}>
+              <button className="btn btn-secondary btn-icon-only modal-close" onClick={closeDrawer} style={{ borderRadius: '50%' }}>
                 <X size={18} />
               </button>
             </div>

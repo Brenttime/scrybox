@@ -1,27 +1,43 @@
+import { useId } from 'react';
 import { useT } from '../utils/i18n';
 
+// The Scrybox mark: an orange deck box with three cards fanned out of it.
+// Same artwork as public/logo.svg and the PWA icons — keep them in sync.
+// useId keeps gradient ids unique when several logos share a page.
 export default function Logo({ style, className }) {
   const { t } = useT();
+  const uid = useId().replace(/:/g, '');
+  const or = `sbor${uid}`;
+  const bg = `sbbg${uid}`;
   return (
     <svg
-      viewBox="0 0 40 40"
-      fill="none"
+      viewBox="0 0 512 512"
       xmlns="http://www.w3.org/2000/svg"
       role="img"
       aria-label={t('common.logoAlt')}
       className={className}
       style={{ width: '100%', height: '100%', ...style }}
     >
-      <rect x="4" y="9" width="32" height="24" rx="2.5" fill="var(--logo-cover, #ff4747)" stroke="var(--logo-ring-stroke, #111)" strokeWidth="1.6"/>
-      <rect x="7" y="12" width="10" height="18" rx="1.5" fill="var(--logo-page-left, #ffd0d0)" stroke="var(--logo-ring-stroke, #111)" strokeWidth="1.2"/>
-      <rect x="23" y="12" width="10" height="18" rx="1.5" fill="var(--logo-page-right, #fff)" stroke="var(--logo-ring-stroke, #111)" strokeWidth="1.2"/>
-      <rect x="18.5" y="9" width="3" height="24" fill="var(--logo-spine, #c92f2f)" stroke="var(--logo-ring-stroke, #111)" strokeWidth="1"/>
-      <path d="M17 16.5 A3 3 0 0 1 23 16.5" fill="none" stroke="var(--logo-ring-stroke, #111)" strokeWidth="2.6" strokeLinecap="round"/>
-      <path d="M17 22 A3 3 0 0 1 23 22" fill="none" stroke="var(--logo-ring-stroke, #111)" strokeWidth="2.6" strokeLinecap="round"/>
-      <path d="M17 27.5 A3 3 0 0 1 23 27.5" fill="none" stroke="var(--logo-ring-stroke, #111)" strokeWidth="2.6" strokeLinecap="round"/>
-      <path d="M17 16.5 A3 3 0 0 1 23 16.5" fill="none" stroke="var(--logo-ring-inner, #fff)" strokeWidth="1.4" strokeLinecap="round"/>
-      <path d="M17 22 A3 3 0 0 1 23 22" fill="none" stroke="var(--logo-ring-inner, #fff)" strokeWidth="1.4" strokeLinecap="round"/>
-      <path d="M17 27.5 A3 3 0 0 1 23 27.5" fill="none" stroke="var(--logo-ring-inner, #fff)" strokeWidth="1.4" strokeLinecap="round"/>
+      <defs>
+        <linearGradient id={or} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#ffa45c" />
+          <stop offset="1" stopColor="#ff6a00" />
+        </linearGradient>
+        <linearGradient id={bg} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#1f2329" />
+          <stop offset="1" stopColor="#121417" />
+        </linearGradient>
+      </defs>
+      <rect width="512" height="512" rx="112" fill={`url(#${bg})`} />
+      <g transform="translate(256 300)">
+        <rect x="-70" y="-190" width="110" height="154" rx="12" fill="#1f2329" stroke="#3a3f48" strokeWidth="6" transform="rotate(-18)" />
+        <rect x="-55" y="-200" width="110" height="154" rx="12" fill="#252a31" stroke="#ffa45c" strokeWidth="6" />
+        <rect x="-40" y="-190" width="110" height="154" rx="12" fill="#1f2329" stroke="#3a3f48" strokeWidth="6" transform="rotate(18)" />
+        <path d="M0 -150 l12 28 28 12 -28 12 -12 28 -12 -28 -28 -12 28 -12z" fill={`url(#${or})`} />
+        <path d="M-140 -40 L140 -40 L120 120 L-120 120 Z" fill={`url(#${or})`} />
+        <path d="M-140 -40 L140 -40 L132 10 L-132 10 Z" fill="#000" opacity="0.18" />
+        <rect x="-44" y="30" width="88" height="14" rx="7" fill="#1a0e04" opacity="0.55" />
+      </g>
     </svg>
   );
 }

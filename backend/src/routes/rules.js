@@ -116,6 +116,79 @@ async function getRules(force) {
   }
 }
 
+
+// ---------------------------------------------------------------- keywords
+// Every keyword action (CR 701) and keyword ability (CR 702) with its rules
+// and the reminder text printed on real cards. Reminder text isn't in the CR;
+// it's mined from card_cache.oracle_text ("Flying (This creature can't be
+// blocked...)") and the most common wording wins. Keywords with a number or
+// cost ("Ward {2}", "Toxic 1") get that normalised to N so they group.
+let kwMem = null;
+const norm = s => s.toLowerCase().replace(/[’']/g, "'").trim();
+
+async function mineReminders(names) {
+  const db = require('../db');
+  const want = new Map(names.map(n => [norm(n), n]));
+  const tally = new Map(); // key -> Map(reminder -> count)
+  const cards = new Map();  // key -> count of cards
+  const rows = await db.all("SELECT oracle_text FROM card_cache WHERE oracle_text LIKE '%(%'");
+  // A reminder is "<Keyword>[ cost/N] (<text>)" at the start of a line. Take the
+  // words before the paren and back off one word at a time until they name a
+  // keyword, so "Cumulative upkeep {1}" and "Flying" both resolve.
+  const re = /(?:^|\n)([A-Z][^\n(]{0,60}?) \(([^()]{8,400})\)/g;
+  for (const { oracle_text: t } of rows) {
+    const seen = new Set();
+    for (const m of t.matchAll(re)) {
+      const words = norm(m[1]).replace(/[—–-]/g, ' ').split(/\s+/).filter(Boolean);
+      let key = '';
+      for (let n = Math.min(words.length, 5); n > 0 && !key; n--) {
+        const k = words.slice(0, n).join(' ');
+        if (want.has(k)) key = k;
+      }
+      if (!key) continue;
+      const rem = m[2];
+      if (!tally.has(key)) tally.set(key, new Map());
+      tally.get(key).set(rem, (tally.get(key).get(rem) || 0) + 1);
+      if (!seen.has(key)) { seen.add(key); cards.set(key, (cards.get(key) || 0) + 1); }
+    }
+  }
+  const out = {};
+  for (const [key, m] of tally) {
+    const top = [...m.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    out[key] = { reminder: top, cards: cards.get(key) || 0 };
+  }
+  return out;
+}
+
+async function buildKeywords() {
+  const data = await getRules(false);
+  const cr = data.rules.filter(r => r.src === 'Comprehensive');
+  const heads = cr.filter(r => /^70[12]\.\d+$/.test(r.id) && !['701.1', '702.1'].includes(r.id)
+    && r.text.length < 60 && !/^(General|Keyword)/i.test(r.text));
+  const mined = await mineReminders(heads.map(h => h.text));
+  const keywords = heads.map(h => {
+    const sub = cr.filter(r => new RegExp(`^${h.id.replace('.', '\\.')}[a-z]$`).test(r.id)).map(r => ({ id: r.id, text: r.text }));
+    const m = mined[norm(h.text)] || {};
+    return {
+      name: h.text, id: h.id,
+      kind: h.id.startsWith('701') ? 'action' : 'ability',
+      reminder: m.reminder || null, summary: sub[0] ? sub[0].text : '', cards: m.cards || 0, rules: sub,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  return { fetched: data.fetched, crVersion: data.crVersion, keywords };
+}
+
+router.get('/keywords', async (req, res) => {
+  try {
+    const data = await getRules(false);
+    if (!kwMem || kwMem.fetched !== data.fetched || 'refresh' in req.query) kwMem = await buildKeywords();
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.json(kwMem);
+  } catch (err) {
+    res.status(502).json({ error: `Could not load keywords: ${err.message}` });
+  }
+});
+
 router.get('/', async (req, res) => {
   try {
     res.set('Cache-Control', 'private, max-age=3600');
@@ -128,3 +201,4 @@ router.get('/', async (req, res) => {
 module.exports = router;
 module.exports.parseCR = parseCR;
 module.exports.parseCommander = parseCommander;
+module.exports.mineReminders = mineReminders;

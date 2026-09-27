@@ -477,7 +477,16 @@ const frontendBuildPath = path.join(__dirname, '../../frontend/dist');
 // included — which on a phone is the difference between an instant open and a
 // wait. index.html is served by the catch-all below and stays uncached, so a
 // deploy is still picked up immediately.
-app.use(express.static(frontendBuildPath, { maxAge: '1y', immutable: true, index: false }));
+// Only /assets/ is content-hashed. Everything else in public/ (logo, manifest,
+// PWA icons) keeps a fixed name, so it must revalidate or an icon change never
+// reaches phones that already cached it.
+app.use(express.static(frontendBuildPath, {
+  index: false,
+  setHeaders(res, file) {
+    const hashed = file.includes(`${path.sep}assets${path.sep}`);
+    res.setHeader('Cache-Control', hashed ? 'public, max-age=31536000, immutable' : 'no-cache');
+  },
+}));
 
 // Catch-all route to serve Index.html in production
 app.get('*', (req, res, next) => {

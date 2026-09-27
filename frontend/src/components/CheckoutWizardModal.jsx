@@ -86,7 +86,7 @@ const CheckoutWizardModal = ({ locationsData, mode = 'checkout', onClose, onCanc
               <h2 style={{ fontSize: '1.35rem', color: 'var(--text-strong)', fontWeight: 800, margin: '0 0 0.25rem 0' }}>{t(`wizard.${kind}.title`)}</h2>
               <p style={{ color: 'var(--text-secondary)', margin: 0, fontSize: '0.85rem' }}>{t(`wizard.${kind}.subtitle`)}</p>
             </div>
-            <button className="btn btn-secondary btn-icon-only" onClick={cancel} aria-label={t('common.cancel')}>
+            <button className="btn btn-secondary btn-icon-only modal-close" onClick={cancel} aria-label={t('common.cancel')}>
               <X size={16} />
             </button>
           </div>

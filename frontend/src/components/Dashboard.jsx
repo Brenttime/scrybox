@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { TrendingUp, Coins, Library, Trophy, Plus, ArrowUpRight, Mountain, BookOpen } from 'lucide-react';
+import { TrendingUp, Coins, Library, Trophy, Plus, ArrowUpRight, Mountain, BookOpen, Sparkles } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { getPrintingBadgeLabel, getPrintingBadgeStyle } from '../utils/cardPrinting';
@@ -152,6 +152,9 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
         </button>
         <button type="button" className="btn btn-secondary" onClick={() => onNavigate && onNavigate('limited')}>
           <Mountain size={16} /> {t('nav.limited')}
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={() => onNavigate && onNavigate('keywords')}>
+          <Sparkles size={16} /> {t('kw.title')}
         </button>
       </div>
       {/* Metrics Summary Grid */}

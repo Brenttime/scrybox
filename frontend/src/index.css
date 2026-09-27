@@ -37,12 +37,6 @@
     radial-gradient(at 100% 100%, rgba(239, 68, 68, 0.1) 0px, transparent 50%),
     radial-gradient(at 50% 50%, rgba(20, 28, 47, 0.95) 0px, var(--bg-primary) 100%);
 
-  --logo-cover: #ff4747;
-  --logo-spine: #c92f2f;
-  --logo-page-left: #ffd0d0;
-  --logo-page-right: #ffffff;
-  --logo-ring-stroke: #111111;
-  --logo-ring-inner: #ffffff;
 
   /* Shadows and Transitions */
   --shadow-glow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
@@ -406,7 +400,6 @@ button, input, select, textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  animation: logo-float 3s ease-in-out infinite;
 }
 
 .logo-icon svg,
@@ -1639,7 +1632,18 @@ button, input, select, textarea {
   .nav-tabs.mobile-hide-tabs {
     display: none !important;
   }
+  /* App shell: the document never scrolls on phones; this fixed frame does.
+     Sticky header + fixed tab bar then have nothing under them that can move,
+     so iOS toolbar resize / rubber-band can no longer drag them off-screen. */
+  html, body { height: 100%; overflow: hidden; }
   .app-container {
+    position: fixed;
+    inset: 0;
+    min-height: 0 !important;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
     /* header owns the top inset now (it's sticky and covers the status bar) */
     padding-top: 0 !important;
     padding-left: calc(0.75rem + max(env(safe-area-inset-left, 0px), var(--sal, 0px))) !important;
@@ -2042,3 +2046,5 @@ button, input, select, textarea {
   font-variant-numeric: tabular-nums;
   pointer-events: none;
 }
+
+@keyframes ptr-spin { to { transform: rotate(360deg); } }
