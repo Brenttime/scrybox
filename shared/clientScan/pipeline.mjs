@@ -214,6 +214,43 @@ function stripInFrame(m, r, w, h) {
   return true;
 }
 
+// Recognizer input: a per-length reusable Float32Array (the batch shapes repeat
+// frame after frame: 2x3x48x401, 6x3x48x320, ...), zeroed before reuse so the
+// right padding stays exactly 0, and a 256-entry normalisation table. Safe to
+// reuse: each run is awaited before the next batch is packed. Bounded.
+const REC_LUT = Float32Array.from({ length: 256 }, (_, v) => v / 127.5 - 1);
+const recBufs = new Map();
+function recBuffer(len) {
+  let b = recBufs.get(len);
+  if (b) { b.fill(0); return b; }
+  if (recBufs.size >= 8) recBufs.delete(recBufs.keys().next().value);
+  b = new Float32Array(len);
+  recBufs.set(len, b);
+  return b;
+}
+
+// Pack strips idx (RGB, height REC_H) into one NCHW BGR batch of width W.
+export function packRecBatch(strips, idx, W) {
+  const plane = REC_H * W;
+  const data = recBuffer(idx.length * 3 * plane);
+  idx.forEach((si, n) => {
+    const s = strips[si];
+    const rw = Math.min(W, s.w);
+    // RapidOCR feeds BGR (the sidecar converts RGB->BGR before text_rec).
+    // REC_LUT[v] is the same float32 as v / 127.5 - 1 (R2-#5).
+    const src = s.data, b0 = n * 3 * plane;
+    for (let y = 0; y < REC_H; y++) {
+      let p = y * s.w * 3, o = b0 + y * W;
+      for (let x = 0; x < rw; x++, p += 3, o++) {
+        data[o] = REC_LUT[src[p + 2]];
+        data[o + plane] = REC_LUT[src[p + 1]];
+        data[o + 2 * plane] = REC_LUT[src[p]];
+      }
+    }
+  });
+  return data;
+}
+
 // RapidOCR TextRecognizer: sort by aspect, batches of 6, each padded (zeros,
 // i.e. mid-grey after normalisation) to the batch's widest ratio, min 320/48.
 async function recognize(env, strips) {
@@ -225,21 +262,7 @@ async function recognize(env, strips) {
     let maxRatio = 320 / REC_H;
     for (const i of idx) maxRatio = Math.max(maxRatio, strips[i].w / strips[i].h);
     const W = Math.trunc(REC_H * maxRatio);
-    const plane = REC_H * W;
-    const data = new Float32Array(idx.length * 3 * plane);
-    idx.forEach((si, n) => {
-      const s = strips[si];
-      const rw = Math.min(W, s.w);
-      // RapidOCR feeds BGR (the sidecar converts RGB->BGR before text_rec).
-      for (let y = 0; y < REC_H; y++) {
-        for (let x = 0; x < rw; x++) {
-          const p = (y * s.w + x) * 3, o = n * 3 * plane + y * W + x;
-          data[o] = s.data[p + 2] / 127.5 - 1;
-          data[o + plane] = s.data[p + 1] / 127.5 - 1;
-          data[o + 2 * plane] = s.data[p] / 127.5 - 1;
-        }
-      }
-    });
+    const data = packRecBatch(strips, idx, W);
     const res = await env.rec.run({ [env.rec.inputNames[0]]: new env.ort.Tensor('float32', data, [idx.length, 3, REC_H, W]) });
     const pred = res[env.rec.outputNames[0]];
     const [, steps, classes] = pred.dims;

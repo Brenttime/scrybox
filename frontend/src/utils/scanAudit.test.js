@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIndex, voteFooter, resolveFooter } from '../../../shared/clientScan/text.mjs';
 import { needsServer, NO_TITLE_ESCAPE } from './fastScan.js';
-import { createReader, corneliusTensor, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
+import { createReader, corneliusTensor, CORN_SIZE, packRecBatch } from '../../../shared/clientScan/pipeline.mjs';
 
 // Regressions from the 2026-09 scanner audit.
 
@@ -435,4 +435,24 @@ test('footer rescue stage: a misread number is never snapped to the nearest inde
   const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 3 ? 'lea 169' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+test('recognizer packing: LUT + reused buffers are bit-identical to the reference, padding stays 0 (R2-5)', () => {
+  const REC_H = 48;
+  const strip = (w, seed) => { const d = new Uint8Array(w * REC_H * 3); for (let i = 0; i < d.length; i++) d[i] = (i * 31 + seed * 17) & 255; return { data: d, w, h: REC_H }; };
+  const ref = (strips, idx, W) => {
+    const plane = REC_H * W, data = new Float32Array(idx.length * 3 * plane);
+    idx.forEach((si, n) => { const s = strips[si], rw = Math.min(W, s.w);
+      for (let y = 0; y < REC_H; y++) for (let x = 0; x < rw; x++) { const p = (y * s.w + x) * 3, o = n * 3 * plane + y * W + x;
+        data[o] = s.data[p + 2] / 127.5 - 1; data[o + plane] = s.data[p + 1] / 127.5 - 1; data[o + 2 * plane] = s.data[p] / 127.5 - 1; } });
+    return data;
+  };
+  // Same shape twice with different (narrower) content: stale values from the
+  // first pack must not survive in the padding.
+  const a = [strip(401, 1), strip(380, 2)], b = [strip(200, 3), strip(150, 4)];
+  const pa = Float32Array.from(packRecBatch(a, [0, 1], 401));
+  assert.deepEqual(pa, ref(a, [0, 1], 401));
+  const pb = packRecBatch(b, [0, 1], 401);
+  assert.deepEqual(Float32Array.from(pb), ref(b, [0, 1], 401));
+  for (let v = 0; v < 256; v++) assert.ok(Object.is(Math.fround(v / 127.5 - 1), Float32Array.of(v / 127.5 - 1)[0]));
 });
