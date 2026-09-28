@@ -20,6 +20,8 @@ let timer = null;
 let deviceInfo = null;
 let seq = 0;
 const session = Math.random().toString(36).slice(2, 10);
+// Which bundle produced a record (R2 measurement fix): version + build stamp.
+const BUILD = `${import.meta.env?.VITE_APP_VERSION || '?'}+${import.meta.env?.VITE_SCAN_BUILD || 'dev'}`;
 
 function enabled() {
   try { return localStorage.getItem('scan.telemetry') !== '0'; } catch { return true; }
@@ -69,7 +71,7 @@ let emptyCount = 0;
 export const scanTelemetry = {
   device(info) { deviceInfo = info; },
   begin({ mode, sw, sh }) {
-    const rec = { id: `${session}-${++seq}`, t: new Date().toISOString(), mode, video: [sw, sh], ms: {} };
+    const rec = { id: `${session}-${++seq}`, t: new Date().toISOString(), mode, video: [sw, sh], ms: {}, build: BUILD };
     let done = false;
     return {
       id: rec.id,
@@ -87,6 +89,9 @@ export const scanTelemetry = {
           status: c ? c.status : 'no card',
           sharp: c?.sharpness,
           still: c?.still,
+          dup: c?.duplicate || undefined,
+          fast_settle: c?.fast_settle || undefined,
+          edge: c?.edge_sides,
           near_edge: c?.near_edge || undefined,
           partial: r?.near_edge_partial || undefined,
           quad: c?.near_edge ? c.quad?.map(p => p.map(Math.round)) : undefined,
