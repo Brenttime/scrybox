@@ -34,8 +34,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   const [printing, setPrinting] = useState('Normal');
   const [language, setLanguage] = useState('English');
   const [purchasePrice, setPurchasePrice] = useState(0);
-  const [isTrade, setIsTrade] = useState(0);
-  const [notes, setNotes] = useState('');
   const [isFullScreen, setIsFullScreen] = useState(false);
   // Rules text, fetched per card (not per collection row) so the list payload
   // stays lean. null = not loaded / none.
@@ -83,8 +81,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
     setPrinting(card.printing || 'Normal');
     setLanguage(card.language || 'English');
     setPurchasePrice(card.purchase_price || 0);
-    setIsTrade(card.is_trade ? 1 : 0);
-    setNotes(card.notes || '');
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset form only when the entry changes, not on every card mutation
   }, [targetEntryId, startInEdit]);
 
@@ -115,8 +111,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
           printing,
           language,
           purchase_price: parseFloat(purchasePrice) || 0,
-          is_trade: isTrade ? 1 : 0,
-          notes
         })
       });
       if (res.ok) {
@@ -125,8 +119,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
         card.printing = printing;
         card.language = language;
         card.purchase_price = parseFloat(purchasePrice) || 0;
-        card.is_trade = isTrade ? 1 : 0;
-        card.notes = notes;
         // The server resolves this per printing on the next fetch; mirror it here so
         // a screen still holding this object does not show the old printing's price.
         card.price_trend = resolveCardPrice(card, printing);
@@ -410,35 +402,58 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
           ) : null}
 
           {mode === 'edit' ? (
-            <form onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'rgba(255,255,255,0.02)', padding: '0.6rem 0.9rem', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
-                <input type="checkbox" checked={isTrade === 1} onChange={(e) => setIsTrade(e.target.checked ? 1 : 0)} id="isTrade" style={{ width: '16px', height: '16px', cursor: 'pointer' }} />
-                <label htmlFor="isTrade" style={{ cursor: 'pointer', margin: 0, fontWeight: 700, color: 'var(--text-strong)', fontSize: '0.85rem' }}>
-                  {t('inspector.listedInTrade')}
-                </label>
-              </div>
-
-              <CardEntryFields
-                quantity={q} purchasePrice={purchasePrice} condition={condition} printing={printing} language={language}
-                onQuantity={setQ} onPurchasePrice={setPurchasePrice} onCondition={setCondition} onPrinting={setPrinting} onLanguage={setLanguage}
-              />
-
-              <div className="form-group">
-                <label>{t('inspector.notes')}</label>
-                <textarea
-                  className="input-control"
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder={t('inspector.notesPlaceholder')}
-                  rows={3}
-                  style={{ resize: 'vertical', fontFamily: 'inherit' }}
+            <form onSubmit={handleSave} className="ci-edit-form" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <section>
+                <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '0.4rem' }}>{t('inspector.editCopy')}</div>
+                <CardEntryFields
+                  quantity={q} purchasePrice={purchasePrice} condition={condition} printing={printing} language={language}
+                  onQuantity={setQ} onPurchasePrice={setPurchasePrice} onCondition={setCondition} onPrinting={setPrinting} onLanguage={setLanguage}
                 />
+              </section>
+
+              <section>
+                <button type="button" className="btn btn-secondary ci-change-printing-btn" style={{ width: '100%', padding: '0.65rem 1rem' }} onClick={() => (prints === null ? openPrintings() : setPrints(null))}>
+                  {t('scan.changePrinting')}
+                </button>
+                {prints !== null && (
+                  <div className="ci-printings" style={{ marginTop: '0.5rem', border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 700 }}>
+                      <span>{t('scan.changePrinting')}{Array.isArray(prints) ? ` · ${prints.length}` : ''}</span>
+                      <button type="button" className="btn btn-secondary btn-icon-only" style={{ padding: '0.25rem' }} onClick={() => setPrints(null)} aria-label={t('common.close')}><X size={14} /></button>
+                    </div>
+                    {prints === 'loading' ? (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('fastscan.loadingPrintings')}</div>
+                    ) : prints.length === 0 ? (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('scan.noOtherPrintings')}</div>
+                    ) : (
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(84px, 1fr))', gap: '0.5rem', maxHeight: '320px', overflowY: 'auto' }}>
+                        {prints.map(c => (
+                          <button
+                            key={c.id}
+                            type="button"
+                            disabled={printBusy}
+                            onClick={() => choosePrinting(c)}
+                            aria-pressed={c.id === card.card_id}
+                            style={{ background: 'none', border: c.id === card.card_id ? '2px solid var(--accent-yellow)' : '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.2rem', cursor: 'pointer', color: 'inherit', textAlign: 'center' }}
+                          >
+                            {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" style={{ width: '100%', borderRadius: '4px', display: 'block' }} /> : null}
+                            <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>{String(c.set_id || '').toUpperCase()} · #{c.number}</div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <div style={{ display: 'flex', gap: '0.75rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => { setPrints(null); setMode('view'); }} style={{ flex: 1, padding: '0.7rem' }}>{t('common.cancel')}</button>
+                <button type="submit" className="btn btn-primary" style={{ flex: 2, padding: '0.7rem', fontWeight: 700 }}>{t('inspector.saveChanges')}</button>
               </div>
 
-              <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.25rem' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => setMode('view')} style={{ flex: 1 }}>{t('common.cancel')}</button>
-                <button type="submit" className="btn btn-primary" style={{ flex: 2 }}>{t('inspector.saveChanges')}</button>
-              </div>
+              <button type="button" className="btn btn-danger ci-delete-btn" onClick={handleDelete} style={{ width: '100%', padding: '0.6rem', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}>
+                <Trash2 size={15} /> {t('inspector.deleteCard')}
+              </button>
             </form>
           ) : (
             <>
@@ -485,61 +500,13 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 </div>
               )}
 
-              {/* Main Actions Row: a compact Edit button + Delete. */}
-              {!readOnly && <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                <button className="btn btn-primary ci-edit-btn" style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }} onClick={() => setMode('edit')}>
+              {/* One clear entry point: every per-copy change lives in Edit. */}
+              {!readOnly && (
+                <button type="button" className="btn btn-primary ci-edit-btn" style={{ width: '100%', padding: '0.8rem 1rem', fontSize: '0.95rem', fontWeight: 700 }} onClick={() => setMode('edit')}>
                   {t('inspector.editCard')}
                 </button>
-
-                <button
-                  type="button"
-                  className="btn btn-secondary ci-change-printing-btn"
-                  style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }}
-                  onClick={openPrintings}
-                >
-                  {t('scan.changePrinting')}
-                </button>
-
-                <button
-                  type="button"
-                  className="btn btn-danger btn-icon-only"
-                  style={{ borderRadius: 'var(--radius-sm)', padding: '0.6rem' }}
-                  onClick={handleDelete}
-                  title={t('inspector.deleteCard')}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>}
-
-              {!readOnly && prints !== null && (
-                <div className="ci-printings" style={{ border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 700 }}>
-                    <span>{t('scan.changePrinting')}{Array.isArray(prints) ? ` · ${prints.length}` : ''}</span>
-                    <button type="button" className="btn btn-secondary btn-icon-only" style={{ padding: '0.25rem' }} onClick={() => setPrints(null)} aria-label={t('common.close')}><X size={14} /></button>
-                  </div>
-                  {prints === 'loading' ? (
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('fastscan.loadingPrintings')}</div>
-                  ) : prints.length === 0 ? (
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('scan.noOtherPrintings')}</div>
-                  ) : (
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(84px, 1fr))', gap: '0.5rem', maxHeight: '320px', overflowY: 'auto' }}>
-                      {prints.map(c => (
-                        <button
-                          key={c.id}
-                          type="button"
-                          disabled={printBusy}
-                          onClick={() => choosePrinting(c)}
-                          aria-pressed={c.id === card.card_id}
-                          style={{ background: 'none', border: c.id === card.card_id ? '2px solid var(--accent-yellow)' : '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.2rem', cursor: 'pointer', color: 'inherit', textAlign: 'center' }}
-                        >
-                          {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" style={{ width: '100%', borderRadius: '4px', display: 'block' }} /> : null}
-                          <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>{String(c.set_id || '').toUpperCase()} · #{c.number}</div>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
               )}
+
             </>
           )}
         </div>
