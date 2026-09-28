@@ -1174,7 +1174,8 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       {/* Filter Panel */}
       <div className="glass-panel" style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem' }}>
         {/* Always-visible top bar: search + sort + filters toggle */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 2.5fr) minmax(150px, 1fr) auto', gap: '0.75rem', alignItems: 'flex-end' }}>
+        {/* Search sits on its own row above sort + filters. */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
           <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'flex-end', minWidth: 0 }}>
             <Field label={t('collection.searchLabel')} style={{ flex: 1 }}>
               {/* One box, two languages: plain card name/number/set, or
@@ -1202,6 +1203,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
             </Field>
           </div>
 
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, 1fr) auto', gap: '0.75rem', alignItems: 'flex-end' }}>
           <Field label={t('collection.sortBy')}>
             <select className="select-control" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
               {['added-newest', 'added-oldest', 'name-asc', 'name-desc', 'price-desc', 'price-asc', 'qty-desc', 'set-asc', 'number-asc', 'type-asc', 'rarity-desc', 'rarity-asc', 'language-asc']
@@ -1222,6 +1224,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
               </span>
             )}
           </button>
+          </div>
         </div>
 
         {showFilters && (
