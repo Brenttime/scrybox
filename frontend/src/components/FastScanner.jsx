@@ -35,6 +35,8 @@ const EDGE_HINT = {
 // With rVFC, the shortest pause before waiting for the next decoded frame:
 // yields the main thread (tray, overlay) between passes.
 const AUTO_FRAME_MIN_MS = 8;
+const AUTO_FRAME_MAX_EXTRA_MS = 40;
+const FAST_DEVICE = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 8);
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
 // The tray is capped for render cost, but unsent scans are never dropped to
 // make room: at the cap, auto pauses and asks for a Send instead.
@@ -513,11 +515,16 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     // Backoff, idle (no card) and errors keep their timers. No rVFC (older
     // iOS/Android WebViews): timers exactly as before.
     const shortWait = !r.backoff && !r.none && !r.error && !r.busy;
-    if (shortWait && v && frameClock(v)) {
-      const since = lastCapturedFrame();
+    // Desktop-class devices (the ones that already used the 25 ms gate gap)
+    // look again after AUTO_FRAME_MIN_MS; phones keep their cadence and only
+    // skip a repeated frame (bounded extra wait), so battery/heat is unchanged.
+    const since = lastCapturedFrame();
+    if (shortWait && v && since != null && frameClock(v)) {
+      const first = FAST_DEVICE ? Math.min(wait, AUTO_FRAME_MIN_MS) : wait;
       timerRef.current = setTimeout(() => {
-        newFrameAfter(v, since, Math.max(0, wait - AUTO_FRAME_MIN_MS)).then(() => autoLoop(gen));
-      }, Math.min(wait, AUTO_FRAME_MIN_MS));
+        newFrameAfter(v, since, FAST_DEVICE ? Math.max(0, wait - first) : AUTO_FRAME_MAX_EXTRA_MS)
+          .then(() => { if (autoRef.current && gen === runRef.current) autoLoop(gen); });
+      }, first);
       return;
     }
     timerRef.current = setTimeout(() => autoLoop(gen), wait);

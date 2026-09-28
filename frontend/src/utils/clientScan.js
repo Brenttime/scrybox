@@ -123,13 +123,15 @@ export function resetOnDevice() {
 // frame it drew and the auto loop can wait for a new one instead of sampling
 // the same pixels twice. Without it (older WebViews) frameId stays null and
 // everything runs on timers exactly as before.
-const clocks = new WeakMap();   // video -> {frames, mediaTime, waiters}
+const clocks = new WeakMap();
+const FRAME_CLOCK_STALE_MS = 500;   // video -> {frames, mediaTime, waiters}
 export function frameClock(video) {
   if (!video || typeof video.requestVideoFrameCallback !== 'function') return null;
   let c = clocks.get(video);
   if (c) return c;
-  c = { frames: 0, mediaTime: null, waiters: [] };
+  c = { frames: 0, mediaTime: null, waiters: [], at: 0 };
   const tick = (_now, meta) => {
+    c.at = performance.now();
     c.frames = meta?.presentedFrames ?? c.frames + 1;
     c.mediaTime = meta?.mediaTime ?? null;
     const w = c.waiters; c.waiters = [];
@@ -144,7 +146,7 @@ export function frameClock(video) {
 // maxMs (never waits forever: a paused stream must not stall auto).
 export function newFrameAfter(video, since, maxMs) {
   const c = frameClock(video);
-  if (!c || c.frames !== since) return Promise.resolve();
+  if (!c || since == null || c.frames !== since) return Promise.resolve();
   return new Promise((resolve) => {
     const timer = setTimeout(done, maxMs);
     function done() { clearTimeout(timer); resolve(); }
@@ -178,9 +180,13 @@ async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   let t = performance.now();
   const lap = (k) => { const n = performance.now(); span[k] = Math.round(n - t); t = n; };
   // The frame the canvases are about to draw (the latest presented one).
-  const frameId = clock ? clock.frames : null;
+  // A clock that has not ticked recently (rVFC present but not firing for
+  // this stream, a paused track) must not make every capture look like a
+  // duplicate: fall back to no frame id, i.e. the timer path.
+  const live = clock && clock.at && performance.now() - clock.at < FRAME_CLOCK_STALE_MS;
+  const frameId = live ? clock.frames : null;
   lastFrameId = frameId;
-  if (clock) { span.frame_id = frameId; if (clock.mediaTime != null) span.media_ms = Math.round(clock.mediaTime * 1000); }
+  if (live) { span.frame_id = frameId; if (clock.mediaTime != null) span.media_ms = Math.round(clock.mediaTime * 1000); }
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
   const small = pixels(sc, CORN_SIZE, CORN_SIZE);
