@@ -76,16 +76,21 @@ export default function CardEntryFields({
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem' }}>{Quantity}{Price}</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '0.75rem', alignItems: 'end' }}>
           <div className="form-group">
-            <label>{t('card.foil')}</label>
+            <label>{t('card.finish')}</label>
+            {/* A chip that names the current finish; tapping flips it. */}
             <button
               type="button"
-              role="switch"
-              aria-checked={foil}
-              className="ci-foil-toggle"
+              className="ci-foil-chip"
+              aria-pressed={foil}
               onClick={() => onPrinting(foil ? 'Normal' : 'Holofoil')}
-              style={{ width: '52px', height: '30px', borderRadius: '999px', border: '1px solid var(--border-glass)', background: foil ? 'var(--accent-yellow)' : 'rgba(255,255,255,0.08)', position: 'relative', cursor: 'pointer', padding: 0, transition: 'background 0.15s' }}
+              style={{
+                height: '40px', padding: '0 1rem', borderRadius: '999px', cursor: 'pointer', fontWeight: 700, fontSize: '0.85rem', whiteSpace: 'nowrap',
+                border: foil ? '1px solid var(--accent-yellow)' : '1px solid var(--border-glass)',
+                background: foil ? 'linear-gradient(135deg, rgba(255,215,0,0.25), rgba(180,120,255,0.25), rgba(0,200,255,0.25))' : 'rgba(255,255,255,0.04)',
+                color: foil ? 'var(--text-strong)' : 'var(--text-secondary)',
+              }}
             >
-              <span style={{ position: 'absolute', top: '3px', left: foil ? '25px' : '3px', width: '22px', height: '22px', borderRadius: '50%', background: '#fff', transition: 'left 0.15s' }} />
+              {foil ? t('card.foil') : t('card.nonfoil')}
             </button>
           </div>
           {Language}
