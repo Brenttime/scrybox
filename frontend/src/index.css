@@ -1902,6 +1902,8 @@ button, input, select, textarea {
 .fs-hint { position: absolute; left: 50%; bottom: 112px; transform: translateX(-50%); z-index: 3; padding: 8px 14px; border-radius: 999px; font: 500 13px/1.2 -apple-system, system-ui, sans-serif; color: #f9fafb; background: rgba(12,16,26,.6); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); white-space: nowrap; max-width: 90%; overflow: hidden; text-overflow: ellipsis; }
 .fs-hint.is-error { color: #fecaca; background: rgba(127,29,29,.6); }
 .fs-card.is-pending { opacity: .6; }
+.fs-card.is-failed { opacity: .85; outline: 2px solid rgba(248,113,113,.7); outline-offset: -2px; }
+.fs-card.is-failed .fs-card-art { animation: none; }
 .fs-card.is-pending .fs-card-art { animation: fs-pending 1.2s ease-in-out infinite alternate; }
 @keyframes fs-pending { from { filter: brightness(.8); } to { filter: brightness(1.05); } }
 .fs-dock { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; display: flex; align-items: center; justify-content: center; gap: 36px; padding: 18px 0 22px; background: linear-gradient(to top, rgba(0,0,0,.55), transparent); }

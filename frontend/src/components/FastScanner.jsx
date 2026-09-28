@@ -35,6 +35,7 @@ const EDGE_HINT = {
 // With rVFC, the shortest pause before waiting for the next decoded frame:
 // yields the main thread (tray, overlay) between passes.
 const AUTO_FRAME_MIN_MS = 8;
+const HYDRATE_RETRY_MS = [1000, 3000, 10000, 30000];
 const AUTO_FRAME_MAX_EXTRA_MS = 40;
 const FAST_DEVICE = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 8);
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
@@ -73,14 +74,17 @@ const rowPriceOf = (row) => { const p = usdPrice(row.card, printingOf(row)); ret
 // One tray card, memoized (R2-#12): an auto pass that adds or updates one
 // row no longer re-renders every row of a long tray. Props are the row object
 // (replaced only when that row changes) and stable callbacks.
-const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPatch }) {
+const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPatch, onRetry }) {
   const price = rowPriceOf(row);
   return (
-<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}`} aria-busy={row.pending || undefined}>
+<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}`} aria-busy={row.pending || undefined}>
         <div className="fs-card-art">
           {row.card.image_url ? <img src={row.card.image_url} alt="" loading="lazy" /> : null}
           {!row.sent && !row.pending && (
             <button type="button" className="fs-card-edit" onClick={() => onEdit(row)} aria-label={t('fastscan.changePrinting')} />
+          )}
+          {row.pending && row.hydrateFailed && (
+            <button type="button" className="fs-card-edit fs-card-retry" onClick={() => onRetry(row)} aria-label={t('fastscan.hydrateRetry')} title={t('fastscan.hydrateRetry')} />
           )}
           <button type="button" className="fs-card-x" onClick={() => onDismiss(row.key)} aria-label={t('fastscan.dismiss')}><X size={12} /></button>
           {price != null && <span className="fs-card-price">{priceText(price, 'USD')}</span>}
@@ -129,8 +133,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> {at, place, broken} (auto de-dupe)
   const presRef = useRef(null);         // current presentation (one card in view), for telemetry
+  const epochRef = useRef(0);           // last presentation epoch handed out this run (monotonic)
   const hydrateAbortRef = useRef(null); // background hydrations, aborted on unmount only
-  const hydrateFailedRef = useRef(new Set()); // ids whose background hydration failed: next time, inline + server fallback
   const onDeviceRef = useRef(false);
   const edgeRunRef = useRef(null);   // consecutive near-edge partials, same place
   const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
@@ -301,25 +305,29 @@ export default function FastScanner({ onAddSuccess, showToast }) {
 
   // Background hydration of a pending tray row (R2-#13). Shared with any
   // other pass that proves the same id (hydrateResults dedupes in flight).
-  // On failure the row is removed and the card forgotten, so the next pass
-  // re-proves it and takes the inline path (server fallback on failure).
-  const hydrateRow = useCallback((row) => {
+  // A failure never drops the proven card (review R1-B4): the row stays in
+  // the tray, unsendable, marked failed, and is retried with backoff (and on
+  // tap) until it hydrates or the user dismisses it.
+  const hydrateRow = useCallback((row, attempt = 0) => {
     const ctl = hydrateAbortRef.current || (hydrateAbortRef.current = new AbortController());
     const h = row.hit;
     const th = performance.now();
+    setResults(prev => prev.map(x => (x.key === row.key ? { ...x, hydrateFailed: false } : x)));
     hydrateResults([{ number: h.number ?? 1, ok: true, scryfallId: h.scryfallId, title: h.title, via: h.via }], ctl.signal)
       .then((res) => {
         const card = res?.[0]?.card;
         if (!card) throw new Error('hydrate incomplete');
         if (!aliveRef.current) return;
-        setResults(prev => prev.map(x => (x.key === row.key ? { ...x, card, pending: false, hit: undefined } : x)));
-        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', hydrate_ms: Math.round(performance.now() - th), id_hydrated: card.id });
+        setResults(prev => prev.map(x => (x.key === row.key ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
+        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th) });
       })
       .catch((e) => {
-        hydrateFailedRef.current.add(h.scryfallId);
-        seenIdsRef.current.delete(row.card.id);
-        if (aliveRef.current) setResults(prev => prev.filter(x => x.key !== row.key));
-        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrate-failed', error: e?.message || String(e) });
+        if (!aliveRef.current || ctl.signal.aborted) return;
+        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrate-failed', row: row.key, pres: row.pres, attempt, error: e?.message || String(e) });
+        let still = false;
+        setResults(prev => prev.map(x => { if (x.key !== row.key) return x; still = true; return { ...x, hydrateFailed: true }; }));
+        const delay = HYDRATE_RETRY_MS[Math.min(attempt, HYDRATE_RETRY_MS.length - 1)];
+        setTimeout(() => { if (aliveRef.current && still && resultsRef.current.some(x => x.key === row.key && x.pending)) hydrateRow(row, attempt + 1); }, delay);
       });
   }, []);
 
@@ -389,12 +397,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0 })) {
           // Auto: a proven card goes into the tray at once as a PENDING row
           // (not sendable) while /cards hydrates it in the background, so the
-          // loop keeps capturing (R2-#13). A card whose background hydration
-          // failed before takes the old inline path, which falls back to the
-          // server on failure.
+          // loop keeps capturing (R2-#13). Already-hydrated ids and shutter
+          // presses keep the inline path.
           const proven = (local.results || []).filter(x => x.ok && x.scryfallId);
-          const background = autoPass && proven.length > 0
-            && proven.every(x => !isHydrated(x.scryfallId) && !hydrateFailedRef.current.has(x.scryfallId));
+          const background = autoPass && proven.length > 0 && proven.every(x => !isHydrated(x.scryfallId));
           if (background) {
             out = { ...local, results: local.results.map(x => (x.ok && x.scryfallId
               ? { ...x, card: { id: `mtg-${x.scryfallId}`, name: x.title, set_id: x.set, number: x.num }, pendingHydrate: true } : x)) };
@@ -435,8 +441,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const waited = autoPass && firstSeenRef.current != null ? Math.round(performance.now() - firstSeenRef.current) : ms;
       // Presentation (R2 measurement fix): the card now in view, from the
       // client's own same-frame read when there is one.
-      const pres = nextPresentation(presRef.current, local && !local.error && local.candidates?.length ? local : out, t0);
+      const pres = nextPresentation(presRef.current, local && !local.error && local.candidates?.length ? local : out, performance.now(), epochRef.current);
       presRef.current = pres;
+      if (pres) epochRef.current = Math.max(epochRef.current, pres.epoch);
       const edgeDir = edgeDirection(out.candidates[0]);
       if (!out.candidates.length) setHint(t('fastscan.hintNoCard'));
       else if (!eligible && edgeDir) setHint(t(EDGE_HINT[edgeDir]));
@@ -451,7 +458,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // nor after 4 s of failed reads while it never left (dedupeFresh).
       const now = Date.now();
       const fresh = hits.filter(h => !autoPass || dedupeFresh(seenIdsRef.current, h.card.id, now));
-      notePresence(seenIdsRef.current, out, hits, now);
+      notePresence(seenIdsRef.current, out, hits, now, new Set(fresh.map(h => h.card.id)));
       if (hits.length) firstSeenRef.current = null;
       const tEnd = performance.now();
       tel.end({
@@ -462,13 +469,14 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // its first confident title and to this pass's end (proof/commit).
         pres: pres ? { epoch: pres.epoch, age_ms: Math.round(tEnd - pres.since), title_ms: pres.titleAt != null ? Math.round(pres.titleAt - pres.since) : undefined } : undefined,
         commit_ms: fresh.length ? Math.round(tEnd - t0) : undefined,
+        // Rows inserted this pass that still await /cards (not yet usable).
+        pending_rows: fresh.filter(h => h.pendingHydrate).length || undefined,
       });
-      if (hits.length && pres) presRef.current = null;
       if (fresh.length) {
         setLatency({ total: waited, read: ms });
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
-        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h }));
+        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch }));
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
@@ -536,7 +544,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; resetOnDevice();
+    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; presRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };
@@ -750,7 +758,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         ) : (
           <ul className="fs-cards">
             {results.map(row => (
-              <TrayCard key={row.key} row={row} dest={dest} t={t} onEdit={onEditRow} onDismiss={onDismissRow} onPatch={patchRow} />
+              <TrayCard key={row.key} row={row} dest={dest} t={t} onEdit={onEditRow} onDismiss={onDismissRow} onPatch={patchRow} onRetry={hydrateRow} />
             ))}
           </ul>
         )}

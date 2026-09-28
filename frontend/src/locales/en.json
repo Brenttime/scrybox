@@ -1476,6 +1476,7 @@
   "fastscan.hintMoveUpLeft": "Move the card up and left",
   "fastscan.hintMoveUpRight": "Move the card up and right",
   "fastscan.hintMoveBack": "Card fills the view. Move it farther from the camera",
+  "fastscan.hydrateRetry": "Could not load this card. Tap to retry",
   "fastscan.hintFooter": "Can't read the set number. Tilt away from glare or add light.",
   "fastscan.trayFull": "Tray full ({count} unsent). Send or clear to keep scanning.",
   "fastscan.quantity": "Quantity",
