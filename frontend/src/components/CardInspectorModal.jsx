@@ -333,16 +333,15 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
           </div>
 
           {mode !== 'edit' && builtDecks.length > 0 && (
-            <div className="ci-built-decks" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.45 }}>
-              <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, marginBottom: '0.2rem' }}>{t('inspector.inBuiltDecks')}</div>
-              <ul style={{ margin: 0, paddingLeft: '1rem' }}>
-                {builtDecks.map(d => (
-                  <li key={d.id}>
-                    <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{d.name}</span>
-                    {d.quantity > 1 ? <span style={{ color: 'var(--text-muted)' }}> ×{d.quantity}</span> : null}
-                  </li>
-                ))}
-              </ul>
+            <div className="ci-built-decks" style={{ fontSize: '0.7rem', color: 'var(--text-muted)', lineHeight: 1.35 }}>
+              <span style={{ fontWeight: 700 }}>{t('inspector.inBuiltDecks')}: </span>
+              {builtDecks.map((d, i) => (
+                <span key={d.id}>
+                  {i > 0 ? ' · ' : null}
+                  <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>{d.name}</span>
+                  {d.quantity > 1 ? ` ×${d.quantity}` : null}
+                </span>
+              ))}
             </div>
           )}
 
