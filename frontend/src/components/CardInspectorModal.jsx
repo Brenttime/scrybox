@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Trash2, Maximize2 } from 'lucide-react';
+import { X, Maximize2 } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
@@ -452,14 +452,12 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 <button type="submit" className="btn btn-primary" style={{ flex: 2, padding: '0.7rem', fontWeight: 700 }}>{t('inspector.saveChanges')}</button>
               </div>
 
-              {/* Tucked away: a collapsed disclosure far below Save, so a stray
-                  tap can't reach it (and it still asks to confirm). */}
-              <details className="ci-danger-zone" style={{ marginTop: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-glass)', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                <summary style={{ cursor: 'pointer', userSelect: 'none' }}>{t('inspector.moreOptions')}</summary>
-                <button type="button" className="ci-delete-btn" onClick={handleDelete} style={{ marginTop: '0.6rem', background: 'none', border: '1px solid var(--accent-red)', color: 'var(--accent-red)', borderRadius: 'var(--radius-sm)', padding: '0.35rem 0.8rem', fontSize: '0.75rem', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                  <Trash2 size={13} /> {t('inspector.deleteCard')}
-                </button>
-              </details>
+              {/* Destructive action, HIG-style: the last item in the edit sheet,
+                  its own group after a gap, full-width red text (no fill) so it
+                  reads as an action, not a primary button. Confirm kept. */}
+              <button type="button" className="ci-delete-btn" onClick={handleDelete} style={{ marginTop: '1.25rem', width: '100%', padding: '0.75rem', background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', color: 'var(--accent-red)', fontWeight: 600, fontSize: '0.9rem', cursor: 'pointer' }}>
+                {t('inspector.deleteCard')}
+              </button>
             </form>
           ) : (
             <>
