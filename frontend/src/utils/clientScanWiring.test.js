@@ -37,13 +37,17 @@ const flush = () => new Promise(r => setTimeout(r, 5));
 
 test('worker.onerror during the threaded start: same promise, one 1-thread fallback, no third load', async () => {
   workers.length = 0;
+  let release;
+  const held = new Promise(r => { release = r; });
   behave = [
     (msg, w) => w.crash('pthread spawn failed'),
-    (msg, w) => w.reply({ id: msg.id, ready: true, loadMs: 1, info: { threads: Number(msg.threads) } }),
+    (msg, w) => held.then(() => w.reply({ id: msg.id, ready: true, loadMs: 1, info: { threads: Number(msg.threads) } })),
   ];
   const a = cs.loadClientScan();
-  await flush();                                   // crash handled, fallback in flight
+  await flush();                                   // crash handled, fallback held in flight
+  assert.equal(workers.length, 2, 'fallback worker started');
   const b = cs.loadClientScan();
+  release();
   assert.equal(b, a, 'a caller during the fallback joins the same promise');
   const r = await a;
   assert.equal(r.ok, true);
