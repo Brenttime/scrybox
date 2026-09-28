@@ -534,11 +534,13 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; }
     return quad;
   }
 
-  return { read, probe, stats: env.stats, reset() { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
+  return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
+    // deferral may make this card skip its cheap first look (review R2-#8).
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };

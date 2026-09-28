@@ -401,3 +401,21 @@ test('near-edge re-projection never slides a stage off on-card rows (review R1-B
   assert.equal(r.ok, false, 'no printing from a stage that lost on-card rows');
   assert.equal(r.near_edge_partial?.stage, 'footer0');
 });
+
+// Round 2 (#8): a previous card's deferral must not follow a new presentation.
+test('reset()/no-card clear lastDeferred: a new presentation gets its cheap first look again (R2-8)', async () => {
+  for (const boundary of ['reset', 'probe-null']) {
+    const { reader, calls, setPresent } = fakeReaderIx((_, batch) => (batch === 2 ? 'bolt' : 'zz'));
+    const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+    for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+    const a = await reader.read(sharpFrame(), small, { requireStill: true });
+    assert.equal(a.results[0].deferred, true, 'fixture: first read defers');
+    if (boundary === 'reset') reader.reset();
+    else { setPresent(false); assert.equal(await reader.probe(small, 4, 200, 280), null); setPresent(true); }
+    for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+    const c0 = calls();
+    const b = await reader.read(sharpFrame(), small, { requireStill: true });
+    assert.equal(b.results[0].deferred, true, `${boundary}: new presentation defers its deep stages again`);
+    assert.equal(calls() - c0, 2, `${boundary}: title + first footer batch only`);
+  }
+});

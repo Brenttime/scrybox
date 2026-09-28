@@ -397,7 +397,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };
