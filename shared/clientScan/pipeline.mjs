@@ -19,7 +19,7 @@ import {
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
-  footerNumbers, footerCodes, resolveFooter, retroNumber, strongNumbers, looksLikeCopyright, voteFooter,
+  footerNumbers, footerCodes, resolveFooter, retroNumber, strongNumbers, looksLikeCopyright, voteFooter, normalizeCollector,
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
@@ -169,6 +169,17 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // 49 -> 55, 5 new 0 -> 5, every baseline hit kept, 0 conflicts.
 const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].map(y => [0, 0.22, y, y + 0.035])];
 const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'rescue', 'wide', 'retro'];
+// Pure: does any strong number (N/T or read in 2 strips; set totals ignored)
+// name a printing of this title other than pi, by number?
+export function strongConflict(ix, title, pi, raws) {
+  const pool = ix.byTitle[title] || [];
+  const mine = normalizeCollector(ix.printings[pi][2]);
+  for (const n of strongNumbers(raws).keys()) {
+    if (n === mine) continue;
+    if (pool.some(o => o !== pi && normalizeCollector(ix.printings[o][2]) === n)) return true;
+  }
+  return false;
+}
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
@@ -468,7 +479,8 @@ export function createReader(env) {
     else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
-      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred) };
+      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred),
+        rescued: !!result.rescued || !!(prior && prior.name === result.title && prior.rescued) };
     }
     return base;
   }
@@ -556,6 +568,7 @@ export function createReader(env) {
     if (pi != null) return done(pi, 'unique printed title', []);
 
     const raws = [];
+    let rescued = false;
     const pooled = prior && prior.name === name ? prior.frames : null;
     // Evidence pooled from a deferred frame only saw the first footer batch.
     // Pooling it must not settle the printing before this frame has run the
@@ -568,6 +581,9 @@ export function createReader(env) {
       const all = frames.flat();
       let p = resolveFooter(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));
       if (p == null) p = voteFooter(ix, name, frames);
+      // Rescue reads (this frame or a pooled one) never prove a printing that
+      // another strong number on these frames contradicts.
+      if (p != null && (rescued || prior.rescued) && strongConflict(ix, name, p, all)) { timings.rescue_conflict = 1; p = null; }
       return p == null ? null : done(p, 'title+collector (multi-frame)', all, si);
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
@@ -583,6 +599,7 @@ export function createReader(env) {
         }
         if (nums.length) {
           pi = resolveFooter(ix, name, [], nums);
+          if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
           if (pi != null) return done(pi, 'title+collector (retro frame)', raws, si);
         }
         const pooledHit = tryPooled(si);
@@ -596,6 +613,13 @@ export function createReader(env) {
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
+      // A rescue-stage answer must not contradict ANY strong number read on
+      // this frame (R2-#2 replay: rescue read "089/59%" -> DRC 89 while the
+      // first batch read "080/505", the real MH2 80, dropped only by its set
+      // total check). Conflicting evidence means ambiguity, not a pick.
+      // Holds for every later stage too: the rescue reads stay in raws.
+      if (stage === 'rescue') rescued = true;
+      if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
@@ -610,7 +634,7 @@ export function createReader(env) {
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and

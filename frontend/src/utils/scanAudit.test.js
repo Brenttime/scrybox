@@ -522,3 +522,15 @@ test('title rescue gate: measured always, gated only when every crop is flat and
   assert.equal(o.timings.title_range.length, 2, 'crop contrast recorded for shadow calibration');
   assert.notEqual(o.timings.title_gated, 1, 'contrasty crops are never gated');
 });
+
+test('footer rescue never resolves against a conflicting strong number read on the same frame (Damn DRC 89 vs MH2 80, R2-2)', async () => {
+  // First batch: '080/505' (number 80, total too high for the set check);
+  // rescue: '089/59' (strong 89). Old candidate proved drc 89 -> wrong.
+  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 3 && n === 6 ? '089/59' : 'zz'));
+  const index = loadIndex({ names: ['damn'], canon: {}, excluded: [], sets: ['mh2', 'drc'],
+    printings: [['id-mh2', 'mh2', '80'], ['id-drc', 'drc', '89'], ['id-mh2b', 'mh2', '396']], byTitle: { damn: [0, 1, 2] }, uniqueAlias: {} });
+  const reader = createReader({ ...f.reader.__env, index });
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.notEqual(r.scryfallId, 'id-drc', 'never the misread printing');
+  assert.equal(r.ok, false, JSON.stringify(r));
+});
