@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
-import { X, Trash2, Maximize2, ExternalLink, Search } from 'lucide-react';
+import { X, Trash2, Maximize2 } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { resolveCardPrice } from '../utils/resolveCardPrice';
 import { getPrintingLabel } from '../utils/cardPrinting';
 import { displayRarity } from '../utils/cardRarity';
-import { tcgplayerUrl, cardmarketUrl, searchUrl, priceSource, noLinkReason } from '../utils/marketplaceLinks';
+import { priceSource } from '../utils/marketplaceLinks';
 import CardImage from './CardImage';
 import CardImageZoom from './CardImageZoom';
 import CardImageActions from './CardImageActions';
@@ -429,50 +429,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                   </div>
                 </div>}
               </div>
-
-              {/* Marketplace links. "View on TCGplayer" now means the card's own
-                  product page and nothing else — it used to fall back to a name
-                  search wearing the same label, which for a Japanese printing
-                  reliably found nothing.
-
-                  A search is still offered, as its own action with its own words, so
-                  the reader can tell which of the two they are about to get. */}
-              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                {tcgplayerUrl(card) && (
-                  <a
-                    href={tcgplayerUrl(card)} target="_blank" rel="noopener noreferrer"
-                    className="btn btn-secondary"
-                    style={{ flex: 1, minWidth: '140px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.35rem', fontSize: '0.75rem' }}
-                  >
-                    <ExternalLink size={13} /> {t('inspector.viewOnTcgplayer')}
-                  </a>
-                )}
-                {cardmarketUrl(card) && (
-                  <a
-                    href={cardmarketUrl(card)} target="_blank" rel="noopener noreferrer"
-                    className="btn btn-secondary"
-                    style={{ flex: 1, minWidth: '140px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.35rem', fontSize: '0.75rem' }}
-                  >
-                    <ExternalLink size={13} /> Cardmarket
-                  </a>
-                )}
-                {/* Only shown when there is no direct link — as a fallback the reader
-                    chooses, not a substitute presented as the real thing. */}
-                {!tcgplayerUrl(card) && !cardmarketUrl(card) && searchUrl(card) && (
-                  <a
-                    href={searchUrl(card)} target="_blank" rel="noopener noreferrer"
-                    className="btn btn-secondary"
-                    style={{ flex: 1, minWidth: '140px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.35rem', fontSize: '0.75rem' }}
-                  >
-                    <Search size={13} /> {t('inspector.searchTcgplayer')}
-                  </a>
-                )}
-              </div>
-              {noLinkReason(card) && (
-                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
-                  {noLinkReason(card)}
-                </div>
-              )}
 
               {/* Price History Area Chart */}
               <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={100} defaultRange="30d" />
