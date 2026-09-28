@@ -17,6 +17,7 @@ export function startLoad({ loadOnce, retire, override, state }) {
     // The retry after the cooldown must get a fresh worker too.
     if (!r.ready) retire('load failed');
     const info = r.info && (state.threadFallback ? { ...r.info, threadFallback: state.threadFallback } : r.info);
-    return { ok: !!r.ready, loadMs: r.loadMs, error: r.error, info };
+    const error = r.ready ? r.error : [r.error, state.threadFallback && `after threaded start failed: ${state.threadFallback}`].filter(Boolean).join('; ');
+    return { ok: !!r.ready, loadMs: r.loadMs, error, info };
   })();
 }

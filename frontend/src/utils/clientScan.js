@@ -23,6 +23,7 @@ const READ_TIMEOUT_MS = 8000;     // a normal read is well under 2 s
 const LOAD_RETRY_MS = 30000;      // after a failed load, try again this much later
 
 let worker = null;
+let loading = false;        // a load (incl. its 1-thread fallback) is in flight
 let ready = null;          // Promise<{ok, loadMs, error}>
 let readyFailedAt = 0;
 // One-thread fallback state for the session (see scanLoad.js).
@@ -52,7 +53,10 @@ function ensureWorker() {
     waiting.delete(e.data.id); clearTimeout(w.timer);
     w.resolve(e.data);
   };
-  worker.onerror = (e) => killWorker(e?.message || 'scan worker failed');
+  // During a load, only retire the worker: its pending load call resolves
+  // with the error and startLoad decides (fallback / cooldown). `ready` stays
+  // shared. After startup a crash invalidates the models as before.
+  worker.onerror = (e) => (loading ? retireWorker : killWorker)(e?.message || 'scan worker failed');
   return worker;
 }
 
@@ -101,7 +105,8 @@ export function loadClientScan() {
     // stay shared by every caller until it settles.
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : startLoad({ loadOnce, retire: retireWorker, override: threadOverride(), state: loadState });
+      : (loading = true, startLoad({ loadOnce, retire: retireWorker, override: threadOverride(), state: loadState })
+        .finally(() => { loading = false; }));
     const mine = ready;
     ready.then(r => { if (!r.ok && ready === mine) readyFailedAt = Date.now(); });
   }
