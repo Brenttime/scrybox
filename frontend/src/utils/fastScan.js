@@ -144,6 +144,77 @@ export function nextEdgeRun(prev, out) {
   const same = prev && Math.hypot(prev.cx - cx, prev.cy - cy) <= SAME_PLACE;
   return { cx, cy, count: same ? prev.count + 1 : 1 };
 }
+// --- presentations (R2 measurement fix) -----------------------------------
+// One presentation = one physical card continuously in view. waited_ms used to
+// run from the first candidate after a hit or no-card frame, so a card that
+// replaced an unresolved one inherited its wait (Galactus 8.4 s included
+// 3.5 s of failed Helm of the Host reads). A new presentation starts on a
+// no-card pass, a different confident title, or a card at a different place.
+// Pure; returns the same object when the presentation continues.
+function centreOf(out) {
+  const box = out?.candidates?.[0]?.box;
+  if (!box) return null;
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  return { cx: (box[0] + box[2] / 2) / diag, cy: (box[1] + box[3] / 2) / diag };
+}
+function titleOf(out) {
+  const r = (out?.results || []).find(x => x.title || x.card?.name);
+  return r ? normTitle(r.title || r.card?.name) : null;
+}
+export function nextPresentation(prev, out, at) {
+  if (!out || out.error) return prev;
+  if (!out.candidates?.length) return null;
+  const c = centreOf(out), title = titleOf(out);
+  const moved = prev && c && prev.cx != null && Math.hypot(prev.cx - c.cx, prev.cy - c.cy) > SAME_PLACE;
+  const retitled = prev && title && prev.title && title !== prev.title;
+  if (!prev || moved || retitled) {
+    return { epoch: (prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? at : null };
+  }
+  if (title && !prev.title) return { ...prev, title, titleAt: at, cx: c?.cx ?? prev.cx, cy: c?.cy ?? prev.cy };
+  if (c && prev.cx == null) return { ...prev, cx: c.cx, cy: c.cy };
+  return prev;
+}
+
+// Auto de-dupe (R2 measurement fix). A card seen within DEDUPE_MS is a repeat.
+// Past that, it is re-added only if its presentation was broken in between
+// (lifted: a no-card pass; moved elsewhere; hand motion: moving/blurred; or a
+// different card read at its place). The Masamune was added, repeated, then
+// added again after 4 s of failed reads at the same box: no evidence of a
+// second physical copy. A genuine second copy is still added once the first
+// is lifted or the new one is slid in (both break the presentation).
+export const DEDUPE_MS = 4000;
+export function dedupeFresh(seen, id, at) {
+  const e = seen.get(id);
+  if (!e) return true;
+  return at - e.at > DEDUPE_MS && !!e.broken;
+}
+// Fold one pass into every remembered card's "presentation broken" bit.
+export function notePresence(seen, out, hits, at) {
+  const noCard = !out?.error && !out?.candidates?.length;
+  const status = out?.candidates?.[0]?.status;
+  const c = centreOf(out), title = titleOf(out);
+  const hitIds = new Set(hits.map(h => h.card.id));
+  for (const [id, e] of seen) {
+    if (hitIds.has(id)) continue;
+    if (noCard || status === 'moving' || status === 'too blurry'
+      || (c && e.cx != null && Math.hypot(e.cx - c.cx, e.cy - c.cy) > SAME_PLACE)
+      || (title && e.title && title !== e.title)) e.broken = true;
+  }
+  for (const h of hits) seen.set(h.card.id, { at, cx: c?.cx ?? null, cy: c?.cy ?? null, title: normTitle(h.card.name || h.title), broken: false });
+}
+
+// Directional edge hint (R2-#9): which way to move the card, from the frame
+// sides its outline touches. Guidance only.
+export function edgeDirection(cand) {
+  const s = cand?.edge_sides;
+  if (!s?.length) return null;
+  const v = s.includes('top') && !s.includes('bottom') ? 'down' : s.includes('bottom') && !s.includes('top') ? 'up' : null;
+  const h = s.includes('left') && !s.includes('right') ? 'right' : s.includes('right') && !s.includes('left') ? 'left' : null;
+  if (v && h) return `${v}-${h}`;
+  if (v || h) return v || h;
+  return 'back';   // touches opposite sides: too close to the camera
+}
+
 function normTitle(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 
 // Small-card rescue. Measured on saved scans: a card whose short side is

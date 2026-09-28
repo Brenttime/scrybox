@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE } from './fastScan.js';
+import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE, nextPresentation, dedupeFresh, notePresence, edgeDirection, DEDUPE_MS } from './fastScan.js';
 
 const fail = (title, box = [100, 100, 600, 840]) => ({
   frame: { width: 1080, height: 1920 },
@@ -126,4 +126,52 @@ test('backoff: a titleless server failure is signed with the same-frame client t
   assert.equal(nextFailStreak(null, srv, 0, { fromServer: false, sameFrameLocal: local }), null, 'only a real server attempt');
   const multi = { ...srv, candidates: [...srv.candidates, { number: 2, box: [1200, 100, 600, 840] }] };
   assert.equal(nextFailStreak(null, multi, 0, { fromServer: true, sameFrameLocal: local }), null, 'multi-card server scene: not signed from the single-card client read');
+});
+
+const seen1 = (title, box = [506, 127, 752, 922], status = 'ready') => ({ frame: { width: 1920, height: 1080 }, candidates: [{ number: 1, box, status, eligible: status === 'ready' }], results: [{ number: 1, ok: false, title }] });
+
+test('dedupe: a card that never left is not re-added after 4 s of failed reads (Masamune, R2-0)', () => {
+  const seen = new Map();
+  const id = 'mtg-masamune', hit = [{ card: { id, name: 'The Masamune' } }];
+  assert.equal(dedupeFresh(seen, id, 0), true);
+  notePresence(seen, seen1('the masamune'), hit, 0);
+  for (let t = 500; t < 9000; t += 500) notePresence(seen, seen1('the masamune'), [], t);   // unresolved, same box
+  assert.equal(dedupeFresh(seen, id, 9000), false, 'same card, same place, never lifted: repeat');
+});
+
+test('dedupe: a genuine second copy is added after a lift, a slide, or hand motion (R2-0)', () => {
+  const id = 'mtg-bolt', hit = [{ card: { id, name: 'Lightning Bolt' } }];
+  for (const between of [
+    { frame: { width: 1920, height: 1080 }, candidates: [], results: [] },         // lifted
+    seen1('lightning bolt', [100, 100, 600, 840]),                                    // moved elsewhere
+    seen1(null, [506, 127, 752, 922], 'moving'),                                      // hand in view
+    seen1('galactus'),                                                                // other card at the spot
+  ]) {
+    const seen = new Map();
+    notePresence(seen, seen1('lightning bolt'), hit, 0);
+    notePresence(seen, between, [], 1000);
+    assert.equal(dedupeFresh(seen, id, DEDUPE_MS - 1), false, 'still inside the 4 s window');
+    assert.equal(dedupeFresh(seen, id, DEDUPE_MS + 1), true, JSON.stringify(between.candidates));
+  }
+});
+
+test('presentation epoch: a different title or a lift starts a new one; waiting on the same card does not (R2-0)', () => {
+  let p = nextPresentation(null, seen1('helm of the host'), 0);
+  assert.equal(p.epoch, 1); assert.equal(p.titleAt, 0);
+  p = nextPresentation(p, seen1('helm of the host'), 500);
+  assert.equal(p.epoch, 1);
+  const q = nextPresentation(p, seen1('galactus'), 3500);
+  assert.equal(q.epoch, 2, 'Helm -> Galactus is a new presentation');
+  assert.equal(q.since, 3500);
+  assert.equal(nextPresentation(q, { frame: { width: 1, height: 1 }, candidates: [], results: [] }, 4000), null);
+  const r = nextPresentation(q, seen1(null, [506, 127, 752, 922], 'moving'), 3600);
+  assert.equal(r.epoch, 2, 'no title this pass: same presentation');
+  assert.equal(nextPresentation(q, { error: 'x' }, 4000), q, 'errors carry no information');
+});
+
+test('edgeDirection: which way to move the card (R2-9)', () => {
+  assert.equal(edgeDirection({ edge_sides: ['top'] }), 'down');
+  assert.equal(edgeDirection({ edge_sides: ['bottom', 'right'] }), 'up-left');
+  assert.equal(edgeDirection({ edge_sides: ['top', 'bottom'] }), 'back');
+  assert.equal(edgeDirection({}), null);
 });
