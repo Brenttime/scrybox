@@ -439,7 +439,7 @@ test('footer rescue stage: a misread number is never snapped to the nearest inde
 });
 
 test('tall stage: 0.030 rows read right after the first batch prove a clipped number; a conflicting read still abstains', async () => {
-  // Call 1 title, 2 first batch (0.025), 3 = the tall batch (6 strips).
+  // Call 1 title, 2 first batch (0.030), 3 = the tall batch (6 strips).
   const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, true, JSON.stringify(r));

@@ -201,6 +201,14 @@ const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 // to the first batch's, so a conflicting number still means ambiguity.
 const TALL_ROWS = [0.88, 0.90, 0.92, 0.94, 0.86, 0.84];
 const TALL_H = 0.030;
+// First batch height: 0.030 instead of 0.025, so the collector number is
+// proved on the FIRST read (no deferral, no second frame). Replay of 1,288
+// saved iPhone frames: stage-0 proofs 321 -> 357, matches 652 -> 658,
+// 0 lost, 0 changed, 0 new wrong, recognizer calls 3987 -> 3933. Rejected:
+// 0.028 (1 new wrong, 2 lost), 0.032 (1 lost), tall 0.033/0.035 (2-3 lost),
+// tall back to 0.025 (only +2). 'tall' keeps 0.030: reads are added, and the
+// repeated rows still add a second, differently-sampled vote.
+const FIRST_H = 0.030;
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
 
@@ -641,7 +649,7 @@ export function createReader(env) {
       }
       const rows = stage === 'wide' ? WIDE_ROWS : stage === 'tall' ? TALL_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const hgt = stage === 'tall' ? TALL_H : 0.025;
+      const hgt = stage === 'tall' ? TALL_H : si === 0 ? FIRST_H : 0.025;
       const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + hgt]);
       const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
