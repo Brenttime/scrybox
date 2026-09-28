@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE, nextPresentation, dedupeFresh, notePresence, edgeDirection, DEDUPE_MS } from './fastScan.js';
+import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE, nextPresentation, dedupeFresh, notePresence, edgeDirection, DEDUPE_MS, pixelPrint } from './fastScan.js';
 
 const fail = (title, box = [100, 100, 600, 840]) => ({
   frame: { width: 1080, height: 1920 },
@@ -144,12 +144,14 @@ test('dedupe: a genuine second copy is added after a lift, a slide, or hand moti
   for (const between of [
     { frame: { width: 1920, height: 1080 }, candidates: [], results: [] },         // lifted
     seen1('lightning bolt', [100, 100, 600, 840]),                                    // moved elsewhere
-    seen1(null, [506, 127, 752, 922], 'moving'),                                      // hand in view
     seen1('galactus'),                                                                // other card at the spot
   ]) {
     const seen = new Map();
     notePresence(seen, seen1('lightning bolt'), hit, 0);
     notePresence(seen, between, [], 1000);
+    // The second copy is recognized again and again (suppressed repeats):
+    // that must neither clear the break nor push the deadline (R1-B1).
+    for (let tt = 1500; tt < DEDUPE_MS; tt += 500) notePresence(seen, seen1('lightning bolt'), hit, tt, new Set());
     assert.equal(dedupeFresh(seen, id, DEDUPE_MS - 1), false, 'still inside the 4 s window');
     assert.equal(dedupeFresh(seen, id, DEDUPE_MS + 1), true, JSON.stringify(between.candidates));
   }
@@ -174,4 +176,30 @@ test('edgeDirection: which way to move the card (R2-9)', () => {
   assert.equal(edgeDirection({ edge_sides: ['bottom', 'right'] }), 'up-left');
   assert.equal(edgeDirection({ edge_sides: ['top', 'bottom'] }), 'back');
   assert.equal(edgeDirection({}), null);
+});
+
+test('dedupe: sustained hand motion breaks a presentation, one blurred pass does not (R2-0)', () => {
+  const id = 'mtg-bolt', hit = [{ card: { id, name: 'Lightning Bolt' } }];
+  const seen = new Map();
+  notePresence(seen, seen1('lightning bolt'), hit, 0);
+  notePresence(seen, seen1(null, [506, 127, 752, 922], 'too blurry'), [], 500);
+  notePresence(seen, seen1('lightning bolt'), hit, 1000, new Set());
+  assert.equal(dedupeFresh(seen, id, 9000), false, 'autofocus blip on a sitting card: no re-add');
+  for (let i = 0; i < 3; i++) notePresence(seen, seen1(null, [506, 127, 752, 922], 'moving'), [], 9100 + i * 100);
+  assert.equal(dedupeFresh(seen, id, 9500), true, 'hand swapped the card: second copy allowed');
+});
+
+test('presentation epochs are monotonic across lifts (R1-S1)', () => {
+  let base = 0;
+  const a = nextPresentation(null, seen1('grief'), 0, base); base = a.epoch;
+  assert.equal(nextPresentation(a, { frame: { width: 1, height: 1 }, candidates: [], results: [] }, 10, base), null);
+  const b = nextPresentation(null, seen1('grief'), 20, base);
+  assert.equal(b.epoch, a.epoch + 1);
+});
+
+test('pixelPrint: identical frames match, a one-level change in any sampled channel does not (R1-B2)', () => {
+  const a = new Uint8ClampedArray(384 * 384 * 4); for (let i = 0; i < a.length; i++) a[i] = (i * 7) & 255;
+  const b = a.slice();
+  assert.equal(pixelPrint(a.buffer), pixelPrint(b.buffer));
+  for (const i of [0, 1, 2, 5, 12345, a.length - 5]) { const c = a.slice(); c[i - (i % 5)] ^= 1; assert.notEqual(pixelPrint(c.buffer), pixelPrint(a.buffer), String(i)); }
 });

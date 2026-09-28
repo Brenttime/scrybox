@@ -161,46 +161,56 @@ function titleOf(out) {
   const r = (out?.results || []).find(x => x.title || x.card?.name);
   return r ? normTitle(r.title || r.card?.name) : null;
 }
-export function nextPresentation(prev, out, at) {
+// epochBase: the last epoch handed out in this run, so epochs stay monotonic
+// across lifts (a no-card pass returns null, the next card gets base + 1).
+export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0) {
   if (!out || out.error) return prev;
   if (!out.candidates?.length) return null;
   const c = centreOf(out), title = titleOf(out);
   const moved = prev && c && prev.cx != null && Math.hypot(prev.cx - c.cx, prev.cy - c.cy) > SAME_PLACE;
   const retitled = prev && title && prev.title && title !== prev.title;
   if (!prev || moved || retitled) {
-    return { epoch: (prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? at : null };
+    return { epoch: Math.max(epochBase, prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? at : null };
   }
   if (title && !prev.title) return { ...prev, title, titleAt: at, cx: c?.cx ?? prev.cx, cy: c?.cy ?? prev.cy };
   if (c && prev.cx == null) return { ...prev, cx: c.cx, cy: c.cy };
   return prev;
 }
 
-// Auto de-dupe (R2 measurement fix). A card seen within DEDUPE_MS is a repeat.
-// Past that, it is re-added only if its presentation was broken in between
-// (lifted: a no-card pass; moved elsewhere; hand motion: moving/blurred; or a
-// different card read at its place). The Masamune was added, repeated, then
-// added again after 4 s of failed reads at the same box: no evidence of a
-// second physical copy. A genuine second copy is still added once the first
-// is lifted or the new one is slid in (both break the presentation).
+// Auto de-dupe (R2 measurement fix). A card is re-added only if, since its
+// last COMMITTED add, its presentation was broken (lifted: a no-card pass;
+// moved elsewhere; another card read at its place; or sustained hand motion,
+// MOTION_BREAK moving/blurred passes in a row) and DEDUPE_MS have passed.
+// The Masamune was added, repeated, then added again after 4 s of failed
+// reads at the same box: no evidence of a second physical copy. A suppressed
+// repeat never clears a break or renews the clock (review R1-B1), so a second
+// copy put down after a lift is added once DEDUPE_MS after the first add.
 export const DEDUPE_MS = 4000;
+const MOTION_BREAK = 3;
 export function dedupeFresh(seen, id, at) {
   const e = seen.get(id);
   if (!e) return true;
   return at - e.at > DEDUPE_MS && !!e.broken;
 }
-// Fold one pass into every remembered card's "presentation broken" bit.
-export function notePresence(seen, out, hits, at) {
+// Fold one pass into the remembered cards. committed = ids added this pass.
+export function notePresence(seen, out, hits, at, committed = new Set(hits.map(h => h.card.id))) {
   const noCard = !out?.error && !out?.candidates?.length;
   const status = out?.candidates?.[0]?.status;
+  const motion = status === 'moving' || status === 'too blurry';
   const c = centreOf(out), title = titleOf(out);
   const hitIds = new Set(hits.map(h => h.card.id));
   for (const [id, e] of seen) {
-    if (hitIds.has(id)) continue;
-    if (noCard || status === 'moving' || status === 'too blurry'
+    if (committed.has(id)) continue;
+    if (hitIds.has(id)) { e.motion = 0; continue; }     // suppressed repeat: seen, nothing else changes
+    e.motion = motion ? (e.motion || 0) + 1 : 0;
+    if (noCard || e.motion >= MOTION_BREAK
       || (c && e.cx != null && Math.hypot(e.cx - c.cx, e.cy - c.cy) > SAME_PLACE)
       || (title && e.title && title !== e.title)) e.broken = true;
   }
-  for (const h of hits) seen.set(h.card.id, { at, cx: c?.cx ?? null, cy: c?.cy ?? null, title: normTitle(h.card.name || h.title), broken: false });
+  for (const h of hits) {
+    if (!committed.has(h.card.id) && seen.has(h.card.id)) continue;
+    seen.set(h.card.id, { at, cx: c?.cx ?? null, cy: c?.cy ?? null, title: normTitle(h.card.name || h.title), broken: false, motion: 0 });
+  }
 }
 
 // Directional edge hint (R2-#9): which way to move the card, from the frame
@@ -213,6 +223,15 @@ export function edgeDirection(cand) {
   if (v && h) return `${v}-${h}`;
   if (v || h) return v || h;
   return 'back';   // touches opposite sides: too close to the camera
+}
+
+// FNV-1a over every 5th byte (RGB and alpha interleave, so all channels are
+// sampled across rows): ~120k steps on the 384x384 copy, well under 1 ms.
+export function pixelPrint(buf) {
+  const a = new Uint8Array(buf);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < a.length; i += 5) { h ^= a[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
 }
 
 function normTitle(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }

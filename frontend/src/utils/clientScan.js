@@ -12,7 +12,7 @@
 // Every worker call has a deadline. A worker that crashes or wedges is torn
 // down and the next call gets a fresh one, so a single bad frame can never
 // leave the scanner "busy" forever.
-import { FRAME_MAX } from './fastScan';
+import { FRAME_MAX, pixelPrint } from './fastScan';
 export { needsServer } from './fastScan';
 import { CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 import { isNative, getServerUrl } from '../apiBase';
@@ -148,13 +148,13 @@ export function newFrameAfter(video, since, maxMs) {
   const c = frameClock(video);
   if (!c || since == null || c.frames !== since) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(done, maxMs);
+    const timer = setTimeout(() => { const i = c.waiters.indexOf(done); if (i >= 0) c.waiters.splice(i, 1); resolve(); }, maxMs);
     function done() { clearTimeout(timer); resolve(); }
     c.waiters.push(done);
   });
 }
 
-// The decoded frame the last capture drew (null without rVFC).
+// The decoded frame the last capture drew (null without a live rVFC clock).
 let lastFrameId = null;
 export function lastCapturedFrame() { return lastFrameId; }
 
@@ -180,16 +180,19 @@ async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   let t = performance.now();
   const lap = (k) => { const n = performance.now(); span[k] = Math.round(n - t); t = n; };
   // The frame the canvases are about to draw (the latest presented one).
-  // A clock that has not ticked recently (rVFC present but not firing for
-  // this stream, a paused track) must not make every capture look like a
-  // duplicate: fall back to no frame id, i.e. the timer path.
+  // Frame identity (review R1-B2). With a live rVFC clock: the presented
+  // frame number. Otherwise (no rVFC, or callbacks stopped for this stream)
+  // a fingerprint of the pixels actually drawn: a frozen stream repeats it
+  // exactly and is never counted twice, while live camera noise makes real
+  // frames differ. Either way a duplicate is never settle evidence.
   const live = clock && clock.at && performance.now() - clock.at < FRAME_CLOCK_STALE_MS;
-  const frameId = live ? clock.frames : null;
-  lastFrameId = frameId;
-  if (live) { span.frame_id = frameId; if (clock.mediaTime != null) span.media_ms = Math.round(clock.mediaTime * 1000); }
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
   const small = pixels(sc, CORN_SIZE, CORN_SIZE);
+  const frameId = live ? clock.frames : `p${pixelPrint(small)}`;
+  lastFrameId = live ? frameId : null;
+  span.frame_id = frameId;
+  if (live && clock.mediaTime != null) span.media_ms = Math.round(clock.mediaTime * 1000);
   lap('draw_ms');
   const p = await call({ type: 'probe', small, w, h }, [small]);
   lap('probe_ms');
