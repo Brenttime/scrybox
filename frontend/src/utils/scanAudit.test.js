@@ -80,8 +80,9 @@ function fakeReader(titleFor, opts = {}) {
   cornelius.run = async (x) => { detects++; return run(x); };
   // Each observation 100 ms after the last (the settle window is time-based).
   let tick = 0; const clock = opts.clock || (() => (tick += 100));
-  const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock });
-  reader.__env = { ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock };
+  const reader = createReader({ ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock, settle: opts.settle ?? true });
+  // settle: the legacy stillness window (opt-in in production) stays covered.
+  reader.__env = { ort, cornelius, rec, chars, index, refineCorners: opts.refine ?? false, clock, settle: opts.settle ?? true };
   return { reader, setPresent: (v) => { present = v; }, calls: () => calls, detects: () => detects };
 }
 
@@ -619,4 +620,17 @@ test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)'
   const r = (await reader.read(full, small, { requireStill: true, frameId: t })).results[0];
   assert.equal(r.scryfallId, 'id-lea');
   assert.deepEqual(batches, [2, 6, 6, 4, 2], 'v1 batches + tall; rescue never runs');
+});
+
+test('no settling by default: a sharp still card is read on its first auto frame; blur/clip still gate', async () => {
+  const { reader, calls } = fakeReader(() => 'grief', { settle: false });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  const a = await reader.read(sharpFrame(), small, { requireStill: true });
+  assert.equal(a.results[0]?.ok, true, JSON.stringify(a.candidates[0]));
+  assert.ok(calls() > 0);
+  // Production default (no env.settle): same.
+  const f = fakeReader(() => 'grief');
+  const env = { ...f.reader.__env }; delete env.settle;
+  const b = await createReader(env).read(sharpFrame(), small, { requireStill: true });
+  assert.equal(b.results[0]?.ok, true);
 });

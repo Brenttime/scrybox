@@ -440,8 +440,12 @@ export function createReader(env) {
     cand.still = stillRun;
     if (clipped) cand.status = 'touches frame edge';
     else if (sharp < TITLE_SHARP_FLOOR) cand.status = 'too blurry';
-    else if (requireStill && drift > STILL_DRIFT) cand.status = 'moving';
-    else if (requireStill && (stillRun === 0 || !settled)) cand.status = 'settling';
+    // No settling by default (Brent, 2026-09-28): a sharp, unclipped card is
+    // read on the first frame it is seen. Exact-printing proof (name + number)
+    // and the sharpness floor, not a stillness window, guard correctness.
+    // env.settle === true restores the old multi-observation window.
+    else if (env.settle === true && requireStill && drift > STILL_DRIFT) cand.status = 'moving';
+    else if (env.settle === true && requireStill && (stillRun === 0 || !settled)) cand.status = 'settling';
     cand.eligible = cand.status === 'ready';
     // Tracking ends the moment the card is not plainly in view: a blurred,
     // clipped or moving frame is exactly when one card gets swapped for another
