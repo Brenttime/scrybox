@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import OverflowMenu from './OverflowMenu';
 import CardImage from './CardImage';
+import CardInspectorModal from './CardInspectorModal';
 import { useBackGuard } from '../utils/useBackGuard';
 import { getRememberedView, rememberOpen, clearOpen } from '../utils/viewMemory';
 import { displayName, setReference } from '../utils/languages';
@@ -69,6 +70,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   const [loading, setLoading] = useState(true);
   const [activeList, setActiveList] = useState(null);
   const [listDetail, setListDetail] = useState(null);
+  const [inspectCard, setInspectCard] = useState(null);
 
   // List filters
   const [searchTerm, setSearchTerm] = useState('');
@@ -938,67 +940,63 @@ function Lists({ showToast, handoff, onHandoffDone }) {
           <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>{t('lists.emptyListHint')}</div>
         </div>
       ) : (
-        <div className="glass-panel list-cards-panel" style={{ overflowX: 'auto', padding: 0 }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem' }}>
-            <thead>
-              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                <th style={{ textAlign: 'left', padding: '0.7rem 1rem', color: 'var(--text-muted)', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('lists.cardCol')}</th>
-                <th style={{ textAlign: 'left', padding: '0.7rem 0.5rem', color: 'var(--text-muted)', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('lists.qty')}</th>
-                <th style={{ textAlign: 'left', padding: '0.7rem 0.5rem', color: 'var(--text-muted)', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('lists.owned')}</th>
-                <th style={{ padding: '0.7rem 1rem' }} />
-              </tr>
-            </thead>
-            <tbody>
-              {cards.map(card => {
-                const missing = Math.max(0, card.quantity - (card.owned_qty || 0));
-                return (
-                  <tr key={card.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                    <td style={{ padding: '0.5rem 1rem' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                        <CardImage card={card} alt={displayName(card)}
-                          style={{ width: '38px', height: '54px', borderRadius: '5px', objectFit: 'cover', flexShrink: 0 }} />
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ fontWeight: 700, color: 'var(--text-strong)' }}>{displayName(card)}</div>
-                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                            {setReference(card) || ''}
-                            {card.price_trend > 0 && <span style={{ marginLeft: '0.5rem' }}>${card.price_trend.toFixed(2)}</span>}
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-                    <td style={{ padding: '0.5rem 0.5rem' }}>
-                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                        <button className="btn btn-secondary btn-icon-only" onClick={() => setQty(card.id, card.quantity - 1)}
-                          style={{ width: '22px', height: '22px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Minus size={13} /></button>
-                        <input type="number" min="0" value={card.quantity}
-                          onChange={e => setQty(card.id, parseInt(e.target.value, 10) || 0)}
-                          style={{ width: '52px', textAlign: 'center', fontSize: '0.85rem', fontWeight: 700, padding: '0.2rem', borderRadius: 'var(--radius-sm)', background: 'rgba(0,0,0,0.3)', color: 'var(--text-strong)', border: '1px solid rgba(255,255,255,0.15)' }} />
-                        <button className="btn btn-secondary btn-icon-only" onClick={() => setQty(card.id, card.quantity + 1)}
-                          style={{ width: '22px', height: '22px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Plus size={13} /></button>
-                      </div>
-                    </td>
-                    <td style={{ padding: '0.5rem 0.5rem' }}>
-                      {missing > 0 ? (
-                        <span style={{ color: '#f87171', fontWeight: 700, fontSize: '0.8rem' }}>{t('lists.stillMissing', { count: missing })}</span>
-                      ) : (card.owned_qty > 0 ? (
-                        <span style={{ color: '#34d399', fontWeight: 700, fontSize: '0.8rem' }}>{t('lists.fullyOwned')}</span>
-                      ) : (
-                        <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>0</span>
-                      ))}
-                    </td>
-                    <td style={{ padding: '0.5rem 1rem', textAlign: 'right' }}>
-                      <button className="btn btn-secondary btn-icon-only" onClick={() => removeCard(card.id)} title={t('lists.removeCard')}
-                        style={{ width: '26px', height: '26px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Trash2 size={14} /></button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="card-grid list-card-grid">
+          {cards.map(card => {
+            const missing = Math.max(0, card.quantity - (card.owned_qty || 0));
+            return (
+              <div key={card.id} className="tcg-card list-grid-card" role="button" tabIndex={0}
+                style={{ cursor: 'pointer' }}
+                onClick={() => setInspectCard(card)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setInspectCard(card); } }}>
+                <div className="tcg-card-inner">
+                  <CardImage card={card} className="tcg-card-image" loading="lazy" alt={displayName(card)} />
+                  <div className="list-grid-qty" style={{ position: 'absolute', top: '8px', left: '8px', background: 'rgba(0,0,0,0.85)', color: 'var(--text-strong)', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 800 }}>x{card.quantity}</div>
+                  <div className="list-grid-owned" style={{ position: 'absolute', bottom: '8px', right: '8px', background: 'rgba(0,0,0,0.85)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.65rem', fontWeight: 800 }}>
+                    {missing > 0 ? (
+                      <span style={{ color: '#f87171' }}>{t('lists.stillMissing', { count: missing })}</span>
+                    ) : (card.owned_qty > 0 ? (
+                      <span style={{ color: '#34d399' }}>{t('lists.fullyOwned')}</span>
+                    ) : (
+                      <span style={{ color: 'var(--text-muted)' }}>0</span>
+                    ))}
+                  </div>
+                </div>
+                <div className="tcg-card-info">
+                  <div className="tcg-card-name">{displayName(card)}</div>
+                  <div className="tcg-card-meta">
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70%' }}>{setReference(card) || card.set_name || ''}</span>
+                    <span className="tcg-card-price">{card.price_trend > 0 ? `$${card.price_trend.toFixed(2)}` : ''}</span>
+                  </div>
+                  <div className="list-grid-actions" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.3rem', marginTop: '0.4rem' }}>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                      <button className="btn btn-secondary btn-icon-only" onClick={() => setQty(card.id, card.quantity - 1)} aria-label="-1"
+                        style={{ width: '24px', height: '24px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Minus size={13} /></button>
+                      <input type="number" min="0" value={card.quantity} aria-label={t('lists.qty')}
+                        onChange={e => setQty(card.id, parseInt(e.target.value, 10) || 0)}
+                        style={{ width: '44px', textAlign: 'center', fontSize: '0.8rem', fontWeight: 700, padding: '0.15rem', borderRadius: 'var(--radius-sm)', background: 'rgba(0,0,0,0.3)', color: 'var(--text-strong)', border: '1px solid rgba(255,255,255,0.15)' }} />
+                      <button className="btn btn-secondary btn-icon-only" onClick={() => setQty(card.id, card.quantity + 1)} aria-label="+1"
+                        style={{ width: '24px', height: '24px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Plus size={13} /></button>
+                    </div>
+                    <button className="btn btn-secondary btn-icon-only" onClick={() => removeCard(card.id)} title={t('lists.removeCard')} aria-label={t('lists.removeCard')}
+                      style={{ width: '26px', height: '26px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Trash2 size={14} /></button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
       {/* Edit modal */}
+      {inspectCard && (
+        <CardInspectorModal
+          card={{ ...inspectCard, card_id: inspectCard.id, entry_id: null, quantity: inspectCard.owned_qty || 0 }}
+          readOnly
+          showToast={showToast}
+          onClose={() => setInspectCard(null)}
+        />
+      )}
+
       {showEdit && (
         <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
           <div className="glass-panel" style={{ maxWidth: '420px', width: '100%', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
