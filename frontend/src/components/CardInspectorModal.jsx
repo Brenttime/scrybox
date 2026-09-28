@@ -4,7 +4,6 @@ import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { resolveCardPrice } from '../utils/resolveCardPrice';
-import { getPrintingLabel } from '../utils/cardPrinting';
 import { displayRarity } from '../utils/cardRarity';
 import { priceSource } from '../utils/marketplaceLinks';
 import CardImage from './CardImage';
@@ -466,14 +465,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
 
               {/* Price History Area Chart */}
               <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={100} defaultRange="30d" />
-
-              {/* Specifications Details Grid (per-copy fields; none for a list entry) */}
-              {!readOnly && <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem 1rem', background: 'rgba(255,255,255,0.01)', border: '1px solid var(--border-glass)', padding: '0.75rem', borderRadius: 'var(--radius-sm)', fontSize: '0.75rem' }}>
-                <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specCondition')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.condition}</span></div>
-                <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specPrinting')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{getPrintingLabel(card.printing)}</span></div>
-                <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specLanguage')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.language}</span></div>
-                <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specSupertype')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.supertype}</span></div>
-              </div>}
 
               {!readOnly && card.notes && (
                 <div style={{ background: 'rgba(0,0,0,0.15)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.6rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
