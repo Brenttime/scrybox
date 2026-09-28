@@ -456,3 +456,13 @@ test('recognizer packing: LUT + reused buffers are bit-identical to the referenc
   assert.deepEqual(Float32Array.from(pb), ref(b, [0, 1], 401));
   for (let v = 0; v < 256; v++) assert.ok(Object.is(Math.fround(v / 127.5 - 1), Float32Array.of(v / 127.5 - 1)[0]));
 });
+
+test('resizeLanczos3 fast path is bit-identical to the reference (R2-4)', async () => {
+  const { resizeLanczos3, resizeLanczos3Reference } = await import('../../../shared/clientScan/imaging.mjs');
+  for (const [W, H, ch] of [[640, 360, 4], [517, 911, 3], [384, 384, 4]]) {
+    const src = new Uint8ClampedArray(W * H * ch);
+    for (let i = 0; i < src.length; i++) src[i] = (i * 2654435761 >>> 24) ^ ((i / ch / W) | 0);
+    assert.deepEqual(resizeLanczos3(src, W, H, ch, 384, 384), resizeLanczos3Reference(src, W, H, ch, 384, 384), `${W}x${H}x${ch}`);
+    assert.deepEqual(resizeLanczos3(src, W, H, ch, 384, 384), resizeLanczos3Reference(src, W, H, ch, 384, 384), 'cached taps: same again');
+  }
+});
