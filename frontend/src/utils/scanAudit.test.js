@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIndex, voteFooter, resolveFooter } from '../../../shared/clientScan/text.mjs';
 import { needsServer, NO_TITLE_ESCAPE } from './fastScan.js';
-import { createReader, corneliusTensor, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
+import { createReader, corneliusTensor, CORN_SIZE, packRecBatch } from '../../../shared/clientScan/pipeline.mjs';
 
 // Regressions from the 2026-09 scanner audit.
 
@@ -400,4 +400,199 @@ test('near-edge re-projection never slides a stage off on-card rows (review R1-B
   assert.equal(out.candidates[0].near_edge, true);
   assert.equal(r.ok, false, 'no printing from a stage that lost on-card rows');
   assert.equal(r.near_edge_partial?.stage, 'footer0');
+});
+
+// Round 2 (#8): a previous card's deferral must not follow a new presentation.
+test('reset()/no-card clear lastDeferred: a new presentation gets its cheap first look again (R2-8)', async () => {
+  for (const boundary of ['reset', 'probe-null']) {
+    const { reader, calls, setPresent } = fakeReaderIx((_, batch) => (batch === 2 ? 'bolt' : 'zz'));
+    const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+    for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+    const a = await reader.read(sharpFrame(), small, { requireStill: true });
+    assert.equal(a.results[0].deferred, true, 'fixture: first read defers');
+    if (boundary === 'reset') reader.reset();
+    else { setPresent(false); assert.equal(await reader.probe(small, 4, 200, 280), null); setPresent(true); }
+    for (let i = 0; i < 2; i++) await reader.read(sharpFrame(), small, { requireStill: true });
+    const c0 = calls();
+    const b = await reader.read(sharpFrame(), small, { requireStill: true });
+    assert.equal(b.results[0].deferred, true, `${boundary}: new presentation defers its deep stages again`);
+    assert.equal(calls() - c0, 2, `${boundary}: title + first footer batch only`);
+  }
+});
+
+test('footer rescue stage: taller rows + wide 0.84 prove what the first batch clipped (R2-2)', async () => {
+  // Call 1 title, 2 first footer batch, 3 wide (4 strips), 4 retro (2), 5
+  // must be the 6-strip rescue batch (v1 stopped after retro).
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 6 ? 'lea 161' : 'zz'));
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.equal(r.footer_stage, 3, 'resolved by the rescue batch, after every v1 stage');
+});
+
+test('footer rescue stage: a misread number is never snapped to the nearest indexed one (R2-2)', async () => {
+  // Rescue reads 'lea 169' (index has lea 161 / 2x2 117): no printing.
+  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 5 ? 'lea 169' : 'zz'));
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+test('recognizer packing: LUT + reused buffers are bit-identical to the reference, padding stays 0 (R2-5)', () => {
+  const REC_H = 48;
+  const strip = (w, seed) => { const d = new Uint8Array(w * REC_H * 3); for (let i = 0; i < d.length; i++) d[i] = (i * 31 + seed * 17) & 255; return { data: d, w, h: REC_H }; };
+  const ref = (strips, idx, W) => {
+    const plane = REC_H * W, data = new Float32Array(idx.length * 3 * plane);
+    idx.forEach((si, n) => { const s = strips[si], rw = Math.min(W, s.w);
+      for (let y = 0; y < REC_H; y++) for (let x = 0; x < rw; x++) { const p = (y * s.w + x) * 3, o = n * 3 * plane + y * W + x;
+        data[o] = s.data[p + 2] / 127.5 - 1; data[o + plane] = s.data[p + 1] / 127.5 - 1; data[o + 2 * plane] = s.data[p] / 127.5 - 1; } });
+    return data;
+  };
+  // Same shape twice with different (narrower) content: stale values from the
+  // first pack must not survive in the padding.
+  const a = [strip(401, 1), strip(380, 2)], b = [strip(200, 3), strip(150, 4)];
+  const pa = Float32Array.from(packRecBatch(a, [0, 1], 401));
+  assert.deepEqual(pa, ref(a, [0, 1], 401));
+  const pb = packRecBatch(b, [0, 1], 401);
+  assert.deepEqual(Float32Array.from(pb), ref(b, [0, 1], 401));
+  for (let v = 0; v < 256; v++) assert.ok(Object.is(Math.fround(v / 127.5 - 1), Float32Array.of(v / 127.5 - 1)[0]));
+});
+
+test('resizeLanczos3 fast path is bit-identical to the reference (R2-4)', async () => {
+  const { resizeLanczos3, resizeLanczos3Reference } = await import('../../../shared/clientScan/imaging.mjs');
+  for (const [W, H, ch] of [[640, 360, 4], [517, 911, 3], [384, 384, 4]]) {
+    const src = new Uint8ClampedArray(W * H * ch);
+    for (let i = 0; i < src.length; i++) src[i] = (i * 2654435761 >>> 24) ^ ((i / ch / W) | 0);
+    assert.deepEqual(resizeLanczos3(src, W, H, ch, 384, 384), resizeLanczos3Reference(src, W, H, ch, 384, 384), `${W}x${H}x${ch}`);
+    assert.deepEqual(resizeLanczos3(src, W, H, ch, 384, 384), resizeLanczos3Reference(src, W, H, ch, 384, 384), 'cached taps: same again');
+  }
+});
+
+test('duplicate decoded frames never count as settle evidence and are never read (R2-6)', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+  // One decoded frame (id 7) observed 5 times over 400 ms: never admitted.
+  for (let i = 0; i < 5; i++) { const o = await reader.read(f, small, { requireStill: true, frameId: 7 }); t += 100; if (i) assert.equal(o.candidates[0].duplicate, true); }
+  assert.equal(calls(), 0, 'the same frame repeated is not a settled window');
+  // Distinct frames: normal 180 ms window.
+  for (let id = 8; id < 11; id++) { await reader.read(f, small, { requireStill: true, frameId: id }); t += 100; }
+  assert.ok(calls() > 0);
+  // Without frame ids (no rVFC: iOS < 15.4, old Android) behaviour is unchanged.
+  let t2 = 0; const b = fakeReader(() => 'grief', { clock: () => t2 });
+  for (let i = 0; i < 3; i++) { await b.reader.read(f, small, { requireStill: true }); t2 += 100; }
+  assert.ok(b.calls() > 0, 'no frameId: timer path admits as before');
+});
+
+test('adaptive settle is OFF by default and, when on, only ever admits sooner, on clean distinct frames (R2-1)', async () => {
+  const admitAt = async (opts, frames) => {
+    let t = 0;
+    const f0 = fakeReader(() => 'grief', { clock: () => t });
+    const reader = createReader({ ...f0.reader.__env, ...opts });
+    const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+    for (let i = 0; i < 20; i++) { await reader.read(frames(i), small, { requireStill: true, frameId: i }); if (f0.calls()) return t; t += 60; }
+    return Infinity;
+  };
+  const sharpF = () => sharpFrame();
+  const off = await admitAt({}, sharpF), on = await admitAt({ fastSettle: true }, sharpF);
+  assert.ok(off >= 180, `default window unchanged (${off})`);
+  assert.ok(on >= 120 && on < off, `flag on: shorter for clean frames (${on} vs ${off})`);
+  // Without frame ids the fast path never applies.
+  let t = 0; const g = fakeReader(() => 'grief', { clock: () => t });
+  const r2 = createReader({ ...g.reader.__env, fastSettle: true });
+  for (let i = 0; i < 3; i++) { await r2.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), { requireStill: true }); t += 60; }
+  assert.equal(g.calls(), 0, 'no frameId -> conservative window (120 ms of 60 ms passes is not enough)');
+});
+
+test('edge sides are reported for a directional hint; admission unchanged (R2-9)', async () => {
+  const { reader, calls } = fakeReader(() => 'grief', { corners: nearTop(0.001) });
+  const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(out.candidates[0].status, 'touches frame edge');
+  assert.deepEqual(out.candidates[0].edge_sides, ['top']);
+  assert.equal(calls(), 0);
+});
+
+test('title rescue gate: measured always, gated only when every crop is flat and no title, behind env.titleGate (R2-3/7)', async () => {
+  const { flatTitleCrops } = await import('../../../shared/clientScan/pipeline.mjs');
+  assert.equal(flatTitleCrops([], [10, 12]), true);
+  assert.equal(flatTitleCrops([], [10, 80]), false, 'one contrasty crop keeps the rescue');
+  assert.equal(flatTitleCrops([{ name: 'x' }], [1, 1]), false, 'a title candidate keeps its rescue');
+  assert.equal(flatTitleCrops([], []), false);
+  const { reader } = fakeReader(() => 'zz');
+  const o = await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(o.timings.title_range.length, 2, 'crop contrast recorded for shadow calibration');
+  assert.notEqual(o.timings.title_gated, 1, 'contrasty crops are never gated');
+});
+
+test('footer rescue never resolves against a conflicting strong number read on the same frame (Damn DRC 89 vs MH2 80, R2-2)', async () => {
+  // First batch: '080/505' (number 80, total too high for the set check);
+  // rescue: '089/59' (strong 89). Old candidate proved drc 89 -> wrong.
+  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 5 && n === 6 ? '089/59' : 'zz'));
+  const index = loadIndex({ names: ['damn'], canon: {}, excluded: [], sets: ['mh2', 'drc'],
+    printings: [['id-mh2', 'mh2', '80'], ['id-drc', 'drc', '89'], ['id-mh2b', 'mh2', '396']], byTitle: { damn: [0, 1, 2] }, uniqueAlias: {} });
+  const reader = createReader({ ...f.reader.__env, index });
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.notEqual(r.scryfallId, 'id-drc', 'never the misread printing');
+  assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+test('rescue never pre-empts wide or retro (R1-S2/R2-S2); its evidence blocks conflicting identities (R1-B3)', async () => {
+  const ix2 = () => loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
+    printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+  // Wide says 2x2 147: proved there (stage 1), rescue never runs.
+  const f1 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 3 ? '2x2 147' : calls === 5 && n === 6 ? 'lea 161' : 'zz'));
+  const r1 = (await createReader({ ...f1.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
+  assert.equal(r1.scryfallId, 'id-2x2'); assert.equal(r1.footer_stage, 1);
+  // Retro says 147 (copyright line): proved there (stage 2) with v1's calls.
+  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 4 ? 'wizards 147' : n === 6 && calls === 5 ? 'lea 161' : 'zz'));
+  const r2 = (await createReader({ ...f2.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
+  assert.equal(r2.scryfallId, 'id-2x2'); assert.equal(r2.footer_stage, 2); assert.equal(f2.calls(), 4, 'no extra recognizer call on a v1 retro success');
+  // Rescue reads two identities of one set: ambiguous, never a pick.
+  const ixLea = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea'],
+    printings: [['id-lea', 'lea', '161'], ['id-lea2', 'lea', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const f3 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 6 ? 'lea 161 147' : 'zz'));
+  const r3 = (await createReader({ ...f3.reader.__env, index: ixLea }).read(sharpFrame(), small)).results[0];
+  assert.equal(r3.ok, false, JSON.stringify(r3));
+});
+
+test('fingerprint frame ids (no rVFC / stale clock): a frozen stream is never settle evidence (R1-B2)', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+  for (let i = 0; i < 6; i++) { await reader.read(f, small, { requireStill: true, frameId: 'pabc' }); t += 100; }
+  assert.equal(calls(), 0, 'same pixels 6 times: never admitted');
+  for (const id of ['p1', 'p2', 'p3']) { await reader.read(f, small, { requireStill: true, frameId: id }); t += 100; }
+  assert.ok(calls() > 0, 'distinct frames admit on the normal window');
+  // Fingerprints never enable fast settle.
+  let t2 = 0; const g = fakeReader(() => 'grief', { clock: () => t2 });
+  const r2 = createReader({ ...g.reader.__env, fastSettle: true });
+  for (const id of ['a', 'b', 'c']) { await r2.read(sharpFrame(), small, { requireStill: true, frameId: id }); t2 += 60; }
+  assert.equal(g.calls(), 0);
+});
+
+test('switching frame-id source (rVFC number <-> pixel fingerprint) restarts the settle window (R2-B2)', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+  t = 100; await reader.read(f, small, { requireStill: true, frameId: 7 });
+  t = 200; await reader.read(f, small, { requireStill: true, frameId: 8 });
+  t = 400; await reader.read(f, small, { requireStill: true, frameId: 8 });
+  t = 701; const o = await reader.read(f, small, { requireStill: true, frameId: 'pfrozen' });
+  assert.notEqual(o.candidates[0].status, 'ready'); assert.equal(calls(), 0);
+  t = 801; await reader.read(f, small, { requireStill: true, frameId: 9 });
+  assert.equal(calls(), 0, 'reverse switch restarts too');
+});
+
+test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)', async () => {
+  const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'], printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '161']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  let t = 0, frame = 0, call = 0; const batches = [];
+  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 5 ? '2x2 161' : n === 2 ? 'zz' : '161'; }, { clock: () => t });
+  const reader = createReader({ ...f.reader.__env, index: ix });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), full = sharpFrame();
+  let first; for (t = 0; t <= 200; t += 100) first = await reader.read(full, small, { requireStill: true, frameId: t });
+  assert.equal(first.results[0].deferred, true);
+  frame = 1; call = 0; batches.length = 0;
+  const r = (await reader.read(full, small, { requireStill: true, frameId: t })).results[0];
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.deepEqual(batches, [2, 6, 4, 2], 'v1 batches; rescue never runs');
 });

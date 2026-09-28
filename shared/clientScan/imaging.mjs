@@ -103,12 +103,25 @@ export function sampleStrip(rgba, w, h, m, x0, x1, y0, y1, outH = REC_H) {
       out[o] = acc[0] / n + 0.5; out[o + 1] = acc[1] / n + 0.5; out[o + 2] = acc[2] / n + 0.5;
     }
   }
+  // Pre-stretch contrast of the crop (max channel hi-lo, 0-255): a crop-level
+  // text-quality signal (R2-#3/#7), unlike the global title-band Laplacian.
+  const range = channelRange(out);
   autocontrast(out);
-  return { data: out, w: outW, h: outH };
+  return { data: out, w: outW, h: outH, range };
 }
 
 // PIL ImageOps.autocontrast(cutoff=0) on an RGB image: stretch each channel
 // independently so its darkest value is 0 and its brightest 255.
+export function channelRange(rgb) {
+  let range = 0;
+  for (let c = 0; c < 3; c++) {
+    let lo = 255, hi = 0;
+    for (let i = c; i < rgb.length; i += 3) { const v = rgb[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi - lo > range) range = hi - lo;
+  }
+  return range;
+}
+
 export function autocontrast(rgb) {
   for (let c = 0; c < 3; c++) {
     let lo = 255, hi = 0;
@@ -189,11 +202,50 @@ function lanczosWeights(inN, outN) {
 // Weights and the intermediate buffer depend only on the dimensions, which are
 // fixed for a camera session: computed once, reused (same values, same order).
 const lzCache = new Map();
+// Flattened taps (R2-#4): per output index a start offset and a fixed-stride
+// row of weights, so the inner loops touch only typed arrays. The arithmetic
+// is unchanged: same float32 weights, same tap order, double accumulators,
+// float32 intermediate, same rounding, so the output is bit-identical to
+// resizeLanczos3Reference (asserted in scanAudit.test.js and on real frames).
+function flatTaps(ws) {
+  let n = 0;
+  for (const { w } of ws) n = Math.max(n, w.length);
+  const lo = new Int32Array(ws.length), len = new Int32Array(ws.length), k = new Float32Array(ws.length * n);
+  ws.forEach((e, i) => { lo[i] = e.lo; len[i] = e.w.length; k.set(e.w, i * n); });
+  return { lo, len, k, n };
+}
 export function resizeLanczos3(src, W, H, ch, w, h) {
   const key = `${W}x${H}>${w}x${h}`;
   let c = lzCache.get(key);
-  if (!c) { if (lzCache.size > 4) lzCache.clear(); c = { wx: lanczosWeights(W, w), wy: lanczosWeights(H, h), tmp: new Float32Array(H * w * 3) }; lzCache.set(key, c); }
-  const { wx, wy, tmp } = c;
+  if (!c) { if (lzCache.size > 4) lzCache.clear(); c = { fx: flatTaps(lanczosWeights(W, w)), fy: flatTaps(lanczosWeights(H, h)), tmp: new Float32Array(H * w * 3) }; lzCache.set(key, c); }
+  const { fx, fy, tmp } = c;
+  const xlo = fx.lo, xlen = fx.len, xk = fx.k, xn = fx.n;
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    let o = y * w * 3;
+    for (let x = 0; x < w; x++, o += 3) {
+      const kb = x * xn, L = xlen[x];
+      let p = (row + xlo[x]) * ch, r = 0, g = 0, b = 0;
+      for (let t = 0; t < L; t++, p += ch) { const kt = xk[kb + t]; r += src[p] * kt; g += src[p + 1] * kt; b += src[p + 2] * kt; }
+      tmp[o] = r; tmp[o + 1] = g; tmp[o + 2] = b;
+    }
+  }
+  const out = new Uint8Array(w * h * 3);
+  const ylo = fy.lo, ylen = fy.len, yk = fy.k, yn = fy.n, stride = w * 3;
+  for (let y = 0; y < h; y++) {
+    const kb = y * yn, L = ylen[y], base = ylo[y] * stride;
+    let o = y * stride;
+    for (let x = 0; x < w; x++, o += 3) {
+      let p = base + x * 3, r = 0, g = 0, b = 0;
+      for (let t = 0; t < L; t++, p += stride) { const kt = yk[kb + t]; r += tmp[p] * kt; g += tmp[p + 1] * kt; b += tmp[p + 2] * kt; }
+      out[o] = Math.max(0, Math.min(255, Math.round(r))); out[o + 1] = Math.max(0, Math.min(255, Math.round(g))); out[o + 2] = Math.max(0, Math.min(255, Math.round(b)));
+    }
+  }
+  return out;
+}
+// The pre-R2 implementation, kept as the equivalence reference.
+export function resizeLanczos3Reference(src, W, H, ch, w, h) {
+  const wx = lanczosWeights(W, w), wy = lanczosWeights(H, h), tmp = new Float32Array(H * w * 3);
   for (let y = 0; y < H; y++) for (let x = 0; x < w; x++) {
     const { lo, w: k } = wx[x]; let r = 0, g = 0, b = 0;
     for (let t = 0; t < k.length; t++) { const p = (y * W + lo + t) * ch; r += src[p] * k[t]; g += src[p + 1] * k[t]; b += src[p + 2] * k[t]; }

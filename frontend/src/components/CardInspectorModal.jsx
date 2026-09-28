@@ -28,7 +28,7 @@ const MTG_COLOR_FG = {
 // Self-contained: owns its edit form (PUT) and delete (DELETE) so every screen
 // gets the same rich view + edit without duplicating the form. onUpdate() lets
 // the parent refetch after a change.
-function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false }) {
+function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false }) {
   const { t } = useT();
   const [mode, setMode] = useState('view');
   const [q, setQ] = useState(1);
@@ -257,12 +257,12 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
             </div>
           </div>
           <CardImageActions card={card} compact getSrc={() => document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
-          <CardArtEditor
+          {!readOnly && <CardArtEditor
             card={card}
             hasProviderArt={!!card.image_url}
             showToast={showToast}
             onChanged={onUpdate}
-          />
+          />}
         </div>
 
         {/* Right side: Information / Edit */}
@@ -396,12 +396,12 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                     </div>
                   )}
                 </div>
-                <div>
+                {!readOnly && <div>
                   <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700 }}>{t('inspector.purchaseValue')}</div>
                   <div style={{ fontSize: '1.25rem', fontWeight: 800, color: 'var(--text-strong)', marginTop: '0.15rem' }}>
                     ${formatPrice(card.purchase_price)}
                   </div>
-                </div>
+                </div>}
               </div>
 
               {/* Marketplace links. "View on TCGplayer" now means the card's own
@@ -451,22 +451,22 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {/* Price History Area Chart */}
               <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={100} defaultRange="30d" />
 
-              {/* Specifications Details Grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem 1rem', background: 'rgba(255,255,255,0.01)', border: '1px solid var(--border-glass)', padding: '0.75rem', borderRadius: 'var(--radius-sm)', fontSize: '0.75rem' }}>
+              {/* Specifications Details Grid (per-copy fields; none for a list entry) */}
+              {!readOnly && <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem 1rem', background: 'rgba(255,255,255,0.01)', border: '1px solid var(--border-glass)', padding: '0.75rem', borderRadius: 'var(--radius-sm)', fontSize: '0.75rem' }}>
                 <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specCondition')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.condition}</span></div>
                 <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specPrinting')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{getPrintingLabel(card.printing)}</span></div>
                 <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specLanguage')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.language}</span></div>
                 <div><span style={{ color: 'var(--text-muted)' }}>{t('inspector.specSupertype')}</span> <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{card.supertype}</span></div>
-              </div>
+              </div>}
 
-              {card.notes && (
+              {!readOnly && card.notes && (
                 <div style={{ background: 'rgba(0,0,0,0.15)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.6rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                   {card.notes}
                 </div>
               )}
 
               {/* Main Actions Row: a compact Edit button + Delete. */}
-              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              {!readOnly && <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem', alignItems: 'center', flexWrap: 'wrap' }}>
                 <button className="btn btn-primary ci-edit-btn" style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }} onClick={() => setMode('edit')}>
                   {t('inspector.editCard')}
                 </button>
@@ -491,7 +491,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 >
                   <Trash2 size={16} />
                 </button>
-              </div>
+              </div>}
             </>
           )}
         </div>

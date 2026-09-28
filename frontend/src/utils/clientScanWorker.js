@@ -35,6 +35,8 @@ const BASE = '/scan-assets/';
 const CACHE = 'scrybox-scan-assets';
 let readerPromise = null;
 let pendingReset = false;
+let FLAGS = {};
+let THREAD_OVERRIDE = null;
 
 async function cachedBytes(cache, url) {
   let res = cache ? await cache.match(url) : null;
@@ -77,10 +79,10 @@ async function load() {
   ]);
   const index = loadIndex(JSON.parse(await gunzip(indexGz)));
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
-  const reader = createReader({ ort, cornelius, rec, chars, index });
+  const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate });
   // Which assets this worker actually runs, for scan telemetry: rules out a
   // stale cached index/model when live and replay disagree.
-  const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false };
+  const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false };
   return { reader, info, loadMs: Math.round(performance.now() - t0) };
 }
 
@@ -88,7 +90,7 @@ self.onmessage = async (e) => {
   const { type, id } = e.data;
   if (type === 'load') {
     ORIGIN = e.data.base || '';
-    if (!readerPromise) ort.env.wasm.numThreads = pickThreads(e.data.threads);
+    if (!readerPromise) { ort.env.wasm.numThreads = pickThreads(e.data.threads); THREAD_OVERRIDE = e.data.threads || null; FLAGS = e.data.flags || {}; }
     readerPromise ||= load();
     try {
       const { loadMs, info } = await readerPromise;
@@ -120,13 +122,13 @@ self.onmessage = async (e) => {
   }
   // Phase 2: the full read, reusing the corners phase 1 found for this frame.
   if (type === 'read') {
-    const { frame, w, h, quad, requireStill } = e.data;
+    const { frame, w, h, quad, requireStill, frameId = null } = e.data;
     try {
       if (!readerPromise) throw new Error('reader not loaded');
       const { reader } = await readerPromise;
       const out = await reader.read(
         { data: new Uint8ClampedArray(frame), width: w, height: h },
-        null, { requireStill, quad });
+        null, { requireStill, quad, frameId });
       self.postMessage({ id, out, frame }, [frame]);
     } catch (err) {
       self.postMessage({ id, error: err?.message || String(err), frame }, [frame]);

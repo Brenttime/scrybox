@@ -19,7 +19,7 @@ import {
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
-  footerNumbers, footerCodes, resolveFooter, retroNumber, strongNumbers, looksLikeCopyright, voteFooter,
+  footerNumbers, footerCodes, resolveFooter, retroNumber, strongNumbers, looksLikeCopyright, voteFooter, normalizeCollector,
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
@@ -75,6 +75,25 @@ const STILL_MIN_SEP_MS = 90;
 // cadence, so it is not monotonic across every cadence, and it is never
 // sooner than 2 x 90 ms after the first still observation.
 const STILL_WINDOW_MS = (STILL_OBS - 1) * STILL_MIN_SEP_MS;
+// Adaptive settle (R2-#1), EXPERIMENTAL, off unless env.fastSettle: a window
+// of FAST_SETTLE_MS instead of STILL_WINDOW_MS, but only when every counted
+// observation of it was a distinct decoded frame (frameId), drifted at most
+// half the normal tolerance, and was well above the blur floor. Anything
+// else keeps the conservative window; it can only admit sooner, never later.
+// Off by default: still images cannot validate earlier admission (Astra R2:
+// needs recorded video with decoded-frame timestamps).
+const FAST_SETTLE_MS = 120;
+const FAST_SETTLE_DRIFT = STILL_DRIFT / 2;
+const FAST_SETTLE_SHARP = 4 * 500;
+// Crop-level text contrast gate for the title rescue (R2-#3), EXPERIMENTAL,
+// off unless env.titleGate: skip the second title batch when EVERY first
+// title crop is nearly flat before autocontrast (max channel range below
+// this). Always measured (timings.title_range) for shadow calibration.
+const TITLE_MIN_RANGE = 24;
+// Pure: no confident title from batch one AND every batch-one crop is flat.
+export function flatTitleCrops(cands, ranges) {
+  return !cands.length && ranges.length > 0 && ranges.every(r => Number.isFinite(r) && r < TITLE_MIN_RANGE);
+}
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
@@ -139,7 +158,38 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // failed server fallbacks each. Replay of 71 saved fallback frames: client
 // matches 3 -> 16, 0 printing or title conflicts, 0 baseline hits lost.
 // Still one recognizer call (6 strips = REC_BATCH).
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'retro'];
+// 'rescue' (R2-#2): one batch of the rows the first stage clipped. The wide
+// 0.84 row (WIDE_ROWS has no 0.84, so "R.006" never became "R 0064", Oath of
+// Eorl) and the modern rows 0.035 tall instead of 0.025 (Helm "R.0209" ->
+// "R 0200", H.E.R.B.I.E. "2196" -> "R 0106": the digits' lower edge was
+// cut). Its reads are ADDED to the earlier ones, never substituted, so any
+// conflicting number still makes the footer ambiguous; nothing is ever
+// snapped to the nearest indexed number. One recognizer call (6 strips), only
+// for a card the first batch did not prove. Replay: 71 old fallback frames
+// 49 -> 55, 5 new 0 -> 5, every baseline hit kept, 0 conflicts.
+const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].map(y => [0, 0.22, y, y + 0.035])];
+// Rescue runs LAST, after every original stage (review R1-S2, R2-S2): each
+// card the old order proved is proved by the same stage from the same reads
+// and the same recognizer calls; rescue only sees cards v1 left unproven.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'retro', 'rescue'];
+// Pure: once rescue reads are in the evidence, a printing is proved only if
+// NO other printing of the title is named by it: not by a strong number (N/T
+// or read in 2 strips; set totals ignored), and not by an exact set code +
+// number pair (review R1-B3: "lea 161 117" then a retro "117").
+export function strongConflict(ix, title, pi, raws) {
+  const pool = ix.byTitle[title] || [];
+  const mine = normalizeCollector(ix.printings[pi][2]);
+  const strong = [...strongNumbers(raws).keys()];
+  const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbers(raws));
+  for (const o of pool) {
+    if (o === pi) continue;
+    const n = normalizeCollector(ix.printings[o][2]);
+    if (n === mine && ix.printings[o][1] !== ix.printings[pi][1]) continue;   // same number elsewhere: set evidence decided
+    if (strong.includes(n)) return true;
+    if (codes.has(ix.printings[o][1]) && nums.has(String(ix.printings[o][2]).toLowerCase())) return true;
+  }
+  return false;
+}
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
@@ -204,6 +254,43 @@ function stripInFrame(m, r, w, h) {
   return true;
 }
 
+// Recognizer input: a per-length reusable Float32Array (the batch shapes repeat
+// frame after frame: 2x3x48x401, 6x3x48x320, ...), zeroed before reuse so the
+// right padding stays exactly 0, and a 256-entry normalisation table. Safe to
+// reuse: each run is awaited before the next batch is packed. Bounded.
+const REC_LUT = Float32Array.from({ length: 256 }, (_, v) => v / 127.5 - 1);
+const recBufs = new Map();
+function recBuffer(len) {
+  let b = recBufs.get(len);
+  if (b) { b.fill(0); return b; }
+  if (recBufs.size >= 8) recBufs.delete(recBufs.keys().next().value);
+  b = new Float32Array(len);
+  recBufs.set(len, b);
+  return b;
+}
+
+// Pack strips idx (RGB, height REC_H) into one NCHW BGR batch of width W.
+export function packRecBatch(strips, idx, W) {
+  const plane = REC_H * W;
+  const data = recBuffer(idx.length * 3 * plane);
+  idx.forEach((si, n) => {
+    const s = strips[si];
+    const rw = Math.min(W, s.w);
+    // RapidOCR feeds BGR (the sidecar converts RGB->BGR before text_rec).
+    // REC_LUT[v] is the same float32 as v / 127.5 - 1 (R2-#5).
+    const src = s.data, b0 = n * 3 * plane;
+    for (let y = 0; y < REC_H; y++) {
+      let p = y * s.w * 3, o = b0 + y * W;
+      for (let x = 0; x < rw; x++, p += 3, o++) {
+        data[o] = REC_LUT[src[p + 2]];
+        data[o + plane] = REC_LUT[src[p + 1]];
+        data[o + 2 * plane] = REC_LUT[src[p]];
+      }
+    }
+  });
+  return data;
+}
+
 // RapidOCR TextRecognizer: sort by aspect, batches of 6, each padded (zeros,
 // i.e. mid-grey after normalisation) to the batch's widest ratio, min 320/48.
 async function recognize(env, strips) {
@@ -215,21 +302,7 @@ async function recognize(env, strips) {
     let maxRatio = 320 / REC_H;
     for (const i of idx) maxRatio = Math.max(maxRatio, strips[i].w / strips[i].h);
     const W = Math.trunc(REC_H * maxRatio);
-    const plane = REC_H * W;
-    const data = new Float32Array(idx.length * 3 * plane);
-    idx.forEach((si, n) => {
-      const s = strips[si];
-      const rw = Math.min(W, s.w);
-      // RapidOCR feeds BGR (the sidecar converts RGB->BGR before text_rec).
-      for (let y = 0; y < REC_H; y++) {
-        for (let x = 0; x < rw; x++) {
-          const p = (y * s.w + x) * 3, o = n * 3 * plane + y * W + x;
-          data[o] = s.data[p + 2] / 127.5 - 1;
-          data[o + plane] = s.data[p + 1] / 127.5 - 1;
-          data[o + 2 * plane] = s.data[p] / 127.5 - 1;
-        }
-      }
-    });
+    const data = packRecBatch(strips, idx, W);
     const res = await env.rec.run({ [env.rec.inputNames[0]]: new env.ort.Tensor('float32', data, [idx.length, 3, REC_H, W]) });
     const pred = res[env.rec.outputNames[0]];
     const [, steps, classes] = pred.dims;
@@ -247,6 +320,8 @@ export function createReader(env) {
   let stillSince = 0;             // real time the current still window began
   let readSince = false;          // OCR ran since the last observation
   let lastDeferred = false;       // previous read deferred its deep footer stages
+  let lastFrameId = null;         // decoded-frame id of the last counted observation
+  let fastRun = true;             // every observation of this window qualifies for fast settle
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
   // alone does not prove a printing — reprints share art and differ only in
   // the footer — so a signature match is trusted only while the same physical
@@ -277,14 +352,14 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known } = opts;
+    const { smallChannels = 4, requireStill = false, quad: known, frameId = null } = opts;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -297,9 +372,31 @@ export function createReader(env) {
     const nearEdge = !inside(quad, ex, ey) && inside(quad, tx, ty) && plausibleCard(quad);
     const clipped = !inside(quad, ex, ey) && !nearEdge;
     if (nearEdge) cand.near_edge = true;
+    // Which frame sides the outline is at (R2-#9), for a directional hint.
+    // Guidance only: admission is unchanged.
+    if (clipped || nearEdge) {
+      const sides = [];
+      if (ys.some(y => y <= ey)) sides.push('top');
+      if (ys.some(y => y >= h - ey)) sides.push('bottom');
+      if (xs.some(x => x <= ex)) sides.push('left');
+      if (xs.some(x => x >= w - ex)) sides.push('right');
+      if (sides.length) cand.edge_sides = sides;
+    }
     const diag = Math.hypot(w, h);
+    // The same decoded video frame seen again (R2-#6): it is not new evidence
+    // of stillness, and re-reading its pixels cannot change the answer. In
+    // auto it never advances the settle window and is never read.
+    if (requireStill && frameId != null && frameId === lastFrameId && lastQuad) {
+      cand.duplicate = true; cand.status = 'settling'; cand.still = stillRun;
+      return base;
+    }
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
+    // A change of frame-identity source (decoded-frame number <-> pixel
+    // fingerprint, when rVFC stops or resumes) is not comparable evidence:
+    // the window restarts (review R2-B2).
+    const sourceSwitch = lastFrameId != null && frameId != null && typeof lastFrameId !== typeof frameId;
+    lastFrameId = frameId;
     const tNow = env.clock ? env.clock() : now();
     // A long gap right after an OCR read may not vouch for the frame after it
     // (the card could have moved and come back), so it counts at most as the
@@ -309,20 +406,25 @@ export function createReader(env) {
     // Only a read that actually ran the recognizer counts as a gap "after an
     // OCR read": a geometric abstention (zero rec calls) is as quick as a gate
     // pass and must not force a fresh settle cycle.
-    if (drift > STILL_DRIFT || stillRun === 0) { stillRun = 1; stillSince = tNow; }
+    if (drift > STILL_DRIFT || stillRun === 0 || sourceSwitch) { stillRun = 1; stillSince = tNow; fastRun = true; }
     else if (tNow - lastAt > STILL_GAP_MS && readSince) {
       // The window continues but needs one more observation, and at least
       // STILL_MIN_SEP_MS more of it, after this gap.
       stillRun = Math.min(stillRun + 1, STILL_OBS - 1);
       stillSince = Math.max(stillSince, tNow - STILL_WINDOW_MS + STILL_MIN_SEP_MS);
-    } else stillRun++;
+      fastRun = false;
+    } else { stillRun++; if (drift > FAST_SETTLE_DRIFT) fastRun = false; }
     lastAt = tNow;
     readSince = false;
-    const settled = stillRun >= STILL_OBS && tNow - stillSince >= STILL_WINDOW_MS;
-    cand.still = stillRun;
     let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
+    // Fast settle needs real decoded-frame numbers (rVFC), not fingerprints.
+    if (sharp < FAST_SETTLE_SHARP || typeof frameId !== 'number') fastRun = false;
+    const window = env.fastSettle && fastRun ? FAST_SETTLE_MS : STILL_WINDOW_MS;
+    const settled = stillRun >= STILL_OBS && tNow - stillSince >= window;
+    if (settled && window < STILL_WINDOW_MS && tNow - stillSince < STILL_WINDOW_MS) cand.fast_settle = true;
+    cand.still = stillRun;
     // Blurred or clipped observations are not part of a settled window.
     if (clipped || sharp < TITLE_SHARP_FLOOR) stillRun = 0;
     cand.still = stillRun;
@@ -392,7 +494,8 @@ export function createReader(env) {
     else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
-      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred) };
+      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred),
+        rescued: !!result.rescued || !!(prior && prior.name === result.title && prior.rescued) };
     }
     return base;
   }
@@ -445,12 +548,18 @@ export function createReader(env) {
         if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
     };
-    consider(await recognize(env, strips(TITLE_FIRST, 'title1')), 1);
+    const t1 = strips(TITLE_FIRST, 'title1');
+    const titleRange = t1.map(s => s.range);
+    if (titleRange.length) timings.title_range = titleRange;
+    consider(await recognize(env, t1), 1);
     // The tighter crops rescue weak or partial reads. An exact, high-confidence
     // match of a full index name needs no rescue: skip the second recognizer
     // call. This only selects the TITLE; printings still need their proof.
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
-    if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
+    const flat = flatTitleCrops(cands, titleRange);
+    if (flat) timings.title_flat = 1;
+    if (flat && env.titleGate) timings.title_gated = 1;
+    else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
     timings.title_ms = Math.round(now() - tA);
@@ -474,11 +583,16 @@ export function createReader(env) {
     if (pi != null) return done(pi, 'unique printed title', []);
 
     const raws = [];
+    let rescued = false;
     const pooled = prior && prior.name === name ? prior.frames : null;
     // Evidence pooled from a deferred frame only saw the first footer batch.
     // Pooling it must not settle the printing before this frame has run the
     // stages that frame skipped (wide can disambiguate what narrow misread).
-    const lastStage = (env.footerStages || FOOTER_STAGES).length - 1;
+    // v1's last stage (retro): a deferred frame's pooled evidence may settle
+    // the printing there exactly as in v1, before the added rescue stage
+    // (review R3-S2). Rescue is appended after it and never moves this line.
+    const stageList = env.footerStages || FOOTER_STAGES;
+    const lastStage = stageList.includes('rescue') ? stageList.indexOf('rescue') - 1 : stageList.length - 1;
     const tryPooled = (si) => {
       if (!pooled || !raws.length) return null;
       if (prior.deferred && si < lastStage) return null;
@@ -486,6 +600,9 @@ export function createReader(env) {
       const all = frames.flat();
       let p = resolveFooter(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));
       if (p == null) p = voteFooter(ix, name, frames);
+      // Rescue reads (this frame or a pooled one) never prove a printing that
+      // another strong number on these frames contradicts.
+      if (p != null && (rescued || prior.rescued) && strongConflict(ix, name, p, all)) { timings.rescue_conflict = 1; p = null; }
       return p == null ? null : done(p, 'title+collector (multi-frame)', all, si);
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
@@ -501,6 +618,7 @@ export function createReader(env) {
         }
         if (nums.length) {
           pi = resolveFooter(ix, name, [], nums);
+          if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
           if (pi != null) return done(pi, 'title+collector (retro frame)', raws, si);
         }
         const pooledHit = tryPooled(si);
@@ -509,10 +627,18 @@ export function createReader(env) {
       }
       const rows = stage === 'wide' ? WIDE_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const reads = await recognize(env, strips(rows.map(y => [0, x1, y, y + 0.025]), `footer${si}`));
+      const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + 0.025]);
+      const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
+      // A rescue-stage answer must not contradict ANY strong number read on
+      // this frame (R2-#2 replay: rescue read "089/59%" -> DRC 89 while the
+      // first batch read "080/505", the real MH2 80, dropped only by its set
+      // total check). Conflicting evidence means ambiguity, not a pick.
+      // Holds for every later stage too: the rescue reads stay in raws.
+      if (stage === 'rescue') rescued = true;
+      if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
@@ -527,18 +653,20 @@ export function createReader(env) {
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }
     return quad;
   }
 
-  return { read, probe, stats: env.stats, reset() { lastQuad = null; stillRun = 0; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
+  return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
+    // deferral may make this card skip its cheap first look (review R2-#8).
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };

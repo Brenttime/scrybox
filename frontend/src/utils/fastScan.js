@@ -75,6 +75,7 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
 // lifting the card (a no-card frame) ends the streak at once.
 export const FAIL_BACKOFF_MS = [0, 1000, 2000, 3000];
 const SAME_PLACE = 0.08;   // centre move, fraction of frame diagonal
+const MOTION_BREAK = 3;    // moving/blurred passes in a row that end a presentation
 
 function unresolvedSignature(out) {
   const res = (out?.results || []).find(r => !r.ok && r.title);
@@ -97,10 +98,18 @@ function unresolvedSignature(out) {
 // pass between two failed fallbacks cleared the backoff), while the fixed
 // deadline still expires on time. serverAllowed only ever applies it to the
 // same title in the same place.
-export function nextFailStreak(prev, out, now, { fromServer = true } = {}) {
+// sameFrameLocal (R2-#10): the on-device read of the very frame that was
+// just sent. The sidecar often fails WITHOUT a title ("no confident card
+// title", Helm of the Host) while the client read one; that failed server
+// attempt is then signed with the client's title and position, so the next
+// local failure of the same card backs off instead of re-sending at once.
+// Only for a single-card server answer, and only on a real server attempt.
+export function nextFailStreak(prev, out, now, { fromServer = true, sameFrameLocal = null } = {}) {
   const resolved = (out?.results || []).some(r => r.ok);
   if (resolved || !out?.candidates?.length) return null;
-  const sig = fromServer ? unresolvedSignature(out) : null;
+  let sig = fromServer ? unresolvedSignature(out) : null;
+  if (!sig && fromServer && sameFrameLocal && !sameFrameLocal.error && out.candidates.length === 1
+    && !(out.results || []).some(r => r.title)) sig = unresolvedSignature(sameFrameLocal);
   if (!sig) return prev || null;
   const same = prev && normTitle(prev.title) === normTitle(sig.title)
     && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;
@@ -136,6 +145,116 @@ export function nextEdgeRun(prev, out) {
   const same = prev && Math.hypot(prev.cx - cx, prev.cy - cy) <= SAME_PLACE;
   return { cx, cy, count: same ? prev.count + 1 : 1 };
 }
+// --- presentations (R2 measurement fix) -----------------------------------
+// One presentation = one physical card continuously in view. waited_ms used to
+// run from the first candidate after a hit or no-card frame, so a card that
+// replaced an unresolved one inherited its wait (Galactus 8.4 s included
+// 3.5 s of failed Helm of the Host reads). A new presentation starts on a
+// no-card pass, a different confident title, or a card at a different place.
+// Pure; returns the same object when the presentation continues.
+function centreOf(out) {
+  const box = out?.candidates?.[0]?.box;
+  if (!box) return null;
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  return { cx: (box[0] + box[2] / 2) / diag, cy: (box[1] + box[3] / 2) / diag };
+}
+function titleOf(out) {
+  const r = (out?.results || []).find(x => x.title || x.card?.name);
+  return r ? normTitle(r.title || r.card?.name) : null;
+}
+// Pure (review R4-S1): which pass output describes the presentation.
+// Geometry comes from the on-device read when it saw a card; the title from
+// that read if it has one, else from the final answer (server fallback).
+export function presentationInput(local, localTitled, out) {
+  if (!local) return out;
+  if (localTitled) return local;
+  const r = (out?.results || []).find(x => x.title || x.card?.name);
+  if (!r) return local;
+  return { ...local, results: [{ ...(local.results?.[0] || {}), number: 1, title: r.title || r.card?.name }] };
+}
+
+// epochBase: the last epoch handed out in this run, so epochs stay monotonic
+// across lifts (a no-card pass returns null, the next card gets base + 1).
+// Sustained hand motion (MOTION_BREAK moving/blurred passes) also starts a new
+// presentation, the same rule the de-dupe uses. `at` is when this pass's
+// capture began (first candidate); `titleAt` when its confident title was
+// read: the end of the on-device title stage, or the completion of the
+// server response that carried the title.
+export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0, titleAt = at) {
+  if (!out || out.error) return prev;
+  if (!out.candidates?.length) return null;
+  const c = centreOf(out), title = titleOf(out);
+  const status = out.candidates[0].status;
+  const motion = status === 'moving' || status === 'too blurry' ? (prev?.motion || 0) + 1 : 0;
+  const moved = prev && c && prev.cx != null && Math.hypot(prev.cx - c.cx, prev.cy - c.cy) > SAME_PLACE;
+  const retitled = prev && title && prev.title && title !== prev.title;
+  const shaken = prev && prev.motion >= MOTION_BREAK && !motion;
+  if (!prev || moved || retitled || shaken) {
+    return { epoch: Math.max(epochBase, prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? titleAt : null, motion };
+  }
+  const next = { ...prev, motion };
+  if (title && !prev.title) { next.title = title; next.titleAt = titleAt; }
+  if (c && prev.cx == null) { next.cx = c.cx; next.cy = c.cy; }
+  return next;
+}
+
+// Auto de-dupe (R2 measurement fix). A card is re-added only if, since its
+// last COMMITTED add, its presentation was broken (lifted: a no-card pass;
+// moved elsewhere; another card read at its place; or sustained hand motion,
+// MOTION_BREAK moving/blurred passes in a row) and DEDUPE_MS have passed.
+// The Masamune was added, repeated, then added again after 4 s of failed
+// reads at the same box: no evidence of a second physical copy. A suppressed
+// repeat never clears a break or renews the clock (review R1-B1), so a second
+// copy put down after a lift is added once DEDUPE_MS after the first add.
+export const DEDUPE_MS = 4000;
+export function dedupeFresh(seen, id, at) {
+  const e = seen.get(id);
+  if (!e) return true;
+  return at - e.at > DEDUPE_MS && !!e.broken;
+}
+// Fold one pass into the remembered cards. committed = ids added this pass.
+export function notePresence(seen, out, hits, at, committed = new Set(hits.map(h => h.card.id))) {
+  const noCard = !out?.error && !out?.candidates?.length;
+  const status = out?.candidates?.[0]?.status;
+  const motion = status === 'moving' || status === 'too blurry';
+  const c = centreOf(out), title = titleOf(out);
+  const hitIds = new Set(hits.map(h => h.card.id));
+  for (const [id, e] of seen) {
+    if (committed.has(id)) continue;
+    if (hitIds.has(id)) { e.motion = 0; continue; }     // suppressed repeat: seen, nothing else changes
+    e.motion = motion ? (e.motion || 0) + 1 : 0;
+    if (noCard || e.motion >= MOTION_BREAK
+      || (c && e.cx != null && Math.hypot(e.cx - c.cx, e.cy - c.cy) > SAME_PLACE)
+      || (title && e.title && title !== e.title)) e.broken = true;
+  }
+  for (const h of hits) {
+    if (!committed.has(h.card.id) && seen.has(h.card.id)) continue;
+    seen.set(h.card.id, { at, cx: c?.cx ?? null, cy: c?.cy ?? null, title: normTitle(h.card.name || h.title), broken: false, motion: 0 });
+  }
+}
+
+// Directional edge hint (R2-#9): which way to move the card, from the frame
+// sides its outline touches. Guidance only.
+export function edgeDirection(cand) {
+  const s = cand?.edge_sides;
+  if (!s?.length) return null;
+  const v = s.includes('top') && !s.includes('bottom') ? 'down' : s.includes('bottom') && !s.includes('top') ? 'up' : null;
+  const h = s.includes('left') && !s.includes('right') ? 'right' : s.includes('right') && !s.includes('left') ? 'left' : null;
+  if (v && h) return `${v}-${h}`;
+  if (v || h) return v || h;
+  return 'back';   // touches opposite sides: too close to the camera
+}
+
+// FNV-1a over every 5th byte (RGB and alpha interleave, so all channels are
+// sampled across rows): ~118k steps on the 384x384 copy (host Node p50
+// 0.19 ms; not measured on phones). A collision only skips evidence.
+export function pixelPrint(buf) {
+  const a = new Uint8Array(buf);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < a.length; i += 5) { h ^= a[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36);
+}
+
 function normTitle(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 
 // Small-card rescue. Measured on saved scans: a card whose short side is

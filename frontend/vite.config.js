@@ -19,6 +19,8 @@ export default defineConfig({
   // needs no new global and no eslint exception.
   define: {
     'import.meta.env.VITE_APP_VERSION': JSON.stringify(pkg.version),
+    // Build stamp for scan telemetry: which bundle produced a record.
+    'import.meta.env.VITE_SCAN_BUILD': JSON.stringify(process.env.SCAN_BUILD || new Date().toISOString().replace(/[-:]/g, '').slice(0, 13)),
   },
   // onnxruntime-web ships each entry point twice: a "bundle" build that hands its
   // wasm to the bundler as an asset, and an extern build that fetches the wasm at

@@ -132,7 +132,24 @@ export function loadIndex(raw) {
 
 // server.find_card_by_ocr (the rapidfuzz branch). Returns the CANONICAL title,
 // normalized, or null.
+// Bounded memo (R2-#11): a still card is re-read every frame and the same
+// noisy title string scans all ~35k names for each query variant again. The
+// lookup is a pure function of (index, normalized text, threshold), so the
+// memo lives on the index object itself (a new index = a new memo) and only
+// caches TEXT -> title lookups, never a printing identity across frames.
+const FIND_MEMO_MAX = 512;
 export function findCardByOcr(ix, text, threshold = NAME_MATCH_MIN) {
+  if (!text) return { name: null, score: 0 };
+  const memo = ix.__findMemo || (ix.__findMemo = new Map());
+  const key = `${threshold}\u0000${normName(text)}`;
+  const hit = memo.get(key);
+  if (hit) { memo.delete(key); memo.set(key, hit); return { ...hit }; }
+  const res = findCardByOcrUncached(ix, text, threshold);
+  memo.set(key, res);
+  if (memo.size > FIND_MEMO_MAX) memo.delete(memo.keys().next().value);
+  return { ...res };
+}
+export function findCardByOcrUncached(ix, text, threshold = NAME_MATCH_MIN) {
   if (!text) return { name: null, score: 0 };
   const q = normName(text);
   if (!q || ix.excluded.has(q)) return { name: null, score: 0 };

@@ -12,7 +12,7 @@
 // Every worker call has a deadline. A worker that crashes or wedges is torn
 // down and the next call gets a fresh one, so a single bad frame can never
 // leave the scanner "busy" forever.
-import { FRAME_MAX } from './fastScan';
+import { FRAME_MAX, pixelPrint } from './fastScan';
 export { needsServer } from './fastScan';
 import { CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 import { isNative, getServerUrl } from '../apiBase';
@@ -63,6 +63,14 @@ function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS) {
 function threadOverride() {
   try { return localStorage.getItem('scan.threads') || null; } catch { return null; }
 }
+// Experimental reader switches (review R2), all OFF unless set to '1' in
+// localStorage, so the default path is exactly the validated one:
+//   scan.fastSettle  shorter settle window on clean, distinct decoded frames
+//   scan.titleGate   skip the title rescue batch when every first crop is flat
+export function scanFlags() {
+  const on = (k) => { try { return localStorage.getItem(k) === '1'; } catch { return false; } };
+  return { fastSettle: on('scan.fastSettle'), titleGate: on('scan.titleGate') };
+}
 function assetBase() {
   return isNative ? getServerUrl() : '';
 }
@@ -78,7 +86,7 @@ export function loadClientScan() {
       && typeof DecompressionStream !== 'undefined' && (!isNative || !!getServerUrl());
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : call({ type: 'load', base: assetBase(), threads: threadOverride() }, [], LOAD_TIMEOUT_MS)
+      : call({ type: 'load', base: assetBase(), threads: threadOverride(), flags: scanFlags() }, [], LOAD_TIMEOUT_MS)
         .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
     ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
   }
@@ -109,6 +117,47 @@ export function resetOnDevice() {
   if (worker) worker.postMessage({ type: 'reset' });
 }
 
+// Decoded-frame clock (R2-#6). Where the browser has
+// requestVideoFrameCallback (Chrome/Edge, Safari 15.4+, Android Chrome) every
+// presented camera frame bumps a counter, so a capture knows WHICH decoded
+// frame it drew and the auto loop can wait for a new one instead of sampling
+// the same pixels twice. Without it (older WebViews) frameId stays null and
+// everything runs on timers exactly as before.
+const clocks = new WeakMap();
+const FRAME_CLOCK_STALE_MS = 500;   // video -> {frames, mediaTime, waiters}
+export function frameClock(video) {
+  if (!video || typeof video.requestVideoFrameCallback !== 'function') return null;
+  let c = clocks.get(video);
+  if (c) return c;
+  c = { frames: 0, mediaTime: null, waiters: [], at: 0 };
+  const tick = (_now, meta) => {
+    c.at = performance.now();
+    c.frames = meta?.presentedFrames ?? c.frames + 1;
+    c.mediaTime = meta?.mediaTime ?? null;
+    const w = c.waiters; c.waiters = [];
+    for (const fn of w) fn();
+    video.requestVideoFrameCallback(tick);
+  };
+  video.requestVideoFrameCallback(tick);
+  clocks.set(video, c);
+  return c;
+}
+// Resolves once a frame newer than `since` has been presented, or after
+// maxMs (never waits forever: a paused stream must not stall auto).
+export function newFrameAfter(video, since, maxMs) {
+  const c = frameClock(video);
+  if (!c || since == null || c.frames !== since) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { const i = c.waiters.indexOf(done); if (i >= 0) c.waiters.splice(i, 1); resolve(); }, maxMs);
+    function done() { clearTimeout(timer); resolve(); }
+    c.waiters.push(done);
+  });
+}
+
+// The decoded frame the last capture drew (null without a live rVFC clock).
+let lastFrameId = null;
+export function lastCapturedFrame() { return lastFrameId; }
+
 // Read one frame on-device. Returns the pipeline's server-shaped output
 // ({frame, candidates, results:[{ok, scryfallId, ...}]}), or {error}.
 export function readOnDevice(source, sw, sh, opts = {}) {
@@ -116,6 +165,7 @@ export function readOnDevice(source, sw, sh, opts = {}) {
 }
 
 async function readOnce(source, sw, sh, { requireStill = false } = {}) {
+  const clock = frameClock(source);
   // Re-loads transparently if a crash or deadline tore the last worker down.
   const tq = performance.now();
   const st = await loadClientScan();
@@ -129,9 +179,20 @@ async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   // the pixels they are applied to can never come from different moments.
   let t = performance.now();
   const lap = (k) => { const n = performance.now(); span[k] = Math.round(n - t); t = n; };
+  // The frame the canvases are about to draw (the latest presented one).
+  // Frame identity (review R1-B2). With a live rVFC clock: the presented
+  // frame number. Otherwise (no rVFC, or callbacks stopped for this stream)
+  // a fingerprint of the pixels actually drawn: a frozen stream repeats it
+  // exactly and is never counted twice, while live camera noise makes real
+  // frames differ. Either way a duplicate is never settle evidence.
+  const live = clock && clock.at && performance.now() - clock.at < FRAME_CLOCK_STALE_MS;
   const fc = ctx2d(frameCanvas); fc.drawImage(source, 0, 0, w, h);
   const sc = ctx2d(smallCanvas); sc.drawImage(source, 0, 0, CORN_SIZE, CORN_SIZE);
   const small = pixels(sc, CORN_SIZE, CORN_SIZE);
+  const frameId = live ? clock.frames : `p${pixelPrint(small)}`;
+  lastFrameId = live ? frameId : null;
+  span.frame_id = frameId;
+  if (live && clock.mediaTime != null) span.media_ms = Math.round(clock.mediaTime * 1000);
   lap('draw_ms');
   const p = await call({ type: 'probe', small, w, h }, [small]);
   lap('probe_ms');
@@ -139,7 +200,7 @@ async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   if (!p.quad) return { ...p.out, span };          // no card: skip the full-frame readback
   const frame = pixels(fc, w, h);
   lap('readback_ms');
-  const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill }, [frame]);
+  const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill, frameId }, [frame]);
   lap('worker_read_ms');
   return r.error ? { error: r.error, span } : { ...r.out, span };
 }
@@ -159,7 +220,24 @@ const hydrated = new Map();
 let lastHydrateMs = 0;
 export function takeHydrateMs() { const v = lastHydrateMs; lastHydrateMs = 0; return v; }   // scryfallId -> hydrated result (auto passes re-see cards)
 const HYDRATE_TIMEOUT_MS = 8000;
-export async function hydrateResults(results, signal) {
+export function isHydrated(scryfallId) { return hydrated.has(scryfallId); }
+// In-flight /cards requests (R2-#13): an auto loop that keeps capturing while
+// a hydration is still pending re-sees the same card; it joins the request
+// already running for those ids instead of sending another.
+const inflight = new Map();
+export function hydrateResults(results, signal) {
+  const key = results.filter(r => r.ok && r.scryfallId && !hydrated.has(r.scryfallId)).map(r => `${r.number}:${r.scryfallId}`).sort().join(',');
+  if (!key) return hydrateOnce(results, signal);
+  let p = inflight.get(key);
+  if (!p) {
+    p = hydrateOnce(results, signal);
+    inflight.set(key, p);
+    const clear = () => { if (inflight.get(key) === p) inflight.delete(key); };
+    p.then(clear, clear);
+  }
+  return p;
+}
+async function hydrateOnce(results, signal) {
   results = results.map(x => (x.ok && hydrated.has(x.scryfallId) ? { ...x, ...hydrated.get(x.scryfallId), number: x.number } : x));
   const hits = results.filter(r => r.ok && r.scryfallId && !r.card);
   if (!hits.length) return results;
