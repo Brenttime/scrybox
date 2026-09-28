@@ -582,3 +582,17 @@ test('switching frame-id source (rVFC number <-> pixel fingerprint) restarts the
   t = 801; await reader.read(f, small, { requireStill: true, frameId: 9 });
   assert.equal(calls(), 0, 'reverse switch restarts too');
 });
+
+test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)', async () => {
+  const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'], printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '161']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  let t = 0, frame = 0, call = 0; const batches = [];
+  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 5 ? '2x2 161' : n === 2 ? 'zz' : '161'; }, { clock: () => t });
+  const reader = createReader({ ...f.reader.__env, index: ix });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), full = sharpFrame();
+  let first; for (t = 0; t <= 200; t += 100) first = await reader.read(full, small, { requireStill: true, frameId: t });
+  assert.equal(first.results[0].deferred, true);
+  frame = 1; call = 0; batches.length = 0;
+  const r = (await reader.read(full, small, { requireStill: true, frameId: t })).results[0];
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.deepEqual(batches, [2, 6, 4, 2], 'v1 batches; rescue never runs');
+});

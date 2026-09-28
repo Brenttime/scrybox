@@ -331,7 +331,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!aliveRef.current) return;
         life.delete(row.key);
         setResults(prev => prev.map(x => (x.key === row.key ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
-        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th), usable_ms: row.t0 != null ? Math.round(performance.now() - row.t0) : undefined });
+        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th), usable_enqueue_ms: row.t0 != null ? Math.round(performance.now() - row.t0) : undefined });
       })
       .catch((e) => {
         if (!aliveRef.current || ctl.signal.aborted) { life.delete(row.key); return; }
@@ -392,12 +392,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       };
       const hedged = onDeviceRef.current && !autoPass ? serverRead(grabJpeg(source, sw, sh, canvasRef)) : null;
       hedged?.catch(() => {});
-      let local = null, localDoneAt = null;
+      let local = null, localStart = null;
       if (onDeviceRef.current) {
         const tl = performance.now();
+        localStart = tl;
         local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
-        localDoneAt = performance.now();
-        tel.mark('local_ms', localDoneAt - tl);
+        tel.mark('local_ms', performance.now() - tl);
         tel.local(local);
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
         else if (!local?.candidates?.length) { why = 'no-card'; failStreakRef.current = null; }
@@ -458,7 +458,14 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const waited = autoPass && firstSeenRef.current != null ? Math.round(performance.now() - firstSeenRef.current) : ms;
       // Presentation (R2 measurement fix): the card now in view, from the
       // client's own same-frame read when there is one.
-      const pres = nextPresentation(presRef.current, local && !local.error && local.candidates?.length ? local : out, t0, epochRef.current, localDoneAt ?? performance.now());
+      // Title time from the source that supplied the title: the on-device
+      // read's own title stage end (capture + detect/refine/title ms), or,
+      // when only the server read a title, the end of the server round trip.
+      const useLocal = !!(local && !local.error && local.candidates?.length);
+      const lt = local?.timings || {};
+      const localTitleAt = localStart != null && lt.title_ms != null ? localStart + (local.span?.wait_ms || 0) + (local.span?.draw_ms || 0) + (local.span?.probe_ms || 0) + (local.span?.readback_ms || 0) + (lt.total_ms || 0) - (lt.footer_ms || 0) : null;
+      const titleSrc = useLocal && (local.results || []).some(x => x.title) ? localTitleAt : performance.now();
+      const pres = nextPresentation(presRef.current, useLocal ? local : out, t0, epochRef.current, titleSrc ?? performance.now());
       presRef.current = pres;
       if (pres) epochRef.current = Math.max(epochRef.current, pres.epoch);
       const edgeDir = edgeDirection(out.candidates[0]);
@@ -485,10 +492,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // Presentation timeline: epoch, and ms from its first candidate to
         // its first confident title and to this pass's end (proof/commit).
         pres: pres ? { epoch: pres.epoch, age_ms: Math.round(tEnd - pres.since), title_ms: pres.titleAt != null ? Math.round(pres.titleAt - pres.since) : undefined } : undefined,
-        // Pass start -> tray insertion enqueued (not the React paint). Rows
-        // still awaiting /cards are counted in pending_rows: they become
-        // usable at their 'hydrated' record (usable_ms from the same start).
-        insert_ms: fresh.length ? Math.round(tEnd - t0) : undefined,
+        // Approximations, named as such: pass start -> tray insertion
+        // ENQUEUED (not painted). Rows still awaiting /cards are counted in
+        // pending_rows; their 'hydrated' record carries hydrate_ms and
+        // usable_enqueue_ms (pass start -> sendable state enqueued).
+        insert_enqueue_ms: fresh.length ? Math.round(tEnd - t0) : undefined,
         pending_rows: fresh.filter(h => h.pendingHydrate).length || undefined,
       });
       if (fresh.length) {

@@ -588,7 +588,11 @@ export function createReader(env) {
     // Evidence pooled from a deferred frame only saw the first footer batch.
     // Pooling it must not settle the printing before this frame has run the
     // stages that frame skipped (wide can disambiguate what narrow misread).
-    const lastStage = (env.footerStages || FOOTER_STAGES).length - 1;
+    // v1's last stage (retro): a deferred frame's pooled evidence may settle
+    // the printing there exactly as in v1, before the added rescue stage
+    // (review R3-S2). Rescue is appended after it and never moves this line.
+    const stageList = env.footerStages || FOOTER_STAGES;
+    const lastStage = stageList.includes('rescue') ? stageList.indexOf('rescue') - 1 : stageList.length - 1;
     const tryPooled = (si) => {
       if (!pooled || !raws.length) return null;
       if (prior.deferred && si < lastStage) return null;
