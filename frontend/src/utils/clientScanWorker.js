@@ -6,19 +6,19 @@
 // /scan-assets/ (content-hashed names, served immutable) and kept in the Cache
 // API, so a returning phone starts reading without touching the network.
 //
-// Same ORT entry point and settings as detectWorker, for the reasons spelled
-// out there: CPU wasm EP only (no jsep/webgpu binaries), one thread (no
-// COOP/COEP on an arbitrary self-hosted proxy).
+// CPU wasm EP only (no jsep/webgpu binaries). Threads only when the page is
+// cross-origin isolated (backend coep.js: credentialless on Blink/Gecko,
+// require-corp on WebKit); otherwise one thread.
 import * as ort from 'onnxruntime-web/wasm';
 import { createReader } from '../../../shared/clientScan/pipeline.mjs';
 import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 
 ort.env.wasm.wasmPaths = '/ort/';
-// Threads need cross-origin isolation (COEP credentialless + COOP, set by the
-// backend). Replay on saved frames: 2 threads cut matched-read p50 ~30% on a
-// 4-core host and 4 was no better, so every device defaults to 2 (a phone in
-// desktop-site mode cannot be told from a desktop by its UA). localStorage
-// 'scan.threads' (passed in the load message) overrides for A/B tests.
+// Threads need cross-origin isolation (COOP + COEP, backend coep.js). Replay
+// on saved frames: 2 threads cut matched-read p50 ~30% on a 4-core host and 4
+// was no better, so isolated devices with >= 4 cores default to 2. If a
+// threaded start fails, clientScan.js retries once in a fresh worker at 1
+// thread (scanLoad.js). localStorage 'scan.threads' overrides for A/B tests.
 function pickThreads(override) {
   if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1;
   const n = Number(override);

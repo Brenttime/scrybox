@@ -16,6 +16,7 @@ import { FRAME_MAX, pixelPrint } from './fastScan';
 export { needsServer } from './fastScan';
 import { CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 import { isNative, getServerUrl } from '../apiBase';
+import { startLoad } from './scanLoad.js';
 
 const LOAD_TIMEOUT_MS = 120000;   // first download of ~40 MB on a slow phone
 const READ_TIMEOUT_MS = 8000;     // a normal read is well under 2 s
@@ -24,17 +25,20 @@ const LOAD_RETRY_MS = 30000;      // after a failed load, try again this much la
 let worker = null;
 let ready = null;          // Promise<{ok, loadMs, error}>
 let readyFailedAt = 0;
-// Review (iOS COEP S1): a failed multi-thread start can leave ORT's module
-// aborted for the life of that worker, so the retry must be a NEW worker at
-// one thread. Remembered for the session so a bad device never loops.
-let forceOneThread = false;
+// One-thread fallback state for the session (see scanLoad.js).
+const loadState = { forceOneThread: false, threadFallback: null };
 let nextId = 1;
 const waiting = new Map(); // id -> {resolve, timer}
 
-function killWorker(reason) {
+// Ends the worker and fails its pending calls, without touching `ready`.
+function retireWorker(reason) {
   if (worker) { worker.terminate(); worker = null; }
   for (const { resolve, timer } of waiting.values()) { clearTimeout(timer); resolve({ error: reason }); }
   waiting.clear();
+}
+
+function killWorker(reason) {
+  retireWorker(reason);
   // The models lived in that worker; the next load must start over.
   ready = null;
 }
@@ -52,10 +56,10 @@ function ensureWorker() {
   return worker;
 }
 
-function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS) {
+function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS, onTimeout = killWorker) {
   const id = nextId++;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => killWorker('scan worker timed out'), timeoutMs);
+    const timer = setTimeout(() => onTimeout('scan worker timed out'), timeoutMs);
     waiting.set(id, { resolve, timer });
     ensureWorker().postMessage({ ...msg, id }, transfer);
   });
@@ -83,8 +87,8 @@ function assetBase() {
 // phone that cannot run it simply keeps the server scanner. A failure is
 // retried after LOAD_RETRY_MS instead of being remembered until reload.
 function loadOnce(threads) {
-  return call({ type: 'load', base: assetBase(), threads, flags: scanFlags() }, [], LOAD_TIMEOUT_MS)
-    .then(r => ({ ...r, threadsTried: r.threads ?? r.info?.threads ?? null }));
+  // A load timeout retires the worker but leaves `ready` to the load itself.
+  return call({ type: 'load', base: assetBase(), threads, flags: scanFlags() }, [], LOAD_TIMEOUT_MS, retireWorker);
 }
 
 export function loadClientScan() {
@@ -93,20 +97,17 @@ export function loadClientScan() {
     readyFailedAt = 0;
     const supported = typeof Worker !== 'undefined' && typeof WebAssembly !== 'undefined'
       && typeof DecompressionStream !== 'undefined' && (!isNative || !!getServerUrl());
+    // retireWorker, not killWorker: `ready` is this very promise and must
+    // stay shared by every caller until it settles.
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : loadOnce(forceOneThread ? '1' : threadOverride()).then(async (r) => {
-        const multi = !forceOneThread && r.threadsTried !== 1;
-        if (r.ready || !multi) return r;
-        forceOneThread = true;
-        killWorker('threaded start failed');
-        const r1 = await loadOnce('1');
-        return { ...r1, info: r1.info && { ...r1.info, threadFallback: r.error || 'failed' } };
-      }).then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
-    ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
+      : startLoad({ loadOnce, retire: retireWorker, override: threadOverride(), state: loadState });
+    const mine = ready;
+    ready.then(r => { if (!r.ok && ready === mine) readyFailedAt = Date.now(); });
   }
   return ready;
 }
+
 
 let frameCanvas = null, smallCanvas = null;
 function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }

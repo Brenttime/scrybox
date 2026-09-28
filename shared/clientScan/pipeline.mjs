@@ -168,9 +168,10 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // for a card the first batch did not prove. Replay: 71 old fallback frames
 // 49 -> 55, 5 new 0 -> 5, every baseline hit kept, 0 conflicts.
 const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].map(y => [0, 0.22, y, y + 0.035])];
-// Rescue runs LAST, after every original stage (review R1-S2, R2-S2): each
-// card the old order proved is proved by the same stage from the same reads
-// and the same recognizer calls; rescue only sees cards v1 left unproven.
+// Rescue runs LAST, after every other stage (review R1-S2, R2-S2); it only
+// sees cards no earlier stage proved. A card the first batch proves costs the
+// same calls as before; 'tall' (below) runs before wide/retro, so later-stage
+// successes may now resolve at tall or pay one extra call.
 // 'tall' right after the first batch: replay of every 4th saved frame (322)
 // +12 printings, 0 lost, 0 changed, no new wrong (vs 0.035 everywhere: +16
 // but 6 lost). Taller-only-everywhere was rejected for those losses.

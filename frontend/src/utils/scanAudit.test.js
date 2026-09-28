@@ -444,13 +444,20 @@ test('tall stage: 0.030 rows read right after the first batch prove a clipped nu
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.scryfallId, 'id-lea');
   assert.equal(r.footer_stage, 1);
-  // The first batch read '2x2 127' (a real 2x2 printing here); tall reads
-  // lea 161: conflicting set+number evidence is ambiguity, not a pick.
+  // First batch reads a strong but unresolved '127/505' (set total fails the
+  // set check); tall reads 'lea 161'; 127 is another indexed printing of the
+  // title: conflicting evidence abstains, and tall was reached (Astra repro).
   const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
     printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '127']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
-  const c0 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 2 ? '2x2 127' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
+  const seen = [];
+  const c0 = fakeReader((calls, n) => { seen.push([calls, n]); return calls === 1 ? 'bolt' : calls === 2 ? '127/505' : calls === 3 && n === 6 ? 'lea 161' : 'zz'; });
   const q = (await createReader({ ...c0.reader.__env, index: ix }).read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
-  assert.notEqual(q.scryfallId, 'id-lea', JSON.stringify(q));
+  assert.ok(seen.some(([c, n]) => c === 3 && n === 6), 'tall batch ran');
+  assert.equal(q.ok, false, JSON.stringify(q));
+  // And never snaps: tall 'lea 169' (no such printing) proves nothing.
+  const s0 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 169' : 'zz'));
+  const q2 = (await createReader({ ...s0.reader.__env, index: ix }).read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(q2.ok, false, JSON.stringify(q2));
 });
 
 test('recognizer packing: LUT + reused buffers are bit-identical to the reference, padding stays 0 (R2-5)', () => {
@@ -542,7 +549,7 @@ test('title rescue gate: measured always, gated only when every crop is flat and
 test('footer rescue never resolves against a conflicting strong number read on the same frame (Damn DRC 89 vs MH2 80, R2-2)', async () => {
   // First batch: '080/505' (number 80, total too high for the set check);
   // rescue: '089/59' (strong 89). Old candidate proved drc 89 -> wrong.
-  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 5 && n === 6 ? '089/59' : 'zz'));
+  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 6 && n === 6 ? '089/59' : 'zz'));
   const index = loadIndex({ names: ['damn'], canon: {}, excluded: [], sets: ['mh2', 'drc'],
     printings: [['id-mh2', 'mh2', '80'], ['id-drc', 'drc', '89'], ['id-mh2b', 'mh2', '396']], byTitle: { damn: [0, 1, 2] }, uniqueAlias: {} });
   const reader = createReader({ ...f.reader.__env, index });
@@ -555,18 +562,19 @@ test('rescue never pre-empts wide or retro (R1-S2/R2-S2); its evidence blocks co
   const ix2 = () => loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
     printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
   const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
-  // Wide says 2x2 147: proved there (stage 1), rescue never runs.
-  const f1 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 3 ? '2x2 147' : calls === 5 && n === 6 ? 'lea 161' : 'zz'));
+  // Order: 1 title, 2 first batch, 3 tall (6), 4 wide (4), 5 retro (2), 6 rescue (6).
+  // Wide says 2x2 147: proved there (stage 2), rescue never runs.
+  const f1 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 4 && n === 4 ? '2x2 147' : calls === 6 && n === 6 ? 'lea 161' : 'zz'));
   const r1 = (await createReader({ ...f1.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
-  assert.equal(r1.scryfallId, 'id-2x2'); assert.equal(r1.footer_stage, 1);
-  // Retro says 147 (copyright line): proved there (stage 2) with v1's calls.
-  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 4 ? 'wizards 147' : n === 6 && calls === 5 ? 'lea 161' : 'zz'));
+  assert.equal(r1.scryfallId, 'id-2x2'); assert.equal(r1.footer_stage, 2); assert.equal(f1.calls(), 4);
+  // Retro says 147 (copyright line): proved there (stage 3), rescue never runs.
+  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 2 ? 'wizards 147' : n === 6 && calls === 6 ? 'lea 161' : 'zz'));
   const r2 = (await createReader({ ...f2.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
-  assert.equal(r2.scryfallId, 'id-2x2'); assert.equal(r2.footer_stage, 2); assert.equal(f2.calls(), 4, 'no extra recognizer call on a v1 retro success');
+  assert.equal(r2.scryfallId, 'id-2x2'); assert.equal(r2.footer_stage, 3); assert.equal(f2.calls(), 5, 'no rescue call on a retro success');
   // Rescue reads two identities of one set: ambiguous, never a pick.
   const ixLea = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea'],
     printings: [['id-lea', 'lea', '161'], ['id-lea2', 'lea', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
-  const f3 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 6 ? 'lea 161 147' : 'zz'));
+  const f3 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 6 && n === 6 ? 'lea 161 147' : 'zz'));
   const r3 = (await createReader({ ...f3.reader.__env, index: ixLea }).read(sharpFrame(), small)).results[0];
   assert.equal(r3.ok, false, JSON.stringify(r3));
 });
