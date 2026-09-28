@@ -190,6 +190,69 @@ Reviews: `.hermes/audits/astra-scanfix-r1.md`, `astra-scanfix-r2.md`.
 Rollback:
 `cd ~/projects/bindarr-host && cp docker-compose.yml.bak-scanfix docker-compose.yml && docker compose up -d bindarr`
 
+## Round-2 speedups (scanfix2 build, 2026-09-28)
+Based on Astra's round-2 audit (`.hermes/audits/astra-perf-round2.md`) of the
+541-card Windows session (adds p50 807 ms, p90 1566 ms). Branch
+`perf/scan-speedups-2` off tag v1. One commit per item.
+- Shipped, on by default:
+  - Footer rescue stage (#2). One 6-strip batch: the wide 0.84 row plus
+    0.035-tall modern rows. It runs after every v1 stage, so the v1 stages and
+    their recognizer calls are unchanged. Its reads are added to the earlier
+    ones, never used in their place. Once rescue has read, no exit (stage,
+    retro or pooled vote) may prove a printing that another strong number or
+    set+number read contradicts.
+  - The 1286-frame replay caught a wrong printing on the first attempt:
+    Damn read `089/59%` and was proven DRC 89, but the card is MH2 80.
+    This rule fixed it.
+  - Resets (#8): `lastDeferred` is cleared on reset and on no-card frames.
+    The no-title run is cleared on auto start.
+  - Backoff (#10): a titleless server failure is signed with the same-frame
+    client title and position.
+  - Equivalent rewrites: fuzzy lookup memo (#11: 5940 lookups, 0
+    mismatches), recognizer LUT and buffers (#5: bit-identical), and
+    flattened-tap Lanczos (#4: 0 differing bytes on real frames).
+  - Frames (#6): rVFC frame ids, with a pixel fingerprint when rVFC is
+    missing or stale. A repeated frame never counts as settle evidence and
+    is never read. Switching between the two id sources restarts the window.
+  - Presentation epoch and a presence-aware dedupe (#0): no re-add without a
+    lift, slide, other card, or sustained motion. Build stamp added to
+    telemetry.
+  - Directional edge hint and dashed safe region (#9). This is guidance
+    only; admission is unchanged.
+  - Memoized tray, and no busy re-render per auto pass (#12).
+  - Background hydration (#13). Rows stay pending and unsendable until
+    hydrated. A failure keeps the row and retries it.
+- Shipped behind flags, off by default: `localStorage scan.fastSettle=1`
+  (120 ms settle window on clean, distinct rVFC frames, #1) and
+  `scan.titleGate=1` (skip title rescue when every first crop is flat, #3/#7;
+  crop contrast is always logged as `timings.title_range`). Both need
+  recorded-video or telemetry calibration before they can be turned on.
+- Threads (#14): the default stays at 2. `scan.threads` (existing) is now
+  reported in device info.
+- Not done (#15): WebGPU/WebNN. The worker imports the wasm-only ORT, jsep
+  assets are not shipped, and no GPU adapter or navigator.ml was available
+  to test on. Revisit once Brent's Windows Chrome reports an adapter.
+- Replay (baseline v1 -> candidate):
+  - 71 old fallback frames: 49 -> 55.
+  - 5 new fallback frames: 0 -> 5.
+  - Harness: 8 -> 8.
+  - 1286 debug frames: 564 -> 621 matched, server agreements 347 -> 363,
+    wrong 2 -> 2 (the same two Flicker frames as before).
+  - 0 lost, 0 changed.
+- Live-worker browser check on the deployed bundle agrees: Oath, Helm,
+  Masamune and H.E.R.B.I.E. resolve via rescue, and Damn abstains.
+- Review: Astra, 5 rounds (`.hermes/audits/astra-r2impl-review1..5.md`).
+  Round 5 gave SHIP once the full replay showed 0 lost and 0 new wrong,
+  which it did.
+  - The review caught: second copies suppressed by dedupe, frozen frames
+    counted as settle evidence (including a switch between id sources),
+    ambiguity escaping through retro and pooled votes, rescue pre-empting
+    v1 stages, hydration failures dropping rows, and title-timing sources.
+- Next: a Windows scan round on this build (telemetry build stamp
+  `1.8.5+20260928T0206`), a threads A/B (`scan.threads`), then calibrating
+  the fastSettle and titleGate flags from the new `dup`, `fast_settle` and
+  `title_range` telemetry.
+
 ## Known open items
 - Measure the new build on the PC and a phone (target < 1 s).
 - Targeted OCR-confusion handling (Icy Reception). The frame still
