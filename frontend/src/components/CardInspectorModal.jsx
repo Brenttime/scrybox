@@ -341,7 +341,20 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {!isEnglish(card.language) && setCode(card) && (
                 <span style={{ fontFamily: 'monospace', color: 'var(--text-muted)' }}> ({setCode(card)})</span>
               )}
-              {cardNumber ? ` • #${cardNumber}` : ''}{displayRarity(card) ? ` • ${displayRarity(card)}` : ''} • {t('inspector.owned', { count: card.quantity ?? 1 })}
+              {cardNumber ? ` • #${cardNumber}` : ''}{displayRarity(card) ? ` • ${displayRarity(card)}` : ''}
+              {!readOnly && targetEntryId && (
+                <button
+                  type="button"
+                  className="ci-proxy-btn"
+                  aria-pressed={!!card.is_proxy}
+                  disabled={proxyBusy}
+                  onClick={toggleProxy}
+                  style={{ background: 'none', border: '1px solid var(--border-glass)', borderRadius: '999px', padding: '0 0.45rem', margin: '0 0.3rem', fontSize: '0.65rem', lineHeight: 1.6, color: 'var(--text-muted)', cursor: 'pointer', verticalAlign: 'middle' }}
+                >
+                  {card.is_proxy ? t('inspector.unmarkProxy') : t('inspector.markProxy')}
+                </button>
+              )}
+              {' • '}{t('inspector.owned', { count: card.quantity ?? 1 })}
             </p>
 
             {/* MTG cards: show color pips + type line. */}
@@ -476,17 +489,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {!readOnly && <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem', alignItems: 'center', flexWrap: 'wrap' }}>
                 <button className="btn btn-primary ci-edit-btn" style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }} onClick={() => setMode('edit')}>
                   {t('inspector.editCard')}
-                </button>
-
-                <button
-                  type="button"
-                  className={`btn ${card.is_proxy ? 'btn-primary' : 'btn-secondary'} ci-proxy-btn`}
-                  style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }}
-                  aria-pressed={!!card.is_proxy}
-                  disabled={proxyBusy}
-                  onClick={toggleProxy}
-                >
-                  {card.is_proxy ? t('inspector.unmarkProxy') : t('inspector.markProxy')}
                 </button>
 
                 <button
