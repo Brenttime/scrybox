@@ -103,12 +103,25 @@ export function sampleStrip(rgba, w, h, m, x0, x1, y0, y1, outH = REC_H) {
       out[o] = acc[0] / n + 0.5; out[o + 1] = acc[1] / n + 0.5; out[o + 2] = acc[2] / n + 0.5;
     }
   }
+  // Pre-stretch contrast of the crop (max channel hi-lo, 0-255): a crop-level
+  // text-quality signal (R2-#3/#7), unlike the global title-band Laplacian.
+  const range = channelRange(out);
   autocontrast(out);
-  return { data: out, w: outW, h: outH };
+  return { data: out, w: outW, h: outH, range };
 }
 
 // PIL ImageOps.autocontrast(cutoff=0) on an RGB image: stretch each channel
 // independently so its darkest value is 0 and its brightest 255.
+export function channelRange(rgb) {
+  let range = 0;
+  for (let c = 0; c < 3; c++) {
+    let lo = 255, hi = 0;
+    for (let i = c; i < rgb.length; i += 3) { const v = rgb[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi - lo > range) range = hi - lo;
+  }
+  return range;
+}
+
 export function autocontrast(rgb) {
   for (let c = 0; c < 3; c++) {
     let lo = 255, hi = 0;

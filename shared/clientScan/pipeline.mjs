@@ -75,6 +75,25 @@ const STILL_MIN_SEP_MS = 90;
 // cadence, so it is not monotonic across every cadence, and it is never
 // sooner than 2 x 90 ms after the first still observation.
 const STILL_WINDOW_MS = (STILL_OBS - 1) * STILL_MIN_SEP_MS;
+// Adaptive settle (R2-#1), EXPERIMENTAL, off unless env.fastSettle: a window
+// of FAST_SETTLE_MS instead of STILL_WINDOW_MS, but only when every counted
+// observation of it was a distinct decoded frame (frameId), drifted at most
+// half the normal tolerance, and was well above the blur floor. Anything
+// else keeps the conservative window; it can only admit sooner, never later.
+// Off by default: still images cannot validate earlier admission (Astra R2:
+// needs recorded video with decoded-frame timestamps).
+const FAST_SETTLE_MS = 120;
+const FAST_SETTLE_DRIFT = STILL_DRIFT / 2;
+const FAST_SETTLE_SHARP = 4 * 500;
+// Crop-level text contrast gate for the title rescue (R2-#3), EXPERIMENTAL,
+// off unless env.titleGate: skip the second title batch when EVERY first
+// title crop is nearly flat before autocontrast (max channel range below
+// this). Always measured (timings.title_range) for shadow calibration.
+const TITLE_MIN_RANGE = 24;
+// Pure: no confident title from batch one AND every batch-one crop is flat.
+export function flatTitleCrops(cands, ranges) {
+  return !cands.length && ranges.length > 0 && ranges.every(r => Number.isFinite(r) && r < TITLE_MIN_RANGE);
+}
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
@@ -280,6 +299,8 @@ export function createReader(env) {
   let stillSince = 0;             // real time the current still window began
   let readSince = false;          // OCR ran since the last observation
   let lastDeferred = false;       // previous read deferred its deep footer stages
+  let lastFrameId = null;         // decoded-frame id of the last counted observation
+  let fastRun = true;             // every observation of this window qualifies for fast settle
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
   // alone does not prove a printing — reprints share art and differ only in
   // the footer — so a signature match is trusted only while the same physical
@@ -310,14 +331,14 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known } = opts;
+    const { smallChannels = 4, requireStill = false, quad: known, frameId = null } = opts;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -330,9 +351,27 @@ export function createReader(env) {
     const nearEdge = !inside(quad, ex, ey) && inside(quad, tx, ty) && plausibleCard(quad);
     const clipped = !inside(quad, ex, ey) && !nearEdge;
     if (nearEdge) cand.near_edge = true;
+    // Which frame sides the outline is at (R2-#9), for a directional hint.
+    // Guidance only: admission is unchanged.
+    if (clipped || nearEdge) {
+      const sides = [];
+      if (ys.some(y => y <= ey)) sides.push('top');
+      if (ys.some(y => y >= h - ey)) sides.push('bottom');
+      if (xs.some(x => x <= ex)) sides.push('left');
+      if (xs.some(x => x >= w - ex)) sides.push('right');
+      if (sides.length) cand.edge_sides = sides;
+    }
     const diag = Math.hypot(w, h);
+    // The same decoded video frame seen again (R2-#6): it is not new evidence
+    // of stillness, and re-reading its pixels cannot change the answer. In
+    // auto it never advances the settle window and is never read.
+    if (requireStill && frameId != null && frameId === lastFrameId && lastQuad) {
+      cand.duplicate = true; cand.status = 'settling'; cand.still = stillRun;
+      return base;
+    }
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
+    lastFrameId = frameId;
     const tNow = env.clock ? env.clock() : now();
     // A long gap right after an OCR read may not vouch for the frame after it
     // (the card could have moved and come back), so it counts at most as the
@@ -342,20 +381,24 @@ export function createReader(env) {
     // Only a read that actually ran the recognizer counts as a gap "after an
     // OCR read": a geometric abstention (zero rec calls) is as quick as a gate
     // pass and must not force a fresh settle cycle.
-    if (drift > STILL_DRIFT || stillRun === 0) { stillRun = 1; stillSince = tNow; }
+    if (drift > STILL_DRIFT || stillRun === 0) { stillRun = 1; stillSince = tNow; fastRun = true; }
     else if (tNow - lastAt > STILL_GAP_MS && readSince) {
       // The window continues but needs one more observation, and at least
       // STILL_MIN_SEP_MS more of it, after this gap.
       stillRun = Math.min(stillRun + 1, STILL_OBS - 1);
       stillSince = Math.max(stillSince, tNow - STILL_WINDOW_MS + STILL_MIN_SEP_MS);
-    } else stillRun++;
+      fastRun = false;
+    } else { stillRun++; if (drift > FAST_SETTLE_DRIFT) fastRun = false; }
     lastAt = tNow;
     readSince = false;
-    const settled = stillRun >= STILL_OBS && tNow - stillSince >= STILL_WINDOW_MS;
-    cand.still = stillRun;
     let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
+    if (sharp < FAST_SETTLE_SHARP || frameId == null) fastRun = false;
+    const window = env.fastSettle && fastRun ? FAST_SETTLE_MS : STILL_WINDOW_MS;
+    const settled = stillRun >= STILL_OBS && tNow - stillSince >= window;
+    if (settled && window < STILL_WINDOW_MS && tNow - stillSince < STILL_WINDOW_MS) cand.fast_settle = true;
+    cand.still = stillRun;
     // Blurred or clipped observations are not part of a settled window.
     if (clipped || sharp < TITLE_SHARP_FLOOR) stillRun = 0;
     cand.still = stillRun;
@@ -478,12 +521,18 @@ export function createReader(env) {
         if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
     };
-    consider(await recognize(env, strips(TITLE_FIRST, 'title1')), 1);
+    const t1 = strips(TITLE_FIRST, 'title1');
+    const titleRange = t1.map(s => s.range);
+    if (titleRange.length) timings.title_range = titleRange;
+    consider(await recognize(env, t1), 1);
     // The tighter crops rescue weak or partial reads. An exact, high-confidence
     // match of a full index name needs no rescue: skip the second recognizer
     // call. This only selects the TITLE; printings still need their proof.
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
-    if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
+    const flat = flatTitleCrops(cands, titleRange);
+    if (flat) timings.title_flat = 1;
+    if (flat && env.titleGate) timings.title_gated = 1;
+    else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
     timings.title_ms = Math.round(now() - tA);
@@ -568,13 +617,13 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }
     return quad;
   }
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };

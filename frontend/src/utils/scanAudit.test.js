@@ -466,3 +466,59 @@ test('resizeLanczos3 fast path is bit-identical to the reference (R2-4)', async 
     assert.deepEqual(resizeLanczos3(src, W, H, ch, 384, 384), resizeLanczos3Reference(src, W, H, ch, 384, 384), 'cached taps: same again');
   }
 });
+
+test('duplicate decoded frames never count as settle evidence and are never read (R2-6)', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+  // One decoded frame (id 7) observed 5 times over 400 ms: never admitted.
+  for (let i = 0; i < 5; i++) { const o = await reader.read(f, small, { requireStill: true, frameId: 7 }); t += 100; if (i) assert.equal(o.candidates[0].duplicate, true); }
+  assert.equal(calls(), 0, 'the same frame repeated is not a settled window');
+  // Distinct frames: normal 180 ms window.
+  for (let id = 8; id < 11; id++) { await reader.read(f, small, { requireStill: true, frameId: id }); t += 100; }
+  assert.ok(calls() > 0);
+  // Without frame ids (no rVFC: iOS < 15.4, old Android) behaviour is unchanged.
+  let t2 = 0; const b = fakeReader(() => 'grief', { clock: () => t2 });
+  for (let i = 0; i < 3; i++) { await b.reader.read(f, small, { requireStill: true }); t2 += 100; }
+  assert.ok(b.calls() > 0, 'no frameId: timer path admits as before');
+});
+
+test('adaptive settle is OFF by default and, when on, only ever admits sooner, on clean distinct frames (R2-1)', async () => {
+  const admitAt = async (opts, frames) => {
+    let t = 0;
+    const f0 = fakeReader(() => 'grief', { clock: () => t });
+    const reader = createReader({ ...f0.reader.__env, ...opts });
+    const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
+    for (let i = 0; i < 20; i++) { await reader.read(frames(i), small, { requireStill: true, frameId: i }); if (f0.calls()) return t; t += 60; }
+    return Infinity;
+  };
+  const sharpF = () => sharpFrame();
+  const off = await admitAt({}, sharpF), on = await admitAt({ fastSettle: true }, sharpF);
+  assert.ok(off >= 180, `default window unchanged (${off})`);
+  assert.ok(on >= 120 && on < off, `flag on: shorter for clean frames (${on} vs ${off})`);
+  // Without frame ids the fast path never applies.
+  let t = 0; const g = fakeReader(() => 'grief', { clock: () => t });
+  const r2 = createReader({ ...g.reader.__env, fastSettle: true });
+  for (let i = 0; i < 3; i++) { await r2.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), { requireStill: true }); t += 60; }
+  assert.equal(g.calls(), 0, 'no frameId -> conservative window (120 ms of 60 ms passes is not enough)');
+});
+
+test('edge sides are reported for a directional hint; admission unchanged (R2-9)', async () => {
+  const { reader, calls } = fakeReader(() => 'grief', { corners: nearTop(0.001) });
+  const out = await reader.read(sharpFrame(1000, 1000), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(out.candidates[0].status, 'touches frame edge');
+  assert.deepEqual(out.candidates[0].edge_sides, ['top']);
+  assert.equal(calls(), 0);
+});
+
+test('title rescue gate: measured always, gated only when every crop is flat and no title, behind env.titleGate (R2-3/7)', async () => {
+  const { flatTitleCrops } = await import('../../../shared/clientScan/pipeline.mjs');
+  assert.equal(flatTitleCrops([], [10, 12]), true);
+  assert.equal(flatTitleCrops([], [10, 80]), false, 'one contrasty crop keeps the rescue');
+  assert.equal(flatTitleCrops([{ name: 'x' }], [1, 1]), false, 'a title candidate keeps its rescue');
+  assert.equal(flatTitleCrops([], []), false);
+  const { reader } = fakeReader(() => 'zz');
+  const o = await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4));
+  assert.equal(o.timings.title_range.length, 2, 'crop contrast recorded for shadow calibration');
+  assert.notEqual(o.timings.title_gated, 1, 'contrasty crops are never gated');
+});
