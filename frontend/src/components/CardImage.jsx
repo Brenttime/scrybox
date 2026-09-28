@@ -61,6 +61,10 @@ export default function CardImage({ card, src, fallbackSrc, alt, ...imgProps }) 
   return (
     <img
       {...imgProps}
+      // CORS mode, not overridable: WebKit gets COEP require-corp (backend
+      // coep.js), under which a no-cors Scryfall image (no CORP header) is
+      // blocked. Scryfall answers CORS with *, so this loads everywhere.
+      crossOrigin="anonymous"
       src={current}
       alt={alt ?? card?.name ?? ''}
       // Lets callers style or test the placeholder state without re-deriving it.

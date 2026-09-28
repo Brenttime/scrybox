@@ -99,6 +99,22 @@ if (process.env.TRUST_PROXY) {
 // `reportOnly` to false to enforce once a production smoke test confirms the
 // scan flow and card images load cleanly under these directives.
 // ponytail: Report-Only ceiling — enforce after a prod verification pass.
+// Cross-origin isolation, so the on-device scanner can run onnxruntime-web
+// with worker threads (SharedArrayBuffer). COOP same-origin is helmet's
+// default. Chromium/Firefox get 'credentialless': third-party images and
+// Google Fonts load without cookies and without CORP headers. WebKit (every
+// iOS browser, desktop Safari) has no credentialless, only 'require-corp', so
+// it gets that: card images carry crossorigin="anonymous" (Scryfall answers
+// CORS with *) and Google Fonts send CORP cross-origin. Before this, iPhones
+// were never isolated and read with one thread. SCAN_ISOLATION=0 turns it off;
+// SCAN_ISOLATION_WEBKIT=0 keeps WebKit unisolated.
+const { coepFor } = require('./coep');
+app.use((req, res, next) => {
+  const p = coepFor(req.get('user-agent') || '');
+  if (p) res.setHeader('Cross-Origin-Embedder-Policy', p);
+  res.vary('User-Agent');
+  next();
+});
 app.use(helmet({
   // HSTS pins the host to HTTPS in the browser. When we terminate TLS ourselves
   // with a self-signed certificate that is a lockout: Chrome stops offering the
@@ -106,14 +122,8 @@ app.use(helmet({
   // helmet's default (on) for every other deployment, including a reverse proxy
   // with a real certificate.
   hsts: !selfSignedTls(),
-  // Cross-origin isolation, so the on-device scanner can run onnxruntime-web
-  // with worker threads (SharedArrayBuffer). 'credentialless' rather than
-  // 'require-corp': Scryfall card images and Google Fonts still load (without
-  // cookies) with no CORP headers from those hosts. Browsers without
-  // credentialless support (Safari) are simply not isolated and keep the
-  // single-thread scanner. COOP same-origin is already helmet's default.
-  // Off with SCAN_ISOLATION=0.
-  crossOriginEmbedderPolicy: process.env.SCAN_ISOLATION === '0' ? false : { policy: 'credentialless' },
+  // COEP is set per request by coepFor() above (WebKit needs require-corp).
+  crossOriginEmbedderPolicy: false,
   contentSecurityPolicy: {
     reportOnly: true,
     directives: {

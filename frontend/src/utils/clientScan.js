@@ -24,6 +24,10 @@ const LOAD_RETRY_MS = 30000;      // after a failed load, try again this much la
 let worker = null;
 let ready = null;          // Promise<{ok, loadMs, error}>
 let readyFailedAt = 0;
+// Review (iOS COEP S1): a failed multi-thread start can leave ORT's module
+// aborted for the life of that worker, so the retry must be a NEW worker at
+// one thread. Remembered for the session so a bad device never loops.
+let forceOneThread = false;
 let nextId = 1;
 const waiting = new Map(); // id -> {resolve, timer}
 
@@ -78,6 +82,11 @@ function assetBase() {
 // Start the one-time download. Resolves {ok:false} rather than throwing: a
 // phone that cannot run it simply keeps the server scanner. A failure is
 // retried after LOAD_RETRY_MS instead of being remembered until reload.
+function loadOnce(threads) {
+  return call({ type: 'load', base: assetBase(), threads, flags: scanFlags() }, [], LOAD_TIMEOUT_MS)
+    .then(r => ({ ...r, threadsTried: r.threads ?? r.info?.threads ?? null }));
+}
+
 export function loadClientScan() {
   if (ready && readyFailedAt && Date.now() - readyFailedAt > LOAD_RETRY_MS) ready = null;
   if (!ready) {
@@ -86,8 +95,14 @@ export function loadClientScan() {
       && typeof DecompressionStream !== 'undefined' && (!isNative || !!getServerUrl());
     ready = !supported
       ? Promise.resolve({ ok: false, error: 'unsupported browser' })
-      : call({ type: 'load', base: assetBase(), threads: threadOverride(), flags: scanFlags() }, [], LOAD_TIMEOUT_MS)
-        .then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
+      : loadOnce(forceOneThread ? '1' : threadOverride()).then(async (r) => {
+        const multi = !forceOneThread && r.threadsTried !== 1;
+        if (r.ready || !multi) return r;
+        forceOneThread = true;
+        killWorker('threaded start failed');
+        const r1 = await loadOnce('1');
+        return { ...r1, info: r1.info && { ...r1.info, threadFallback: r.error || 'failed' } };
+      }).then(r => ({ ok: !!r.ready, loadMs: r.loadMs, error: r.error, info: r.info }));
     ready.then(r => { if (!r.ok) readyFailedAt = Date.now(); });
   }
   return ready;

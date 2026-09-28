@@ -79,7 +79,7 @@ const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPat
   return (
 <li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}`} aria-busy={row.pending || undefined}>
         <div className="fs-card-art">
-          {row.card.image_url ? <img src={row.card.image_url} alt="" loading="lazy" /> : null}
+          {row.card.image_url ? <img src={row.card.image_url} alt="" loading="lazy" crossOrigin="anonymous" /> : null}
           {!row.sent && !row.pending && (
             <button type="button" className="fs-card-edit" onClick={() => onEdit(row)} aria-label={t('fastscan.changePrinting')} />
           )}
@@ -813,7 +813,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                     <li key={c.id} className={`fs-card${c.id === editing.card.id ? ' is-current' : ''}`}>
                       <button type="button" className="fs-print" onClick={() => choosePrinting(c)} aria-pressed={c.id === editing.card.id}>
                         <div className="fs-card-art">
-                          {c.image_url ? <img src={c.image_url} alt="" loading="lazy" /> : null}
+                          {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" /> : null}
                           {priceOf(c) != null && <span className="fs-card-price">{priceText(priceOf(c), 'USD')}</span>}
                           {c.id === editing.card.id && <span className="fs-card-badge"><Check size={14} /></span>}
                         </div>

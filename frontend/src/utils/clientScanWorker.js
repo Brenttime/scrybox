@@ -97,7 +97,7 @@ self.onmessage = async (e) => {
       self.postMessage({ id, ready: true, loadMs, info });
     } catch (err) {
       readerPromise = null;
-      self.postMessage({ id, ready: false, error: err?.message || String(err) });
+      self.postMessage({ id, ready: false, error: err?.message || String(err), threads: ort.env.wasm.numThreads });
     }
     return;
   }

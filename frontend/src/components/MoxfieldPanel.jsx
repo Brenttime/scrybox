@@ -86,13 +86,18 @@ function AuthorCard({ author, onRemove, onSyncDecklist, onSyncContents, onSyncDe
   const lastDecklist = timeAgo(author.last_decklist_sync_at);
   const lastContentCheck = timeAgo(author.last_content_check_at);
   const lastContent = timeAgo(author.last_content_sync);
+  // Moxfield avatars send no CORS/CORP headers, so an iPhone (COEP
+  // require-corp, for the scanner's threads) blocks them: fall back to the
+  // initials. Keyed on the URL so a new avatar is tried again.
+  const [failedAvatar, setFailedAvatar] = useState(null);
+  const avatar = author.profile_image_url && failedAvatar !== author.profile_image_url ? author.profile_image_url : null;
 
   return (
     <div className="glass-panel" style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
       {/* Author header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-        {author.profile_image_url ? (
-          <img src={author.profile_image_url} alt="" style={{ width: '2.25rem', height: '2.25rem', borderRadius: '50%', objectFit: 'cover', border: '1px solid var(--border-glass)' }} />
+        {avatar ? (
+          <img src={avatar} alt="" onError={() => setFailedAvatar(avatar)} style={{ width: '2.25rem', height: '2.25rem', borderRadius: '50%', objectFit: 'cover', border: '1px solid var(--border-glass)' }} />
         ) : (
           <div style={{ width: '2.25rem', height: '2.25rem', borderRadius: '50%', background: 'var(--surface-3)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)', fontSize: '0.9rem', fontWeight: 700 }}>
             {(author.display_name || author.moxfield_user || '?').slice(0, 2).toUpperCase()}
