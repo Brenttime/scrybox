@@ -168,10 +168,10 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // for a card the first batch did not prove. Replay: 71 old fallback frames
 // 49 -> 55, 5 new 0 -> 5, every baseline hit kept, 0 conflicts.
 const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].map(y => [0, 0.22, y, y + 0.035])];
-// Rescue runs AFTER the original stages it could otherwise pre-empt (review
-// R1-S2): every card the old order proved is proved by the same stage from
-// the same reads; rescue only sees cards that first + wide left unproven.
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'rescue', 'retro'];
+// Rescue runs LAST, after every original stage (review R1-S2, R2-S2): each
+// card the old order proved is proved by the same stage from the same reads
+// and the same recognizer calls; rescue only sees cards v1 left unproven.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'retro', 'rescue'];
 // Pure: once rescue reads are in the evidence, a printing is proved only if
 // NO other printing of the title is named by it: not by a strong number (N/T
 // or read in 2 strips; set totals ignored), and not by an exact set code +
@@ -392,6 +392,10 @@ export function createReader(env) {
     }
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
+    // A change of frame-identity source (decoded-frame number <-> pixel
+    // fingerprint, when rVFC stops or resumes) is not comparable evidence:
+    // the window restarts (review R2-B2).
+    const sourceSwitch = lastFrameId != null && frameId != null && typeof lastFrameId !== typeof frameId;
     lastFrameId = frameId;
     const tNow = env.clock ? env.clock() : now();
     // A long gap right after an OCR read may not vouch for the frame after it
@@ -402,7 +406,7 @@ export function createReader(env) {
     // Only a read that actually ran the recognizer counts as a gap "after an
     // OCR read": a geometric abstention (zero rec calls) is as quick as a gate
     // pass and must not force a fresh settle cycle.
-    if (drift > STILL_DRIFT || stillRun === 0) { stillRun = 1; stillSince = tNow; fastRun = true; }
+    if (drift > STILL_DRIFT || stillRun === 0 || sourceSwitch) { stillRun = 1; stillSince = tNow; fastRun = true; }
     else if (tNow - lastAt > STILL_GAP_MS && readSince) {
       // The window continues but needs one more observation, and at least
       // STILL_MIN_SEP_MS more of it, after this gap.
