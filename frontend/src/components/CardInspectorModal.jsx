@@ -55,6 +55,19 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
     return () => { cancelled = true; };
   }, [oracleCardId]);
 
+  // Built decks this card is pulled into (collection copies only).
+  const [builtDecks, setBuiltDecks] = useState([]);
+  useEffect(() => {
+    setBuiltDecks([]);
+    if (!oracleCardId || readOnly) return undefined;
+    let cancelled = false;
+    fetch(`/api/cards/${encodeURIComponent(oracleCardId)}/decks`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!cancelled && Array.isArray(d?.decks)) setBuiltDecks(d.decks); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [oracleCardId, readOnly]);
+
   useBackGuard(isFullScreen, () => setIsFullScreen(false));
 
   const targetEntryId = card?.entry_id || card?.id;
@@ -318,6 +331,20 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               </div>
             )}
           </div>
+
+          {mode !== 'edit' && builtDecks.length > 0 && (
+            <div className="ci-built-decks" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+              <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, marginBottom: '0.2rem' }}>{t('inspector.inBuiltDecks')}</div>
+              <ul style={{ margin: 0, paddingLeft: '1rem' }}>
+                {builtDecks.map(d => (
+                  <li key={d.id}>
+                    <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{d.name}</span>
+                    {d.quantity > 1 ? <span style={{ color: 'var(--text-muted)' }}> ×{d.quantity}</span> : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           {mode !== 'edit' && oracle && (oracle.faces?.length || oracle.oracle_text) ? (
             <div className="ci-oracle" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.7rem 0.85rem' }}>

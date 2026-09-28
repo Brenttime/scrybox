@@ -563,6 +563,7 @@
   "zoom.copyFailed": "Couldn't copy",
   "zoom.share": "Share",
   "inspector.fullScreen": "Full Screen",
+  "inspector.inBuiltDecks": "In Built decks",
   "inspector.forTrade": "For Trade",
   "inspector.markProxy": "Mark as proxy",
   "inspector.unmarkProxy": "Unmark proxy",

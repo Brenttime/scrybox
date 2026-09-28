@@ -476,6 +476,33 @@ router.get('/cards/:id/oracle', async (req, res) => {
   }
 });
 
+// Built (checked-out) decks that use this card, matched by logical card like
+// the checkout allocation (any printing). Basic lands are never pulled, so
+// they are never listed.
+router.get('/cards/:id/decks', async (req, res) => {
+  try {
+    const { sqlCardKey, sqlIsBasicLand } = require('../utils/cardIdentity');
+    const decks = await db.all(`
+      SELECT d.id, d.name, SUM(dc.quantity) AS quantity
+      FROM decks d
+      CROSS JOIN deck_cards dc ON dc.deck_id = d.id
+      CROSS JOIN card_cache dcc ON dcc.id = dc.card_id
+      CROSS JOIN card_cache target ON target.id = ?
+      WHERE ${sqlCardKey('dcc')} = ${sqlCardKey('target')}
+        AND d.user_id = ?
+        AND d.checked_out = 1
+        AND dc.quantity > 0
+        AND NOT ${sqlIsBasicLand('target')}
+      GROUP BY d.id, d.name
+      ORDER BY d.name COLLATE NOCASE
+    `, [req.params.id, req.user.id]);
+    res.json({ decks: decks.map(d => ({ id: d.id, name: d.name, quantity: Number(d.quantity) || 0 })) });
+  } catch (err) {
+    console.error('card deck usage lookup failed:', err.message);
+    res.status(500).json({ error: 'Could not load decks' });
+  }
+});
+
 // Get Card Price History
 router.get('/cards/:id/price-history', async (req, res) => {
   const { id } = req.params;

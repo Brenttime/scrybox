@@ -195,12 +195,23 @@ export function strongConflict(ix, title, pi, raws) {
   return false;
 }
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
-// 'tall': the first batch's rows again at 0.030 instead of 0.025. iPhone
-// telemetry (MSH/MSC "U 0086", "8088"/"0888" for 0088) and replay: the
-// 0.025 strip clips the digits' lower edge on many frames. Reads are added
-// to the first batch's, so a conflicting number still means ambiguity.
+// First batch height FIRST_H = 0.030 (was 0.025): the 0.025 strip clipped
+// the digits' lower edge on many iPhone frames (telemetry: "8281" for SOS
+// 0281, " U 0128N", "6.0139" for C 0129), costing a ~400 ms second call.
+// 'tall' is now the complementary crop: the same rows at the old 0.025, so a
+// card the taller strip misreads still gets the v1 read. The two heights
+// MUST differ: strongNumbers counts a number read in 2 strips as
+// corroborated, and identical crops would count ONE read twice (Astra
+// review: 0.030/0.030 gained 4 stage-1 "proofs" from exact duplicate reads;
+// rejected). Reads are added to the first batch's, so a conflicting number
+// still means ambiguity.
+// Full-corpus replay (1288 frames) vs first 0.025 / tall 0.030: hits
+// 652 -> 654, stage-0 proofs 321 -> 357, 0 lost, 0 changed printings, 0 new
+// wrong, recognizer calls 3987 -> 3945.
 const TALL_ROWS = [0.88, 0.90, 0.92, 0.94, 0.86, 0.84];
-const TALL_H = 0.030;
+const TALL_H = 0.025;
+const FIRST_H = 0.030;
+export const FOOTER_HEIGHTS = Object.freeze({ first: FIRST_H, tall: TALL_H });
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
 
@@ -641,7 +652,7 @@ export function createReader(env) {
       }
       const rows = stage === 'wide' ? WIDE_ROWS : stage === 'tall' ? TALL_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const hgt = stage === 'tall' ? TALL_H : 0.025;
+      const hgt = stage === 'tall' ? TALL_H : si === 0 ? FIRST_H : 0.025;
       const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + hgt]);
       const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
