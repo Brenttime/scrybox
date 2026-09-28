@@ -171,7 +171,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   // Stacking state (default to stacked). Printing is deliberately not a toggle:
   // it is always part of the stack key, so foils never fold into non-foils.
   const [stackCards, setStackCards] = useState(true);
-  const [stackByCondition, setStackByCondition] = useState(false);
+  const stackByCondition = false;
 
   // Multi-select / bulk actions — shared long-press + /api/collection/bulk logic.
   const {
@@ -1263,10 +1263,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
             {/* Copy: the physical copy you own. */}
             <div className="filter-section-title">{t('mtg.sectionCopy')}</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
-              <Field label={t('card.condition')}>
-                <MultiSelectDropdown label={t('card.condition')} allLabel={t('collection.allConditions')} value={conditionFilter} onChange={setConditionFilter}
-                  options={CONDITIONS.map(c => ({ value: c, label: c }))} />
-              </Field>
               <Field label={t('card.printing')}>
                 <MultiSelectDropdown label={t('card.printing')} allLabel={t('collection.allPrintings')} value={printingFilter} onChange={setPrintingFilter}
                   options={PRINTING_OPTIONS} />
@@ -1297,17 +1293,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                   {t('collection.stackDuplicates')}
                 </label>
               </div>
-
-              {stackCards && (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <input type="checkbox" id="stackByConditionOpt" checked={stackByCondition} onChange={(e) => setStackByCondition(e.target.checked)} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />
-                    <label htmlFor="stackByConditionOpt" style={{ cursor: 'pointer', margin: 0, fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                      {t('collection.splitByCondition')}
-                    </label>
-                  </div>
-                </>
-              )}
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <input type="checkbox" id="tradeOnlyOpt" checked={tradeOnly} onChange={(e) => setTradeOnly(e.target.checked)} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />
