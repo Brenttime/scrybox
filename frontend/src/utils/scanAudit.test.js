@@ -421,20 +421,36 @@ test('reset()/no-card clear lastDeferred: a new presentation gets its cheap firs
 });
 
 test('footer rescue stage: taller rows + wide 0.84 prove what the first batch clipped (R2-2)', async () => {
-  // Call 1 title, 2 first footer batch, 3 wide (4 strips), 4 retro (2), 5
-  // must be the 6-strip rescue batch (v1 stopped after retro).
-  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 6 ? 'lea 161' : 'zz'));
+  // Call 1 title, 2 first footer batch, 3 tall (6), 4 wide (4 strips), 5
+  // retro (2), 6 must be the 6-strip rescue batch.
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 6 && n === 6 ? 'lea 161' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.scryfallId, 'id-lea');
-  assert.equal(r.footer_stage, 3, 'resolved by the rescue batch, after every v1 stage');
+  assert.equal(r.footer_stage, 4, 'resolved by the rescue batch, after every other stage');
 });
 
 test('footer rescue stage: a misread number is never snapped to the nearest indexed one (R2-2)', async () => {
   // Rescue reads 'lea 169' (index has lea 161 / 2x2 117): no printing.
-  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 5 ? 'lea 169' : 'zz'));
+  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 6 ? 'lea 169' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+test('tall stage: 0.030 rows read right after the first batch prove a clipped number; a conflicting read still abstains', async () => {
+  // Call 1 title, 2 first batch (0.025), 3 = the tall batch (6 strips).
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.equal(r.footer_stage, 1);
+  // The first batch read '2x2 127' (a real 2x2 printing here); tall reads
+  // lea 161: conflicting set+number evidence is ambiguity, not a pick.
+  const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
+    printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '127']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const c0 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 2 ? '2x2 127' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
+  const q = (await createReader({ ...c0.reader.__env, index: ix }).read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.notEqual(q.scryfallId, 'id-lea', JSON.stringify(q));
 });
 
 test('recognizer packing: LUT + reused buffers are bit-identical to the reference, padding stays 0 (R2-5)', () => {
@@ -586,7 +602,7 @@ test('switching frame-id source (rVFC number <-> pixel fingerprint) restarts the
 test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)', async () => {
   const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'], printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '161']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
   let t = 0, frame = 0, call = 0; const batches = [];
-  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 5 ? '2x2 161' : n === 2 ? 'zz' : '161'; }, { clock: () => t });
+  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 6 ? '2x2 161' : n === 2 ? 'zz' : '161'; }, { clock: () => t });
   const reader = createReader({ ...f.reader.__env, index: ix });
   const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), full = sharpFrame();
   let first; for (t = 0; t <= 200; t += 100) first = await reader.read(full, small, { requireStill: true, frameId: t });
@@ -594,5 +610,5 @@ test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)'
   frame = 1; call = 0; batches.length = 0;
   const r = (await reader.read(full, small, { requireStill: true, frameId: t })).results[0];
   assert.equal(r.scryfallId, 'id-lea');
-  assert.deepEqual(batches, [2, 6, 4, 2], 'v1 batches; rescue never runs');
+  assert.deepEqual(batches, [2, 6, 6, 4, 2], 'v1 batches + tall; rescue never runs');
 });

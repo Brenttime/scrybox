@@ -171,7 +171,10 @@ const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].
 // Rescue runs LAST, after every original stage (review R1-S2, R2-S2): each
 // card the old order proved is proved by the same stage from the same reads
 // and the same recognizer calls; rescue only sees cards v1 left unproven.
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'retro', 'rescue'];
+// 'tall' right after the first batch: replay of every 4th saved frame (322)
+// +12 printings, 0 lost, 0 changed, no new wrong (vs 0.035 everywhere: +16
+// but 6 lost). Taller-only-everywhere was rejected for those losses.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'tall', 'wide', 'retro', 'rescue'];
 // Pure: once rescue reads are in the evidence, a printing is proved only if
 // NO other printing of the title is named by it: not by a strong number (N/T
 // or read in 2 strips; set totals ignored), and not by an exact set code +
@@ -191,6 +194,12 @@ export function strongConflict(ix, title, pi, raws) {
   return false;
 }
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
+// 'tall': the first batch's rows again at 0.030 instead of 0.025. iPhone
+// telemetry (MSH/MSC "U 0086", "8088"/"0888" for 0088) and replay: the
+// 0.025 strip clips the digits' lower edge on many frames. Reads are added
+// to the first batch's, so a conflicting number still means ambiguity.
+const TALL_ROWS = [0.88, 0.90, 0.92, 0.94, 0.86, 0.84];
+const TALL_H = 0.030;
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = [0.855, 0.845];
 
@@ -625,9 +634,10 @@ export function createReader(env) {
         if (pooledHit) return pooledHit;
         continue;
       }
-      const rows = stage === 'wide' ? WIDE_ROWS : stage;
+      const rows = stage === 'wide' ? WIDE_ROWS : stage === 'tall' ? TALL_ROWS : stage;
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
-      const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + 0.025]);
+      const hgt = stage === 'tall' ? TALL_H : 0.025;
+      const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + hgt]);
       const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
@@ -637,7 +647,7 @@ export function createReader(env) {
       // first batch read "080/505", the real MH2 80, dropped only by its set
       // total check). Conflicting evidence means ambiguity, not a pick.
       // Holds for every later stage too: the rescue reads stay in raws.
-      if (stage === 'rescue') rescued = true;
+      if (stage === 'rescue' || stage === 'tall') rescued = true;
       if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
       if (pi != null) return done(pi, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);

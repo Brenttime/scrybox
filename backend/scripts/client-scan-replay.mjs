@@ -43,7 +43,7 @@ const rec = await ort.InferenceSession.create(path.join(assets, manifest.rec), s
 const cornelius = await ort.InferenceSession.create(path.join(modelDir, 'cornelius.onnx'), sessOpts);
 console.log(`loaded: index ${tIndex} ms, total ${Date.now() - tLoad} ms; ${index.names.length} names, ${index.printings.length} printings`);
 
-const reader = createReader({ ort, cornelius, rec, chars, index, footerStages: process.env.STAGES ? JSON.parse(process.env.STAGES) : undefined });
+const reader = createReader({ ort, cornelius, rec, chars, index, footerStages: process.env.STAGES ? JSON.parse(process.env.STAGES) : undefined});
 
 function serverAnswer(j) {
   const ok = (j.results || []).filter(r => r.ok && r.card);
