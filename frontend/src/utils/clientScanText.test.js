@@ -155,3 +155,23 @@ test('voteFooter: multi-frame vote needs 2 frames and one candidate', () => {
   assert.equal(voteFooter(ix, 'damn', [['080'], ['403 080']]), null);    // two candidates
   assert.equal(voteFooter(ix, 'damn', [['x'], ['y']]), null);
 });
+
+test('findCardByOcr: memoized, bounded, and identical to the uncached lookup (R2-11)', async () => {
+  const { findCardByOcrUncached } = await import('../../../shared/clientScan/text.mjs');
+  const names = ['lightning bolt', 'deception', 'reception', 'grief', 'the masamune', 'x'];
+  const ix = loadIndex({ names, canon: {}, excluded: [], sets: [], printings: [], byTitle: {}, uniqueAlias: {} });
+  let reads = 0;
+  const counted = new Proxy(ix.names, { get(tg, k, r) { if (k === 'length') reads++; return Reflect.get(tg, k, r); } });
+  ix.names = counted;
+  for (const q of ['Lightnlng Bolt', 'ley Reception', 'The Masamunc', 'X', 'zzzz']) {
+    const a = findCardByOcr(ix, q);
+    const before = reads;
+    const b = findCardByOcr(ix, q);
+    assert.equal(reads, before, `second identical lookup must not rescan names (${q})`);
+    assert.deepEqual(a, b); assert.deepEqual(a, findCardByOcrUncached(ix, q));
+    b.name = 'mutated';
+    assert.deepEqual(findCardByOcr(ix, q), a, 'callers cannot poison the memo');
+  }
+  for (let i = 0; i < 2000; i++) findCardByOcr(ix, 'noise ' + i);
+  assert.ok(ix.__findMemo.size <= 512, 'bounded');
+});
