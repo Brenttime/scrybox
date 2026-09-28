@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIndex, voteFooter, resolveFooter } from '../../../shared/clientScan/text.mjs';
 import { needsServer, NO_TITLE_ESCAPE } from './fastScan.js';
-import { createReader, corneliusTensor, CORN_SIZE, packRecBatch } from '../../../shared/clientScan/pipeline.mjs';
+import { createReader, corneliusTensor, CORN_SIZE, packRecBatch, FOOTER_HEIGHTS } from '../../../shared/clientScan/pipeline.mjs';
+import { strongNumbers } from '../../../shared/clientScan/text.mjs';
 
 // Regressions from the 2026-09 scanner audit.
 
@@ -438,8 +439,8 @@ test('footer rescue stage: a misread number is never snapped to the nearest inde
   assert.equal(r.ok, false, JSON.stringify(r));
 });
 
-test('tall stage: 0.030 rows read right after the first batch prove a clipped number; a conflicting read still abstains', async () => {
-  // Call 1 title, 2 first batch (0.030), 3 = the tall batch (6 strips).
+test('tall stage: 0.025 rows read right after the first batch prove a clipped number; a conflicting read still abstains', async () => {
+  // Call 1 title, 2 first batch (0.030), 3 = the tall batch (0.025, 6 strips).
   const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -633,4 +634,16 @@ test('no settling by default: a sharp still card is read on its first auto frame
   const env = { ...f.reader.__env }; delete env.settle;
   const b = await createReader(env).read(sharpFrame(), small, { requireStill: true });
   assert.equal(b.results[0]?.ok, true);
+});
+
+test('first footer batch and tall stage never sample identical crops (no self-corroboration)', () => {
+  // strongNumbers treats a number read in 2 strips as corroborated. If the
+  // tall stage re-read the first batch's exact crops, one read would count
+  // twice (Astra review, perf/collector-first-read).
+  assert.notEqual(FOOTER_HEIGHTS.first, FOOTER_HEIGHTS.tall);
+  assert.equal(FOOTER_HEIGHTS.first, 0.030);
+  // The mechanism the guard protects against: a lone read is not strong,
+  // the same text twice is.
+  assert.equal(strongNumbers(['U 0221']).has('221'), false);
+  assert.equal(strongNumbers(['U 0221', 'U 0221']).has('221'), true);
 });
