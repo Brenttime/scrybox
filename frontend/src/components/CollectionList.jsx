@@ -50,7 +50,7 @@ import CardImage from './CardImage';
 import MultiSelectDropdown from './MultiSelectDropdown';
 import ColorPicker from './ColorPicker';
 import { getScrollTop, getViewportHeight, getScrollHeight, offsetInScroller, scrollToTop } from '../utils/scrollRoot';
-import { CARD_TYPES, SUPERTYPES, MANA_VALUES, mvBucket, cardTypes, cardSupertypes, cardSubtypes, uniqueSorted, sortRarities, matchMtgFilters } from '../utils/mtgFilters';
+import { CARD_TYPES, MANA_VALUES, mvBucket, cardTypes, cardSubtypes, uniqueSorted, sortRarities, matchMtgFilters } from '../utils/mtgFilters';
 
 const labelStyle = { fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.03em' };
 const BACKGROUND_PAGE_SIZE = 2000;
@@ -462,10 +462,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   // Magic facets (see utils/mtgFilters): only offer values the binder has.
   const uniqueTypes = useMemo(
     () => CARD_TYPES.filter(ty => collection.some(item => cardTypes(item).includes(ty))),
-    [collection]
-  );
-  const uniqueSupertypes = useMemo(
-    () => SUPERTYPES.filter(st => collection.some(item => cardSupertypes(item).includes(st))),
     [collection]
   );
   const uniqueSubtypes = useMemo(() => uniqueSorted(collection, cardSubtypes), [collection]);
@@ -1248,12 +1244,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                 <MultiSelectDropdown label={t('mtg.subtype')} allLabel={t('mtg.allSubtypes')} value={subtypeFilter} onChange={setSubtypeFilter}
                   options={uniqueSubtypes.map(v => ({ value: v, label: v }))} />
               </Field>
-              {uniqueSupertypes.length > 0 && (
-                <Field label={t('collection.fSupertype')}>
-                  <MultiSelectDropdown label={t('collection.fSupertype')} allLabel={t('collection.allSupertypes')} value={supertypeFilter} onChange={setSupertypeFilter}
-                    options={uniqueSupertypes.map(v => ({ value: v, label: v }))} />
-                </Field>
-              )}
               {uniqueCmcs.length > 0 && (
                 <Field label={t('collection.fManaValue')}>
                   <MultiSelectDropdown label={t('collection.fManaValue')} allLabel={t('collection.allManaValues')} value={cmcFilter} onChange={setCmcFilter}
