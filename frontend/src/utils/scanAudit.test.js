@@ -421,18 +421,18 @@ test('reset()/no-card clear lastDeferred: a new presentation gets its cheap firs
 });
 
 test('footer rescue stage: taller rows + wide 0.84 prove what the first batch clipped (R2-2)', async () => {
-  // Call 1 title, call 2 first footer batch (unreadable), call 3 must be the
-  // 6-strip rescue batch (the old code's call 3 was the 4-strip wide stage).
-  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
+  // Call 1 title, 2 first footer batch, 3 wide (4 strips), 4 must be the
+  // 6-strip rescue batch (the old code's call 4 was the 2-strip retro stage).
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 4 && n === 6 ? 'lea 161' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.scryfallId, 'id-lea');
-  assert.equal(r.footer_stage, 1, 'resolved by the rescue batch');
+  assert.equal(r.footer_stage, 2, 'resolved by the rescue batch, after wide');
 });
 
 test('footer rescue stage: a misread number is never snapped to the nearest indexed one (R2-2)', async () => {
   // Rescue reads 'lea 169' (index has lea 161 / 2x2 117): no printing.
-  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 3 ? 'lea 169' : 'zz'));
+  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 4 ? 'lea 169' : 'zz'));
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.equal(r.ok, false, JSON.stringify(r));
 });
@@ -526,11 +526,42 @@ test('title rescue gate: measured always, gated only when every crop is flat and
 test('footer rescue never resolves against a conflicting strong number read on the same frame (Damn DRC 89 vs MH2 80, R2-2)', async () => {
   // First batch: '080/505' (number 80, total too high for the set check);
   // rescue: '089/59' (strong 89). Old candidate proved drc 89 -> wrong.
-  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 3 && n === 6 ? '089/59' : 'zz'));
+  const f = fakeReader((calls, n) => (calls === 1 ? 'damn' : calls === 2 ? '080/505' : calls === 4 && n === 6 ? '089/59' : 'zz'));
   const index = loadIndex({ names: ['damn'], canon: {}, excluded: [], sets: ['mh2', 'drc'],
     printings: [['id-mh2', 'mh2', '80'], ['id-drc', 'drc', '89'], ['id-mh2b', 'mh2', '396']], byTitle: { damn: [0, 1, 2] }, uniqueAlias: {} });
   const reader = createReader({ ...f.reader.__env, index });
   const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
   assert.notEqual(r.scryfallId, 'id-drc', 'never the misread printing');
   assert.equal(r.ok, false, JSON.stringify(r));
+});
+
+test('rescue never pre-empts the original wide stage (R1-S2) and ambiguity survives the retro exit (R1-B3)', async () => {
+  const ix2 = () => loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
+    printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '147'], ['id-lea2', 'lea', '147']], byTitle: { bolt: [0, 1, 2] }, uniqueAlias: {} });
+  // Wide says 2x2 117 -> proved there, exactly as before; rescue never runs.
+  const seen = [];
+  const f1 = fakeReader((calls, n) => { seen.push(n); return calls === 1 ? 'bolt' : calls === 3 ? '2x2 147' : n === 6 && calls === 4 ? 'lea 161' : 'zz'; });
+  const r1 = (await createReader({ ...f1.reader.__env, index: ix2() }).read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r1.scryfallId, 'id-2x2'); assert.equal(r1.footer_stage, 1);
+  // Rescue reads two LEA identities; a later retro "117" must not pick one.
+  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 4 && n === 6 ? 'lea 161 147' : calls === 5 ? 'wizards 147' : 'zz'));
+  const ixLea = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea'],
+    printings: [['id-lea', 'lea', '161'], ['id-lea2', 'lea', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
+  const r2 = (await createReader({ ...f2.reader.__env, index: ixLea }).read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r2.ok, false, JSON.stringify(r2));
+});
+
+test('fingerprint frame ids (no rVFC / stale clock): a frozen stream is never settle evidence (R1-B2)', async () => {
+  let t = 0;
+  const { reader, calls } = fakeReader(() => 'grief', { clock: () => t });
+  const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), f = sharpFrame();
+  for (let i = 0; i < 6; i++) { await reader.read(f, small, { requireStill: true, frameId: 'pabc' }); t += 100; }
+  assert.equal(calls(), 0, 'same pixels 6 times: never admitted');
+  for (const id of ['p1', 'p2', 'p3']) { await reader.read(f, small, { requireStill: true, frameId: id }); t += 100; }
+  assert.ok(calls() > 0, 'distinct frames admit on the normal window');
+  // Fingerprints never enable fast settle.
+  let t2 = 0; const g = fakeReader(() => 'grief', { clock: () => t2 });
+  const r2 = createReader({ ...g.reader.__env, fastSettle: true });
+  for (const id of ['a', 'b', 'c']) { await r2.read(sharpFrame(), small, { requireStill: true, frameId: id }); t2 += 60; }
+  assert.equal(g.calls(), 0);
 });

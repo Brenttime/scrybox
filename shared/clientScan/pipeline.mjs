@@ -168,15 +168,25 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // for a card the first batch did not prove. Replay: 71 old fallback frames
 // 49 -> 55, 5 new 0 -> 5, every baseline hit kept, 0 conflicts.
 const RESCUE_RECTS = [[0, 0.30, 0.84, 0.865], ...[0.86, 0.88, 0.90, 0.92, 0.94].map(y => [0, 0.22, y, y + 0.035])];
-const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'rescue', 'wide', 'retro'];
-// Pure: does any strong number (N/T or read in 2 strips; set totals ignored)
-// name a printing of this title other than pi, by number?
+// Rescue runs AFTER the original stages it could otherwise pre-empt (review
+// R1-S2): every card the old order proved is proved by the same stage from
+// the same reads; rescue only sees cards that first + wide left unproven.
+const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'wide', 'rescue', 'retro'];
+// Pure: once rescue reads are in the evidence, a printing is proved only if
+// NO other printing of the title is named by it: not by a strong number (N/T
+// or read in 2 strips; set totals ignored), and not by an exact set code +
+// number pair (review R1-B3: "lea 161 117" then a retro "117").
 export function strongConflict(ix, title, pi, raws) {
   const pool = ix.byTitle[title] || [];
   const mine = normalizeCollector(ix.printings[pi][2]);
-  for (const n of strongNumbers(raws).keys()) {
-    if (n === mine) continue;
-    if (pool.some(o => o !== pi && normalizeCollector(ix.printings[o][2]) === n)) return true;
+  const strong = [...strongNumbers(raws).keys()];
+  const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbers(raws));
+  for (const o of pool) {
+    if (o === pi) continue;
+    const n = normalizeCollector(ix.printings[o][2]);
+    if (n === mine && ix.printings[o][1] !== ix.printings[pi][1]) continue;   // same number elsewhere: set evidence decided
+    if (strong.includes(n)) return true;
+    if (codes.has(ix.printings[o][1]) && nums.has(String(ix.printings[o][2]).toLowerCase())) return true;
   }
   return false;
 }
@@ -405,7 +415,8 @@ export function createReader(env) {
     let m = cardToFrame(padQuad(quad));
     const sharp = titleSharpness(rgba, w, h, m);
     cand.sharpness = Math.round(sharp * 10) / 10;
-    if (sharp < FAST_SETTLE_SHARP || frameId == null) fastRun = false;
+    // Fast settle needs real decoded-frame numbers (rVFC), not fingerprints.
+    if (sharp < FAST_SETTLE_SHARP || typeof frameId !== 'number') fastRun = false;
     const window = env.fastSettle && fastRun ? FAST_SETTLE_MS : STILL_WINDOW_MS;
     const settled = stillRun >= STILL_OBS && tNow - stillSince >= window;
     if (settled && window < STILL_WINDOW_MS && tNow - stillSince < STILL_WINDOW_MS) cand.fast_settle = true;
