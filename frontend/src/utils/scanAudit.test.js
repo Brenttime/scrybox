@@ -419,3 +419,20 @@ test('reset()/no-card clear lastDeferred: a new presentation gets its cheap firs
     assert.equal(calls() - c0, 2, `${boundary}: title + first footer batch only`);
   }
 });
+
+test('footer rescue stage: taller rows + wide 0.84 prove what the first batch clipped (R2-2)', async () => {
+  // Call 1 title, call 2 first footer batch (unreadable), call 3 must be the
+  // 6-strip rescue batch (the old code's call 3 was the 4-strip wide stage).
+  const { reader } = fakeReaderIx((calls, n) => (calls === 1 ? 'bolt' : calls === 3 && n === 6 ? 'lea 161' : 'zz'));
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.scryfallId, 'id-lea');
+  assert.equal(r.footer_stage, 1, 'resolved by the rescue batch');
+});
+
+test('footer rescue stage: a misread number is never snapped to the nearest indexed one (R2-2)', async () => {
+  // Rescue reads 'lea 169' (index has lea 161 / 2x2 117): no printing.
+  const { reader } = fakeReaderIx((calls) => (calls === 1 ? 'bolt' : calls === 3 ? 'lea 169' : 'zz'));
+  const r = (await reader.read(sharpFrame(), new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4))).results[0];
+  assert.equal(r.ok, false, JSON.stringify(r));
+});
