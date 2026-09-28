@@ -313,7 +313,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
       if (!tel.get('answered_by')) tel.set({ answered_by: 'server' });
-      const streak = nextFailStreak(failStreakRef.current, out, Date.now(), { fromServer: tel.get('answered_by') === 'server' });
+      const fromServer = tel.get('answered_by') === 'server';
+      const streak = nextFailStreak(failStreakRef.current, out, Date.now(), { fromServer, sameFrameLocal: fromServer && !hedged ? local : null });
       failStreakRef.current = streak;
       const plan = zoomPlan({ candidates: out.candidates, results: out.results, frame: out.frame, sw: out.frame?.width || sw, sh: out.frame?.height || sh });
       const ms = Math.round(performance.now() - t0);

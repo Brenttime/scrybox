@@ -97,10 +97,18 @@ function unresolvedSignature(out) {
 // pass between two failed fallbacks cleared the backoff), while the fixed
 // deadline still expires on time. serverAllowed only ever applies it to the
 // same title in the same place.
-export function nextFailStreak(prev, out, now, { fromServer = true } = {}) {
+// sameFrameLocal (R2-#10): the on-device read of the very frame that was
+// just sent. The sidecar often fails WITHOUT a title ("no confident card
+// title", Helm of the Host) while the client read one; that failed server
+// attempt is then signed with the client's title and position, so the next
+// local failure of the same card backs off instead of re-sending at once.
+// Only for a single-card server answer, and only on a real server attempt.
+export function nextFailStreak(prev, out, now, { fromServer = true, sameFrameLocal = null } = {}) {
   const resolved = (out?.results || []).some(r => r.ok);
   if (resolved || !out?.candidates?.length) return null;
-  const sig = fromServer ? unresolvedSignature(out) : null;
+  let sig = fromServer ? unresolvedSignature(out) : null;
+  if (!sig && fromServer && sameFrameLocal && !sameFrameLocal.error && out.candidates.length === 1
+    && !(out.results || []).some(r => r.title)) sig = unresolvedSignature(sameFrameLocal);
   if (!sig) return prev || null;
   const same = prev && normTitle(prev.title) === normTitle(sig.title)
     && Math.hypot(prev.cx - sig.cx, prev.cy - sig.cy) <= SAME_PLACE;

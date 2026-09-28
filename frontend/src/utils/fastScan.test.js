@@ -111,3 +111,19 @@ test('edge run: a moving pass between partials resets it (review R1-S1)', () => 
   for (let i = 0; i < 7; i++) run = nextEdgeRun(run, edge);
   assert.equal(nextEdgeRun(run, { frame: edge.frame, candidates: [{ number: 1, box: [900, 200, 600, 840], eligible: false, status: 'moving' }], results: [] }), null);
 });
+
+test('backoff: a titleless server failure is signed with the same-frame client title (R2-10)', () => {
+  // Helm of the Host: sidecar says "no confident card title", client read Helm.
+  const srv = { frame: { width: 1920, height: 1080 }, candidates: [{ number: 1, box: [500, 130, 750, 920], eligible: true }], results: [{ number: 1, ok: false, error: 'no confident card title' }] };
+  const local = { frame: { width: 1920, height: 1080 }, candidates: [{ number: 1, box: [502, 131, 750, 918], eligible: true }], results: [{ number: 1, ok: false, title: 'helm of the host', error: 'exact printing not resolved' }] };
+  const s = nextFailStreak(null, srv, 0, { fromServer: true, sameFrameLocal: local });
+  assert.ok(s, 'streak started from the same-frame local title');
+  assert.equal(s.title, 'helm of the host');
+  assert.equal(serverAllowed(s, 500, local), false, 'same card same place: backs off');
+  const other = { ...local, results: [{ number: 1, ok: false, title: 'galactus' }] };
+  assert.equal(serverAllowed(s, 500, other), true, 'a changed title is never held');
+  assert.equal(serverAllowed(s, 1000, local), true, 'deadline releases');
+  assert.equal(nextFailStreak(null, srv, 0, { fromServer: false, sameFrameLocal: local }), null, 'only a real server attempt');
+  const multi = { ...srv, candidates: [...srv.candidates, { number: 2, box: [1200, 100, 600, 840] }] };
+  assert.equal(nextFailStreak(null, multi, 0, { fromServer: true, sameFrameLocal: local }), null, 'multi-card server scene: not signed from the single-card client read');
+});
