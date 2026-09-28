@@ -168,6 +168,10 @@ test('presentation epoch: a different title or a lift starts a new one; waiting 
   assert.equal(nextPresentation(q, { frame: { width: 1, height: 1 }, candidates: [], results: [] }, 4000), null);
   const r = nextPresentation(q, seen1(null, [506, 127, 752, 922], 'moving'), 3600);
   assert.equal(r.epoch, 2, 'no title this pass: same presentation');
+  let m = r; for (let i = 0; i < 3; i++) m = nextPresentation(m, seen1(null, [506, 127, 752, 922], 'moving'), 3700 + i);
+  assert.equal(m.epoch, 2);
+  const after = nextPresentation(m, seen1('galactus'), 3800);
+  assert.equal(after.epoch, 3, 'sustained hand motion then a still card: new presentation (R2-S1)');
   assert.equal(nextPresentation(q, { error: 'x' }, 4000), q, 'errors carry no information');
 });
 

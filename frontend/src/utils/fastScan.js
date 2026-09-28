@@ -75,6 +75,7 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
 // lifting the card (a no-card frame) ends the streak at once.
 export const FAIL_BACKOFF_MS = [0, 1000, 2000, 3000];
 const SAME_PLACE = 0.08;   // centre move, fraction of frame diagonal
+const MOTION_BREAK = 3;    // moving/blurred passes in a row that end a presentation
 
 function unresolvedSignature(out) {
   const res = (out?.results || []).find(r => !r.ok && r.title);
@@ -163,18 +164,26 @@ function titleOf(out) {
 }
 // epochBase: the last epoch handed out in this run, so epochs stay monotonic
 // across lifts (a no-card pass returns null, the next card gets base + 1).
-export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0) {
+// Sustained hand motion (MOTION_BREAK moving/blurred passes) also starts a new
+// presentation, the same rule the de-dupe uses. `at` is when this pass's
+// capture began (first candidate); `titleAt` when its confident title was
+// read (end of the on-device read), if any.
+export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0, titleAt = at) {
   if (!out || out.error) return prev;
   if (!out.candidates?.length) return null;
   const c = centreOf(out), title = titleOf(out);
+  const status = out.candidates[0].status;
+  const motion = status === 'moving' || status === 'too blurry' ? (prev?.motion || 0) + 1 : 0;
   const moved = prev && c && prev.cx != null && Math.hypot(prev.cx - c.cx, prev.cy - c.cy) > SAME_PLACE;
   const retitled = prev && title && prev.title && title !== prev.title;
-  if (!prev || moved || retitled) {
-    return { epoch: Math.max(epochBase, prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? at : null };
+  const shaken = prev && prev.motion >= MOTION_BREAK && !motion;
+  if (!prev || moved || retitled || shaken) {
+    return { epoch: Math.max(epochBase, prev?.epoch || 0) + 1, since: at, cx: c?.cx ?? null, cy: c?.cy ?? null, title, titleAt: title ? titleAt : null, motion };
   }
-  if (title && !prev.title) return { ...prev, title, titleAt: at, cx: c?.cx ?? prev.cx, cy: c?.cy ?? prev.cy };
-  if (c && prev.cx == null) return { ...prev, cx: c.cx, cy: c.cy };
-  return prev;
+  const next = { ...prev, motion };
+  if (title && !prev.title) { next.title = title; next.titleAt = titleAt; }
+  if (c && prev.cx == null) { next.cx = c.cx; next.cy = c.cy; }
+  return next;
 }
 
 // Auto de-dupe (R2 measurement fix). A card is re-added only if, since its
@@ -186,7 +195,6 @@ export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0) {
 // repeat never clears a break or renews the clock (review R1-B1), so a second
 // copy put down after a lift is added once DEDUPE_MS after the first add.
 export const DEDUPE_MS = 4000;
-const MOTION_BREAK = 3;
 export function dedupeFresh(seen, id, at) {
   const e = seen.get(id);
   if (!e) return true;

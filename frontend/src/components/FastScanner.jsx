@@ -135,6 +135,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const presRef = useRef(null);         // current presentation (one card in view), for telemetry
   const epochRef = useRef(0);           // last presentation epoch handed out this run (monotonic)
   const hydrateAbortRef = useRef(null); // background hydrations, aborted on unmount only
+  const hydrateLifeRef = useRef(new Map()); // row key -> {busy, timer}: one retry chain per row
   const onDeviceRef = useRef(false);
   const edgeRunRef = useRef(null);   // consecutive near-edge partials, same place
   const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
@@ -207,7 +208,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // A generation counter, not a DOM ref: bumping the live value is the point.
       // eslint-disable-next-line react-hooks/exhaustive-deps
       runRef.current++;
-      clearTimeout(timerRef.current); scanAbortRef.current?.abort(); hydrateAbortRef.current?.abort(); stopCamera();
+      clearTimeout(timerRef.current); scanAbortRef.current?.abort(); hydrateAbortRef.current?.abort();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      for (const l of hydrateLifeRef.current.values()) clearTimeout(l.timer);
+      stopCamera();
     };
   }, [stopCamera]);
 
@@ -309,6 +313,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // the tray, unsendable, marked failed, and is retried with backoff (and on
   // tap) until it hydrates or the user dismisses it.
   const hydrateRow = useCallback((row, attempt = 0) => {
+    // One lifecycle per row (review R2-S3): a manual retry replaces any
+    // scheduled one, and a row already hydrating is not started twice.
+    const life = hydrateLifeRef.current;
+    const cur = life.get(row.key);
+    if (cur?.busy) return;
+    clearTimeout(cur?.timer);
+    life.set(row.key, { busy: true });
     const ctl = hydrateAbortRef.current || (hydrateAbortRef.current = new AbortController());
     const h = row.hit;
     const th = performance.now();
@@ -318,16 +329,21 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const card = res?.[0]?.card;
         if (!card) throw new Error('hydrate incomplete');
         if (!aliveRef.current) return;
+        life.delete(row.key);
         setResults(prev => prev.map(x => (x.key === row.key ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
-        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th) });
+        scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th), usable_ms: row.t0 != null ? Math.round(performance.now() - row.t0) : undefined });
       })
       .catch((e) => {
-        if (!aliveRef.current || ctl.signal.aborted) return;
+        if (!aliveRef.current || ctl.signal.aborted) { life.delete(row.key); return; }
         scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrate-failed', row: row.key, pres: row.pres, attempt, error: e?.message || String(e) });
         let still = false;
         setResults(prev => prev.map(x => { if (x.key !== row.key) return x; still = true; return { ...x, hydrateFailed: true }; }));
         const delay = HYDRATE_RETRY_MS[Math.min(attempt, HYDRATE_RETRY_MS.length - 1)];
-        setTimeout(() => { if (aliveRef.current && still && resultsRef.current.some(x => x.key === row.key && x.pending)) hydrateRow(row, attempt + 1); }, delay);
+        const timer = setTimeout(() => {
+          life.delete(row.key);
+          if (aliveRef.current && still && resultsRef.current.some(x => x.key === row.key && x.pending)) hydrateRow(row, attempt + 1);
+        }, delay);
+        life.set(row.key, { busy: false, timer });
       });
   }, []);
 
@@ -376,11 +392,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       };
       const hedged = onDeviceRef.current && !autoPass ? serverRead(grabJpeg(source, sw, sh, canvasRef)) : null;
       hedged?.catch(() => {});
-      let local = null;
+      let local = null, localDoneAt = null;
       if (onDeviceRef.current) {
         const tl = performance.now();
         local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
-        tel.mark('local_ms', performance.now() - tl);
+        localDoneAt = performance.now();
+        tel.mark('local_ms', localDoneAt - tl);
         tel.local(local);
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
         else if (!local?.candidates?.length) { why = 'no-card'; failStreakRef.current = null; }
@@ -441,7 +458,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const waited = autoPass && firstSeenRef.current != null ? Math.round(performance.now() - firstSeenRef.current) : ms;
       // Presentation (R2 measurement fix): the card now in view, from the
       // client's own same-frame read when there is one.
-      const pres = nextPresentation(presRef.current, local && !local.error && local.candidates?.length ? local : out, performance.now(), epochRef.current);
+      const pres = nextPresentation(presRef.current, local && !local.error && local.candidates?.length ? local : out, t0, epochRef.current, localDoneAt ?? performance.now());
       presRef.current = pres;
       if (pres) epochRef.current = Math.max(epochRef.current, pres.epoch);
       const edgeDir = edgeDirection(out.candidates[0]);
@@ -468,15 +485,17 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // Presentation timeline: epoch, and ms from its first candidate to
         // its first confident title and to this pass's end (proof/commit).
         pres: pres ? { epoch: pres.epoch, age_ms: Math.round(tEnd - pres.since), title_ms: pres.titleAt != null ? Math.round(pres.titleAt - pres.since) : undefined } : undefined,
-        commit_ms: fresh.length ? Math.round(tEnd - t0) : undefined,
-        // Rows inserted this pass that still await /cards (not yet usable).
+        // Pass start -> tray insertion enqueued (not the React paint). Rows
+        // still awaiting /cards are counted in pending_rows: they become
+        // usable at their 'hydrated' record (usable_ms from the same start).
+        insert_ms: fresh.length ? Math.round(tEnd - t0) : undefined,
         pending_rows: fresh.filter(h => h.pendingHydrate).length || undefined,
       });
       if (fresh.length) {
         setLatency({ total: waited, read: ms });
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
-        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch }));
+        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0 }));
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
@@ -523,9 +542,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     // Backoff, idle (no card) and errors keep their timers. No rVFC (older
     // iOS/Android WebViews): timers exactly as before.
     const shortWait = !r.backoff && !r.none && !r.error && !r.busy;
-    // Desktop-class devices (the ones that already used the 25 ms gate gap)
-    // look again after AUTO_FRAME_MIN_MS; phones keep their cadence and only
-    // skip a repeated frame (bounded extra wait), so battery/heat is unchanged.
+    // Devices reporting >= 8 logical cores (the ones that already used the
+    // 25 ms gate gap; some phones qualify) look again after AUTO_FRAME_MIN_MS;
+    // the rest keep their cadence and only skip a repeated frame (bounded
+    // extra wait).
     const since = lastCapturedFrame();
     if (shortWait && v && since != null && frameClock(v)) {
       const first = FAST_DEVICE ? Math.min(wait, AUTO_FRAME_MIN_MS) : wait;

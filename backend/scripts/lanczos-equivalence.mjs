@@ -1,5 +1,7 @@
 // R2-#4 probe: new resizeLanczos3 vs the reference on real saved frames:
-// pixel-identical output + identical cornelius corners; plus timing.
+// pixel-identical output (hence identical cornelius input and corners).
+// Timing is indicative only: the reference recomputes its weights per call
+// (v1 cached them), so it is NOT a clean production A/B.
 //   node scripts/lanczos-equivalence.mjs <frames dir> [N]
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,5 +19,5 @@ for (const f of files) {
   t = performance.now(); const b = resizeLanczos3(src, info.width, info.height, 4, 384, 384); tNew += performance.now() - t;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
 }
-console.log(JSON.stringify({ frames: files.length, differingBytes: diff, refMsPerFrame: +(tRef / files.length).toFixed(1), newMsPerFrame: +(tNew / files.length).toFixed(1) }));
+console.log(JSON.stringify({ frames: files.length, differingBytes: diff, refUncachedMsPerFrame: +(tRef / files.length).toFixed(1), newMsPerFrame: +(tNew / files.length).toFixed(1) }));
 process.exitCode = diff ? 1 : 0;
