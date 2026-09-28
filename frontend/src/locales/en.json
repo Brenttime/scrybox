@@ -589,6 +589,7 @@
   "inspector.specSupertype": "Supertype:",
   "inspector.editCard": "Edit Card",
   "inspector.editCopy": "This copy",
+  "inspector.moreOptions": "More options",
   "inspector.deleteCard": "Delete Card",
   "inspector.entryUpdated": "Card entry updated.",
   "inspector.errUpdate": "Failed to update card.",

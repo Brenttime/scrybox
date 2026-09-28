@@ -452,9 +452,14 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 <button type="submit" className="btn btn-primary" style={{ flex: 2, padding: '0.7rem', fontWeight: 700 }}>{t('inspector.saveChanges')}</button>
               </div>
 
-              <button type="button" className="btn btn-danger ci-delete-btn" onClick={handleDelete} style={{ width: '100%', padding: '0.6rem', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}>
-                <Trash2 size={15} /> {t('inspector.deleteCard')}
-              </button>
+              {/* Tucked away: a collapsed disclosure far below Save, so a stray
+                  tap can't reach it (and it still asks to confirm). */}
+              <details className="ci-danger-zone" style={{ marginTop: '1.5rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-glass)', fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                <summary style={{ cursor: 'pointer', userSelect: 'none' }}>{t('inspector.moreOptions')}</summary>
+                <button type="button" className="ci-delete-btn" onClick={handleDelete} style={{ marginTop: '0.6rem', background: 'none', border: '1px solid var(--accent-red)', color: 'var(--accent-red)', borderRadius: 'var(--radius-sm)', padding: '0.35rem 0.8rem', fontSize: '0.75rem', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                  <Trash2 size={13} /> {t('inspector.deleteCard')}
+                </button>
+              </details>
             </form>
           ) : (
             <>
