@@ -12,7 +12,6 @@ import CardImageZoom from './CardImageZoom';
 import CardImageActions from './CardImageActions';
 import CardEntryFields from './CardEntryFields';
 import PriceHistoryChart from './PriceHistoryChart';
-import CardArtEditor from './CardArtEditor';
 import { useBackGuard } from '../utils/useBackGuard';
 import { useT } from '../utils/i18n';
 
@@ -72,6 +71,9 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
 
   const targetEntryId = card?.entry_id || card?.id;
   const [proxyBusy, setProxyBusy] = useState(false);
+  // Change printing: null = closed, 'loading', or the list of same-name printings.
+  const [prints, setPrints] = useState(null);
+  const [printBusy, setPrintBusy] = useState(false);
   const [, setProxyTick] = useState(0);
 
   useEffect(() => {
@@ -139,6 +141,44 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
     } catch (err) {
       console.error(err);
       showToast && showToast(t('inspector.errEdit'));
+    }
+  };
+
+  const openPrintings = async () => {
+    setPrints('loading');
+    try {
+      const qs = new URLSearchParams({ name: card.name, prints: '1', scope: 'internet', limit: '250' });
+      const r = await fetch(`/api/search?${qs}`);
+      const list = r.ok ? await r.json() : [];
+      const same = (Array.isArray(list) ? list : []).filter(c => c.name === card.name);
+      setPrints(same);
+    } catch { setPrints([]); }
+  };
+
+  const choosePrinting = async (c) => {
+    if (!targetEntryId || printBusy) return;
+    if (c.id === card.card_id) { setPrints(null); return; }
+    setPrintBusy(true);
+    try {
+      const res = await fetch(`/api/collection/${targetEntryId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ card_id: c.id })
+      });
+      if (res.ok) {
+        showToast && showToast(t('inspector.entryUpdated'));
+        setPrints(null);
+        onUpdate && onUpdate();
+        onClose();
+      } else {
+        const body = await res.json().catch(() => null);
+        showToast && showToast(body?.error || t('inspector.errUpdate'));
+      }
+    } catch (err) {
+      console.error(err);
+      showToast && showToast(t('common.errBackend'));
+    } finally {
+      setPrintBusy(false);
     }
   };
 
@@ -270,12 +310,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
             </div>
           </div>
           <CardImageActions card={card} compact getSrc={() => document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
-          {!readOnly && <CardArtEditor
-            card={card}
-            hasProviderArt={!!card.image_url}
-            showToast={showToast}
-            onChanged={onUpdate}
-          />}
         </div>
 
         {/* Right side: Information / Edit */}
@@ -466,6 +500,15 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
 
                 <button
                   type="button"
+                  className="btn btn-secondary ci-change-printing-btn"
+                  style={{ padding: '0.4rem 0.9rem', fontSize: '0.8rem' }}
+                  onClick={openPrintings}
+                >
+                  {t('scan.changePrinting')}
+                </button>
+
+                <button
+                  type="button"
                   className="btn btn-danger btn-icon-only"
                   style={{ borderRadius: 'var(--radius-sm)', padding: '0.6rem' }}
                   onClick={handleDelete}
@@ -474,6 +517,36 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                   <Trash2 size={16} />
                 </button>
               </div>}
+
+              {!readOnly && prints !== null && (
+                <div className="ci-printings" style={{ border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 700 }}>
+                    <span>{t('scan.changePrinting')}{Array.isArray(prints) ? ` · ${prints.length}` : ''}</span>
+                    <button type="button" className="btn btn-secondary btn-icon-only" style={{ padding: '0.25rem' }} onClick={() => setPrints(null)} aria-label={t('common.close')}><X size={14} /></button>
+                  </div>
+                  {prints === 'loading' ? (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('fastscan.loadingPrintings')}</div>
+                  ) : prints.length === 0 ? (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('scan.noOtherPrintings')}</div>
+                  ) : (
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(84px, 1fr))', gap: '0.5rem', maxHeight: '320px', overflowY: 'auto' }}>
+                      {prints.map(c => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          disabled={printBusy}
+                          onClick={() => choosePrinting(c)}
+                          aria-pressed={c.id === card.card_id}
+                          style={{ background: 'none', border: c.id === card.card_id ? '2px solid var(--accent-yellow)' : '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.2rem', cursor: 'pointer', color: 'inherit', textAlign: 'center' }}
+                        >
+                          {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" style={{ width: '100%', borderRadius: '4px', display: 'block' }} /> : null}
+                          <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>{String(c.set_id || '').toUpperCase()} · #{c.number}</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>

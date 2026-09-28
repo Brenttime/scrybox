@@ -609,7 +609,7 @@ router.put('/collection/:id', async (req, res) => {
   const { id } = req.params;
   const {
     quantity, condition, printing, language, purchase_price,
-    is_trade, notes, is_proxy
+    is_trade, notes, is_proxy, card_id
   } = req.body;
 
   try {
@@ -618,6 +618,27 @@ router.put('/collection/:id', async (req, res) => {
 
     const updates = [];
     const params = [];
+
+    // Change printing: point the copy at another printing of the SAME card.
+    // Deck allocation is keyed on card name, so a same-name swap never moves
+    // copies between decks; a different card is rejected.
+    const newCardId = card_id !== undefined && card_id !== null && String(card_id) !== String(entry.card_id)
+      ? String(card_id) : null;
+    if (newCardId) {
+      await cardApi.hydrate(newCardId).catch(() => {});
+      let target = await db.get(`SELECT * FROM card_cache WHERE id = ?`, [newCardId]);
+      if (!target) {
+        await cardApi.getCardById(newCardId);
+        target = await db.get(`SELECT * FROM card_cache WHERE id = ?`, [newCardId]);
+      }
+      if (!target) return res.status(404).json({ error: `Card ID ${newCardId} not found.` });
+      const current = await db.get(`SELECT name FROM card_cache WHERE id = ?`, [entry.card_id]);
+      const norm = (n) => String(n || '').trim().toLowerCase();
+      if (current && norm(current.name) !== norm(target.name)) {
+        return res.status(400).json({ error: 'A printing change must stay on the same card.' });
+      }
+      updates.push('card_id = ?'); params.push(newCardId);
+    }
 
     // Absolute, not additive: see the reconcile below. Deliberately NOT part of
     // the UPDATE — setStackQuantity owns the quantity column so the two can
@@ -638,7 +659,7 @@ router.put('/collection/:id', async (req, res) => {
     if (notes !== undefined) { updates.push('notes = ?'); params.push(notes); }
     if (is_proxy !== undefined) { updates.push('is_proxy = ?'); params.push(is_proxy ? 1 : 0); }
 
-    const touchesPhysicalStack = requestedQty !== null
+    const touchesPhysicalStack = requestedQty !== null || newCardId !== null
       || condition !== undefined || printing !== undefined || language !== undefined
       || is_proxy !== undefined;
 
@@ -673,7 +694,7 @@ router.put('/collection/:id', async (req, res) => {
             AND language = ? AND id != ? AND quantity > 0
             AND COALESCE(is_proxy, 0) = ?
         `, [
-          req.user.id, currentEntry.card_id, targetCondition, targetPrinting,
+          req.user.id, newCardId || currentEntry.card_id, targetCondition, targetPrinting,
           targetLanguage, id, targetProxy
         ]);
         const projectedStackQty = Math.max(0, Number(currentEntry.quantity) || 0)
