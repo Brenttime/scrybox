@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE, nextPresentation, dedupeFresh, notePresence, edgeDirection, DEDUPE_MS, pixelPrint } from './fastScan.js';
+import { fitContain, quadPath, FRAME_MAX, zoomPlan, nextFailStreak, serverAllowed, needsServer, nextEdgeRun, isEdgePartial, EDGE_ESCAPE, nextPresentation, dedupeFresh, notePresence, edgeDirection, DEDUPE_MS, pixelPrint, presentationInput } from './fastScan.js';
 
 const fail = (title, box = [100, 100, 600, 840]) => ({
   frame: { width: 1080, height: 1920 },
@@ -206,4 +206,15 @@ test('pixelPrint: identical frames match, a one-level change in any sampled chan
   const b = a.slice();
   assert.equal(pixelPrint(a.buffer), pixelPrint(b.buffer));
   for (const i of [0, 1, 2, 5, 12345, a.length - 5]) { const c = a.slice(); c[i - (i % 5)] ^= 1; assert.notEqual(pixelPrint(c.buffer), pixelPrint(a.buffer), String(i)); }
+});
+
+test('presentationInput: title from the source that read it, geometry from the local read (R4-S1)', () => {
+  const local = seen1(null); const srv = { frame: local.frame, candidates: local.candidates, results: [{ ok: true, card: { name: 'Helm of the Host' } }] };
+  const a = presentationInput(local, false, srv);
+  assert.equal(a.candidates, local.candidates);
+  assert.equal(nextPresentation(null, a, 100, 0, 1000).titleAt, 1000, 'server title carried with its time');
+  const titled = seen1('galactus');
+  assert.equal(presentationInput(titled, true, srv), titled);
+  assert.equal(presentationInput(null, false, srv), srv);
+  assert.equal(presentationInput(local, false, { results: [] }), local);
 });

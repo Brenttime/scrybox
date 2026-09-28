@@ -162,12 +162,24 @@ function titleOf(out) {
   const r = (out?.results || []).find(x => x.title || x.card?.name);
   return r ? normTitle(r.title || r.card?.name) : null;
 }
+// Pure (review R4-S1): which pass output describes the presentation.
+// Geometry comes from the on-device read when it saw a card; the title from
+// that read if it has one, else from the final answer (server fallback).
+export function presentationInput(local, localTitled, out) {
+  if (!local) return out;
+  if (localTitled) return local;
+  const r = (out?.results || []).find(x => x.title || x.card?.name);
+  if (!r) return local;
+  return { ...local, results: [{ ...(local.results?.[0] || {}), number: 1, title: r.title || r.card?.name }] };
+}
+
 // epochBase: the last epoch handed out in this run, so epochs stay monotonic
 // across lifts (a no-card pass returns null, the next card gets base + 1).
 // Sustained hand motion (MOTION_BREAK moving/blurred passes) also starts a new
 // presentation, the same rule the de-dupe uses. `at` is when this pass's
 // capture began (first candidate); `titleAt` when its confident title was
-// read (end of the on-device read), if any.
+// read: the end of the on-device title stage, or the completion of the
+// server response that carried the title.
 export function nextPresentation(prev, out, at, epochBase = prev?.epoch || 0, titleAt = at) {
   if (!out || out.error) return prev;
   if (!out.candidates?.length) return null;
@@ -234,7 +246,8 @@ export function edgeDirection(cand) {
 }
 
 // FNV-1a over every 5th byte (RGB and alpha interleave, so all channels are
-// sampled across rows): ~120k steps on the 384x384 copy, well under 1 ms.
+// sampled across rows): ~118k steps on the 384x384 copy (host Node p50
+// 0.19 ms; not measured on phones). A collision only skips evidence.
 export function pixelPrint(buf) {
   const a = new Uint8Array(buf);
   let h = 0x811c9dc5;

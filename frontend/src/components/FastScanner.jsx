@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, dedupeFresh, notePresence, edgeDirection } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -385,14 +385,15 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const r = await fetch('/api/cardscan/frame', { method: 'POST', headers, body, signal: abort.signal });
         if (r.status === 429) { tel.set({ server_status: 429 }); return { busy: true, backoff: true }; }
         const j = await readJson(r);
-        tel.mark('server_rtt_ms', performance.now() - tr);
+        serverDoneAt = performance.now();
+        tel.mark('server_rtt_ms', serverDoneAt - tr);
         tel.server(j);
         if (!r.ok || !j.ok) throw new Error(j.error || t('fastscan.serviceError'));
         return j;
       };
       const hedged = onDeviceRef.current && !autoPass ? serverRead(grabJpeg(source, sw, sh, canvasRef)) : null;
       hedged?.catch(() => {});
-      let local = null, localStart = null;
+      let local = null, localStart = null, serverDoneAt = null;
       if (onDeviceRef.current) {
         const tl = performance.now();
         localStart = tl;
@@ -458,14 +459,18 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const waited = autoPass && firstSeenRef.current != null ? Math.round(performance.now() - firstSeenRef.current) : ms;
       // Presentation (R2 measurement fix): the card now in view, from the
       // client's own same-frame read when there is one.
-      // Title time from the source that supplied the title: the on-device
-      // read's own title stage end (capture + detect/refine/title ms), or,
-      // when only the server read a title, the end of the server round trip.
-      const useLocal = !!(local && !local.error && local.candidates?.length);
+      // Presentation input: geometry from the on-device read when it saw a
+      // card, title + title time from whichever source actually read the
+      // title (review R4-S1): the local title stage's end (capture + draw/
+      // probe/readback + detect/refine/title), else the server response's
+      // own completion time (hedged or sequential).
+      const localHasCard = !!(local && !local.error && local.candidates?.length);
+      const localTitled = localHasCard && (local.results || []).some(x => x.title);
       const lt = local?.timings || {};
       const localTitleAt = localStart != null && lt.title_ms != null ? localStart + (local.span?.wait_ms || 0) + (local.span?.draw_ms || 0) + (local.span?.probe_ms || 0) + (local.span?.readback_ms || 0) + (lt.total_ms || 0) - (lt.footer_ms || 0) : null;
-      const titleSrc = useLocal && (local.results || []).some(x => x.title) ? localTitleAt : performance.now();
-      const pres = nextPresentation(presRef.current, useLocal ? local : out, t0, epochRef.current, titleSrc ?? performance.now());
+      const presOut = presentationInput(localHasCard ? local : null, localTitled, out);
+      const titleAt = localTitled ? localTitleAt : (serverDoneAt ?? performance.now());
+      const pres = nextPresentation(presRef.current, presOut, t0, epochRef.current, titleAt ?? performance.now());
       presRef.current = pres;
       if (pres) epochRef.current = Math.max(epochRef.current, pres.epoch);
       const edgeDir = edgeDirection(out.candidates[0]);
