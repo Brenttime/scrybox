@@ -12,6 +12,7 @@ export default function CardEntryFields({
   quantity, purchasePrice, condition, printing, language,
   onQuantity, onPurchasePrice, onCondition, onPrinting, onLanguage,
   variant = 'grid',
+  compact = false,   // card-details edit menu: no condition, foil as a toggle
 }) {
   const { t } = useT();
   const stacked = variant === 'stacked';
@@ -68,6 +69,30 @@ export default function CardEntryFields({
     </div>
   );
 
+  if (compact) {
+    const foil = printing === 'Holofoil';
+    return (
+      <>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem' }}>{Quantity}{Price}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '0.75rem', alignItems: 'end' }}>
+          <div className="form-group">
+            <label>{t('card.foil')}</label>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={foil}
+              className="ci-foil-toggle"
+              onClick={() => onPrinting(foil ? 'Normal' : 'Holofoil')}
+              style={{ width: '52px', height: '30px', borderRadius: '999px', border: '1px solid var(--border-glass)', background: foil ? 'var(--accent-yellow)' : 'rgba(255,255,255,0.08)', position: 'relative', cursor: 'pointer', padding: 0, transition: 'background 0.15s' }}
+            >
+              <span style={{ position: 'absolute', top: '3px', left: foil ? '25px' : '3px', width: '22px', height: '22px', borderRadius: '50%', background: '#fff', transition: 'left 0.15s' }} />
+            </button>
+          </div>
+          {Language}
+        </div>
+      </>
+    );
+  }
   if (stacked) {
     // Language omitted here: scanner defaults to English and it's rarely changed
     // on a quick add. Still editable later in the card inspector.

@@ -406,6 +406,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               <section>
                 <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '0.4rem' }}>{t('inspector.editCopy')}</div>
                 <CardEntryFields
+                  compact
                   quantity={q} purchasePrice={purchasePrice} condition={condition} printing={printing} language={language}
                   onQuantity={setQ} onPurchasePrice={setPurchasePrice} onCondition={setCondition} onPrinting={setPrinting} onLanguage={setLanguage}
                 />
