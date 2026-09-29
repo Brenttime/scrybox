@@ -170,6 +170,8 @@
   "deck.allDecks": "All Decks",
   "deck.hidePrecons": "Hide Precons",
   "deck.onlyPrecons": "Only Precons",
+  "deck.hideMoxfield": "Hide Moxfield",
+  "deck.onlyMoxfield": "Only Moxfield",
   "deck.sortNewest": "Newest First",
   "deck.sortOldest": "Oldest First",
   "deck.sortMostCards": "Most Cards",
