@@ -517,7 +517,10 @@
   transform: none !important;
   box-shadow: none !important;
 }
-:root[data-theme="manabox"] .list-tile:last-child { border-bottom: 0 !important; }
+:root[data-theme="manabox"] .list-tile { border-bottom: 0 !important; }
+:root[data-theme="manabox"] .swipe-row { border-bottom: 1px solid var(--mb-line); }
+:root[data-theme="manabox"] .swipe-row:last-child { border-bottom: 0; }
+:root[data-theme="manabox"] .swipe-row-content { background: var(--mb-card); }
 :root[data-theme="manabox"] .list-tile:hover { background: var(--mb-card-hover) !important; }
 :root[data-theme="manabox"] .list-tile-accent {
   grid-area: icon;
@@ -536,11 +539,6 @@
 }
 :root[data-theme="manabox"] .list-tile-head { grid-area: head; min-width: 0; }
 :root[data-theme="manabox"] .list-tile-title > div:first-child { font-size: 0.95rem !important; font-weight: 650 !important; }
-:root[data-theme="manabox"] .list-tile-delete {
-  background: transparent !important;
-  color: var(--text-muted) !important;
-}
-:root[data-theme="manabox"] .list-tile-delete:hover { color: #ff8c8c !important; }
 :root[data-theme="manabox"] .list-tile-stats {
   grid-area: value;
   flex-direction: column-reverse;
@@ -553,7 +551,7 @@
   font-weight: 750;
   font-size: 0.95rem;
 }
-/* Head row shares the grid row: title left, delete right. */
+/* Head row shares the grid row with the value. */
 :root[data-theme="manabox"] .list-tile-head { display: flex !important; }
 
 
