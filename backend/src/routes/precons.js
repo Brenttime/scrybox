@@ -22,12 +22,26 @@ const defaultShape = (type) => (COMMANDER_TYPES.has(type)
   ? { format: 'Commander / EDH', category: null, accentColor: '#8b5cf6', targetSize: 100 }
   : { format: 'Standard', category: null, accentColor: '#eab308', targetSize: 60 });
 
+// Quick precons lists paper products sold as ready-to-play decks. MTGJSON's
+// index also carries Secret Lair drops (own panel), Jumpstart half-decks,
+// MTGO/Arena digital lists, land packs, Shandalar AI decks and tournament
+// lists; none of those are precons.
+const PRECON_TYPES = new Set([
+  'Commander Deck', 'Theme Deck', 'Intro Pack', 'Planeswalker Deck', 'Duel Deck',
+  'Challenger Deck', 'Pioneer Challenger Deck', 'Event Deck', 'Modern Event Deck',
+  'Starter Deck', 'Starter Kit', 'Spellslinger Starter Kit', 'Welcome Deck',
+  'Game Night Deck', 'Clash Pack', 'Brawl Deck', 'Guild Kit', 'Archenemy Deck',
+  'Planechase Deck', 'Premium Deck', 'Enhanced Deck', 'Advanced Deck',
+  'Challenge Deck', 'Box Set',
+]);
+const isPrecon = (d) => PRECON_TYPES.has(d.type);
+
 router.get('/', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q is required' });
   try {
     const index = await getPreconIndex();
-    const matches = rankPrecons(index.decks, q).slice(0, 50)
+    const matches = rankPrecons(index.decks.filter(isPrecon), q).slice(0, 50)
       .map(({ _score, _at, ...d }) => d);
     res.json({
       results: matches,
@@ -81,3 +95,4 @@ router.post('/import', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.isPrecon = isPrecon;
