@@ -5,6 +5,7 @@ import {
   Layers, Minus, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
   Star, Heart, Gift, Flame, Crown, Gem, Swords, Shield, Sparkles, Bookmark, Trophy, Skull, Zap, Target, Package, Coins,
 } from 'lucide-react';
+import SwipeToDelete from './SwipeToDelete';
 import OverflowMenu from './OverflowMenu';
 import CardImage from './CardImage';
 import CardInspectorModal from './CardInspectorModal';
@@ -714,7 +715,14 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             {filteredLists.map(list => {
               const accent = list.accent_color || '#10b981';
               return (
-                <div key={list.id} className="glass-panel list-tile"
+                <SwipeToDelete key={list.id} label={t('lists.deleteList')}
+                  onDelete={reset => {
+                    if (!window.confirm(t('lists.confirmDelete', { name: list.name }))) { reset(); return; }
+                    fetch(`/api/lists/${list.id}`, { method: 'DELETE' })
+                      .then(r => { if (!r.ok) throw new Error(); showToast(t('lists.deleted')); fetchLists(); })
+                      .catch(() => { reset(); showToast(t('lists.errDelete')); });
+                  }}>
+                <div className="glass-panel list-tile"
                   style={{ '--list-accent': accent,
                     display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '1.25rem',
                     position: 'relative', overflow: 'hidden', cursor: 'pointer',
@@ -736,11 +744,6 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                       {list.description && <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '0.2rem', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{list.description}</div>}
                       </div>
                     </div>
-                    <button className="btn btn-danger btn-icon-only list-tile-delete" title={t('lists.deleteList')} aria-label={t('lists.deleteList')}
-                      onClick={e => { e.stopPropagation(); window.confirm(t('lists.confirmDelete', { name: list.name })) && fetch(`/api/lists/${list.id}`, { method: 'DELETE' }).then(() => { showToast(t('lists.deleted')); fetchLists(); }); }}
-                      style={{ width: '1.6rem', height: '1.6rem', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <Trash2 size={14} />
-                    </button>
                   </div>
                   <div className="list-tile-stats" style={{ display: 'flex', gap: '0.75rem', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
                     <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
@@ -753,6 +756,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                     </span>
                   </div>
                 </div>
+                </SwipeToDelete>
               );
             })}
           </div>

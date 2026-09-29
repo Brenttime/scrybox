@@ -2053,3 +2053,12 @@ button, input, select, textarea {
 }
 
 @keyframes ptr-spin { to { transform: rotate(360deg); } }
+
+/* Swipe-to-delete rows (components/SwipeToDelete.jsx) */
+.swipe-row { position: relative; overflow: hidden; }
+.swipe-row-content { position: relative; z-index: 1; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
+.swipe-row-action {
+  position: absolute; top: 0; right: 0; bottom: 0; width: 88px; border: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  background: var(--accent-red, #ef4444); color: #fff; font-size: 0.75rem; font-weight: 700; cursor: pointer;
+}
