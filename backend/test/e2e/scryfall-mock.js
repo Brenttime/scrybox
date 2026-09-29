@@ -57,7 +57,7 @@ axios.Axios.prototype.get = async function(url, config) {
       return {
         data: {
           data: [{
-            name: 'precons-test', code: 'LEA', type: 'Sample Deck',
+            name: 'precons-test', code: 'LEA', type: 'Theme Deck',
             releaseDate: '2020-01-01', fileName: 'precons-test', source: 'https://example.test'
           }],
           meta: { date: '2026-01-01', version: 'test' }

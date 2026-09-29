@@ -45,6 +45,13 @@ const DECKS = [
   assert.deepStrictEqual(hits, ['Lorehold Spirit']);
   assert.deepStrictEqual(require('../src/utils/preconData').setNameMap({ data: [{ code: 'soc', name: 'X' }] }), { SOC: 'X' });
 
+  // Only real paper precons are searchable.
+  const { isPrecon } = require('../src/routes/precons');
+  assert.ok(isPrecon({ type: 'Commander Deck' }));
+  for (const type of ['Secret Lair Drop', 'Jumpstart', 'MTGO Redemption', 'Shandalar Enemy Deck', 'Bundle Land Pack', 'World Championship Deck']) {
+    assert.ok(!isPrecon({ type }), type);
+  }
+
   // No match is an empty list, not an error.
   assert.deepStrictEqual(rankPrecons(DECKS, 'zzzqq'), []);
 
