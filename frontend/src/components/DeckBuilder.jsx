@@ -78,7 +78,7 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   // Deck Selection Menu Controls
   const [deckSearchTerm, setDeckSearchTerm] = useState('');
-  const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon'
+  const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon' | 'no_moxfield' | 'moxfield'
   useEffect(() => { localStorage.setItem('deckSourceFilter', deckSourceFilter); }, [deckSourceFilter]);
   const [deckStatusFilter, setDeckStatusFilter] = useState('all'); // 'all' | 'ready' | 'in_progress' | 'in_play'
   const [deckSortBy, setDeckSortBy] = useState('created_desc'); // 'created_desc' | 'created_asc' | 'name_asc' | 'cards_desc'
@@ -921,10 +921,12 @@ function DeckBuilder({ showToast, onNavigate }) {
     else if (deckStatusFilter === 'in_progress') matchesStatus = (deck.total_cards || 0) < (deck.target_size || 60);
     else if (deckStatusFilter === 'in_play') matchesStatus = !!deck.checked_out;
 
-    const isPreconDeck = deck.source === 'precon';
+    const src = deck.source === 'precon' || deck.source === 'moxfield' ? deck.source : null;
     const matchesSource = deckSourceFilter === 'all'
-      || (deckSourceFilter === 'no_precon' && !isPreconDeck)
-      || (deckSourceFilter === 'precon' && isPreconDeck);
+      || (deckSourceFilter === 'no_precon' && src !== 'precon')
+      || (deckSourceFilter === 'precon' && src === 'precon')
+      || (deckSourceFilter === 'no_moxfield' && src !== 'moxfield')
+      || (deckSourceFilter === 'moxfield' && src === 'moxfield');
 
     return matchesSearch && matchesStatus && matchesSource;
   }).sort((a, b) => {
@@ -1022,6 +1024,8 @@ function DeckBuilder({ showToast, onNavigate }) {
                   <option value="all">{t('deck.allDecks')}</option>
                   <option value="no_precon">{t('deck.hidePrecons')}</option>
                   <option value="precon">{t('deck.onlyPrecons')}</option>
+                  <option value="no_moxfield">{t('deck.hideMoxfield')}</option>
+                  <option value="moxfield">{t('deck.onlyMoxfield')}</option>
                 </select>
 
                 {/* Sort Order */}
