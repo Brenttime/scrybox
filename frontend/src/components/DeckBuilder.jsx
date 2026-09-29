@@ -78,6 +78,8 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   // Deck Selection Menu Controls
   const [deckSearchTerm, setDeckSearchTerm] = useState('');
+  const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon'
+  useEffect(() => { localStorage.setItem('deckSourceFilter', deckSourceFilter); }, [deckSourceFilter]);
   const [deckStatusFilter, setDeckStatusFilter] = useState('all'); // 'all' | 'ready' | 'in_progress' | 'in_play'
   const [deckSortBy, setDeckSortBy] = useState('created_desc'); // 'created_desc' | 'created_asc' | 'name_asc' | 'cards_desc'
   const [deckSelectionViewMode, setDeckSelectionViewMode] = useState('grid'); // 'grid' | 'table'
@@ -919,7 +921,12 @@ function DeckBuilder({ showToast, onNavigate }) {
     else if (deckStatusFilter === 'in_progress') matchesStatus = (deck.total_cards || 0) < (deck.target_size || 60);
     else if (deckStatusFilter === 'in_play') matchesStatus = !!deck.checked_out;
 
-    return matchesSearch && matchesStatus;
+    const isPreconDeck = deck.source === 'precon';
+    const matchesSource = deckSourceFilter === 'all'
+      || (deckSourceFilter === 'no_precon' && !isPreconDeck)
+      || (deckSourceFilter === 'precon' && isPreconDeck);
+
+    return matchesSearch && matchesStatus && matchesSource;
   }).sort((a, b) => {
     if (deckSortBy === 'name_asc') return a.name.localeCompare(b.name);
     if (deckSortBy === 'cards_desc') return (b.total_cards || 0) - (a.total_cards || 0);
@@ -1003,6 +1010,19 @@ function DeckBuilder({ showToast, onNavigate }) {
                     <option value="in_play">{t('deck.statusInPlayEmoji')}</option>
                   </select>
                 </div>
+
+                {/* Source Filter */}
+                <select
+                  className="select-control"
+                  aria-label={t('deck.sourceFilter')}
+                  value={deckSourceFilter}
+                  onChange={e => setDeckSourceFilter(e.target.value)}
+                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', height: 'auto' }}
+                >
+                  <option value="all">{t('deck.allDecks')}</option>
+                  <option value="no_precon">{t('deck.hidePrecons')}</option>
+                  <option value="precon">{t('deck.onlyPrecons')}</option>
+                </select>
 
                 {/* Sort Order */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
