@@ -792,16 +792,19 @@ button, input, select, textarea {
 /* Dashboard Detail Layout */
 .dashboard-details {
   display: grid;
-  grid-template-columns: 1fr;
+  /* minmax(0, ...) so a wide chart/label can never push a column past the
+     viewport (plain 1fr has an auto min = its content's min width). */
+  grid-template-columns: minmax(0, 1fr);
   gap: 1.5rem;
   margin-bottom: 2rem;
 }
 
 @media (min-width: 1024px) {
   .dashboard-details {
-    grid-template-columns: 2fr 1fr;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
   }
 }
+.dashboard-details > * { min-width: 0; }
 
 /* Charts and Distributions styling */
 .chart-container {
