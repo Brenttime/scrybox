@@ -1173,7 +1173,7 @@
   "orderimport.ownedBadge": "own {count}",
   "orderimport.unresolvedNote": "{count} line(s) could not be matched to your catalogue and will be skipped.",
   "orderimport.failedNote": "{count} line(s) failed to save.",
-  "orderimport.added": "Added {count} card(s) (copies) from the order.",
+  "orderimport.added": "Added {count} card(s) from the order.",
   "orderimport.noCards": "Nothing to add — no lines in this order resolved to catalogue cards.",
   "orderimport.confirmAdd": "Add {count} card(s)",
   "orderimport.confirmNote": "Each card is filed with the quantity, unit price and condition the order recorded. Foils follow the order; there is no override.",
