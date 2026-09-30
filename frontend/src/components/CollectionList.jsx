@@ -1,5 +1,5 @@
 import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Search, Trash2, Edit2, LayoutGrid, List, SlidersHorizontal, X, MousePointerClick, Braces } from 'lucide-react';
+import { Search, Trash2, Edit2, LayoutGrid, List, SlidersHorizontal, X, Braces, Repeat, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
@@ -178,6 +178,8 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     selectMode, setSelectMode, selectedIds, setSelectedIds, toggleSelect, selectAt, clearSelection, exitSelectMode,
     pressHandlers, longPressFired, runBulk,
   } = useMultiSelect({ showToast, onChanged: onUpdate });
+  const [moreOpen, setMoreOpen] = useState(false);
+  useEffect(() => { if (!selectMode) setMoreOpen(false); }, [selectMode]);
 
   const collectionSessionQuery = useMemo(() => makeCollectionSessionQuery({
     authKey: token,
@@ -1126,47 +1128,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   };
 
   return (
-    <div>
-      {/* Header: sub-tabs + selection hint + view toggle */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', borderBottom: '1px solid var(--border-glass)', paddingBottom: '0.75rem', flexWrap: 'wrap', gap: '0.75rem' }}>
-        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '0.95rem', fontWeight: 800, color: 'var(--text-strong)', padding: '0.45rem 0.5rem' }}>{t('nav.collection')}</span>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {/* Multi-select toggle (long-press cards is the primary path) */}
-          <button
-            className={`btn ${selectMode ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
-            style={{ fontSize: '0.8rem', padding: '0.4rem 0.9rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
-            title={t('collection.selectHint')}
-          >
-            <MousePointerClick size={14} />
-            {t(selectMode ? 'bulk.done' : 'collection.select')}
-          </button>
-
-          {/* View Toggle */}
-          <div style={{ display: 'flex', background: 'rgba(0,0,0,0.2)', padding: '2px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
-            <button
-              className={`btn btn-icon-only ${viewMode === 'gallery' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => switchViewMode('gallery')}
-              style={{ borderRadius: 'var(--radius-sm)', padding: '0.4rem 0.5rem', width: '32px', height: '32px' }}
-              title={t('collection.galleryView')}
-            >
-              <LayoutGrid size={14} />
-            </button>
-            <button
-              className={`btn btn-icon-only ${viewMode === 'list' ? 'btn-primary' : 'btn-secondary'}`}
-              onClick={() => switchViewMode('list')}
-              style={{ borderRadius: 'var(--radius-sm)', padding: '0.4rem 0.5rem', width: '32px', height: '32px' }}
-              title={t('collection.listView')}
-            >
-              <List size={14} />
-            </button>
-          </div>
-        </div>
-      </div>
-
+    <div style={selectMode ? { paddingBottom: '6rem' } : undefined}>
       {/* Filter Panel */}
       <div className="glass-panel" style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem' }}>
         {/* Always-visible top bar: search + sort + filters toggle */}
@@ -1321,9 +1283,16 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
             {scryfallPredicate.mode === 'catalog' && liveIncomplete ? ` · ${t('collection.scryfallLiveIncomplete')}` : ''}
             {liveError ? ` · ${liveError}` : ''}
           </span>
-          {!resultsIncomplete && (
-            <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>${formatPrice(totalValue)}</strong></span>
-          )}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.6rem', marginLeft: 'auto' }}>
+            {!resultsIncomplete && (
+              <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>${formatPrice(totalValue)}</strong></span>
+            )}
+            <span className="coll-viewtoggle" role="group" aria-label="View">
+              <button type="button" aria-pressed={viewMode === 'gallery'} className={viewMode === 'gallery' ? 'on' : ''} onClick={() => switchViewMode('gallery')} title={t('collection.galleryView')}><LayoutGrid size={15} /></button>
+              <button type="button" aria-pressed={viewMode === 'list'} className={viewMode === 'list' ? 'on' : ''} onClick={() => switchViewMode('list')} title={t('collection.listView')}><List size={15} /></button>
+            </span>
+            <button type="button" className="coll-textbtn" onClick={() => setSelectMode(true)} title={t('collection.selectHint')}>{t('collection.select')}</button>
+          </span>
         </div>
       )}
 
@@ -1345,47 +1314,58 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         </div>
       )}
 
-      {/* Bulk action bar */}
+      {/* Select mode, Photos/Files style: slim sticky header (Cancel | N
+          selected | Select All) + a bottom action bar of icon buttons; the
+          rarer actions live in a "More" sheet. Long-press a card also arms it. */}
       {selectMode && (
-        <div className="glass-panel" style={{ marginBottom: '1rem', padding: '0.75rem 1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', position: 'sticky', top: '0.5rem', zIndex: 30 }}>
-          <span style={{ fontWeight: 800, color: 'var(--text-strong)', fontSize: '0.85rem' }}>{t('bulk.selected', { count: selectedIds.size })}</span>
-          <button
-            className="btn btn-secondary"
-            style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }}
-            disabled={resultsIncomplete}
-            onClick={() => setSelectedIds(new Set(filteredCollection.map(i => i.entry_id)))}
-          >
-            {t('bulk.selectAll', { count: filteredCollection.length })}
-          </button>
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} onClick={clearSelection}>{t('bulk.clear')}</button>
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} disabled={!selectedIds.size} onClick={() => handleExportSelectionList('plain')} title={t('settings.cardlistHint')}>{t('collection.exportListPlain')}</button>
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} disabled={!selectedIds.size} onClick={() => handleExportSelectionList('detailed')} title={t('settings.cardlistHint')}>{t('collection.exportListDetailed')}</button>
-          <div style={{ width: '1px', height: '22px', background: 'var(--border-glass)' }} />
-          <button className="btn btn-danger" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} disabled={!selectedIds.size} onClick={() => runBulk('delete', null, t('bulk.confirmDelete', { count: selectedIds.size }))}>{t('bulk.delete')}</button>
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} disabled={!selectedIds.size} onClick={() => runBulk('trade', null)}>{t('bulk.markTrade')}</button>
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem' }} disabled={!selectedIds.size} onClick={() => runBulk('untrade', null)}>{t('bulk.untrade')}</button>
-          <div style={{ width: '1px', height: '22px', background: 'var(--border-glass)' }} />
-          <select className="select-control" value="" disabled={!selectedIds.size} onChange={(e) => { if (e.target.value) runBulk('condition', e.target.value); e.target.value = ''; }} style={{ fontSize: '0.72rem', maxWidth: '150px', padding: '0.3rem 0.4rem' }}>
-            <option value="">{t('bulk.setCondition')}</option>
-            {CONDITIONS.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <select className="select-control" value="" disabled={!selectedIds.size} onChange={(e) => { if (e.target.value) runBulk('printing', e.target.value); e.target.value = ''; }} style={{ fontSize: '0.72rem', maxWidth: '150px', padding: '0.3rem 0.4rem' }}>
-            <option value="">{t('bulk.setPrinting')}</option>
-            {PRINTING_OPTIONS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
-          </select>
-          <div style={{ width: '1px', height: '22px', background: 'var(--border-glass)' }} />
-          <PackPriceSplitter
-            entryIds={Array.from(selectedIds)}
-            showToast={showToast}
-            onApplied={() => { clearSelection(); onUpdate(); }}
-          />
-          <div style={{ width: '1px', height: '22px', background: 'var(--border-glass)' }} />
-          <AddToDeckSelect
-            onAdd={(id) => runBulk('add_to_deck', id)}
-            disabled={!selectedIds.size}
-            style={{ fontSize: '0.72rem', maxWidth: '160px', padding: '0.3rem 0.4rem' }}
-          />
-          <button className="btn btn-secondary" style={{ fontSize: '0.72rem', padding: '0.3rem 0.6rem', marginLeft: 'auto' }} onClick={exitSelectMode}>{t('bulk.done')}</button>
+        <div className="coll-selbar" role="toolbar" aria-label={t('bulk.selected', { count: selectedIds.size })}>
+          <button type="button" className="coll-textbtn" onClick={exitSelectMode}>{t('common.cancel')}</button>
+          <strong>{selectedIds.size ? t('bulk.selected', { count: selectedIds.size }) : t('collection.selectItems')}</strong>
+          {selectedIds.size && selectedIds.size === filteredCollection.length ? (
+            <button type="button" className="coll-textbtn" onClick={clearSelection}>{t('collection.deselectAll')}</button>
+          ) : (
+            <button type="button" className="coll-textbtn" disabled={resultsIncomplete}
+              onClick={() => setSelectedIds(new Set(filteredCollection.map(i => i.entry_id)))}>{t('collection.selectAllShort')}</button>
+          )}
+        </div>
+      )}
+      {selectMode && (
+        <div className="coll-actionbar" role="toolbar">
+          <button type="button" disabled={!selectedIds.size} onClick={() => runBulk('trade', null)}><Repeat size={20} /><span>{t('collection.actTrade')}</span></button>
+          <label className={`coll-actionbar-deck ${selectedIds.size ? '' : 'is-disabled'}`}>
+            <Layers size={20} /><span>{t('collection.actDeck')}</span>
+            <AddToDeckSelect onAdd={(id) => runBulk('add_to_deck', id)} disabled={!selectedIds.size} style={{ position: 'absolute', inset: 0, opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }} />
+          </label>
+          <button type="button" disabled={!selectedIds.size} onClick={() => handleExportSelectionList('plain')}><Share size={20} /><span>{t('collection.actExport')}</span></button>
+          <button type="button" disabled={!selectedIds.size} onClick={() => setMoreOpen(true)}><MoreHorizontal size={20} /><span>{t('collection.actMore')}</span></button>
+          <button type="button" className="danger" disabled={!selectedIds.size} onClick={() => runBulk('delete', null, t('bulk.confirmDelete', { count: selectedIds.size }))}><Trash2 size={20} /><span>{t('bulk.delete')}</span></button>
+        </div>
+      )}
+      {selectMode && moreOpen && (
+        <div className="fs-sheet-backdrop" onClick={() => setMoreOpen(false)}>
+          <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+            <div className="fs-sheet-head">
+              <strong>{t('bulk.selected', { count: selectedIds.size })}</strong>
+              <button type="button" className="coll-textbtn" onClick={() => setMoreOpen(false)}>{t('bulk.done')}</button>
+            </div>
+            <label className="coll-more-row">{t('bulk.setCondition')}
+              <select className="select-control" value="" onChange={(e) => { if (e.target.value) { runBulk('condition', e.target.value); setMoreOpen(false); } }}>
+                <option value="">—</option>
+                {CONDITIONS.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+            <label className="coll-more-row">{t('bulk.setPrinting')}
+              <select className="select-control" value="" onChange={(e) => { if (e.target.value) { runBulk('printing', e.target.value); setMoreOpen(false); } }}>
+                <option value="">—</option>
+                {PRINTING_OPTIONS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </label>
+            <button type="button" className="coll-more-row" onClick={() => { runBulk('untrade', null); setMoreOpen(false); }}>{t('bulk.untrade')}</button>
+            <button type="button" className="coll-more-row" onClick={() => { handleExportSelectionList('detailed'); setMoreOpen(false); }}>{t('collection.exportListDetailed')}</button>
+            <div className="coll-more-row" style={{ display: 'block' }}>
+              <PackPriceSplitter entryIds={Array.from(selectedIds)} showToast={showToast} onApplied={() => { setMoreOpen(false); clearSelection(); onUpdate(); }} />
+            </div>
+          </div>
         </div>
       )}
 
@@ -1437,9 +1417,9 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                 onClick={(e) => activateCard(item, e)}
                 {...pressHandlers(item.entry_id)}
               >
-                <div className="tcg-card-inner" style={{ ...rarityStyle, ...(selected ? { outline: '3px solid var(--accent-red)', outlineOffset: '2px' } : {}) }}>
+                <div className="tcg-card-inner" style={{ ...rarityStyle, ...(selectMode ? { transition: 'transform .15s ease, opacity .15s ease', transform: selected ? 'scale(.94)' : 'none', opacity: selected ? 1 : .85 } : {}) }}>
                   {selectMode && (
-                    <div style={{ position: 'absolute', top: '6px', right: '6px', zIndex: 20, width: '22px', height: '22px', borderRadius: '50%', background: selected ? 'var(--accent-red)' : 'rgba(0,0,0,0.6)', border: '2px solid #fff', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-strong)', fontSize: '0.8rem', fontWeight: 900 }}>{selected ? '✓' : ''}</div>
+                    <div className={`coll-check ${selected ? 'on' : ''}`} aria-hidden="true">{selected && <CheckCircle2 size={24} strokeWidth={2.4} />}</div>
                   )}
                   <CardImage card={item} className="tcg-card-image" loading="lazy" draggable={false} />
                   {getFoilOverlayClass(item.printing) && (
