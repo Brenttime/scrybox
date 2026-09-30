@@ -1,5 +1,5 @@
 import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Repeat, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
+import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
@@ -87,7 +87,9 @@ function Field({ label, children, style }) {
 
 function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCardFilter, setSelectedCardFilter }) {
   const { t } = useT();
-  const [tradeOnly, setTradeOnly] = useState(false);
+  // 'For trade' was removed from the app; the flag stays off.
+  const tradeOnly = false;
+  const setTradeOnly = () => {};
   const initialQueryRef = useRef(makeCollectionSessionQuery({
     authKey: token,
     revision: statsTrigger,
@@ -1258,12 +1260,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                 </label>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <input type="checkbox" id="tradeOnlyOpt" checked={tradeOnly} onChange={(e) => setTradeOnly(e.target.checked)} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />
-                <label htmlFor="tradeOnlyOpt" style={{ cursor: 'pointer', margin: 0, fontSize: '0.75rem', color: 'var(--accent-yellow)', fontWeight: 600 }}>
-                  {t('collection.tradeOnly')}
-                </label>
-              </div>
 
               {activeFilterCount > 0 && (
                 <button className="btn btn-secondary" onClick={clearAllFilters} style={{ marginLeft: 'auto', fontSize: '0.72rem', padding: '0.3rem 0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
@@ -1329,7 +1325,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       )}
       {selectMode && (
         <div className="coll-actionbar" role="toolbar">
-          <button type="button" disabled={!selectedIds.size} onClick={() => runBulk('trade', null)}><Repeat size={20} /><span>{t('collection.actTrade')}</span></button>
           <label className={`coll-actionbar-deck ${selectedIds.size ? '' : 'is-disabled'}`}>
             <Layers size={20} /><span>{t('collection.actDeck')}</span>
             <AddToDeckSelect onAdd={(id) => runBulk('add_to_deck', id)} disabled={!selectedIds.size} style={{ position: 'absolute', inset: 0, opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }} />
@@ -1358,7 +1353,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                 {PRINTING_OPTIONS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
               </select>
             </label>
-            <button type="button" className="coll-more-row" onClick={() => { runBulk('untrade', null); setMoreOpen(false); }}>{t('bulk.untrade')}</button>
             <button type="button" className="coll-more-row" onClick={() => { handleExportSelectionList('detailed'); setMoreOpen(false); }}>{t('collection.exportListDetailed')}</button>
             <div className="coll-more-row" style={{ display: 'block' }}>
               <PackPriceSplitter entryIds={Array.from(selectedIds)} showToast={showToast} onApplied={() => { setMoreOpen(false); clearSelection(); onUpdate(); }} />

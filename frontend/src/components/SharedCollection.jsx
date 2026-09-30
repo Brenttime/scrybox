@@ -47,12 +47,11 @@ function typeColor(name, i) {
 
 function SharedCollection({ shareToken }) {
   const { t, locale } = useT();
-  const getInitialList = () => new URLSearchParams(window.location.search).get('list') || 'collection';
 
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [listType, setListType] = useState(getInitialList);
+  const listType = 'collection'; // trade binder removed;
 
   const [searchFilter, setSearchFilter] = useState('');
   const [rarityFilter, setRarityFilter] = useState('');
@@ -159,15 +158,10 @@ function SharedCollection({ shareToken }) {
   const typeChartData = types.map((entry, i) => ({ name: entry.name, value: entry.value, color: typeColor(entry.name, i) }));
   const rarityChartData = rarities.map((r, i) => ({ ...r, fill: COLORS[i % COLORS.length] }));
 
-  const handleTabChange = (type) => {
-    setListType(type);
-    const newUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname}?list=${type}`;
-    window.history.pushState({ path: newUrl }, '', newUrl);
-  };
 
   // Every label on this page changes with the list being shown, so the list kind
   // is part of the key rather than three parallel ternaries.
-  const kind = ['collection', 'trade'].includes(listType) ? listType : 'collection';
+  const kind = 'collection'; // trade binder removed
   const valueLabel = t(`shared.${kind}.valueLabel`);
   const qtyLabel = t(`shared.${kind}.qtyLabel`);
   const listTitle = t(`shared.${kind}.title`);
@@ -209,14 +203,6 @@ function SharedCollection({ shareToken }) {
         </div>
       </header>
 
-      {/* Public Sub Navigation Tabs */}
-      <div className="sub-nav-tabs" style={{ marginBottom: '1.5rem' }}>
-        {['collection', 'trade'].map((val) => (
-          <button key={val} className={`sub-nav-tab ${listType === val ? 'active' : ''}`} onClick={() => handleTabChange(val)}>
-            {t(`shared.${val}.tab`)}
-          </button>
-        ))}
-      </div>
 
       {/* Title block */}
       <div className="glass-panel" style={{ marginBottom: '1.5rem' }}>

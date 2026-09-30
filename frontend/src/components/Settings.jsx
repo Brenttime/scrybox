@@ -344,7 +344,6 @@ function Settings({ user, onUpdateUser, showToast, target }) {
 
   const origin = publicBaseUrl || `${window.location.protocol}//${window.location.host}`;
   const shareUrl = `${origin}/share/${user?.share_token}`;
-  const tradeUrl = `${origin}/share/${user?.share_token}?list=trade`;
 
   const [copiedType, setCopiedType] = useState(''); // 'collection', 'trade'
 
@@ -425,22 +424,6 @@ function Settings({ user, onUpdateUser, showToast, target }) {
                 </div>
               </div>
 
-              <div className="form-group" style={{ marginBottom: 0 }}>
-                <label>{t('settings.linkTrade')}</label>
-                <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <input 
-                    type="text" 
-                    className="input-control" 
-                    value={tradeUrl} 
-                    readOnly 
-                    style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.2)', color: 'var(--text-secondary)', cursor: 'default' }}
-                  />
-                  <button className="btn btn-secondary" onClick={() => copyToClipboard(tradeUrl, 'trade')} style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', whiteSpace: 'nowrap' }}>
-                    {copiedType === 'trade' ? <Check size={14} style={{ color: 'var(--success)' }} /> : <Clipboard size={14} />}
-                    <span>{t('settings.copy')}</span>
-                  </button>
-                </div>
-              </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '0.5rem' }}>
                 <button
