@@ -709,7 +709,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         <div className="glass-panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', padding: '1rem 1.25rem' }}>
           <div style={{ position: 'relative', flex: '1 1 240px', minWidth: '220px' }}>
             <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-            <input type="text" className="input-control" placeholder={t('deck.filterPlaceholder')}
+            <input type="text" className="input-control" placeholder={t('lists.filterPlaceholder')}
               value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
               style={{ paddingLeft: '2.25rem', width: '100%', fontSize: '0.85rem' }} />
           </div>

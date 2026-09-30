@@ -166,6 +166,7 @@
   "deck.tabStats": "Stats",
   "deck.addToDeck": "Add to Deck…",
   "deck.filterPlaceholder": "Filter decks by name or description...",
+  "lists.filterPlaceholder": "Filter lists by name or description...",
   "deck.allStatuses": "All Statuses",
   "deck.sourceFilter": "Deck source",
   "deck.allDecks": "All Decks",
