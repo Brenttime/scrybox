@@ -72,6 +72,20 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   const [activeList, setActiveList] = useState(null);
   const [listDetail, setListDetail] = useState(null);
   const [inspectCard, setInspectCard] = useState(null);
+  // Same details the Collection view shows: when you own this printing, open
+  // your real collection entry (editable, proxy, built decks, notes) through
+  // the shared CardInspectorModal; only unowned cards fall back to read-only.
+  const openCardDetails = async (card) => {
+    const fallback = { ...card, card_id: card.id, entry_id: null, quantity: card.owned_qty || 0, __readOnly: true };
+    if (!(card.owned_qty > 0)) { setInspectCard(fallback); return; }
+    try {
+      const res = await fetch(`/api/collection?card_id=${encodeURIComponent(card.id)}`);
+      const rows = res.ok ? await res.json() : [];
+      setInspectCard(Array.isArray(rows) && rows.length ? rows[0] : fallback);
+    } catch {
+      setInspectCard(fallback);
+    }
+  };
 
   // List filters
   const [searchTerm, setSearchTerm] = useState('');
@@ -949,8 +963,8 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             return (
               <div key={card.id} className="tcg-card list-grid-card" role="button" tabIndex={0}
                 style={{ cursor: 'pointer' }}
-                onClick={() => setInspectCard(card)}
-                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setInspectCard(card); } }}>
+                onClick={() => openCardDetails(card)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCardDetails(card); } }}>
                 <div className="tcg-card-inner">
                   <CardImage card={card} className="tcg-card-image" loading="lazy" alt={displayName(card)} />
                   <div className="list-grid-qty" style={{ position: 'absolute', top: '8px', left: '8px', background: 'rgba(0,0,0,0.85)', color: 'var(--text-strong)', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 800 }}>x{card.quantity}</div>
@@ -993,9 +1007,11 @@ function Lists({ showToast, handoff, onHandoffDone }) {
       {/* Edit modal */}
       {inspectCard && (
         <CardInspectorModal
-          card={{ ...inspectCard, card_id: inspectCard.id, entry_id: null, quantity: inspectCard.owned_qty || 0 }}
-          readOnly
+          card={inspectCard}
+          readOnly={!!inspectCard.__readOnly}
           showToast={showToast}
+          onUpdate={() => { if (activeList) loadList(activeList.id); }}
+          onDeleted={() => { setInspectCard(null); if (activeList) loadList(activeList.id); }}
           onClose={() => setInspectCard(null)}
         />
       )}

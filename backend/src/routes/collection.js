@@ -333,6 +333,12 @@ router.get('/collection', async (req, res) => {
       filterSql += ` AND c.is_trade = ?`;
       filterParams.push(isTrade === 'true' || isTrade === '1' ? 1 : 0);
     }
+    // One printing's owned rows, so other views (Lists) can open the same
+    // collection card details the Collection view does.
+    if (req.query.card_id) {
+      filterSql += ` AND c.card_id = ?`;
+      filterParams.push(String(req.query.card_id));
+    }
 
     const query = `
       SELECT
