@@ -412,7 +412,9 @@ async function writes() {
   const res = await addOrderToCollection({ user, lines: LINES, copies: 2 }, wdeps);
   assert.ok(resolveHits.n === 1, 'the injected resolver must be the one that ran (no live-network fallback)');
   assert.ok(bulkCalls.length >= 1, 'the injected bulk core must be the one that ran');
-  assert.strictEqual(res.added, 2, 'both resolvable lines filed as one stacked entry each; the nameless line never reached the core');
+  const filedCopies = bulkCalls.flatMap((c) => c.entries).reduce((n, e) => n + e.quantity, 0);
+  assert.strictEqual(res.added, filedCopies, 'added counts copies filed (order qty x copies), not card types');
+  assert.strictEqual(bulkCalls.flatMap((c) => c.entries).length, 2, 'both resolvable lines filed as one stacked entry each; the nameless line never reached the core');
   assert.strictEqual(res.failed.length, 0);
   assert.ok(bulkCalls.length >= 1, 'the bulk core was used');
   const flat = bulkCalls.flatMap((c) => c.entries);

@@ -705,7 +705,9 @@ async function addOrderToCollection({ user, lines, condition, printingMode = 'au
     const group = plan.filter((e) => e.printing === printing);
     if (!group.length) continue;
     const res = await bulk(user, group, { condition: cond, printing, language, stackable: true });
-    added += (res && res.added ? res.added.length : 0);
+    // Count COPIES, not card types: an order line of 4x one card is 4 cards.
+    const qtyById = new Map(group.map((e) => [e.card_id, e.quantity || 1]));
+    for (const a of (res && res.added) || []) added += qtyById.get(a.card_id) || 1;
     if (res && res.failed) failed.push(...res.failed);
   }
   return {
