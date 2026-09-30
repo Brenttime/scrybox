@@ -509,7 +509,7 @@
   align-items: center;
   column-gap: 14px !important;
   row-gap: 0 !important;
-  padding: 14px !important;
+  padding: 20px 16px !important;
   background: transparent !important;
   border: 0 !important;
   border-bottom: 1px solid var(--mb-line) !important;
