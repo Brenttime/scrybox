@@ -1739,11 +1739,22 @@ button, input, select, textarea {
 }
 
 @media (max-width: 560px) {
-  /* Two labels side by side stop fitting at a phone's width, and a segmented
-     control that overflows its track is worse than a stacked one. */
+  /* Phones: keep the modes in one horizontal row that scrolls sideways
+     instead of stacking them into a tall vertical menu. */
   .sl-mode-tabs {
-    flex-direction: column;
-    gap: 0.35rem;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    scroll-snap-type: x proximity;
+  }
+  .sl-mode-tabs::-webkit-scrollbar { display: none; }
+  .sl-mode-tabs .sub-nav-tab {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 0.6rem 0.9rem;
+    scroll-snap-align: start;
   }
 }
 
