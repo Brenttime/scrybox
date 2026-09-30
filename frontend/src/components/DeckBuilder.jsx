@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, BarChart2, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Filter, Layers, ListChecks, Copy, Gamepad2, SlidersHorizontal, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ExternalLink, ShoppingCart } from 'lucide-react';
+import { Plus, Trash2, X, ChevronLeft, Play, BarChart2, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ExternalLink, ShoppingCart } from 'lucide-react';
 import { ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip } from 'recharts';
 import { shuffleArray } from '../utils/shuffle';
 import { displayName } from '../utils/languages';
@@ -944,7 +944,7 @@ function DeckBuilder({ showToast, onNavigate }) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           
           {/* Top Banner Header & Primary Action */}
-          <div className="glass-panel deck-vault-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'nowrap', gap: '1rem', padding: '1.25rem 1.5rem', background: 'linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(15, 23, 42, 0.8))', border: '1px solid rgba(255, 255, 255, 0.1)' }}>
+          <div className="glass-panel deck-vault-header" style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'nowrap', alignItems: 'center', gap: '1rem', padding: '0.9rem 1.1rem', background: 'linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(15, 23, 42, 0.8))', border: '1px solid rgba(255, 255, 255, 0.1)' }}>
             <div style={{ minWidth: 0 }}>
               <h2 style={{ fontSize: '1.4rem', color: 'var(--text-strong)', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0 }}>
                 <Layers size={22} style={{ color: 'var(--accent-yellow)' }} />
@@ -959,114 +959,53 @@ function DeckBuilder({ showToast, onNavigate }) {
                 ref={addDeckButtonRef}
                 className="btn btn-primary" 
                 onClick={() => setShowAddDeckModal(true)}
-                style={{ padding: '0.6rem 1.25rem', fontSize: '0.9rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.5rem', boxShadow: '0 4px 14px rgba(234, 179, 8, 0.25)' }}
+                style={{ padding: '0.45rem 0.9rem', fontSize: '0.85rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.35rem' }}
               >
-                <Plus size={18} /> {t('deck.addDeck')}
+                <Plus size={16} /> {t('deck.addDeck')}
               </button>
             </div>
           </div>
 
-          {/* Search, Filters, Sorting & View Toolbar */}
-          <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '1rem 1.25rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
-              
-              {/* Search input */}
-              <div style={{ position: 'relative', flex: '1 1 240px', minWidth: '220px' }}>
-                <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                <input
-                  type="text"
-                  className="input-control"
-                  placeholder={t('deck.filterPlaceholder')}
-                  value={deckSearchTerm}
-                  onChange={e => setDeckSearchTerm(e.target.value)}
-                  style={{ paddingLeft: '2.25rem', width: '100%', fontSize: '0.85rem' }}
-                />
-                {deckSearchTerm && (
-                  <button
-                    className="btn btn-secondary btn-icon-only"
-                    onClick={() => setDeckSearchTerm('')}
-                    style={{ position: 'absolute', right: '0.4rem', top: '50%', transform: 'translateY(-50%)', width: '20px', height: '20px', padding: 0, fontSize: '0.7rem' }}
-                  >
-                    <X size={12} />
-                  </button>
-                )}
-              </div>
-
+          {/* Search, Filters, Sorting & View Toolbar: search row + one row of
+              compact chips (scrolls sideways on narrow phones). */}
+          <div className="deck-toolbar">
+            <div className="deck-toolbar-search">
+              <Search size={16} />
+              <input
+                type="text"
+                className="input-control"
+                placeholder={t('deck.filterPlaceholder')}
+                value={deckSearchTerm}
+                onChange={e => setDeckSearchTerm(e.target.value)}
+              />
+              {deckSearchTerm && (
+                <button type="button" className="deck-toolbar-clear" onClick={() => setDeckSearchTerm('')} aria-label="Clear"><X size={14} /></button>
+              )}
             </div>
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', paddingTop: '0.5rem', borderTop: '1px solid var(--border-glass)' }}>
-              
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-                {/* Status Filter */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                  <Filter size={14} style={{ color: 'var(--text-muted)' }} />
-                  <select
-                    className="select-control"
-                    value={deckStatusFilter}
-                    onChange={e => setDeckStatusFilter(e.target.value)}
-                    style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', height: 'auto' }}
-                  >
-                    <option value="all">{t('deck.allStatuses')}</option>
-                    <option value="ready">{t('deck.statusBattleReady')}</option>
-                    <option value="in_progress">{t('deck.statusBuildingCount')}</option>
-                    <option value="in_play">{t('deck.statusInPlayEmoji')}</option>
-                  </select>
-                </div>
-
-                {/* Source Filter */}
-                <select
-                  className="select-control"
-                  aria-label={t('deck.sourceFilter')}
-                  value={deckSourceFilter}
-                  onChange={e => setDeckSourceFilter(e.target.value)}
-                  style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', height: 'auto' }}
-                >
-                  <option value="all">{t('deck.allDecks')}</option>
-                  <option value="no_precon">{t('deck.hidePrecons')}</option>
-                  <option value="precon">{t('deck.onlyPrecons')}</option>
-                  <option value="no_moxfield">{t('deck.hideMoxfield')}</option>
-                  <option value="moxfield">{t('deck.onlyMoxfield')}</option>
-                </select>
-
-                {/* Sort Order */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                  <SlidersHorizontal size={14} style={{ color: 'var(--text-muted)' }} />
-                  <select
-                    className="select-control"
-                    value={deckSortBy}
-                    onChange={e => setDeckSortBy(e.target.value)}
-                    style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', height: 'auto' }}
-                  >
-                    <option value="created_desc">{t('deck.sortNewest')}</option>
-                    <option value="created_asc">{t('deck.sortOldest')}</option>
-                    <option value="name_asc">{t('collection.sort.name-asc')}</option>
-                    <option value="cards_desc">{t('deck.sortMostCards')}</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* View Mode Toggle: Grid vs Table */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '3px', background: 'rgba(0,0,0,0.3)', padding: '2px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
-                <button
-                  type="button"
-                  className={`btn ${deckSelectionViewMode === 'grid' ? 'btn-primary' : 'btn-secondary'}`}
-                  style={{ padding: '0.25rem 0.55rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '4px' }}
-                  onClick={() => setDeckSelectionViewMode('grid')}
-                  title={t('deck.gridView')}
-                >
-                  <LayoutGrid size={13} /> Grid
-                </button>
-                <button
-                  type="button"
-                  className={`btn ${deckSelectionViewMode === 'table' ? 'btn-primary' : 'btn-secondary'}`}
-                  style={{ padding: '0.25rem 0.55rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '4px' }}
-                  onClick={() => setDeckSelectionViewMode('table')}
-                  title={t('deck.tableView')}
-                >
-                  <List size={13} /> Table
-                </button>
-              </div>
-
+            <div className="deck-toolbar-chips">
+              <select className="deck-chip" aria-label={t('deck.allStatuses')} value={deckStatusFilter} onChange={e => setDeckStatusFilter(e.target.value)}>
+                <option value="all">{t('deck.allStatuses')}</option>
+                <option value="ready">{t('deck.statusBattleReady')}</option>
+                <option value="in_progress">{t('deck.statusBuildingCount')}</option>
+                <option value="in_play">{t('deck.statusInPlayEmoji')}</option>
+              </select>
+              <select className="deck-chip" aria-label={t('deck.sourceFilter')} value={deckSourceFilter} onChange={e => setDeckSourceFilter(e.target.value)}>
+                <option value="all">{t('deck.allDecks')}</option>
+                <option value="no_precon">{t('deck.hidePrecons')}</option>
+                <option value="precon">{t('deck.onlyPrecons')}</option>
+                <option value="no_moxfield">{t('deck.hideMoxfield')}</option>
+                <option value="moxfield">{t('deck.onlyMoxfield')}</option>
+              </select>
+              <select className="deck-chip" aria-label="Sort" value={deckSortBy} onChange={e => setDeckSortBy(e.target.value)}>
+                <option value="created_desc">{t('deck.sortNewest')}</option>
+                <option value="created_asc">{t('deck.sortOldest')}</option>
+                <option value="name_asc">{t('collection.sort.name-asc')}</option>
+                <option value="cards_desc">{t('deck.sortMostCards')}</option>
+              </select>
+              <span className="deck-viewtoggle" role="group" aria-label="View">
+                <button type="button" className={deckSelectionViewMode === 'grid' ? 'on' : ''} aria-pressed={deckSelectionViewMode === 'grid'} onClick={() => setDeckSelectionViewMode('grid')} title={t('deck.gridView')}><LayoutGrid size={15} /></button>
+                <button type="button" className={deckSelectionViewMode === 'table' ? 'on' : ''} aria-pressed={deckSelectionViewMode === 'table'} onClick={() => setDeckSelectionViewMode('table')} title={t('deck.tableView')}><List size={15} /></button>
+              </span>
             </div>
           </div>
 
