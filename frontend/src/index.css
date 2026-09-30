@@ -2076,3 +2076,42 @@ button, input, select, textarea {
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
   background: var(--accent-red, #ef4444); color: #fff; font-size: 0.75rem; font-weight: 700; cursor: pointer;
 }
+
+/* Dashboard Tools section: header + grid of reference-screen tiles. */
+.dash-section-title {
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin: 0.25rem 0 0.6rem;
+}
+.dash-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+.dash-tool {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 1rem;
+  min-width: 0;
+  text-align: left;
+  cursor: pointer;
+  color: var(--text-primary);
+  font: inherit;
+}
+.dash-tool-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.06);
+  color: var(--accent-green, #10b981);
+}
+.dash-tool-label { font-weight: 700; font-size: 0.9rem; }
+@media (hover: hover) { .dash-tool:hover { background: rgba(255,255,255,0.06); } }

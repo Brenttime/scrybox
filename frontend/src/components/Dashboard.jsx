@@ -146,17 +146,6 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
-        <button type="button" className="btn btn-secondary" onClick={() => onNavigate && onNavigate('rules')}>
-          <BookOpen size={16} /> {t('rules.title')}
-        </button>
-        <button type="button" className="btn btn-secondary" onClick={() => onNavigate && onNavigate('limited')}>
-          <Mountain size={16} /> {t('nav.limited')}
-        </button>
-        <button type="button" className="btn btn-secondary" onClick={() => onNavigate && onNavigate('keywords')}>
-          <Sparkles size={16} /> {t('kw.title')}
-        </button>
-      </div>
       {/* Metrics Summary Grid */}
       <div className="metrics-grid">
         {/* Net Worth Card with historical switcher */}
@@ -259,6 +248,21 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
             <span>{t('dash.uniqueCount', { count: summary.uniqueCards })}</span>
           </div>
         </div>
+      </div>
+
+      {/* Tools: reference screens, in a grid under the money widgets. */}
+      <h3 className="dash-section-title">{t('dash.tools')}</h3>
+      <div className="dash-tools-grid">
+        {[
+          { key: 'rules', icon: BookOpen, label: t('rules.title') },
+          { key: 'limited', icon: Mountain, label: t('nav.limited') },
+          { key: 'keywords', icon: Sparkles, label: t('kw.title') },
+        ].map(({ key, icon: Icon, label }) => (
+          <button key={key} type="button" className="glass-panel dash-tool" onClick={() => onNavigate && onNavigate(key)}>
+            <span className="dash-tool-icon"><Icon size={20} /></span>
+            <span className="dash-tool-label">{label}</span>
+          </button>
+        ))}
       </div>
 
       <Suspense

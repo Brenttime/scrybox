@@ -113,6 +113,7 @@
   "priceHistory.noData": "No price data for this window.",
   "priceHistory.sourceCardmarket": "Cardmarket 30-day averages",
   "dash.retry": "Retry",
+  "dash.tools": "Tools",
   "dash.errStats": "Failed to load stats",
   "dash.errLoad": "Error loading dashboard statistics: {error}",
   "dash.emptyTitle": "Welcome to Scrybox!",
