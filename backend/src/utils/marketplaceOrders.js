@@ -336,10 +336,15 @@ async function fetchManapoolOrder({ email, token, orderNumber, httpGet: http = h
 // authoritative count is the detail's nested per-seller items, so the handful
 // of shown rows are fetched. One detail failing degrades to the list number
 // rather than failing the picker.
-async function manapoolRecentOrderSummaries({ email, token, limit = RECENT_LIMIT, httpGet: http = httpGet } = {}) {
+async function manapoolRecentOrderSummaries({ email, token, limit = RECENT_LIMIT, offset = 0, httpGet: http = httpGet, meta = null } = {}) {
   const rows = await fetchManapoolOrderList({ email, token, httpGet: http });
   const stampOf = (o) => String(pick(o, ['created_at', 'createdAt', 'created', 'date', 'placedAt', 'orderDate']) || '');
-  const dated = [...rows].sort((a, b) => stampOf(b).localeCompare(stampOf(a)));
+  const numbered = [...rows]
+    .filter((r) => pick(r, ['order_number', 'orderNumber', 'number', 'id']) != null)
+    .sort((a, b) => stampOf(b).localeCompare(stampOf(a)));
+  const start = Math.max(0, Math.floor(Number(offset) || 0));
+  if (meta) meta.total = numbered.length;
+  const dated = numbered.slice(start);
   const out = [];
   for (const row of dated) {
     if (out.length >= limit) break;

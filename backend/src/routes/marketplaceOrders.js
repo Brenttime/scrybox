@@ -204,8 +204,10 @@ router.get('/recent/:source', async (req, res) => {
       if (!row.manapool_email || !row.manapool_token || !row.manapool_enabled) {
         return res.status(400).json({ error: 'ManaPool is not configured or is turned off' });
       }
-      const orders = await manapoolRecentOrderSummaries({ email: row.manapool_email, token: row.manapool_token, limit: RECENT_LIMIT });
-      return res.json({ source, orders });
+      const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+      const meta = {};
+      const orders = await manapoolRecentOrderSummaries({ email: row.manapool_email, token: row.manapool_token, limit: RECENT_LIMIT, offset, meta });
+      return res.json({ source, orders, offset, total: meta.total ?? null, hasMore: meta.total != null ? offset + RECENT_LIMIT < meta.total : false });
     } else {
       if (!row.tcgplayer_cookies || !row.tcgplayer_enabled) {
         return res.status(400).json({ error: 'TCGplayer is not configured or is turned off' });

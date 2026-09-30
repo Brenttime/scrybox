@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ShoppingCart, Loader2, ShieldAlert, KeyRound, Bookmark, Copy, Smartphone } from 'lucide-react';
+import { ShoppingCart, Loader2, ShieldAlert, KeyRound, Bookmark, Copy, Smartphone, ChevronUp, ChevronDown } from 'lucide-react';
 import CardImage from './CardImage';
 import { LANGUAGES } from '../utils/cardOptions';
 import { useT } from '../utils/i18n';
@@ -71,20 +71,20 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
   // Recent-order picker: fetch the source's list when the form opens (and when
   // the source tab changes). It is a convenience, never a blocker: any failure
   // just hides the list and the manual number field stays the path.
-  const [recent, setRecent] = useState({ loading: false, orders: null, error: '' });
+  const [recent, setRecent] = useState({ loading: false, orders: null, error: '', offset: 0, hasMore: false });
   const recentSeq = useRef(0);
-  const loadRecent = async (src) => {
+  const loadRecent = async (src, offset = 0) => {
     if (src === 'tcgplayer' || !readyFor(src)) return;
     const seq = ++recentSeq.current;
     setRecent((r) => ({ ...r, loading: true }));
     try {
-      const res = await fetch(`/api/marketplace/recent/${src}`);
+      const res = await fetch(`/api/marketplace/recent/${src}?offset=${offset}`);
       const data = await res.json().catch(() => ({}));
       if (seq !== recentSeq.current) return;
-      if (!res.ok) { setRecent({ loading: false, orders: null, error: data.list_unavailable ? 'list' : 'error' }); return; }
-      setRecent({ loading: false, orders: data.orders || [], error: '' });
+      if (!res.ok) { setRecent({ loading: false, orders: null, error: data.list_unavailable ? 'list' : 'error', offset: 0, hasMore: false }); return; }
+      setRecent({ loading: false, orders: data.orders || [], error: '', offset: data.offset ?? offset, hasMore: !!data.hasMore });
     } catch {
-      if (seq === recentSeq.current) setRecent({ loading: false, orders: null, error: 'error' });
+      if (seq === recentSeq.current) setRecent({ loading: false, orders: null, error: 'error', offset: 0, hasMore: false });
     }
   };
 
@@ -276,12 +276,14 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
 
         {source !== 'tcgplayer' && (<>
         {/* Recent orders: a quick-pick list when the provider exposes one. */}
-        {readyFor(source) && recent.loading && (
+        {readyFor(source) && recent.loading && !Array.isArray(recent.orders) && (
           <div style={{ fontSize: '.78rem', color: 'var(--text-secondary)' }}>{t('orderimport.recentLoading')}</div>
         )}
-        {readyFor(source) && !recent.loading && Array.isArray(recent.orders) && recent.orders.length > 0 && (
+        {readyFor(source) && Array.isArray(recent.orders) && recent.orders.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '.35rem' }}>
             <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-secondary)' }}>{t('orderimport.recentTitle')}</div>
+            <div style={{ display: 'flex', gap: '.5rem', alignItems: 'stretch' }}>
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '.35rem', opacity: recent.loading ? .5 : 1 }}>
             {recent.orders.map((o) => (
               <button key={o.number} type="button"
                 className={`btn btn-small ${orderNumber.trim() === o.number ? 'btn-primary' : 'btn-secondary'}`}
@@ -294,6 +296,24 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
                 <span style={{ marginLeft: 'auto', opacity: .8 }}>{t('orderimport.recentCopies', { count: o.cardCount })}</span>
               </button>
             ))}
+            </div>
+            {source === 'manapool' && (
+              <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', gap: '.35rem' }}>
+                <button type="button" className="btn btn-small btn-secondary" aria-label="Newer orders"
+                  style={{ flex: 1, padding: '0 .5rem' }}
+                  disabled={busy || recent.loading || recent.offset <= 0}
+                  onClick={() => loadRecent(source, Math.max(0, recent.offset - 3))}>
+                  <ChevronUp size={18} />
+                </button>
+                <button type="button" className="btn btn-small btn-secondary" aria-label="Older orders"
+                  style={{ flex: 1, padding: '0 .5rem' }}
+                  disabled={busy || recent.loading || !recent.hasMore}
+                  onClick={() => loadRecent(source, recent.offset + 3)}>
+                  <ChevronDown size={18} />
+                </button>
+              </div>
+            )}
+            </div>
           </div>
         )}
         {readyFor(source) && !recent.loading && recent.error === 'list' && (
