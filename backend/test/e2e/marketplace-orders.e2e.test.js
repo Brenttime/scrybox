@@ -221,7 +221,8 @@ async function runTests() {
     // condition/printing/price preserved, and reports the held-out extras.
     const add = await post('add', { source: 'manapool', order_number: '90001' });
     assert.strictEqual(add.status, 200, `add returned ${add.status}: ${JSON.stringify(add.body)}`);
-    assert.strictEqual(add.body.added, 2, 'both card types filed');
+    assert.strictEqual(add.body.added, 3, 'added counts copies (2x + 1x), not card types');
+    assert.strictEqual(add.body.resolved, 2, 'both card types filed');
     assert.deepStrictEqual(add.body.failed, [], 'nothing should fail on a clean import');
     assert.strictEqual(add.body.totalListed, 3);
     assert.strictEqual(add.body.unresolved, 0, 'the sealed box is not counted as an unresolved card');
@@ -247,7 +248,7 @@ async function runTests() {
     const lotusBefore = before7.filter((r) => r.name === 'Black Lotus');
     const reAdd = await post('add', { source: 'manapool', order_number: '90001' });
     assert.strictEqual(reAdd.status, 200);
-    assert.strictEqual(reAdd.body.added, 2, 'the re-import still reports its two card types');
+    assert.strictEqual(reAdd.body.added, 3, 'the re-import still reports its three copies');
     assert.deepStrictEqual(reAdd.body.failed, [], 're-import must not fail against existing rows');
     const after7 = await collection();
     const lotusAfter = after7.filter((r) => r.name === 'Black Lotus');

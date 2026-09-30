@@ -418,6 +418,8 @@ app.use('/api/card-art', cardArtRoutes);
 // The cost: bare '/api' mounts stack up, so a late handler re-runs the earlier
 // routers' authenticateToken (and its sessions⋈users SELECT) on its way past.
 app.use('/api', authenticateToken);
+// Any write by a user drops their cached dashboard stats (utils/statsCache).
+app.use('/api', require('./utils/statsCache').invalidateOnWrite);
 
 // Parse large payloads only after authentication. The normal parser intentionally
 // skipped these paths above so valid imports and scan images retain the 15 MB cap.

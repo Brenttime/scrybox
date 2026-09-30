@@ -3,9 +3,10 @@ const db = require('../db');
 const { resolveCardPrice, isVintageSet, parseSqliteUtc, applyProxyRarity } = require('../utils/priceHelpers');
 
 const router = express.Router();
+const { cached } = require('../utils/statsCache');
 
 // 7. Get Collection Statistics & Analytics
-router.get('/stats', async (req, res) => {
+router.get('/stats', cached(() => 'stats', async (req, res) => {
   try {
     const now = Date.now();
     const oneDayMs = 24 * 60 * 60 * 1000;
@@ -280,10 +281,10 @@ router.get('/stats', async (req, res) => {
     console.error(error);
     res.status(500).json({ error: 'Failed to compute statistics' });
   }
-});
+}));
 
 // 7b. Get Collection Net Worth Timeline History
-router.get('/stats/history', async (req, res) => {
+router.get('/stats/history', cached((req) => `history:${String(req.query.period || '30d')}`, async (req, res) => {
   try {
     const { period = '30d' } = req.query;
 
@@ -407,7 +408,7 @@ router.get('/stats/history', async (req, res) => {
     console.error(error);
     res.status(500).json({ error: 'Failed to compute timeline history' });
   }
-});
+}));
 
 // 7c. Net worth, on its own, for scripts and dashboards (issue #33).
 //

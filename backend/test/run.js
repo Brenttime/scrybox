@@ -52,7 +52,7 @@ if (!files.length) {
 
 const failed = [];
 for (const file of files) {
-  const { status } = spawnSync(process.execPath, [path.join(TEST_DIR, file)], { stdio: 'inherit' });
+  const { status } = spawnSync(process.execPath, [path.join(TEST_DIR, file)], { stdio: 'inherit', env: { ...process.env, STATS_CACHE: '0' } });
   if (status !== 0) failed.push(file);
   console.log(`${status === 0 ? 'PASS' : 'FAIL'}: ${file}`);
 }

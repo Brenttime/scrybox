@@ -54,13 +54,20 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
   // Money and dates follow the interface language, not the browser's: a user who
   // picked German sees 1.234,56 and 3.8.2026 even on an en-US browser.
   const money = (n) => (n || 0).toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const [stats, setStats] = useState(null);
-  const [loading, setLoading] = useState(true);
+  // Last dashboard, per user, painted instantly on open while a fresh copy
+  // loads (stale-while-revalidate). Keyed by username so accounts never mix.
+  const cacheKey = (name) => {
+    try { return `scrybox_dash_${JSON.parse(localStorage.getItem('bindarr_user') || '{}').username || 'anon'}_${name}`; } catch { return `scrybox_dash_anon_${name}`; }
+  };
+  const readCache = (name) => { try { return JSON.parse(localStorage.getItem(cacheKey(name)) || 'null'); } catch { return null; } };
+  const writeCache = (name, v) => { try { localStorage.setItem(cacheKey(name), JSON.stringify(v)); } catch { /* quota */ } };
+  const [stats, setStats] = useState(() => readCache('stats'));
+  const [loading, setLoading] = useState(() => !readCache('stats'));
   const [error, setError] = useState(null);
   const [timePeriod, setTimePeriod] = useState('30d');
   
   // Timeline Chart State
-  const [historyData, setHistoryData] = useState([]);
+  const [historyData, setHistoryData] = useState(() => readCache('history_30d') || []);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
   // Clickable Card Inspector State
@@ -80,16 +87,19 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
   const fetchStats = async () => {
     try {
-      setLoading(true);
+      if (!stats) setLoading(true);
       const response = await fetch('/api/stats');
       if (!response.ok) {
         throw new Error(t('dash.errStats'));
       }
       const data = await response.json();
       setStats(data);
+      setError(null);
+      writeCache('stats', data);
     } catch (err) {
       console.error(err);
-      setError(err.message);
+      // Keep showing the cached dashboard if the refresh fails.
+      if (!stats) setError(err.message);
     } finally {
       setLoading(false);
     }
@@ -97,11 +107,13 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
   const fetchTimelineHistory = async () => {
     try {
-      setLoadingHistory(true);
+      const cachedHistory = readCache(`history_${timePeriod}`);
+      if (cachedHistory) setHistoryData(cachedHistory); else setLoadingHistory(true);
       const response = await fetch(`/api/stats/history?period=${timePeriod}`);
       if (response.ok) {
         const data = await response.json();
         setHistoryData(data);
+        writeCache(`history_${timePeriod}`, data);
       }
     } catch (err) {
       console.error('Error loading history timeline:', err);
