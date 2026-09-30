@@ -1134,58 +1134,36 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
   return (
     <div style={selectMode ? { paddingBottom: '6rem' } : undefined}>
       {/* Filter Panel */}
-      <div className="glass-panel" style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem' }}>
-        {/* Always-visible top bar: search + sort + filters toggle */}
-        {/* Search sits on its own row above sort + filters. */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-          <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'flex-end', minWidth: 0 }}>
-            <Field label={t('collection.searchLabel')} style={{ flex: 1 }}>
-              {/* One box, two languages: plain card name/number/set, or
-                  Scryfall syntax — auto-detected, no toggle, no hint copy.
-                  The box IS the documentation: monospace + braces icon the
-                  moment it holds a query. (A hint paragraph here wrapped to
-                  ten lines on phones and made the whole panel jumbled.) */}
-              <div style={{ position: 'relative' }}>
-                <input
-                  type="text"
-                  className="input-control"
-                  placeholder={t('collection.searchPlaceholder')}
-                  value={searchFilter}
-                  onChange={(e) => setSearchFilter(e.target.value)}
-                  style={{
-                    width: '100%',
-                    paddingLeft: '2.5rem',
-                    fontFamily: looksLikeSyntax(searchFilter.trim()) ? 'var(--font-mono, monospace)' : undefined,
-                  }}
-                />
-                {looksLikeSyntax(searchFilter.trim())
-                  ? <Braces size={16} style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                  : <Search size={16} style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />}
-              </div>
-            </Field>
+      <div className={showFilters ? 'glass-panel' : undefined} style={showFilters ? { marginBottom: '1rem', padding: '0.75rem 0.9rem' } : { marginBottom: '0.75rem' }}>
+        {/* Compact top bar (same pattern as Decks): bare search, then one row
+            of chips for sort + filters. The panel chrome only appears while
+            the filter drawer is open. */}
+        <div className="deck-toolbar">
+          <div className="deck-toolbar-search">
+            {looksLikeSyntax(searchFilter.trim()) ? <Braces size={16} /> : <Search size={16} />}
+            <input
+              type="text"
+              className="input-control"
+              aria-label={t('collection.searchLabel')}
+              placeholder={t('collection.searchPlaceholder')}
+              value={searchFilter}
+              onChange={(e) => setSearchFilter(e.target.value)}
+              style={{ fontFamily: looksLikeSyntax(searchFilter.trim()) ? 'var(--font-mono, monospace)' : undefined }}
+            />
+            {searchFilter && (
+              <button type="button" className="deck-toolbar-clear" onClick={() => setSearchFilter('')} aria-label="Clear"><X size={14} /></button>
+            )}
           </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(150px, 1fr) auto', gap: '0.75rem', alignItems: 'flex-end' }}>
-          <Field label={t('collection.sortBy')}>
-            <select className="select-control" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+          <div className="deck-toolbar-chips">
+            <select className="deck-chip" aria-label={t('collection.sortBy')} value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
               {['added-newest', 'added-oldest', 'name-asc', 'name-desc', 'price-desc', 'price-asc', 'qty-desc', 'set-asc', 'number-asc', 'type-asc', 'rarity-desc', 'rarity-asc', 'language-asc']
                 .map(key => <option key={key} value={key}>{t(`collection.sort.${key}`)}</option>)}
             </select>
-          </Field>
-
-          <button
-            className={`btn ${showFilters ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => setShowFilters(s => !s)}
-            style={{ padding: '0.5rem 0.9rem', height: '40px', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}
-          >
-            <SlidersHorizontal size={15} />
-            {t('collection.filters')}
-            {activeFilterCount > 0 && (
-              <span style={{ background: 'var(--accent-red)', color: 'var(--text-strong)', fontSize: '0.65rem', fontWeight: 900, borderRadius: '999px', padding: '1px 7px', minWidth: '18px', textAlign: 'center' }}>
-                {activeFilterCount}
-              </span>
-            )}
-          </button>
+            <button type="button" className={`deck-chip deck-chip-btn ${showFilters || activeFilterCount ? 'on' : ''}`} onClick={() => setShowFilters(s => !s)} aria-expanded={showFilters}>
+              <SlidersHorizontal size={13} />
+              {t('collection.filters')}
+              {activeFilterCount > 0 && <span className="deck-chip-count">{activeFilterCount}</span>}
+            </button>
           </div>
         </div>
 
