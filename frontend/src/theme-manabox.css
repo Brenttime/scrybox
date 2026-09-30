@@ -497,10 +497,14 @@
    chip, name + card count on the left and list value on the right. */
 :root[data-theme="manabox"] .list-tiles {
   grid-template-columns: 1fr !important;
-  gap: 0 !important;
-  background: var(--mb-card);
+  gap: 12px !important;
+  background: transparent;
+}
+/* Each list is its own card with open space between them. */
+:root[data-theme="manabox"] .list-tiles > * {
   border-radius: var(--radius-md);
   overflow: hidden;
+  background: var(--mb-card);
 }
 :root[data-theme="manabox"] .list-tile {
   display: grid !important;
@@ -520,6 +524,7 @@
 :root[data-theme="manabox"] .list-tile { border-bottom: 0 !important; }
 :root[data-theme="manabox"] .swipe-row { border-bottom: 1px solid var(--mb-line); }
 :root[data-theme="manabox"] .swipe-row:last-child { border-bottom: 0; }
+:root[data-theme="manabox"] .list-tiles .swipe-row { border-bottom: 0; }
 :root[data-theme="manabox"] .swipe-row-content { background: var(--mb-card); }
 :root[data-theme="manabox"] .list-tile:hover { background: var(--mb-card-hover) !important; }
 :root[data-theme="manabox"] .list-tile-accent {
