@@ -685,7 +685,6 @@ function Lists({ showToast, handoff, onHandoffDone }) {
               <ListChecks size={22} style={{ color: 'var(--accent-green, #10b981)' }} />
               {t('nav.lists')}
             </h2>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '0.25rem' }}>{t('lists.subtitle')}</p>
           </div>
           <button className="btn btn-primary" onClick={openCreate}
             style={{ padding: '0.6rem 1.25rem', fontSize: '0.9rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
