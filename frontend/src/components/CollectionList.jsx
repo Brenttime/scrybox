@@ -1,5 +1,5 @@
 import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Search, Trash2, Edit2, LayoutGrid, List, SlidersHorizontal, X, Braces, Repeat, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
+import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Repeat, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
@@ -1024,6 +1024,8 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     }
   }, [displayCards, viewMode, virtualWindow]);
 
+  // Collection is grid-only now; kept for the list renderer + anchor logic.
+  // eslint-disable-next-line no-unused-vars
   const switchViewMode = (nextViewMode) => {
     if (nextViewMode === viewMode) return;
 
@@ -1287,10 +1289,6 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
             {!resultsIncomplete && (
               <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>${formatPrice(totalValue)}</strong></span>
             )}
-            <span className="coll-viewtoggle" role="group" aria-label="View">
-              <button type="button" aria-pressed={viewMode === 'gallery'} className={viewMode === 'gallery' ? 'on' : ''} onClick={() => switchViewMode('gallery')} title={t('collection.galleryView')}><LayoutGrid size={15} /></button>
-              <button type="button" aria-pressed={viewMode === 'list'} className={viewMode === 'list' ? 'on' : ''} onClick={() => switchViewMode('list')} title={t('collection.listView')}><List size={15} /></button>
-            </span>
             <button type="button" className="coll-textbtn" onClick={() => setSelectMode(true)} title={t('collection.selectHint')}>{t('collection.select')}</button>
           </span>
         </div>
