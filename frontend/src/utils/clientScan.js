@@ -291,3 +291,12 @@ async function hydrateOnce(results, signal) {
   if (out.some(x => x.scryfallId && !(x.ok && x.card))) throw new Error('hydrate incomplete');
   return out;
 }
+
+// Card rows for footer twins the reader could not split (printing picker).
+export async function fetchChoices(choices, signal) {
+  const ids = (choices || []).map(c => c.scryfallId || c.id);
+  const r = await fetch('/api/cardscan/choices', { signal, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok || !Array.isArray(j.cards)) throw new Error(j.error || 'choices failed');
+  return j.cards;
+}

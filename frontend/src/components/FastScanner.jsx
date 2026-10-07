@@ -4,8 +4,8 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection } from '../utils/fastScan';
-import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame } from '../utils/clientScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel } from '../utils/fastScan';
+import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
@@ -77,12 +77,13 @@ const rowPriceOf = (row) => { const p = usdPrice(row.card, printingOf(row)); ret
 const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPatch, onRetry }) {
   const price = rowPriceOf(row);
   return (
-<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}`} aria-busy={row.pending || undefined}>
+<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}${row.needsChoice ? ' is-choice' : ''}`} aria-busy={row.pending || undefined}>
         <div className="fs-card-art">
           {row.card.image_url ? <img src={row.card.image_url} alt="" loading="lazy" crossOrigin="anonymous" /> : null}
           {!row.sent && !row.pending && (
-            <button type="button" className="fs-card-edit" onClick={() => onEdit(row)} aria-label={t('fastscan.changePrinting')} />
+            <button type="button" className="fs-card-edit" onClick={() => onEdit(row)} aria-label={row.needsChoice ? t('fastscan.choosePrinting') : t('fastscan.changePrinting')} />
           )}
+          {row.needsChoice && <span className="fs-card-choose" aria-hidden="true">{t('fastscan.choosePrinting')}</span>}
           {row.pending && row.hydrateFailed && (
             <button type="button" className="fs-card-edit fs-card-retry" onClick={() => onRetry(row)} aria-label={t('fastscan.hydrateRetry')} title={t('fastscan.hydrateRetry')} />
           )}
@@ -91,7 +92,7 @@ const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPat
           {row.sent && <span className="fs-card-badge"><Check size={14} /></span>}
         </div>
         <div className="fs-card-name">{displayName(row.card)}</div>
-        <div className="fs-card-meta">{String(row.card.set_id || '').toUpperCase()} · #{row.card.number}</div>
+        <div className="fs-card-meta">{row.needsChoice ? choiceLabel(row.choose) : `${String(row.card.set_id || '').toUpperCase()} · #${row.card.number}`}</div>
         {!row.sent && (
           <div className="fs-card-quick">
             <div className="fs-qty" role="group" aria-label={t('fastscan.quantity')}>
@@ -429,6 +430,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
             if (!out.results) { out = null; why = 'hydrate-failed'; }
             else tel.set({ answered_by: 'client' });
           }
+          // Footer twins proven on-device: fetch their card rows for the picker.
+          if (out && out.results.some(x => !x.ok && x.choices?.length > 1)) {
+            try {
+              out = { ...out, results: await Promise.all(out.results.map(async x => (!x.ok && x.choices?.length > 1 ? { ...x, choices: await fetchChoices(x.choices, abort.signal) } : x))) };
+              tel.set({ choice: true });
+            } catch (e) { tel.set({ choice_error: e?.message || String(e) }); out = null; why = 'choices-failed'; }
+          }
         }
       }
       if (out) abort.abort();
@@ -452,7 +460,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const ms = Math.round(performance.now() - t0);
       const byNumber = new Map(out.results.map(x => [x.number ?? x.scene_number, x]));
       drawOverlay(out.frame, out.candidates, byNumber);
-      const hits = out.results.filter(x => x.ok && x.card);
+      // Proven printings, plus proven footers that several printings share
+      // (the user picks those in the tray; never a guess).
+      const hits = [...out.results.filter(x => x.ok && x.card), ...choiceHits(out.results)];
       const eligible = out.candidates.filter(c => c.eligible).length;
       if (!out.candidates.length) firstSeenRef.current = null;
       else if (firstSeenRef.current == null) firstSeenRef.current = t0;
@@ -492,7 +502,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const tEnd = performance.now();
       tel.end({
         outcome: hits.length ? (fresh.length ? 'added' : 'repeat') : (out.candidates.length ? 'miss' : 'no-card'),
-        hits: hits.map(h => `${h.card.name}[${h.card.set_id} ${h.card.number}]`).slice(0, 8),
+        hits: hits.map(h => (h.choose ? `${h.card.name}[choose ${h.choose.map(c => `${c.set_id} ${c.number}`).join(' | ')}]` : `${h.card.name}[${h.card.set_id} ${h.card.number}]`)).slice(0, 8),
         total_ms: ms, waited_ms: waited,
         // Presentation timeline: epoch, and ms from its first candidate to
         // its first confident title and to this pass's end (proof/commit).
@@ -508,7 +518,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         setLatency({ total: waited, read: ms });
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
-        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0 }));
+        const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
+          ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
@@ -612,7 +623,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // Send every unsent scan to the chosen destination in one request.
   const sendAll = async () => {
     // Pending rows (still hydrating, R2-#13) are never sent: they have no card row yet.
-    const rows = results.filter(r => !r.sent && !r.pending);
+    // Rows waiting for a printing choice are never sent until the user picks.
+    const rows = results.filter(r => !r.sent && !r.pending && !r.needsChoice);
     if (!rows.length || sending) return;
     setSending(true);
     try {
@@ -662,6 +674,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const openPrintings = async (row) => {
     if (row.sent) return;
     setEditKey(row.key); setPrints(null);
+    if (row.needsChoice && row.choose?.length) { setPrints(row.choose); return; }
     try {
       const qs = new URLSearchParams({ name: row.card.name, prints: '1', scope: 'internet', limit: '250' });
       const r = await fetch(`/api/search?${qs}`);
@@ -671,7 +684,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     } catch { setPrints([row.card]); }
   };
   const choosePrinting = (card) => {
-    setResults(prev => prev.map(x => (x.key === editKey ? { ...x, card } : x)));
+    setResults(prev => prev.map(x => (x.key === editKey ? { ...x, card, needsChoice: false, choose: undefined } : x)));
     setEditKey(null); setPrints(null);
   };
   const editing = results.find(r => r.key === editKey);
@@ -718,7 +731,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     return <div className="fs-offline glass-panel">{t('fastscan.unavailable')}</div>;
   }
 
-  const pending = results.filter(r => !r.sent && !r.pending).length;
+  const pending = results.filter(r => !r.sent && !r.pending && !r.needsChoice).length;
   // Scanner shows USD only. A printing with no USD quote (Scryfall fell back
   // to EUR) shows no price at all rather than a euro figure or a mixed total.
   const priceOf = (card, printing = 'Normal') => usdPrice(card, printing);
@@ -801,7 +814,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
               <div className="fs-sheet-head">
                 <div>
                   <div className="fs-tray-title">{displayName(editing.card)}</div>
-                  <div className="fs-card-meta">{t('fastscan.changePrinting')}{prints ? ` · ${prints.length}` : ''}</div>
+                  <div className="fs-card-meta">{editing.needsChoice ? choiceLabel(editing.choose) : `${t('fastscan.changePrinting')}${prints ? ` · ${prints.length}` : ''}`}</div>
                 </div>
                 <button type="button" className="fs-ghost" onClick={() => setEditKey(null)} aria-label={t('fastscan.dismiss')}><X size={16} /></button>
               </div>

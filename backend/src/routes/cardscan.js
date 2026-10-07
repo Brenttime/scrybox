@@ -12,6 +12,8 @@
 //   POST /api/cardscan/scan     { cards:[{number,image,box,quad}] } -> results
 //   POST /api/cardscan/cards    { results:[{number,scryfallId,title,via}] } -> hydrated
 //                               (cards the phone read on-device)
+//   POST /api/cardscan/choices  { ids:[scryfallId x2-8] } -> { cards } for the
+//                               printing picker (footer twins)
 const express = require('express');
 const axios = require('axios');
 const scryfallApi = require('../scryfallApi');
@@ -55,7 +57,22 @@ async function hydrate(result) {
     if (card) out.card = card;
     else { out.ok = false; out.error = 'printing not in the card database yet'; }
   }
+  // The scan cascade proved the footer but several printings carry it (e.g.
+  // an original and its The List / Mystery Booster reprint): the user picks.
+  const choices = !result.ok && result.footer_ocr?.choices;
+  if (Array.isArray(choices) && choices.length > 1) {
+    const cards = await hydrateChoices(choices.map(c => c.id || c.scryfallId));
+    if (cards) out.choices = cards;
+  }
   return out;
+}
+
+const SCRY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Every id must hydrate, or there is no choice to offer (null).
+async function hydrateChoices(ids) {
+  if (!Array.isArray(ids) || ids.length < 2 || ids.length > 8 || ids.some(id => !SCRY_ID.test(String(id || '')))) return null;
+  const cards = await Promise.all(ids.map(id => scryfallApi.getCardById(`mtg-${id}`).catch(() => null)));
+  return cards.every(Boolean) ? cards : null;
 }
 
 // One round trip: the full frame goes up, the sidecar detects, warps and reads
@@ -111,6 +128,13 @@ router.post('/cards', async (req, res) => {
     footer_ocr: { resolved_by: x.via },
   })));
   res.json({ ok: true, results });
+});
+
+// Footer twins the phone found on-device: card rows for the printing picker.
+router.post('/choices', async (req, res) => {
+  const cards = await hydrateChoices(req.body?.ids);
+  if (!cards) return res.status(400).json({ ok: false, error: 'Expected 2-8 card ids that exist' });
+  res.json({ ok: true, cards });
 });
 
 // Client scan telemetry (frontend/src/utils/scanTelemetry.js): per-pass

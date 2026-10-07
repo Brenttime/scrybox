@@ -117,17 +117,63 @@ export function loadIndex(raw) {
   for (const p of raw.printings) {
     if (/^\d+$/.test(p[2])) setMax.set(p[1], Math.max(setMax.get(p[1]) || 0, Number(p[2])));
   }
+  const setLookup = new Set(raw.sets);
+  // Physical footer key per printing (see physicalKey). Data-driven: any
+  // reprint-sheet set numbering its cards '<ORIGINAL SET>-<num>' collides
+  // with that original automatically, with no per-set code.
+  const phys = raw.printings.map(p => physicalKey(p[1], p[2], setLookup));
+  for (const [i, p] of raw.printings.entries()) {
+    const k = phys[i];
+    if (k.set !== p[1] && /^\d+$/.test(k.num)) setMax.set(k.set, Math.max(setMax.get(k.set) || 0, Number(k.num)));
+  }
   return {
-    names, nameIx, canonOf, setMax,
+    names, nameIx, canonOf, setMax, phys,
     excluded: new Set(raw.excluded),
     sets: raw.sets,
     setRank: new Map(raw.sets.map((c, i) => [c, i])),
-    setLookup: new Set(raw.sets),
+    setLookup,
     setLengths: [...new Set(raw.sets.map(c => c.length))].sort((a, b) => b - a),
     printings: raw.printings,          // [id, set, num]
     byTitle: raw.byTitle,              // normalized title -> printing indices
     uniqueAlias: raw.uniqueAlias,      // canonical norm -> [[alias, printing]]
   };
+}
+
+// The footer a printing physically carries. Reprint-sheet sets (The List,
+// Mystery Booster 2: Scryfall 'plst', numbers like 'ODY-129') print the
+// ORIGINAL card's footer ('129/350'), told apart only by a small symbol in
+// the bottom-left corner. So a number '<SET>-<N>' whose prefix is another
+// known set code is physically set SET, number N. Everything else is its own
+// set and number. Two printings of a title with the same key are a collision
+// group: footer OCR can never tell them apart.
+export function physicalKey(set, num, setLookup) {
+  const m = /^([a-z0-9]{2,6})-0*(\d+[a-z]?)[^a-z0-9]*$/i.exec(String(num ?? ''));
+  if (m && m[1].toLowerCase() !== set && setLookup.has(m[1].toLowerCase())) {
+    const n = normalizeCollector(m[2]);
+    return { set: m[1].toLowerCase(), num: n, raw: n, sheet: true };
+  }
+  // raw: the number as the resolver always compared it (lowercase, as
+  // indexed), so ordinary printings match exactly as before.
+  return { set, num: normalizeCollector(num), raw: String(num ?? '').toLowerCase(), sheet: false };
+}
+const physKeyStr = (k) => `${k.set}:${k.num}`;
+// Index objects built by hand (tests) may lack .phys: derive it lazily.
+function physOf(ix) {
+  if (!ix.phys) {
+    const look = ix.setLookup || new Set(ix.sets || []);
+    ix.phys = ix.printings.map(p => physicalKey(p[1], p[2], look));
+  }
+  return ix.phys;
+}
+
+// Every printing of `title` whose physical footer equals printing pi's
+// (pi included, pool order). Length 1 = the footer alone proves pi.
+export function physicalTwins(ix, title, pi) {
+  const pool = ix.byTitle[title] || [];
+  const ph = physOf(ix);
+  const k = physKeyStr(ph[pi]);
+  const twins = pool.filter(o => o === pi || physKeyStr(ph[o]) === k);
+  return twins.includes(pi) ? twins : [pi, ...twins];
 }
 
 // server.find_card_by_ocr (the rapidfuzz branch). Returns the CANONICAL title,
@@ -231,8 +277,13 @@ export function footerCodes(ix, raws) {
 }
 
 // The retro copyright line: only a trailing number, never a (c) year.
+// 2003-2010 frames end the line with 'N/T' ('... Coast LLC 50/249'): the
+// collector number is N, never the set total T.
 export function retroNumber(raw) {
-  const m = /(\d{1,4}[a-z]?)\s*$/.exec(String(raw).trim());
+  const t = String(raw).trim();
+  const nt = /(?<![\d/])(\d{1,4}[a-z]?)\s*\/\s*(\d{2,4})\s*$/i.exec(t);
+  if (nt) return Number.parseInt(nt[1], 10) <= Number(nt[2]) * 2 + 50 ? nt[1].toLowerCase() : null;
+  const m = /(\d{1,4}[a-z]?)\s*$/.exec(t);
   if (!m || /^(19|20)\d\d$/.test(m[1])) return null;
   return m[1];
 }
@@ -275,35 +326,45 @@ export function looksLikeCopyright(raw) {
   return /wizard|coast|\b(19|20)\d\d\b|©|tm\s*&/i.test(String(raw));
 }
 
-// server._resolve_footer_candidates: one printing only when the evidence has
-// exactly one valid identity; otherwise null.
+// server._resolve_footer_candidates, on PHYSICAL footers: the evidence must
+// name exactly one physical footer (set as printed + number). Returns every
+// printing of the title carrying that footer (a collision group when more
+// than one: e.g. ODY 129 and The List 'ODY-129'), or null.
 // `setless` = numbers allowed to resolve without a set code, as an iterable of
 // numbers or a Map(number -> printed set total) from strongNumbers (default:
 // every number, the sidecar's behaviour).
-export function resolveFooter(ix, title, codes, numbers, setless = numbers) {
+export function resolveFooterGroup(ix, title, codes, numbers, setless = numbers) {
   const totals = setless instanceof Map ? setless : new Map([...setless].map(n => [n, 0]));
   const pool = ix.byTitle[title] || [];
+  const ph = physOf(ix);
   const exact = new Set();
   for (const code of codes) {
     for (const number of numbers) {
       for (const pi of pool) {
-        const p = ix.printings[pi];
-        if (p[1] === code && String(p[2]).toLowerCase() === number) exact.add(pi);
+        if (ph[pi].set === code && ph[pi].raw === number) exact.add(pi);
       }
     }
   }
-  if (exact.size === 1) return [...exact][0];
+  const group = (hits) => {
+    const keys = new Set([...hits].map(pi => physKeyStr(ph[pi])));
+    return keys.size === 1 ? physicalTwins(ix, title, [...hits][0]) : null;
+  };
+  if (exact.size) return group(exact);
   // Contradictory exact set+number evidence is ambiguity, not permission to
   // fall through to the weaker set-less pass and pick one of them.
-  if (exact.size > 1) return null;
   const global = new Set();
   for (const [number, total] of totals) {
     for (const pi of pool) {
-      const p = ix.printings[pi];
-      if (normalizeCollector(p[2]) === number && (!total || (ix.setMax.get(p[1]) || 0) >= total)) global.add(pi);
+      if (normalizeCollector(ph[pi].raw) === number && (!total || (ix.setMax.get(ph[pi].set) || 0) >= total)) global.add(pi);
     }
   }
-  return global.size === 1 ? [...global][0] : null;
+  return global.size ? group(global) : null;
+}
+
+// One printing, or null (a collision group is NOT one printing).
+export function resolveFooter(ix, title, codes, numbers, setless = numbers) {
+  const g = resolveFooterGroup(ix, title, codes, numbers, setless);
+  return g && g.length === 1 ? g[0] : null;
 }
 
 // Multi-frame vote, constrained to the title's own printings. Consecutive
@@ -313,12 +374,13 @@ export function resolveFooter(ix, title, codes, numbers, setless = numbers) {
 // (3+ chars, as modern footers print it) appears in >= 2 distinct frames and
 // no other candidate printing's number appears in ANY frame. Set codes read in
 // the frames narrow the candidates first.
-export function voteFooter(ix, title, frames) {
+export function voteFooterGroup(ix, title, frames) {
   let pool = ix.byTitle[title] || [];
   if (pool.length < 2 || frames.length < 2) return null;
+  const ph = physOf(ix);
   const codes = footerCodes(ix, frames.flat());
   if (codes.length) {
-    const inSet = pool.filter(pi => codes.includes(ix.printings[pi][1]));
+    const inSet = pool.filter(pi => codes.includes(ph[pi].set));
     if (inSet.length) pool = inSet;
   }
   // Drop the printed set total of every "N/T" read before flattening: once
@@ -330,23 +392,30 @@ export function voteFooter(ix, title, frames) {
     .replace(/(\d{1,4}[a-z]?)\s*\/\s*\d{2,4}/g, '$1 ')
     .split(/\s+/).map(tok => tok.replace(/[^a-z0-9]/g, '')).filter(Boolean)));
   const key = (pi) => {
-    const n = String(ix.printings[pi][2]).toLowerCase();
+    const n = ph[pi].raw;
     return /^\d+$/.test(n) ? n.padStart(3, '0') : n;
   };
+  // One vote per PHYSICAL footer: twins (same set as printed + number) are
+  // one candidate, never two.
   const hits = new Map();
   for (const pi of pool) {
     const k = key(pi);
     if (k.length < 3) continue;
     // "NNN/303": never let the printed set total vote for card #303.
-    if (Number(k) === (ix.setMax.get(ix.printings[pi][1]) || -1)) continue;
+    if (Number(k) === (ix.setMax.get(ph[pi].set) || -1)) continue;
     const n = texts.filter(toks => toks.some(tok => tok.includes(k))).length;
-    if (n) hits.set(pi, n);
+    if (n) hits.set(physKeyStr(ph[pi]), [pi, n]);
   }
   if (hits.size !== 1) return null;
-  const [[pi, n]] = [...hits];
+  const [[, [pi, n]]] = [...hits];
   // The number must be unique among the candidates, too (two printings can
   // share a number across sets when no set code was read).
   const k = key(pi);
-  if (pool.some(o => o !== pi && key(o) === k)) return null;
-  return n >= 2 ? pi : null;
+  if (pool.some(o => key(o) === k && physKeyStr(ph[o]) !== physKeyStr(ph[pi]))) return null;
+  return n >= 2 ? physicalTwins(ix, title, pi) : null;
+}
+
+export function voteFooter(ix, title, frames) {
+  const g = voteFooterGroup(ix, title, frames);
+  return g && g.length === 1 ? g[0] : null;
 }

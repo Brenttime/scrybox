@@ -19,7 +19,7 @@ import {
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
-  footerNumbers, footerCodes, resolveFooter, retroNumber, strongNumbers, looksLikeCopyright, voteFooter, normalizeCollector,
+  footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins,
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
@@ -180,19 +180,38 @@ const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'tall', 'wide', 're
 // NO other printing of the title is named by it: not by a strong number (N/T
 // or read in 2 strips; set totals ignored), and not by an exact set code +
 // number pair (review R1-B3: "lea 161 117" then a retro "117").
+// Compared on PHYSICAL footers (text.physicalKey): pi's footer twins are the
+// same evidence, never a conflict.
 export function strongConflict(ix, title, pi, raws) {
   const pool = ix.byTitle[title] || [];
-  const mine = normalizeCollector(ix.printings[pi][2]);
+  const ph = ix.phys;
+  const twins = new Set(physicalTwins(ix, title, pi));
+  const mine = ph[pi].num;
   const strong = [...strongNumbers(raws).keys()];
   const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbers(raws));
   for (const o of pool) {
-    if (o === pi) continue;
-    const n = normalizeCollector(ix.printings[o][2]);
-    if (n === mine && ix.printings[o][1] !== ix.printings[pi][1]) continue;   // same number elsewhere: set evidence decided
+    if (twins.has(o)) continue;
+    const n = ph[o].num;
+    if (n === mine && ph[o].set !== ph[pi].set) continue;   // same number elsewhere: set evidence decided
     if (strong.includes(n)) return true;
-    if (codes.has(ix.printings[o][1]) && nums.has(String(ix.printings[o][2]).toLowerCase())) return true;
+    if (codes.has(ph[o].set) && nums.has(ph[o].raw)) return true;
   }
   return false;
+}
+
+// Old-frame copyright line. 2003-2010 frames end it with 'N/T' at the far
+// right ('TM & (c) 1993-2010 Wizards of the Coast LLC 50/249'); on a padded
+// webcam outline that line sits lower (0.865-0.88) than the retro-border row
+// (0.845-0.855) the stage read before. All four rows ride in one recognizer
+// call. A trailing number counts only on a line that looks like the
+// copyright line, or as a clean 'N/T' with a plausible set total (T >= 40,
+// N <= T): never a P/T box ('4/3') and never a (c) year.
+const RETRO_ALL_ROWS = [0.855, 0.845, 0.865, 0.875];
+export function retroLineNumber(text) {
+  if (looksLikeCopyright(text)) return retroNumber(text);
+  const nt = /(?<![\d/])(\d{1,3})\s*\/\s*(\d{2,3})\s*$/.exec(String(text).trim());
+  if (nt && Number(nt[2]) >= 40 && Number(nt[1]) >= 1 && Number(nt[1]) <= Number(nt[2])) return String(Number(nt[1]));
+  return null;
 }
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 // First batch height FIRST_H = 0.030 (was 0.025): the 0.025 strip clipped
@@ -213,7 +232,7 @@ const TALL_H = 0.025;
 const FIRST_H = 0.030;
 export const FOOTER_HEIGHTS = Object.freeze({ first: FIRST_H, tall: TALL_H });
 const WIDE_X1 = 0.30;
-const RETRO_ROWS = [0.855, 0.845];
+const RETRO_ROWS = RETRO_ALL_ROWS;
 
 // Cornelius input: the frame squashed to 384x384 (fit: fill, like the server's
 // cvScan), ImageNet-normalised, NCHW.
@@ -602,6 +621,17 @@ export function createReader(env) {
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
       return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw };
     };
+    // A proven PHYSICAL footer: one printing -> done. Several printings with
+    // that footer (a reprint sheet such as The List / MB2 next to its
+    // original) -> the footer cannot decide, and no later footer stage can
+    // either. The cascade stops and the user picks; never a guess.
+    const settle = (group, via, footer, stage = -1) => {
+      if (group.length === 1) return done(group[0], via, footer, stage);
+      timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
+      return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage,
+        choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
+        title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw };
+    };
     let pi = uniqueTitlePrinting(ix, name);
     if (pi != null) return done(pi, 'unique physical printing', []);
     pi = uniqueOcrPrinting(ix, raw, name);
@@ -623,12 +653,12 @@ export function createReader(env) {
       if (prior.deferred && si < lastStage) return null;
       const frames = [...pooled, raws];
       const all = frames.flat();
-      let p = resolveFooter(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));
-      if (p == null) p = voteFooter(ix, name, frames);
+      let g = resolveFooterGroup(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));
+      if (g == null) g = voteFooterGroup(ix, name, frames);
       // Rescue reads (this frame or a pooled one) never prove a printing that
       // another strong number on these frames contradicts.
-      if (p != null && (rescued || prior.rescued) && strongConflict(ix, name, p, all)) { timings.rescue_conflict = 1; p = null; }
-      return p == null ? null : done(p, 'title+collector (multi-frame)', all, si);
+      if (g != null && (rescued || prior.rescued) && strongConflict(ix, name, g[0], all)) { timings.rescue_conflict = 1; g = null; }
+      return g == null ? null : settle(g, 'title+collector (multi-frame)', all, si);
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
       if (stage === 'retro') {
@@ -637,14 +667,17 @@ export function createReader(env) {
         const nums = [];
         for (const r of reads) {
           if (!r.text || r.conf < RETRO_CONF) continue;
-          const n = looksLikeCopyright(r.text) ? retroNumber(r.text) : null;
+          const n = retroLineNumber(r.text);
           if (n && !nums.includes(n)) nums.push(n);
           raws.push(r.text);
         }
         if (nums.length) {
-          pi = resolveFooter(ix, name, [], nums);
-          if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
-          if (pi != null) return done(pi, 'title+collector (retro frame)', raws, si);
+          // Two different trailing numbers is ambiguity (resolveFooterGroup
+          // returns null for two physical footers).
+          let g = resolveFooterGroup(ix, name, [], nums);
+          // Always guarded: retro reads join everything earlier stages read.
+          if (g != null && strongConflict(ix, name, g[0], raws)) { timings.rescue_conflict = 1; g = null; }
+          if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);
         }
         const pooledHit = tryPooled(si);
         if (pooledHit) return pooledHit;
@@ -657,15 +690,15 @@ export function createReader(env) {
       const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
-      pi = resolveFooter(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
+      let g = resolveFooterGroup(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
       // A rescue-stage answer must not contradict ANY strong number read on
       // this frame (R2-#2 replay: rescue read "089/59%" -> DRC 89 while the
       // first batch read "080/505", the real MH2 80, dropped only by its set
       // total check). Conflicting evidence means ambiguity, not a pick.
       // Holds for every later stage too: the rescue reads stay in raws.
       if (stage === 'rescue' || stage === 'tall') rescued = true;
-      if (pi != null && rescued && strongConflict(ix, name, pi, raws)) { timings.rescue_conflict = 1; pi = null; }
-      if (pi != null) return done(pi, 'title+set+collector', raws, si);
+      if (g != null && rescued && strongConflict(ix, name, g[0], raws)) { timings.rescue_conflict = 1; g = null; }
+      if (g != null) return settle(g, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
       // Auto, first look at this card: the deep stages (wide, retro) cost
