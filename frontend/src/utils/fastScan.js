@@ -54,6 +54,9 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
   if (!out || out.error) return true;
   const cand = out.candidates?.[0];
   const res = out.results?.[0];
+  // A proven footer shared by several printings: the cascade is finished and
+  // the user picks. The server cannot split it either.
+  if (res && !res.ok && res.choices?.length > 1) return false;
   if (res && !res.ok && autoPass) {
     if (res.deferred) return false;
     if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
@@ -291,4 +294,18 @@ export function zoomPlan({ candidates = [], results = [], frame, sw, sh, max = 3
     crops.push({ number: c.number, sx: Math.round(x0), sy: Math.round(y0), sw: Math.round(x1 - x0), sh: Math.round(y1 - y0), scale });
   }
   return { crops, tooSmall };
+}
+
+// Pure: results whose printing the user must choose (footer twins), as tray
+// hits. The placeholder id is stable for the same twin set, so Auto de-dupe
+// treats a card that stays in view as one row, never one per pass.
+export function choiceKey(ids) { return `choose:${[...ids].sort().join(',')}`; }
+export function choiceHits(results) {
+  return (results || []).filter(r => !r.ok && Array.isArray(r.choices) && r.choices.length > 1 && r.choices.every(c => c && c.id))
+    .map(r => ({ ...r, ok: false, card: { ...r.choices[0], id: choiceKey(r.choices.map(c => c.id)) }, choose: r.choices }));
+}
+// "Odyssey or The List?" from the candidates' own set names (set-agnostic).
+export function choiceLabel(cards) {
+  const names = [...new Set((cards || []).map(c => c.set_name || String(c.set_id || '').toUpperCase()).filter(Boolean))];
+  return names.length ? `${names.join(' or ')}?` : '';
 }

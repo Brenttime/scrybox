@@ -564,13 +564,13 @@ test('rescue never pre-empts wide or retro (R1-S2/R2-S2); its evidence blocks co
   const ix2 = () => loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'],
     printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '147']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
   const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
-  // Order: 1 title, 2 first batch, 3 tall (6), 4 wide (4), 5 retro (2), 6 rescue (6).
+  // Order: 1 title, 2 first batch, 3 tall (6), 4 wide (4), 5 retro (4), 6 rescue (6).
   // Wide says 2x2 147: proved there (stage 2), rescue never runs.
   const f1 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 4 && n === 4 ? '2x2 147' : calls === 6 && n === 6 ? 'lea 161' : 'zz'));
   const r1 = (await createReader({ ...f1.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
   assert.equal(r1.scryfallId, 'id-2x2'); assert.equal(r1.footer_stage, 2); assert.equal(f1.calls(), 4);
   // Retro says 147 (copyright line): proved there (stage 3), rescue never runs.
-  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 2 ? 'wizards 147' : n === 6 && calls === 6 ? 'lea 161' : 'zz'));
+  const f2 = fakeReader((calls, n) => (calls === 1 ? 'bolt' : calls === 5 && n === 4 ? 'wizards 147' : n === 6 && calls === 6 ? 'lea 161' : 'zz'));
   const r2 = (await createReader({ ...f2.reader.__env, index: ix2() }).read(sharpFrame(), small)).results[0];
   assert.equal(r2.scryfallId, 'id-2x2'); assert.equal(r2.footer_stage, 3); assert.equal(f2.calls(), 5, 'no rescue call on a retro success');
   // Rescue reads two identities of one set: ambiguous, never a pick.
@@ -612,7 +612,7 @@ test('switching frame-id source (rVFC number <-> pixel fingerprint) restarts the
 test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)', async () => {
   const ix = loadIndex({ names: ['bolt'], canon: {}, excluded: [], sets: ['lea', '2x2'], printings: [['id-lea', 'lea', '161'], ['id-2x2', '2x2', '161']], byTitle: { bolt: [0, 1] }, uniqueAlias: {} });
   let t = 0, frame = 0, call = 0; const batches = [];
-  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 6 ? '2x2 161' : n === 2 ? 'zz' : '161'; }, { clock: () => t });
+  const f = fakeReader((_c, n) => { call++; batches.push(n); return call === 1 ? 'bolt' : frame === 0 ? 'lea' : call === 6 ? '2x2 161' : n === 4 && call === 5 ? 'zz' : '161'; }, { clock: () => t });
   const reader = createReader({ ...f.reader.__env, index: ix });
   const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4), full = sharpFrame();
   let first; for (t = 0; t <= 200; t += 100) first = await reader.read(full, small, { requireStill: true, frameId: t });
@@ -620,7 +620,7 @@ test('deferred pooled proof settles at v1\'s retro stage, before rescue (R3-S2)'
   frame = 1; call = 0; batches.length = 0;
   const r = (await reader.read(full, small, { requireStill: true, frameId: t })).results[0];
   assert.equal(r.scryfallId, 'id-lea');
-  assert.deepEqual(batches, [2, 6, 6, 4, 2], 'v1 batches + tall; rescue never runs');
+  assert.deepEqual(batches, [2, 6, 6, 4, 4], 'v1 batches + tall; retro now reads 4 rows; rescue never runs');
 });
 
 test('no settling by default: a sharp still card is read on its first auto frame; blur/clip still gate', async () => {

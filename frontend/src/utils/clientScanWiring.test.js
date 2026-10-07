@@ -81,3 +81,30 @@ test('onerror then a failed 1-thread fallback: cooldown holds, then a fresh work
   assert.equal(workers[workers.length - 1].loads[0], '1', 'still one thread (sticky)');
   assert.ok(workers.slice(0, base).every(w => w.dead), 'failed workers retired');
 });
+
+// Review R3-S2: one shared /choices request per twin set; each caller's abort
+// ends only its own wait, never the request or another caller's.
+test('fetchChoices: shared request, per-caller cancellation', async () => {
+  let calls = 0, release;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, '/api/cardscan/choices'); calls++;
+    await new Promise(r => { release = r; });
+    return { ok: true, json: async () => ({ ok: true, cards: [{ id: 'mtg-a' }, { id: 'mtg-b' }] }) };
+  };
+  const ids = [{ scryfallId: 'a' }, { scryfallId: 'b' }];
+  const first = new AbortController(), joiner = new AbortController();
+  const p1 = cs.fetchChoices(ids, first.signal);
+  const p2 = cs.fetchChoices([...ids].reverse(), joiner.signal);
+  const pre = new AbortController(); pre.abort();
+  await assert.rejects(cs.fetchChoices(ids, pre.signal), { name: 'AbortError' });
+  joiner.abort();
+  await assert.rejects(p2, { name: 'AbortError' });
+  first.abort();
+  await assert.rejects(p1, { name: 'AbortError' });
+  const p3 = cs.fetchChoices(ids, new AbortController().signal);
+  release();
+  assert.equal((await p3).length, 2, 'the shared request survives every caller abort');
+  assert.equal(calls, 1);
+  assert.equal((await cs.fetchChoices(ids)).length, 2);
+  assert.equal(calls, 1, 'cached');
+});

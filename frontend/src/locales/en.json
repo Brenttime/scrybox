@@ -1469,6 +1469,7 @@
   "fastscan.autoOn": "Auto on",
   "fastscan.single": "Single",
   "fastscan.changePrinting": "Change printing",
+  "fastscan.choosePrinting": "Choose printing",
   "fastscan.undo": "Undo",
   "fastscan.undone": "Moved back from {where}",
   "fastscan.undoFailed": "Undo failed",
