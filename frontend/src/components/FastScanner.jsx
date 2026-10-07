@@ -671,21 +671,34 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     } finally { setSending(false); }
   };
 
+  // Each sheet opening owns its request: a late /api/search answer for a
+  // sheet that was closed or replaced never lands in another row's picker
+  // (review R1-B6).
+  const printsReqRef = useRef(0);
   const openPrintings = async (row) => {
     if (row.sent) return;
+    const req = ++printsReqRef.current;
     setEditKey(row.key); setPrints(null);
     if (row.needsChoice && row.choose?.length) { setPrints(row.choose); return; }
+    let next;
     try {
       const qs = new URLSearchParams({ name: row.card.name, prints: '1', scope: 'internet', limit: '250' });
       const r = await fetch(`/api/search?${qs}`);
       const list = r.ok ? await r.json() : [];
       const same = (Array.isArray(list) ? list : []).filter(c => c.name === row.card.name);
-      setPrints(same.length ? same : [row.card]);
-    } catch { setPrints([row.card]); }
+      next = same.length ? same : [row.card];
+    } catch { next = [row.card]; }
+    if (req === printsReqRef.current) setPrints(next);
   };
+  const closePrintings = () => { printsReqRef.current++; setEditKey(null); setPrints(null); };
   const choosePrinting = (card) => {
-    setResults(prev => prev.map(x => (x.key === editKey ? { ...x, card, needsChoice: false, choose: undefined } : x)));
-    setEditKey(null); setPrints(null);
+    setResults(prev => prev.map((x) => {
+      if (x.key !== editKey) return x;
+      // A choice row only accepts one of its own candidates.
+      if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined } : x;
+      return card.name === x.card.name ? { ...x, card } : x;
+    }));
+    closePrintings();
   };
   const editing = results.find(r => r.key === editKey);
   const openPrintingsRef = useRef(openPrintings);
@@ -809,14 +822,14 @@ export default function FastScanner({ onAddSuccess, showToast }) {
           </ul>
         )}
         {editing && (
-          <div className="fs-sheet-backdrop" onClick={() => setEditKey(null)}>
+          <div className="fs-sheet-backdrop" onClick={closePrintings}>
             <div className="fs-sheet glass-panel" role="dialog" aria-modal="true" aria-label={t('fastscan.changePrinting')} onClick={e => e.stopPropagation()}>
               <div className="fs-sheet-head">
                 <div>
                   <div className="fs-tray-title">{displayName(editing.card)}</div>
                   <div className="fs-card-meta">{editing.needsChoice ? choiceLabel(editing.choose) : `${t('fastscan.changePrinting')}${prints ? ` · ${prints.length}` : ''}`}</div>
                 </div>
-                <button type="button" className="fs-ghost" onClick={() => setEditKey(null)} aria-label={t('fastscan.dismiss')}><X size={16} /></button>
+                <button type="button" className="fs-ghost" onClick={closePrintings} aria-label={t('fastscan.dismiss')}><X size={16} /></button>
               </div>
               {prints == null ? (
                 <div className="fs-tray-empty">{t('fastscan.loadingPrintings')}</div>

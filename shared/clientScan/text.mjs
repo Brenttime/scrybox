@@ -282,7 +282,8 @@ export function footerCodes(ix, raws) {
 export function retroNumber(raw) {
   const t = String(raw).trim();
   const nt = /(?<![\d/])(\d{1,4}[a-z]?)\s*\/\s*(\d{2,4})\s*$/i.exec(t);
-  if (nt) return Number.parseInt(nt[1], 10) <= Number(nt[2]) * 2 + 50 ? nt[1].toLowerCase() : null;
+  // A (c) year is never a collector number, also not as '2003/2010'.
+  if (nt) return !/^(19|20)\d\d$/.test(nt[1]) && Number.parseInt(nt[1], 10) <= Number(nt[2]) * 2 + 50 ? nt[1].toLowerCase() : null;
   const m = /(\d{1,4}[a-z]?)\s*$/.exec(t);
   if (!m || /^(19|20)\d\d$/.test(m[1])) return null;
   return m[1];

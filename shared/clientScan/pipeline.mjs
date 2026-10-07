@@ -207,11 +207,22 @@ export function strongConflict(ix, title, pi, raws) {
 // copyright line, or as a clean 'N/T' with a plausible set total (T >= 40,
 // N <= T): never a P/T box ('4/3') and never a (c) year.
 const RETRO_ALL_ROWS = [0.855, 0.845, 0.865, 0.875];
+// Rows read before the old-frame rows were added: only their text joins the
+// general footer evidence, exactly as before. The added rows' text is kept
+// for diagnostics only and counts solely through retroLineNumber (review
+// R1-B3: two '7/5' P/T reads from the new rows proved Grief H2R #7).
+const RETRO_LEGACY_ROWS = 2;
 export function retroLineNumber(text) {
   if (looksLikeCopyright(text)) return retroNumber(text);
   const nt = /(?<![\d/])(\d{1,3})\s*\/\s*(\d{2,3})\s*$/.exec(String(text).trim());
   if (nt && Number(nt[2]) >= 40 && Number(nt[1]) >= 1 && Number(nt[1]) <= Number(nt[2])) return String(Number(nt[1]));
   return null;
+}
+// The printed set total of a trailing 'N/T', or 0 (review R1-B5: '89/303'
+// must not prove DRC #89 when DRC stops at 184).
+export function retroLineTotal(text) {
+  const nt = /(?<![\d/])\d{1,4}[a-z]?\s*\/\s*(\d{2,4})\s*$/i.exec(String(text).trim());
+  return nt ? Number(nt[1]) : 0;
 }
 const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 // First batch height FIRST_H = 0.030 (was 0.025): the 0.025 strip clipped
@@ -635,7 +646,10 @@ export function createReader(env) {
     let pi = uniqueTitlePrinting(ix, name);
     if (pi != null) return done(pi, 'unique physical printing', []);
     pi = uniqueOcrPrinting(ix, raw, name);
-    if (pi != null) return done(pi, 'unique printed title', []);
+    // A printed alias unique to one printing still shares that printing's
+    // physical footer with any reprint-sheet twin (R1-B2: 'Leotau Grizalho'
+    // ARB 69 / plst ARB-69): only the footer cascade (and the user) decide.
+    if (pi != null && physicalTwins(ix, name, pi).length === 1) return done(pi, 'unique printed title', []);
 
     const raws = [];
     let rescued = false;
@@ -664,17 +678,20 @@ export function createReader(env) {
       if (stage === 'retro') {
         const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025]), 'retro'));
         if (truncated) return partial({ title: name, footer_ocr: raws });
-        const nums = [];
-        for (const r of reads) {
-          if (!r.text || r.conf < RETRO_CONF) continue;
+        const totals = new Map();
+        const retroRaw = [];
+        reads.forEach((r, ri) => {
+          if (!r.text || r.conf < RETRO_CONF) return;
           const n = retroLineNumber(r.text);
-          if (n && !nums.includes(n)) nums.push(n);
-          raws.push(r.text);
-        }
+          if (n) totals.set(n, Math.max(totals.get(n) || 0, retroLineTotal(r.text)));
+          if (ri < RETRO_LEGACY_ROWS) raws.push(r.text); else retroRaw.push(r.text);
+        });
+        if (retroRaw.length) timings.retro_raw = retroRaw;
+        const nums = [...totals.keys()];
         if (nums.length) {
           // Two different trailing numbers is ambiguity (resolveFooterGroup
-          // returns null for two physical footers).
-          let g = resolveFooterGroup(ix, name, [], nums);
+          // returns null for two physical footers). N/T carries its total.
+          let g = resolveFooterGroup(ix, name, [], nums, totals);
           // Always guarded: retro reads join everything earlier stages read.
           if (g != null && strongConflict(ix, name, g[0], raws)) { timings.rescue_conflict = 1; g = null; }
           if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);

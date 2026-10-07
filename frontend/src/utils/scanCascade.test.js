@@ -14,17 +14,26 @@ import { needsServer, choiceHits, choiceKey, choiceLabel } from './fastScan.js';
 // Real printings (Scryfall, 2026-10): Diabolic Tutor has ody 129 and The List
 // ODY-129 (identical physical footer '129/350'); Twisted Image som 50 / plst
 // SOM-50 / a25 75.
-const SETS = ['ody', 'plst', 'som', 'a25', 'm12', 'sld', 'pmei'];
+const SETS = ['ody', 'plst', 'som', 'a25', 'm12', 'sld', 'pmei', 'mh2', 'h2r', 'drc', 'arb', 'nph'];
 const ix = () => loadIndex({
-  names: ['diabolic tutor', 'twisted image', 'promo thing'], canon: {}, excluded: [], sets: SETS,
+  names: ['diabolic tutor', 'twisted image', 'promo thing', 'grief', 'damn', 'grizzled leotau', 'leotau grizalho', 'surgical extraction'], canon: { 6: 'grizzled leotau' }, excluded: [], sets: SETS,
   printings: [
     ['id-ody', 'ody', '129'], ['id-plst-ody', 'plst', 'ODY-129'], ['id-m12', 'm12', '92'],
     ['id-som', 'som', '50'], ['id-plst-som', 'plst', 'SOM-50'], ['id-a25', 'a25', '75'],
     ['id-pmei', 'pmei', '2020-1'], ['id-sld', 'sld', 'IFIYW-3'],
     // Set sizes as printed (the N/T total check): ODY 350, SOM 249, M12 249.
     ['f-ody', 'ody', '350'], ['f-som', 'som', '249'], ['f-m12', 'm12', '249'],
+    // Review R1 probes (real numbers): Grief mh2 87 / h2r 7, Damn mh2 80 /
+    // drc 89 (DRC stops at 184), Grizzled Leotau arb 69 + plst ARB-69 with a
+    // unique printed alias, Surgical Extraction sld 2003.
+    ['id-grief-mh2', 'mh2', '87'], ['id-grief-h2r', 'h2r', '7'],
+    ['id-damn-mh2', 'mh2', '80'], ['id-damn-drc', 'drc', '89'], ['f-drc', 'drc', '184'], ['f-mh2', 'mh2', '303'],
+    ['id-leo-arb', 'arb', '69'], ['id-leo-plst', 'plst', 'ARB-69'],
+    ['id-se-sld', 'sld', '2003'], ['id-se-nph', 'nph', '74'],
   ],
-  byTitle: { 'diabolic tutor': [0, 1, 2], 'twisted image': [3, 4, 5], 'promo thing': [6, 7] }, uniqueAlias: {},
+  byTitle: { 'diabolic tutor': [0, 1, 2], 'twisted image': [3, 4, 5], 'promo thing': [6, 7],
+    grief: [11, 12], damn: [13, 14], 'grizzled leotau': [17, 18], 'surgical extraction': [19, 20] },
+  uniqueAlias: { 'grizzled leotau': [['leotau grizalho', 18]] },
 });
 
 test('physicalKey: a <SET>-<N> number of another known set prints that set\'s footer; nothing else changes', () => {
@@ -75,15 +84,17 @@ test('old-frame copyright line: the collector number is N of a trailing N/T, nev
 function reader(textFor) {
   const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
   const cornelius = { run: async () => ({ corners: { data: [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] }, sharpness: { data: [0.9] } }) };
-  const chars = ['', ...'abcdefghijklmnopqrstuvwxyz0123456789/ '];
+  const chars = ['', ...'abcdefghijklmnopqrstuvwxyz0123456789/ ©'];
   let calls = 0;
   const rec = {
     inputNames: ['x'], outputNames: ['y'],
     run: async ({ x }) => {
       calls++;
-      const n = x.dims[0], text = textFor(calls, n), steps = text.length, classes = chars.length;
+      const n = x.dims[0], texts = Array.from({ length: n }, (_, b) => textFor(calls, n, b));
+      const steps = Math.max(...texts.map(t => t.length)) * 2 + 1, classes = chars.length;
       const data = new Float32Array(n * steps * classes);
-      for (let b = 0; b < n; b++) for (let s = 0; s < steps; s++) data[(b * steps + s) * classes + chars.indexOf(text[s])] = 1;
+      // Odd steps carry characters, even steps blanks (so repeats survive CTC).
+      for (let b = 0; b < n; b++) for (let s = 0; s < steps; s++) data[(b * steps + s) * classes + (s % 2 ? chars.indexOf(texts[b][(s - 1) / 2] ?? '') : 0)] = 1;
       return { y: { data, dims: [n, steps, classes] } };
     },
   };
@@ -131,4 +142,24 @@ test('a choice result never goes to the server and becomes one stable tray row',
   assert.equal(choiceHits([{ ok: false, choices: [...cards].reverse() }])[0].card.id, hits[0].card.id);
   assert.equal(choiceLabel(cards), 'The List or Odyssey?');
   assert.equal(choiceHits([{ ok: false, choices: [cards[0]] }]).length, 0, 'one candidate is not a choice');
+});
+
+// Astra review R1 (each reproduced a wrong printing on the first candidate).
+test('R1-B2: a unique printed alias with a footer twin is not a proof', async () => {
+  const { r } = reader(() => 'leotau grizalho');
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(res.ok, true, JSON.stringify(res));
+});
+for (const [title, line, why] of [['damn', '89/303', 'B5: set total'], ['surgical extraction', '© 2003/2010', 'B4: year range'], ['grief', '7/5', 'B3: P/T box'], ['grief', 'draw 7', 'B3: rules digits']]) {
+  test(`R1-${why}: '${line}' on the added old-frame rows never proves ${title}`, async () => {
+    const { r } = reader((c, n, b) => (c === 1 ? title : c === 5 && n === 4 && b >= 2 ? line : 'zz'));
+    const res = (await r.read(sharpFrame(), small)).results[0];
+    assert.notEqual(res.ok, true, JSON.stringify(res));
+    assert.equal(res.choices, undefined);
+  });
+}
+test('R1-B5: an N/T copyright line still resolves in a set that runs to #T', async () => {
+  const { r } = reader((c, n) => (c === 1 ? 'damn' : c === 5 && n === 4 ? 'of the coast 80/303' : 'zz'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.equal(res.scryfallId, 'id-damn-mh2', JSON.stringify(res));
 });
