@@ -253,6 +253,73 @@ Based on Astra's round-2 audit (`.hermes/audits/astra-perf-round2.md`) of the
   the fastSettle and titleGate flags from the new `dup`, `fast_settle` and
   `title_range` telemetry.
 
+## Set-agnostic identification cascade (scancascade build, 2026-10-07)
+Trigger: Windows Chrome webcam session `17lonf8t` (build
+`1.8.5+20260930T2351`). Twisted Image (SOM 50/249, 2003 frame, List
+symbol) looped on "exact printing not resolved" for 30+ s. Diabolic Tutor
+was ADDED as ODY 129, but the card is The List ODY-129. Brent: "durable
+solution that is agnostic to set ... iterate down ways to scan ... fastest
+way wins". Never guess.
+- Root causes:
+  - The footer resolver compared Scryfall numbers literally. The List / MB2
+    (`plst`) numbers like `ODY-129` never matched a printed `129`, so
+    `ody 129` looked unique.
+  - Old-frame (2003-2010) copyright lines end with `N/T` at y ~0.865-0.88
+    on a padded webcam outline. The retro rows (0.845/0.855) never read it,
+    and the old trailing-number rule returned T (the set total).
+- Shipped (client `shared/clientScan/*`, sidecar `server.py`, both
+  data-driven):
+  - Physical footer key per printing: a number `<SET>-<N>` whose prefix
+    is ANOTHER known set code prints that set's footer. 5568 of 5588 plst
+    printings map; the other 20 are online-only originals. pmei `2020-1`
+    and sld `IFIYW-3` keep their own set. No per-set code.
+  - Resolvers return the whole collision group (`resolveFooterGroup`,
+    `_resolve_footer_group`). Exactly one printing = added; several =
+    the cascade stops with `printing needs a choice` plus `choices`. A
+    unique printed alias with a twin is not a proof. The visual matcher may
+    not pick between twins (Scryfall's plst images are the original scans).
+  - Retro stage: 4 rows (0.855, 0.845, 0.865, 0.875) in one recognizer
+    call. `N/T` -> N, with the total checked against the set's highest
+    number. Years are rejected (also `2003/2010`). A bare `N/T` line needs
+    T >= 40. The added rows feed only this parser, never general footer
+    evidence. Validated numbers stay strong constraints for every later
+    stage and for pooled frames (expiring with their frame). Unreconciled
+    ones settle the card on the server (no per-card fallback).
+  - UI: a choice becomes a tray row "Choose printing" with
+    "<set> or <set>?". It opens the existing printing sheet with only the
+    candidates (images) and is never sent until picked. Auto dedupes it by
+    a stable key. Backend `POST /api/cardscan/choices`; /frame passes
+    `footer_ocr.choices` through.
+- Not done: a corner-symbol discriminator stage. Footer twins abstain to
+  the picker instead. A future stage would slot in before the picker,
+  without changing the contract.
+- Replay, 1364 saved frames:
+  - Client: matched 655 -> 601, wrong 2 -> 2 (pre-existing), 0 lost,
+    0 changed.
+  - Client gained 4: Tide Shaper MH2 394 from "2021 Wizards of the Coast
+    394".
+  - Client former hits that became choices (intended, every one a real
+    plst twin): 58 frames, from Chainer MH2 289 (23), Refuse to Yield
+    SNC 27 (17), Specimen Collector MH2 64 (10), Timeless Dragon MH2 35
+    (5) and Lonis MH2 204 (3).
+  - Client misses that became choices: 10 Twisted Image frames
+    (SOM 50 / plst SOM-50).
+  - Server (sidecar, serial): hits 524 -> 466. The 58 former hits all
+    became choices (the same five plst twins), 0 lost, 0 changed. 6
+    Twisted Image misses became choices. p50/p90 385/1053 -> 397/1289 ms.
+- Review: Astra, 4 rounds (`.hermes/audits/astra-r1..r4.md`). Ten
+  blockers were found and fixed, each with a regression test that fails
+  on the previous code. R4 verdict: SHIP.
+  - Caught: alias shortcut, retro choice overwritten by a later sweep, P/T
+    and rules digits from the new rows, `(c) 2003/2010`, a set-total
+    bypass, a stale picker request, retro constraints lost across stages,
+    frames and the per-card fallback, and shared-promise cancellation.
+- Suspect rows (added 2026-10-07 for printings that have a plst twin;
+  NOT changed): see the deploy report.
+- Next: a Windows scan round with List cards and originals mixed.
+  Measure how often the picker appears, and consider a bottom-left
+  corner-symbol stage if it is frequent.
+
 ## Known open items
 - Measure the new build on the PC and a phone (target < 1 s).
 - Targeted OCR-confusion handling (Icy Reception). The frame still
