@@ -206,15 +206,18 @@ test('R3-B1: retro-only constraints are kept (no other footer text) and veto lat
     assert.notEqual(res.ok, true, `frame ${k + 2}: ${JSON.stringify(res)}`);
   }
 });
-test('R3-S1: held numbers expire with their frame (evidence window)', async () => {
+test('R3-S1: held numbers expire with their frame (evidence window), not before', async () => {
   const rows = ['of the coast 80/303', 'of the coast 89/184'];
   const { drv, push } = scripted();
   push(() => 'damn', () => 'x', () => '', () => '', (n, b) => (b >= 2 ? rows[b - 2] : ''), () => '');
   const f = sharpFrame();
   await drv.r.read(f, small);
-  // Six more unresolved frames push the conflicting one out of the window.
-  for (let k = 0; k < 6; k++) { push(() => 'damn', () => 'x', () => 'x', () => 'x', () => 'x', () => 'x'); await drv.r.read(f, small); }
-  push(() => 'damn', ...Array.from({ length: 5 }, () => (n, b) => (b === 0 ? 'drc 089' : '')));
-  const res = (await drv.r.read(f, small)).results[0];
-  assert.equal(res.scryfallId, 'id-damn-drc', JSON.stringify(res));
+  // One weak '089' per frame: pooling may only prove DRC 89 after the
+  // conflicting frame has left the 6-frame window.
+  const weak = () => push(() => 'damn', ...Array.from({ length: 5 }, (_, k) => (n, b) => (k === 0 && b === 0 ? '089' : '')));
+  const out = [];
+  for (let k = 0; k < 8; k++) { weak(); out.push((await drv.r.read(f, small)).results[0]); }
+  const firstOk = out.findIndex(r => r.ok);
+  assert.ok(firstOk >= 5, `resolved too early (frame ${firstOk + 2}): the held conflict was dropped`);
+  assert.equal(out[firstOk].scryfallId, 'id-damn-drc', JSON.stringify(out.map(r => r.error || r.scryfallId)));
 });

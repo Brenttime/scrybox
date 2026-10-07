@@ -301,6 +301,7 @@ const choiceCache = new Map();   // twin-set key -> Promise<cards> (in flight or
 export function fetchChoices(choices, signal) {
   const ids = (choices || []).map(c => c.scryfallId || c.id);
   const key = [...ids].sort().join(',');
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
   let p = choiceCache.get(key);
   if (!p) {
     p = fetchChoicesOnce(ids);
