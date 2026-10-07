@@ -296,27 +296,34 @@ async function hydrateOnce(results, signal) {
 // Same deadline as hydration (covers the body too), and cached per twin set:
 // Auto re-sees the card every pass.
 const choiceCache = new Map();   // twin-set key -> Promise<cards> (in flight or done)
+// The shared request has its own deadline and no caller's signal; each
+// caller's own abort only ends ITS wait (review R3-S2).
 export function fetchChoices(choices, signal) {
   const ids = (choices || []).map(c => c.scryfallId || c.id);
   const key = [...ids].sort().join(',');
-  if (choiceCache.has(key)) return choiceCache.get(key);
-  const p = fetchChoicesOnce(ids, signal);
-  if (choiceCache.size >= 64) choiceCache.delete(choiceCache.keys().next().value);
-  choiceCache.set(key, p);
-  // Failures are not cached; overlapping callers share the one request.
-  p.catch(() => { if (choiceCache.get(key) === p) choiceCache.delete(key); });
-  return p;
+  let p = choiceCache.get(key);
+  if (!p) {
+    p = fetchChoicesOnce(ids);
+    if (choiceCache.size >= 64) choiceCache.delete(choiceCache.keys().next().value);
+    choiceCache.set(key, p);
+    // Failures are not cached; overlapping callers share the one request.
+    p.catch(() => { if (choiceCache.get(key) === p) choiceCache.delete(key); });
+  }
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
-async function fetchChoicesOnce(ids, signal) {
+async function fetchChoicesOnce(ids) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), HYDRATE_TIMEOUT_MS);
-  const onAbort = () => ctl.abort();
-  if (signal?.aborted) ctl.abort();
-  signal?.addEventListener('abort', onAbort, { once: true });
   try {
     const r = await fetch('/api/cardscan/choices', { signal: ctl.signal, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const j = await r.json().catch((e) => { if (e?.name === 'AbortError') throw e; return {}; });
     if (!r.ok || !j.ok || !Array.isArray(j.cards) || j.cards.length !== ids.length) throw new Error(j.error || 'choices failed');
     return j.cards;
-  } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
+  } finally { clearTimeout(timer); }
 }

@@ -183,3 +183,38 @@ test('R2-NEW-S1: a zero-padded copyright N/T (050/249) proves the footer', async
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.error, 'printing needs a choice', JSON.stringify(res));
 });
+
+// Astra review R3: held numbers are stored per frame (also with no other
+// footer text) and expire with their frame.
+// Script per recognizer call: title (1 call: exact, high confidence), then
+// footer stages first(6) tall(6) wide(4) retro(4) rescue(6).
+function scripted() {
+  const script = [];
+  const drv = reader((c, n, b) => (script[c - 1] ? script[c - 1](n, b) : ''));
+  return { drv, push: (...fns) => script.push(...fns) };
+}
+test('R3-B1: retro-only constraints are kept (no other footer text) and veto later frames of the same card', async () => {
+  const rows = ['of the coast 80/303', 'of the coast 89/184'];
+  const { drv, push } = scripted();
+  push(() => 'damn', () => '', () => '', () => '', (n, b) => (b >= 2 ? rows[b - 2] : ''), () => '');
+  const f = sharpFrame();
+  const first = (await drv.r.read(f, small)).results[0];
+  assert.deepEqual(first.held, ['80', '89']);
+  for (let k = 0; k < 2; k++) {
+    push(() => 'damn', ...Array.from({ length: 5 }, () => (n, b) => (b === 0 ? '089' : '')));
+    const res = (await drv.r.read(f, small)).results[0];
+    assert.notEqual(res.ok, true, `frame ${k + 2}: ${JSON.stringify(res)}`);
+  }
+});
+test('R3-S1: held numbers expire with their frame (evidence window)', async () => {
+  const rows = ['of the coast 80/303', 'of the coast 89/184'];
+  const { drv, push } = scripted();
+  push(() => 'damn', () => 'x', () => '', () => '', (n, b) => (b >= 2 ? rows[b - 2] : ''), () => '');
+  const f = sharpFrame();
+  await drv.r.read(f, small);
+  // Six more unresolved frames push the conflicting one out of the window.
+  for (let k = 0; k < 6; k++) { push(() => 'damn', () => 'x', () => 'x', () => 'x', () => 'x', () => 'x'); await drv.r.read(f, small); }
+  push(() => 'damn', ...Array.from({ length: 5 }, () => (n, b) => (b === 0 ? 'drc 089' : '')));
+  const res = (await drv.r.read(f, small)).results[0];
+  assert.equal(res.scryfallId, 'id-damn-drc', JSON.stringify(res));
+});

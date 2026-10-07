@@ -550,11 +550,17 @@ export function createReader(env) {
     // so a printing that needed its footer is re-read every time.
     if (nearEdge) { evidence = null; tracked = null; }
     else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
-    else if (result.title && (result.footer_ocr?.length || result.deferred)) {
-      const keep = prior && prior.name === result.title ? prior.frames : [];
-      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred),
-        rescued: !!result.rescued || !!(prior && prior.name === result.title && prior.rescued),
-        held: [...new Set([...(result.held || []), ...(prior && prior.name === result.title ? prior.held || [] : [])])] };
+    else if (result.title && (result.footer_ocr?.length || result.deferred || result.held?.length)) {
+      // Validated old-frame numbers are stored per frame, aligned with the
+      // frames window, so they expire with their own frame (review R3-S1)
+      // and are kept even when the frame read no other footer text (R3-B1).
+      const same = prior && prior.name === result.title;
+      const keep = same ? prior.frames : [];
+      const keepHeld = same ? prior.heldFrames || keep.map(() => []) : [];
+      evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr || []].slice(-EVIDENCE_KEEP),
+        heldFrames: [...keepHeld, result.held || []].slice(-EVIDENCE_KEEP), age: 0,
+        deferred: !!result.deferred || !!(same && prior.deferred),
+        rescued: !!result.rescued || !!(same && prior.rescued) };
     }
     return base;
   }
@@ -656,9 +662,14 @@ export function createReader(env) {
     if (pi != null && physicalTwins(ix, name, pi).length === 1) return done(pi, 'unique printed title', []);
 
     const raws = [];
-    const held = [];   // validated old-frame collector numbers (constraints)
+    const held = [];   // validated old-frame collector numbers read THIS frame
     let rescued = false;
     const pooled = prior && prior.name === name ? prior.frames : null;
+    // Earlier frames of this same tracked card (inside the evidence window)
+    // keep vetoing: a number validated on its copyright line a moment ago
+    // still contradicts any other footer read now (review R3).
+    const priorHeld = pooled ? [...new Set((prior.heldFrames || []).flat())] : [];
+    const veto = () => [...new Set([...held, ...priorHeld])];
     // Evidence pooled from a deferred frame only saw the first footer batch.
     // Pooling it must not settle the printing before this frame has run the
     // stages that frame skipped (wide can disambiguate what narrow misread).
@@ -676,7 +687,7 @@ export function createReader(env) {
       if (g == null) g = voteFooterGroup(ix, name, frames);
       // Rescue reads (this frame or a pooled one) never prove a printing that
       // another strong number on these frames contradicts.
-      const hold = [...new Set([...held, ...(prior.held || [])])];
+      const hold = veto();
       if (g != null && (rescued || prior.rescued || hold.length) && strongConflict(ix, name, g[0], all, hold)) { timings.rescue_conflict = 1; g = null; }
       return g == null ? null : settle(g, 'title+collector (multi-frame)', all, si);
     };
@@ -702,7 +713,7 @@ export function createReader(env) {
           // Always guarded: retro reads join everything earlier stages read,
           // and every validated retro number (also one its total filtered
           // out) vetoes any other footer.
-          if (g != null && strongConflict(ix, name, g[0], raws, held)) { timings.rescue_conflict = 1; g = null; }
+          if (g != null && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
           if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);
         }
         const pooledHit = tryPooled(si);
@@ -723,7 +734,7 @@ export function createReader(env) {
       // total check). Conflicting evidence means ambiguity, not a pick.
       // Holds for every later stage too: the rescue reads stay in raws.
       if (stage === 'rescue' || stage === 'tall') rescued = true;
-      if (g != null && (rescued || held.length) && strongConflict(ix, name, g[0], raws, held)) { timings.rescue_conflict = 1; g = null; }
+      if (g != null && (rescued || held.length || priorHeld.length) && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
       if (g != null) return settle(g, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
