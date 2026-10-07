@@ -19,7 +19,7 @@ import {
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
-  footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins,
+  footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 
 export const CORN_SIZE = 384;
@@ -182,12 +182,15 @@ const FOOTER_STAGES = [[0.88, 0.90, 0.92, 0.94, 0.86, 0.84], 'tall', 'wide', 're
 // number pair (review R1-B3: "lea 161 117" then a retro "117").
 // Compared on PHYSICAL footers (text.physicalKey): pi's footer twins are the
 // same evidence, never a conflict.
-export function strongConflict(ix, title, pi, raws) {
+// `held`: collector numbers validated on the old-frame copyright line
+// (retroLineNumber). They count as strong evidence everywhere, so a number
+// they name always vetoes a different footer (review R2-NEW-B1).
+export function strongConflict(ix, title, pi, raws, held = []) {
   const pool = ix.byTitle[title] || [];
   const ph = ix.phys;
   const twins = new Set(physicalTwins(ix, title, pi));
   const mine = ph[pi].num;
-  const strong = [...strongNumbers(raws).keys()];
+  const strong = [...strongNumbers(raws).keys(), ...held];
   const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbers(raws));
   for (const o of pool) {
     if (twins.has(o)) continue;
@@ -550,7 +553,8 @@ export function createReader(env) {
     else if (result.title && (result.footer_ocr?.length || result.deferred)) {
       const keep = prior && prior.name === result.title ? prior.frames : [];
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr].slice(-EVIDENCE_KEEP), age: 0, deferred: !!result.deferred || !!(prior && prior.name === result.title && prior.deferred),
-        rescued: !!result.rescued || !!(prior && prior.name === result.title && prior.rescued) };
+        rescued: !!result.rescued || !!(prior && prior.name === result.title && prior.rescued),
+        held: [...new Set([...(result.held || []), ...(prior && prior.name === result.title ? prior.held || [] : [])])] };
     }
     return base;
   }
@@ -652,6 +656,7 @@ export function createReader(env) {
     if (pi != null && physicalTwins(ix, name, pi).length === 1) return done(pi, 'unique printed title', []);
 
     const raws = [];
+    const held = [];   // validated old-frame collector numbers (constraints)
     let rescued = false;
     const pooled = prior && prior.name === name ? prior.frames : null;
     // Evidence pooled from a deferred frame only saw the first footer batch.
@@ -671,7 +676,8 @@ export function createReader(env) {
       if (g == null) g = voteFooterGroup(ix, name, frames);
       // Rescue reads (this frame or a pooled one) never prove a printing that
       // another strong number on these frames contradicts.
-      if (g != null && (rescued || prior.rescued) && strongConflict(ix, name, g[0], all)) { timings.rescue_conflict = 1; g = null; }
+      const hold = [...new Set([...held, ...(prior.held || [])])];
+      if (g != null && (rescued || prior.rescued || hold.length) && strongConflict(ix, name, g[0], all, hold)) { timings.rescue_conflict = 1; g = null; }
       return g == null ? null : settle(g, 'title+collector (multi-frame)', all, si);
     };
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
@@ -682,8 +688,9 @@ export function createReader(env) {
         const retroRaw = [];
         reads.forEach((r, ri) => {
           if (!r.text || r.conf < RETRO_CONF) return;
-          const n = retroLineNumber(r.text);
-          if (n) totals.set(n, Math.max(totals.get(n) || 0, retroLineTotal(r.text)));
+          const n0 = retroLineNumber(r.text);
+          const n = n0 && normalizeCollector(n0);   // '050/249' -> 50 (R2-NEW-S1)
+          if (n) { totals.set(n, Math.max(totals.get(n) || 0, retroLineTotal(r.text))); if (!held.includes(n)) held.push(n); }
           if (ri < RETRO_LEGACY_ROWS) raws.push(r.text); else retroRaw.push(r.text);
         });
         if (retroRaw.length) timings.retro_raw = retroRaw;
@@ -692,8 +699,10 @@ export function createReader(env) {
           // Two different trailing numbers is ambiguity (resolveFooterGroup
           // returns null for two physical footers). N/T carries its total.
           let g = resolveFooterGroup(ix, name, [], nums, totals);
-          // Always guarded: retro reads join everything earlier stages read.
-          if (g != null && strongConflict(ix, name, g[0], raws)) { timings.rescue_conflict = 1; g = null; }
+          // Always guarded: retro reads join everything earlier stages read,
+          // and every validated retro number (also one its total filtered
+          // out) vetoes any other footer.
+          if (g != null && strongConflict(ix, name, g[0], raws, held)) { timings.rescue_conflict = 1; g = null; }
           if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);
         }
         const pooledHit = tryPooled(si);
@@ -714,7 +723,7 @@ export function createReader(env) {
       // total check). Conflicting evidence means ambiguity, not a pick.
       // Holds for every later stage too: the rescue reads stay in raws.
       if (stage === 'rescue' || stage === 'tall') rescued = true;
-      if (g != null && rescued && strongConflict(ix, name, g[0], raws)) { timings.rescue_conflict = 1; g = null; }
+      if (g != null && (rescued || held.length) && strongConflict(ix, name, g[0], raws, held)) { timings.rescue_conflict = 1; g = null; }
       if (g != null) return settle(g, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
@@ -729,7 +738,7 @@ export function createReader(env) {
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and

@@ -163,3 +163,23 @@ test('R1-B5: an N/T copyright line still resolves in a set that runs to #T', asy
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.scryfallId, 'id-damn-mh2', JSON.stringify(res));
 });
+
+// Astra review R2: validated old-frame numbers stay constraints for later
+// stages; padded N/T normalizes; a total belongs to its own number.
+test('R2-NEW-B1: a validated retro number vetoes a later different footer (80/303 + 89/184, then drc 089)', async () => {
+  const rows = ['of the coast 80/303', 'of the coast 89/184'];
+  const { r } = reader((c, n, b) => (c === 1 ? 'damn' : c === 5 && n === 4 && b >= 2 ? rows[b - 2] : c === 6 ? 'drc 089' : 'zz'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(res.ok, true, JSON.stringify(res));
+});
+test('R2-NEW-B1: a total-filtered retro number still conflicts inside the retro stage (80/505 + 89/184)', async () => {
+  const rows = ['of the coast 80/505', 'of the coast 89/184'];
+  const { r } = reader((c, n, b) => (c === 1 ? 'damn' : c === 5 && n === 4 && b >= 2 ? rows[b - 2] : 'zz'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(res.ok, true, JSON.stringify(res));
+});
+test('R2-NEW-S1: a zero-padded copyright N/T (050/249) proves the footer', async () => {
+  const { r } = reader((c, n, b) => (c === 1 ? 'twisted image' : c === 5 && n === 4 && b >= 2 ? 'of the coast 050/249' : 'zz'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.equal(res.error, 'printing needs a choice', JSON.stringify(res));
+});

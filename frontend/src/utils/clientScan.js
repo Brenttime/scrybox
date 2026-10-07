@@ -295,11 +295,19 @@ async function hydrateOnce(results, signal) {
 // Card rows for footer twins the reader could not split (printing picker).
 // Same deadline as hydration (covers the body too), and cached per twin set:
 // Auto re-sees the card every pass.
-const choiceCache = new Map();
-export async function fetchChoices(choices, signal) {
+const choiceCache = new Map();   // twin-set key -> Promise<cards> (in flight or done)
+export function fetchChoices(choices, signal) {
   const ids = (choices || []).map(c => c.scryfallId || c.id);
   const key = [...ids].sort().join(',');
   if (choiceCache.has(key)) return choiceCache.get(key);
+  const p = fetchChoicesOnce(ids, signal);
+  if (choiceCache.size >= 64) choiceCache.delete(choiceCache.keys().next().value);
+  choiceCache.set(key, p);
+  // Failures are not cached; overlapping callers share the one request.
+  p.catch(() => { if (choiceCache.get(key) === p) choiceCache.delete(key); });
+  return p;
+}
+async function fetchChoicesOnce(ids, signal) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), HYDRATE_TIMEOUT_MS);
   const onAbort = () => ctl.abort();
@@ -309,8 +317,6 @@ export async function fetchChoices(choices, signal) {
     const r = await fetch('/api/cardscan/choices', { signal: ctl.signal, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const j = await r.json().catch((e) => { if (e?.name === 'AbortError') throw e; return {}; });
     if (!r.ok || !j.ok || !Array.isArray(j.cards) || j.cards.length !== ids.length) throw new Error(j.error || 'choices failed');
-    if (choiceCache.size >= 64) choiceCache.delete(choiceCache.keys().next().value);
-    choiceCache.set(key, j.cards);
     return j.cards;
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); }
 }
