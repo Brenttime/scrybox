@@ -46,11 +46,19 @@ export function quadPath(cand, { s, ox, oy }) {
 //     different outcome starts over (nextEdgeRun).
 export const NO_TITLE_ESCAPE = 4;
 export const EDGE_ESCAPE = 8;
+// Auto pass on a reprint-sheet / Mystery Booster title (res.sheet_like) whose
+// printing the phone could not prove yet: no, for SHEET_ESCAPE passes in a
+// row. The proof for these cards is the List stamp or the copyright-line
+// number, both read on-device; 2026-10-08 telemetry: every server fallback
+// on them (Hatchet Bully, Smokestack, Chain of Smog, Hullbreacher) failed and
+// cost ~2.2 s, while the next local frame proved the card. The server still
+// gets one try after SHEET_ESCAPE misses.
+export const SHEET_ESCAPE = 4;
 export function isEdgePartial(out) {
   const res = out?.results?.[0];
   return !!(res && !res.ok && res.near_edge_partial);
 }
-export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
+export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0, sheetRun = 0 }) {
   if (!out || out.error) return true;
   const cand = out.candidates?.[0];
   const res = out.results?.[0];
@@ -61,6 +69,7 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0 }) {
     if (res.deferred) return false;
     if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
     if (res.near_edge_partial && edgeRun < EDGE_ESCAPE) return false;
+    if (res.sheet_like && res.title && sheetRun < SHEET_ESCAPE) return false;
   }
   if (res) return !res.ok;
   if (!cand || !cand.eligible) return !autoPass;

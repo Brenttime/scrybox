@@ -81,7 +81,9 @@ function threadOverride() {
 //   scan.titleGate   skip the title rescue batch when every first crop is flat
 export function scanFlags() {
   const on = (k) => { try { return localStorage.getItem(k) === '1'; } catch { return false; } };
-  return { fastSettle: on('scan.fastSettle'), titleGate: on('scan.titleGate') };
+  // '1' on, '0' off, unset: the worker's default.
+  const tri = (k) => { try { const v = localStorage.getItem(k); return v === '1' ? true : v === '0' ? false : null; } catch { return null; } };
+  return { fastSettle: on('scan.fastSettle'), titleGate: on('scan.titleGate'), retroFirst: tri('scan.retroFirst') };
 }
 function assetBase() {
   return isNative ? getServerUrl() : '';

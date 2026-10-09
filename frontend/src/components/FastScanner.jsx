@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -140,6 +140,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const onDeviceRef = useRef(false);
   const edgeRunRef = useRef(null);   // consecutive near-edge partials, same place
   const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
+  const sheetRunRef = useRef(0);     // consecutive unproven reprint-sheet (List/MB2) reads
 
   const [service, setService] = useState(null);
   const [devices, setDevices] = useState([]);
@@ -410,10 +411,21 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const r0 = local?.results?.[0];
         if (autoPass && r0 && !r0.ok && r0.error === 'no confident card title') noTitleRunRef.current++;
         else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') noTitleRunRef.current = 0;
+        // Unproven reprint-sheet title: count local misses (deferred first
+        // looks included) toward the bounded server escape.
+        if (autoPass && r0 && !r0.ok && r0.sheet_like && r0.title) sheetRunRef.current++;
+        else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') sheetRunRef.current = 0;
         // A settling pass says nothing new about the edge: keep the run. Any
         // other outcome (moving included) goes through nextEdgeRun and resets it.
         if (local?.candidates?.[0]?.status !== 'settling') edgeRunRef.current = nextEdgeRun(edgeRunRef.current, local);
-        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0 })) {
+        // A reprint-sheet title still unproven after SHEET_ESCAPE local passes:
+        // the server has never split these (2026-10-08/09 telemetry, 0 of
+        // ~120 tries), so offer the title's printings as a one-tap picker.
+        if (autoPass && r0 && !r0.ok && r0.sheet_like && r0.title_choices?.length > 1 && sheetRunRef.current >= SHEET_ESCAPE) {
+          local = { ...local, results: local.results.map((x, i) => (i === 0 ? { ...x, retry: false, error: 'printing needs a choice', choices: x.title_choices, via: 'title (printing picker)' } : x)) };
+          tel.set({ sheet_picker: true });
+        }
+        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0, sheetRun: sheetRunRef.current })) {
           // Auto: a proven card goes into the tray at once as a PENDING row
           // (not sendable) while /cards hydrates it in the background, so the
           // loop keeps capturing (R2-#13). Already-hydrated ids and shutter
@@ -448,7 +460,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!stale()) setHint(t('fastscan.hintFooter'));
         tel.end({ outcome: 'held' });
         return { held: true };
-      } else { noTitleRunRef.current = 0; edgeRunRef.current = null; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
+      } else { noTitleRunRef.current = 0; sheetRunRef.current = 0; edgeRunRef.current = null; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
       // Stopped or navigated away while this was in flight: drop it on the floor.
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
@@ -588,7 +600,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; presRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; presRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };

@@ -21,6 +21,7 @@ import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
   footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
+import { readListStamp, STAMP_RECT } from './stamp.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -95,6 +96,16 @@ export function flatTitleCrops(cands, ranges) {
   return !cands.length && ranges.length > 0 && ranges.every(r => Number.isFinite(r) && r < TITLE_MIN_RANGE);
 }
 const REC_BATCH = 6;                // RapidOCR rec_batch_num
+// Margin above stamp.mjs's 'present' thresholds, required for every use of a
+// present stamp. Every stamped webcam frame of 2026-10-07 scored >= 0.69 /
+// 1.19; the only non-List 'present' in 670 saved frames (a blurred,
+// hand-covered quad) scored 0.65 / 0.98.
+const STAMP_SOLO = Object.freeze({ ncc: 0.66, contrast: 1.10 });
+// Sets whose cards may carry a planeswalker stamp under their OWN collector
+// numbers (not '<SET>-<N>'): Mystery Booster playtest cards, The List
+// (Unfinity foil), MB2 and Mystery Booster Commander. The footer-free stamp
+// exit never fires when a title has a printing here.
+const STAMP_OWN_NUMBERING = new Set(['cmb1', 'cmb2', 'ulst', 'mb2', 'mbc']);
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
 // A same-frame correction, never more than the stillness tolerance: a
@@ -216,7 +227,14 @@ const RETRO_ALL_ROWS = [0.855, 0.845, 0.865, 0.875];
 // R1-B3: two '7/5' P/T reads from the new rows proved Grief H2R #7).
 const RETRO_LEGACY_ROWS = 2;
 export function retroLineNumber(text) {
-  if (looksLikeCopyright(text)) return retroNumber(text);
+  if (looksLikeCopyright(text)) {
+    // Old copyright lines end in the collector number, which OCR sometimes
+    // reads twice with no gap ('Inc.143143', 2026-10-09 Terrain Generator,
+    // 6 frames). An exact doubled 3-digit run is that number once.
+    const dup = /(?<!\d)(\d{3})\1\s*$/.exec(String(text).trim());
+    if (dup) return dup[1];
+    return retroNumber(text);
+  }
   const nt = /(?<![\d/])(\d{1,3})\s*\/\s*(\d{2,3})\s*$/.exec(String(text).trim());
   if (nt && Number(nt[2]) >= 40 && Number(nt[1]) >= 1 && Number(nt[1]) <= Number(nt[2])) return String(Number(nt[1]));
   return null;
@@ -646,8 +664,32 @@ export function createReader(env) {
     // that footer (a reprint sheet such as The List / MB2 next to its
     // original) -> the footer cannot decide, and no later footer stage can
     // either. The cascade stops and the user picks; never a guess.
+    // The List / MB2 stamp (stamp.mjs), read at most once per frame and only
+    // for a title with a reprint-sheet printing. Only a PRESENT stamp is
+    // evidence: a stamp that is not seen may be covered, glared or outside
+    // the crop (review R1-B1), so 'absent' never selects anything.
+    let stamp;
+    const listStamp = () => {
+      if (stamp !== undefined) return stamp;
+      stamp = null;
+      if (env.listStamp === false || !quad) return stamp;
+      const mq = cardToFrame(quad);
+      if (!stripInFrame(mq, STAMP_RECT, w, h)) return stamp;
+      const ts = now();
+      const st = (env.stampReader || readListStamp)(rgba, w, h, mq);
+      const strong = st.verdict === 'present' && st.ncc >= STAMP_SOLO.ncc && st.contrast >= STAMP_SOLO.contrast;
+      stamp = { ...st, present: strong };
+      timings.stamp = { v: st.verdict, strong, ncc: Math.round(st.ncc * 100) / 100, c: Math.round(st.contrast * 100) / 100, s: st.sharp, ms: Math.round(now() - ts) };
+      return stamp;
+    };
+    const ph = ix.phys;
+    const sheetOf = (g) => g.filter(o => ph[o].sheet);
+    // Footer twins (an original and its reprint-sheet copy) with a strong
+    // present stamp: the sheet printing, if the group has exactly one.
     const settle = (group, via, footer, stage = -1) => {
       if (group.length === 1) return done(group[0], via, footer, stage);
+      const sheet = sheetOf(group);
+      if (sheet.length === 1 && sheet.length < group.length && listStamp()?.present) return done(sheet[0], `${via} + list stamp`, footer, stage);
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
       return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage,
         choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
@@ -691,31 +733,74 @@ export function createReader(env) {
       if (g != null && (rescued || prior.rescued || hold.length) && strongConflict(ix, name, g[0], all, hold)) { timings.rescue_conflict = 1; g = null; }
       return g == null ? null : settle(g, 'title+collector (multi-frame)', all, si);
     };
+    // The copyright-line (retro) stage, callable early for reprint-sheet
+    // titles on the first look (see below) and in its normal place.
+    let retroDone = false;
+    const retroStage = async (si) => {
+      retroDone = true;
+      const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025]), 'retro'));
+      if (truncated) return null;
+      const totals = new Map();
+      const retroRaw = [];
+      reads.forEach((r, ri) => {
+        if (!r.text || r.conf < RETRO_CONF) return;
+        const n0 = retroLineNumber(r.text);
+        const n = n0 && normalizeCollector(n0);   // '050/249' -> 50 (R2-NEW-S1)
+        if (n) { totals.set(n, Math.max(totals.get(n) || 0, retroLineTotal(r.text))); if (!held.includes(n)) held.push(n); }
+        if (ri < RETRO_LEGACY_ROWS) raws.push(r.text); else retroRaw.push(r.text);
+      });
+      if (retroRaw.length) timings.retro_raw = retroRaw;
+      const nums = [...totals.keys()];
+      if (nums.length) {
+        // Two different trailing numbers is ambiguity (resolveFooterGroup
+        // returns null for two physical footers). N/T carries its total.
+        let g = resolveFooterGroup(ix, name, [], nums, totals);
+        // Always guarded: retro reads join everything earlier stages read,
+        // and every validated retro number (also one its total filtered
+        // out) vetoes any other footer.
+        if (g != null && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
+        if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);
+      }
+      return null;
+    };
+    // A title with a reprint-sheet or Mystery Booster printing (plst '<SET>-N',
+    // or a set that stamps under its own numbering such as mb2).
+    const sheetLike = (ix.byTitle[name] || []).some(o => ph[o].sheet || STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
+    // A printing under its own Mystery Booster numbering (mb2 232): its only
+    // number is on the copyright line, so that line is the useful read. A
+    // List-only title ('<SET>-N') is split by the stamp, not by the number
+    // (its copyright number names the original/List twin pair either way).
+    const ownNumbered = (ix.byTitle[name] || []).some(o => STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
+    // Reprint-sheet titles with a short printing list: hand the caller the
+    // full list so it can offer a one-tap picker instead of stalling (the
+    // title is proven; only the printing is not). Never auto-picked.
+    const titleChoices = sheetLike && (ix.byTitle[name] || []).length <= 10
+      ? ix.byTitle[name].map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }) : undefined;
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
-      if (stage === 'retro') {
-        const reads = await recognize(env, strips(RETRO_ROWS.map(y => [0.35, 0.95, y, y + 0.025]), 'retro'));
-        if (truncated) return partial({ title: name, footer_ocr: raws });
-        const totals = new Map();
-        const retroRaw = [];
-        reads.forEach((r, ri) => {
-          if (!r.text || r.conf < RETRO_CONF) return;
-          const n0 = retroLineNumber(r.text);
-          const n = n0 && normalizeCollector(n0);   // '050/249' -> 50 (R2-NEW-S1)
-          if (n) { totals.set(n, Math.max(totals.get(n) || 0, retroLineTotal(r.text))); if (!held.includes(n)) held.push(n); }
-          if (ri < RETRO_LEGACY_ROWS) raws.push(r.text); else retroRaw.push(r.text);
-        });
-        if (retroRaw.length) timings.retro_raw = retroRaw;
-        const nums = [...totals.keys()];
-        if (nums.length) {
-          // Two different trailing numbers is ambiguity (resolveFooterGroup
-          // returns null for two physical footers). N/T carries its total.
-          let g = resolveFooterGroup(ix, name, [], nums, totals);
-          // Always guarded: retro reads join everything earlier stages read,
-          // and every validated retro number (also one its total filtered
-          // out) vetoes any other footer.
-          if (g != null && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
-          if (g != null) return settle(g, 'title+collector (retro frame)', raws, si);
+      // Second look at a reprint-sheet title whose footer rows have shown no
+      // digit on any frame: its number can only be on the copyright line
+      // (MB2 / 1997-2008 frames). Read that line before tall/wide. Same retro
+      // rules and vetoes; on a miss the normal order continues. 2026-10-09
+      // CDP bench: Smokestack spent ~0.45 s in tall+wide that never read a
+      // digit. Modern footers print digits in these rows, so they keep the
+      // v1 order (review R1-B4: Damn drc 89 vs mh2 80). Own-numbered (mb2)
+      // titles take it also without a pooled frame: a card that follows a
+      // deferred read is read with every stage at once (Smokestack 1.03 s,
+      // 5 calls, hand-held 2026-10-09).
+      if (si === 1 && !retroDone && (ownNumbered || (sheetLike && pooled && ![...pooled.flat(), ...raws].some(t => /\d/.test(t))))) {
+        const ri = stageList.indexOf('retro');
+        if (ri > 0) {
+          timings.retro_early = 1;
+          const hit = await retroStage(ri);
+          if (truncated) return partial({ title: name, footer_ocr: raws });
+          if (hit) return hit;
         }
+      }
+      if (stage === 'retro') {
+        if (retroDone) continue;
+        const hit = await retroStage(si);
+        if (truncated) return partial({ title: name, footer_ocr: raws });
+        if (hit) return hit;
         const pooledHit = tryPooled(si);
         if (pooledHit) return pooledHit;
         continue;
@@ -738,18 +823,58 @@ export function createReader(env) {
       if (g != null) return settle(g, 'title+set+collector', raws, si);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
+      // Title + strong stamp after the first footer batch did not resolve:
+      // the title's single reprint-sheet printing, without the deep (old
+      // frame) stages. Only when nothing read so far points elsewhere: no
+      // number this frame or a pooled frame read names another printing's
+      // footer, and no validated copyright-line number (review R1-B3). A
+      // printing that carries the stamp under its own numbering (cmb1 97 vs
+      // plst MKM-170, R1-B2) prints a different number, which the first
+      // batch reads on those modern frames; then this exit stays closed.
+      if (si === 0) {
+        const pool = ix.byTitle[name] || [];
+        const sheet = sheetOf(pool);
+        // Every OTHER printing of the title must be one that cannot carry the
+        // stamp: products that stamp cards under their own numbering
+        // (playtest cmb1/cmb2, ulst, mb2, mbc; review R1-B2) close the exit.
+        const stampable = pool.some(o => o !== sheet[0] && STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
+        if (sheet.length === 1 && !stampable && listStamp()?.present) {
+          const all = pooled ? [...pooled.flat(), ...raws] : raws;
+          const mine = ph[sheet[0]];
+          const nums = new Set([...footerNumbers(all), ...strongNumbers(all).keys()].map(normalizeCollector));
+          const other = pool.some(o => o !== sheet[0] && nums.has(ph[o].num) && ph[o].num !== mine.num);
+          const held2 = veto();
+          if (!other && !held2.some(n => n !== mine.num) && !strongConflict(ix, name, sheet[0], all, held2)) return done(sheet[0], 'title + list stamp', all, si);
+          timings.stamp_blocked = 1;
+        }
+      }
       // Auto, first look at this card: the deep stages (wide, retro) cost
       // ~0.9 s and on a frame this fresh usually fail too (Windows telemetry:
       // Refute Destiny, Marwyn). Stop here; this frame's footer reads are
       // pooled, and the next still frame of the same card continues with them
       // and runs every stage.
       if (auto && !pooled && si === 0) {
+        // env.retroFirst (default on at >= 4 ORT threads, see the worker): a
+        // title with an own-numbered (mb2) printing reads its copyright line on
+        // the first look. Not List-only titles: 2026-10-09 hand-held runs, it
+        // cost Fire Servant / Woodland Changeling ~0.25 s per first frame and
+        // never proved them (the stamp does).
+        // 2026-10-09 CDP bench, 4 threads: Smokestack 1.35 s -> 0.63-0.83 s.
+        if (env.retroFirst && ownNumbered && !retroDone) {
+          const ri = stageList.indexOf('retro');
+          if (ri > 0) {
+            timings.retro_first = 1;
+            const hit = await retroStage(ri);
+            if (truncated) return partial({ title: name, footer_ocr: raws });
+            if (hit) return hit;
+          }
+        }
         timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw };
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined };
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and
