@@ -140,6 +140,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   const onDeviceRef = useRef(false);
   const edgeRunRef = useRef(null);   // consecutive near-edge partials, same place
   const noTitleRunRef = useRef(0);   // consecutive auto passes with unreadable title OCR
+  const titledRunRef = useRef(0);    // consecutive titled-but-unproven reads
   const sheetRunRef = useRef(0);     // consecutive unproven reprint-sheet (List/MB2) reads
 
   const [service, setService] = useState(null);
@@ -413,6 +414,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') noTitleRunRef.current = 0;
         // Unproven reprint-sheet title: count local misses (deferred first
         // looks included) toward the bounded server escape.
+        if (autoPass && r0 && !r0.ok && r0.title && r0.error === 'exact printing not resolved') titledRunRef.current++;
+        else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') titledRunRef.current = 0;
         if (autoPass && r0 && !r0.ok && r0.sheet_like && r0.title) sheetRunRef.current++;
         else if (!local?.error && local?.candidates?.[0]?.status !== 'settling' && local?.candidates?.[0]?.status !== 'moving') sheetRunRef.current = 0;
         // A settling pass says nothing new about the edge: keep the run. Any
@@ -425,7 +428,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
           local = { ...local, results: local.results.map((x, i) => (i === 0 ? { ...x, retry: false, error: 'printing needs a choice', choices: x.title_choices, via: 'title (printing picker)' } : x)) };
           tel.set({ sheet_picker: true });
         }
-        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0, sheetRun: sheetRunRef.current })) {
+        if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0, sheetRun: sheetRunRef.current, titledRun: titledRunRef.current })) {
           // Auto: a proven card goes into the tray at once as a PENDING row
           // (not sendable) while /cards hydrates it in the background, so the
           // loop keeps capturing (R2-#13). Already-hydrated ids and shutter
@@ -460,7 +463,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (!stale()) setHint(t('fastscan.hintFooter'));
         tel.end({ outcome: 'held' });
         return { held: true };
-      } else { noTitleRunRef.current = 0; sheetRunRef.current = 0; edgeRunRef.current = null; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
+      } else { noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; edgeRunRef.current = null; out = await serverRead((async () => (onDeviceRef.current && await Promise.resolve(lastFrameJpeg()).catch(() => null)) || grabJpeg(source, sw, sh, canvasRef))()); }
       // Stopped or navigated away while this was in flight: drop it on the floor.
       if (stale()) { tel.end({ outcome: 'stale' }); return { busy: true }; }
       if (out.busy) { tel.end({ outcome: 'busy' }); return out; }
@@ -600,7 +603,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; presRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; presRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };

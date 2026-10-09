@@ -345,7 +345,7 @@ test('first look: a reprint-sheet title is flagged sheet_like on deferral (serve
 test('needsServer: an unproven reprint-sheet title stays on-device for SHEET_ESCAPE auto passes', () => {
   const out = { candidates: [{ eligible: true }], results: [{ ok: false, error: 'exact printing not resolved', title: 'smokestack', sheet_like: true }] };
   assert.equal(needsServer(out, { autoPass: true, sheetRun: 1 }), false);
-  assert.equal(needsServer(out, { autoPass: true, sheetRun: 4 }), true);
+  assert.equal(needsServer(out, { autoPass: true, sheetRun: 4, titledRun: 6 }), true);
   assert.equal(needsServer(out, { autoPass: false, sheetRun: 1 }), true);
 });
 
@@ -383,4 +383,23 @@ test('second look: a non-sheet title keeps the v1 stage order (tall before retro
   await r.read(sharpFrame(), small, { requireStill: true });
   const res = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
   assert.equal(res.ok, false); assert.ok(calls() >= 6, `calls ${calls()}`);
+});
+
+test('a title that starts a longer title never proves its unique printing alone (Mind / Mind Roots)', async () => {
+  const { loadIndex, uniqueTitlePrinting } = await import('../../../shared/clientScan/text.mjs');
+  const idx = loadIndex({ names: ['mind', 'mind roots', 'flicker', 'flickering hound', 'growth curve'], canon: {}, excluded: [], sets: ['akh', 'sos', 'uds', 'gtc'],
+    printings: [['id-mind', 'akh', '219'], ['id-roots', 'sos', '203'], ['id-flicker', 'uds', '9'], ['id-hound', 'gtc', '50'], ['id-gc', 'sos', '193']],
+    byTitle: { mind: [0], 'mind roots': [1], flicker: [2], 'flickering hound': [3], 'growth curve': [4] }, uniqueAlias: {} });
+  assert.equal(uniqueTitlePrinting(idx, 'mind'), null);
+  assert.equal(uniqueTitlePrinting(idx, 'flicker'), null);
+  assert.equal(uniqueTitlePrinting(idx, 'mind roots'), 1);
+  assert.equal(uniqueTitlePrinting(idx, 'growth curve'), 4);
+});
+
+test('needsServer: a titled but unproven card stays on-device for TITLED_ESCAPE auto passes', async () => {
+  const { TITLED_ESCAPE } = await import('./fastScan.js');
+  const out = { candidates: [{ eligible: true }], results: [{ ok: false, error: 'exact printing not resolved', title: 'suspend aggression' }] };
+  assert.equal(needsServer(out, { autoPass: true, titledRun: 1 }), false);
+  assert.equal(needsServer(out, { autoPass: true, titledRun: TITLED_ESCAPE }), true);
+  assert.equal(needsServer(out, { autoPass: false, titledRun: 1 }), true, 'shutter presses still ask the server');
 });

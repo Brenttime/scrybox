@@ -126,8 +126,18 @@ export function loadIndex(raw) {
     const k = phys[i];
     if (k.set !== p[1] && /^\d+$/.test(k.num)) setMax.set(k.set, Math.max(setMax.get(k.set) || 0, Number(k.num)));
   }
+  // Titles that are the start of a longer title ('mind' -> 'mind roots',
+  // 'flicker' -> 'flickering hound'). A clipped or half-covered title reads
+  // as the shorter card, so such a title never proves a printing alone.
+  const sorted = [...names].sort();
+  const prefixOfLonger = new Set();
+  for (let i = 0; i + 1 < sorted.length; i++) {
+    for (let j = i + 1; j < sorted.length && sorted[j].startsWith(sorted[i]); j++) {
+      if (sorted[j].length > sorted[i].length) { prefixOfLonger.add(sorted[i]); break; }
+    }
+  }
   return {
-    names, nameIx, canonOf, setMax, phys,
+    names, nameIx, canonOf, setMax, phys, prefixOfLonger,
     excluded: new Set(raw.excluded),
     sets: raw.sets,
     setRank: new Map(raw.sets.map((c, i) => [c, i])),
@@ -225,6 +235,10 @@ export function findCardByOcrUncached(ix, text, threshold = NAME_MATCH_MIN) {
 }
 
 export function uniqueTitlePrinting(ix, title) {
+  // 2026-10-09 iPhone: 'Mind Roots' read as 'Mind' -> added akh 219; the
+  // 2026-09-26 frames: half-covered 'Flickering Hound' -> Flicker UDS 9.
+  // A prefix title needs its footer like any multi-printing title.
+  if (ix.prefixOfLonger?.has(title)) return null;
   const m = ix.byTitle[title];
   return m && m.length === 1 ? m[0] : null;
 }
