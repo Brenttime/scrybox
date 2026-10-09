@@ -24,6 +24,13 @@ function pickThreads(override) {
   const n = Number(override);
   if (n >= 1 && n <= 8) return Math.floor(n);
   const cores = self.navigator?.hardwareConcurrency || 1;
+  // 2026-10-09 live A/B on the 16-core Windows PC (same Smokestack, CDP-driven,
+  // 3 runs each): 2 threads 1.95-2.16 s to added, 4 threads 1.35-1.52 s,
+  // 8 threads 1.32-1.52 s. Deep footer stage 1.23 s -> 0.76 s.
+  // Same bench: with 4 threads, reading the copyright line on the FIRST look
+  // (retroFirst, the default at >= 4 threads) took Smokestack to 0.63-0.83 s.
+  // At 2 threads it made first looks 1-2 s (scanspeed4), so it stays off there.
+  if (cores >= 8) return 4;
   return cores >= 4 ? 2 : 1;
 }
 ort.env.wasm.numThreads = 1;
@@ -79,7 +86,7 @@ async function load() {
   ]);
   const index = loadIndex(JSON.parse(await gunzip(indexGz)));
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
-  const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate });
+  const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate, retroFirst: FLAGS.retroFirst ?? ort.env.wasm.numThreads >= 4 });
   // Which assets this worker actually runs, for scan telemetry: rules out a
   // stale cached index/model when live and replay disagree.
   const info = { index: manifest.index, rec: manifest.rec, cornBytes: cornBytes.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false };

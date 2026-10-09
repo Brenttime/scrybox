@@ -81,7 +81,7 @@ test('old-frame copyright line: the collector number is N of a trailing N/T, nev
 });
 
 // Pipeline with a fake recognizer: text per recognizer call.
-function reader(textFor) {
+function reader(textFor, extra = {}) {
   const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
   const cornelius = { run: async () => ({ corners: { data: [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] }, sharpness: { data: [0.9] } }) };
   const chars = ['', ...'abcdefghijklmnopqrstuvwxyz0123456789/ ©'];
@@ -98,7 +98,7 @@ function reader(textFor) {
       return { y: { data, dims: [n, steps, classes] } };
     },
   };
-  return { r: createReader({ ort, cornelius, rec, chars, index: ix(), refineCorners: false, clock: () => 0 }), calls: () => calls };
+  return { r: createReader({ ort, cornelius, rec, chars, index: ix(), refineCorners: false, clock: () => 0, listStamp: false, ...extra }), calls: () => calls };
 }
 function sharpFrame(w = 200, h = 280) {
   const data = new Uint8ClampedArray(w * h * 4);
@@ -220,4 +220,167 @@ test('R3-S1: held numbers expire with their frame (evidence window), not before'
   const firstOk = out.findIndex(r => r.ok);
   assert.ok(firstOk >= 5, `resolved too early (frame ${firstOk + 2}): the held conflict was dropped`);
   assert.equal(out[firstOk].scryfallId, 'id-damn-drc', JSON.stringify(out.map(r => r.error || r.scryfallId)));
+});
+
+// ---- The List / MB2 stamp (2026-10-07 speed round) ----
+// Real webcam crops of the bottom-left corner (80x100 gray, card space) from
+// Brent's Windows session: two stamped List cards, two unstamped cards, and
+// a hand-blurred stamped frame that must NOT be called absent.
+import fs from 'node:fs';
+import { stampScores, stampVerdict, cropSharpness } from '../../../shared/clientScan/stamp.mjs';
+const CROPS = JSON.parse(fs.readFileSync(new URL('./fixtures/list-stamp-crops.json', import.meta.url), 'utf8'));
+const verdictOf = (c) => { const g = Float32Array.from(c.g); return stampVerdict({ ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) }); };
+
+test('list stamp: real webcam corners read present / absent, a blurred one never absent', () => {
+  assert.equal(verdictOf(CROPS.present_hatchet), 'present');
+  assert.equal(verdictOf(CROPS.present_smog), 'present');
+  assert.equal(verdictOf(CROPS.absent_smokestack), 'absent');
+  assert.equal(verdictOf(CROPS.absent_hull), 'absent');
+  assert.notEqual(verdictOf(CROPS.unknown_blur_smog), 'absent');
+  // A flat (featureless) corner proves nothing.
+  assert.equal(stampVerdict({ ...stampScores(new Float32Array(8000).fill(40), 80, 100), sharp: 0 }), 'unknown');
+});
+
+const stampAs = (verdict, ncc = 0.78, contrast = 1.4) => () => ({ verdict, ncc, contrast, sharp: 90 });
+
+test('pipeline: footer twins + a strong present stamp -> the List printing; absent or weak keeps the picker', async () => {
+  const p = reader((c) => (c === 1 ? 'diabolic tutor' : '129/350 c'), { listStamp: true, stampReader: stampAs('present') });
+  const rp = (await p.r.read(sharpFrame(), small)).results[0];
+  assert.equal(rp.ok, true, JSON.stringify(rp)); assert.equal(rp.scryfallId, 'id-plst-ody');
+  // R1-B1: a stamp that is not seen (covered, glare, cropped) is no proof
+  // of the original: absent never selects.
+  for (const st of [stampAs('absent', 0.2, 0.3), stampAs('unknown', 0.55, 0.7), stampAs('present', 0.62, 0.95)]) {
+    const u = reader((c) => (c === 1 ? 'diabolic tutor' : '129/350 c'), { listStamp: true, stampReader: st });
+    const ru = (await u.r.read(sharpFrame(), small)).results[0];
+    assert.equal(ru.error, 'printing needs a choice', JSON.stringify(ru));
+  }
+});
+
+test('pipeline: title + a strong stamp names the single List printing after one footer batch', async () => {
+  // Twisted Image: som 50, plst SOM-50, a25 75. Old code needed retro (5 calls).
+  const t = reader((c) => (c === 1 ? 'twisted image' : 'zz'), { listStamp: true, stampReader: stampAs('present') });
+  const rt = (await t.r.read(sharpFrame(), small)).results[0];
+  assert.equal(rt.ok, true, JSON.stringify(rt)); assert.equal(rt.scryfallId, 'id-plst-som');
+  assert.equal(rt.via, 'title + list stamp');
+  assert.equal(t.calls(), 2, 'title + first footer batch only');
+  // Weak present, absent, unknown: no shortcut.
+  for (const st of [stampAs('present', 0.62, 0.95), stampAs('absent', 0.2, 0.3), stampAs('unknown', 0.5, 0.6)]) {
+    const w = reader((c) => (c === 1 ? 'twisted image' : 'zz'), { listStamp: true, stampReader: st });
+    assert.equal((await w.r.read(sharpFrame(), small)).results[0].ok, false);
+  }
+});
+
+test('R1-B3: the stamp exit honours numbers read this frame and validated numbers from earlier frames', async () => {
+  // This frame's first batch reads a25's number 75: never plst SOM-50.
+  const t = reader((c) => (c === 1 ? 'twisted image' : 'a25 075'), { listStamp: true, stampReader: stampAs('present') });
+  const rt = (await t.r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(rt.scryfallId, 'id-plst-som', JSON.stringify(rt));
+  // Frame 1 validates copyright-line number 75 (retro); frame 2 sees a
+  // strong stamp and an unreadable footer: the held 75 still vetoes.
+  let frame = 1, base = 0;
+  // Only the ADDED old-frame rows (batch index >= 2) read it, so it lives in
+  // the validated 'held' numbers alone, not in the pooled footer text.
+  const two = reader((c, n, b) => {
+    const k = c - base;
+    if (frame === 1) return k === 1 ? 'twisted image' : n === 4 && k === 5 && b >= 2 ? 'of the coast 75/249' : 'zz';
+    return k === 1 ? 'twisted image' : 'zz';
+  }, { listStamp: true, stampReader: () => (frame === 1 ? { verdict: 'unknown', ncc: 0.3, contrast: 0.3, sharp: 90 } : { verdict: 'present', ncc: 0.8, contrast: 1.5, sharp: 90 }) });
+  const r1 = (await two.r.read(sharpFrame(), small)).results[0];
+  assert.equal(r1.ok, false, JSON.stringify(r1));
+  assert.deepEqual(r1.held, ['75'], JSON.stringify(r1));
+  frame = 2; base = two.calls();
+  const r2 = (await two.r.read(sharpFrame(), small)).results[0];
+  assert.equal(r2.title, 'twisted image', JSON.stringify(r2));
+  assert.notEqual(r2.scryfallId, 'id-plst-som', JSON.stringify(r2));
+});
+
+test('R1-B2: a title with a printing stamped under its own numbering (cmb1, mb2...) never takes the stamp exit', async () => {
+  const base = ix();
+  const i0 = base.printings.length;
+  const raw = { names: [...base.names, 'pick your poison'], canon: {}, excluded: [], sets: [...SETS, 'mkm', 'cmb1'],
+    printings: [...base.printings, ['id-pyp-mkm', 'mkm', '170'], ['id-pyp-plst', 'plst', 'MKM-170'], ['id-pyp-cmb1', 'cmb1', '97']],
+    byTitle: { ...base.byTitle, 'pick your poison': [i0, i0 + 1, i0 + 2] }, uniqueAlias: {} };
+  const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
+  const cornelius = { run: async () => ({ corners: { data: [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] }, sharpness: { data: [0.9] } }) };
+  const chars = ['', ...'abcdefghijklmnopqrstuvwxyz0123456789/ ©'];
+  let calls = 0;
+  const rec = { inputNames: ['x'], outputNames: ['y'], run: async ({ x }) => {
+    calls++; const n = x.dims[0], texts = Array.from({ length: n }, () => (calls === 1 ? 'pick your poison' : 'zz'));
+    const steps = Math.max(...texts.map(t => t.length)) * 2 + 1, classes = chars.length, data = new Float32Array(n * steps * classes);
+    for (let b = 0; b < n; b++) for (let s = 0; s < steps; s++) data[(b * steps + s) * classes + (s % 2 ? chars.indexOf(texts[b][(s - 1) / 2] ?? '') : 0)] = 1;
+    return { y: { data, dims: [n, steps, classes] } };
+  } };
+  const r = createReader({ ort, cornelius, rec, chars, index: loadIndex(raw), refineCorners: false, clock: () => 0, stampReader: stampAs('present') });
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(res.scryfallId, 'id-pyp-plst', JSON.stringify(res));
+  assert.equal(res.ok, false);
+});
+
+test('R1-B1: a real stamped corner with the stamp covered is never called present', () => {
+  const c = CROPS.present_hatchet;
+  const g = Float32Array.from(c.g);
+  // Paint the stamp area (card-space x 8-40, y 650-682 -> crop rows 50-82) with the border tone.
+  for (let y = 48; y < 84; y++) for (let x = 6; x < 42; x++) g[y * c.w + x] = 20;
+  assert.notEqual(stampVerdict({ ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) }), 'present');
+});
+
+test('pipeline: a title with no reprint-sheet printing never reads the stamp', async () => {
+  let n = 0;
+  const g = reader((c) => (c === 1 ? 'grief' : 'mh2 087/303'), { listStamp: true, stampReader: () => { n++; return { verdict: 'present', ncc: 1, contrast: 2, sharp: 90 }; } });
+  const rg = (await g.r.read(sharpFrame(), small)).results[0];
+  assert.equal(rg.ok, true); assert.equal(rg.scryfallId, 'id-grief-mh2'); assert.equal(n, 0);
+});
+
+// ---- 2026-10-08: List / MB2 titles stay on-device ----
+test('first look: a reprint-sheet title is flagged sheet_like on deferral (server skip)', async () => {
+  const { r, calls } = reader((c) => (c === 1 ? 'twisted image' : 'izzy'));
+  const res = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(res.deferred, true, JSON.stringify(res));
+  assert.equal(res.sheet_like, true);
+  assert.equal(calls(), 2, 'first look still costs only title + first batch');
+  const g = reader((c) => (c === 1 ? 'grief' : 'izzy'));
+  assert.equal((await g.r.read(sharpFrame(), small, { requireStill: true })).results[0].sheet_like, undefined);
+});
+
+test('needsServer: an unproven reprint-sheet title stays on-device for SHEET_ESCAPE auto passes', () => {
+  const out = { candidates: [{ eligible: true }], results: [{ ok: false, error: 'exact printing not resolved', title: 'smokestack', sheet_like: true }] };
+  assert.equal(needsServer(out, { autoPass: true, sheetRun: 1 }), false);
+  assert.equal(needsServer(out, { autoPass: true, sheetRun: 4 }), true);
+  assert.equal(needsServer(out, { autoPass: false, sheetRun: 1 }), true);
+});
+
+test('retroLineNumber: a doubled trailing collector number on a copyright line reads once', async () => {
+  const { retroLineNumber } = await import('../../../shared/clientScan/pipeline.mjs');
+  assert.equal(retroLineNumber('3-2000 Wizards of the Coast, Inc.143143'), '143');
+  assert.equal(retroLineNumber('&2024 Wirards of the Coast 232'), '232');
+  assert.equal(retroLineNumber('Wizards of the Coast 4545'), '4545');   // only 3-digit doubles collapse
+  assert.equal(retroLineNumber('2000 Wizards of the Coast'), null);
+});
+
+test('unproven reprint-sheet title carries its printing list for the picker', async () => {
+  const { r } = reader((c) => (c === 1 ? 'twisted image' : 'izzy'));
+  const res = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.deepEqual(res.title_choices?.map(c => c.set).length, 3, JSON.stringify(res));
+  const g = reader((c) => (c === 1 ? 'grief' : 'izzy'));
+  assert.equal((await g.r.read(sharpFrame(), small, { requireStill: true })).results[0].title_choices, undefined);
+});
+
+
+test('second look: a reprint-sheet title with digit-free footers reads the copyright line before tall/wide', async () => {
+  // Frame 1 (auto): calls 1 title, 2 first batch -> deferred.
+  // Frame 2: 3 title, 4 first batch, 5 retro (4 rows) -> proven; tall/wide skipped.
+  const { r, calls } = reader((c, n) => (c === 1 || c === 3 ? 'twisted image' : c === 5 && n === 4 ? 'of the coast llc 50/249' : 'izzy'));
+  const r1 = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(r1.deferred, true, JSON.stringify(r1));
+  const res = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(res.via, 'title+collector (retro frame)', JSON.stringify(res));
+  assert.equal(calls(), 5);
+});
+
+test('second look: a non-sheet title keeps the v1 stage order (tall before retro)', async () => {
+  const { r, calls } = reader((c) => (c === 1 || c === 3 ? 'damn' : 'izzy'));
+  await r.read(sharpFrame(), small, { requireStill: true });
+  const res = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(res.ok, false); assert.ok(calls() >= 6, `calls ${calls()}`);
 });
