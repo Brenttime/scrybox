@@ -201,7 +201,8 @@ test('needsServer: auto skips the server for unreadable titles (bounded) and def
   assert.equal(needsServer(noTitle, { autoPass: true, noTitleRun: NO_TITLE_ESCAPE }), true, 'escape hatch');
   assert.equal(needsServer(noTitle, { autoPass: false }), true, 'shutter always may');
   assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', deferred: true }), { autoPass: true }), false);
-  assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', title: 'x' }), { autoPass: true }), true);
+  assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', title: 'x' }), { autoPass: true }), false, 'titled: stay local');
+  assert.equal(needsServer(out({ ok: false, error: 'exact printing not resolved', title: 'x' }), { autoPass: true, titledRun: 6 }), true, 'titled escape hatch');
   assert.equal(needsServer({ error: 'worker died' }, { autoPass: true }), true);
 });
 

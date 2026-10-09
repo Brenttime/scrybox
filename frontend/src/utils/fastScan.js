@@ -54,11 +54,12 @@ export const EDGE_ESCAPE = 8;
 // cost ~2.2 s, while the next local frame proved the card. The server still
 // gets one try after SHEET_ESCAPE misses.
 export const SHEET_ESCAPE = 4;
+export const TITLED_ESCAPE = 6;
 export function isEdgePartial(out) {
   const res = out?.results?.[0];
   return !!(res && !res.ok && res.near_edge_partial);
 }
-export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0, sheetRun = 0 }) {
+export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0, sheetRun = 0, titledRun = 0 }) {
   if (!out || out.error) return true;
   const cand = out.candidates?.[0];
   const res = out.results?.[0];
@@ -70,6 +71,13 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0, sheetR
     if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
     if (res.near_edge_partial && edgeRun < EDGE_ESCAPE) return false;
     if (res.sheet_like && res.title && sheetRun < SHEET_ESCAPE) return false;
+    // Any title the phone has read but whose printing it hasn't proven yet:
+    // the server reads the same footer from the same frame and has not proven
+    // one since 2026-09-28 (0 of 253 auto fallbacks, 2026-10-07..09 telemetry),
+    // while each costs 1.1-2.3 s during which the phone sits idle (iPhone
+    // 2026-10-09: Suspend Aggression 6.4 s, Zaffai 3.6 s). Keep reading
+    // locally; the server gets one try after TITLED_ESCAPE misses.
+    if (res.title && res.error === 'exact printing not resolved' && titledRun < TITLED_ESCAPE) return false;
   }
   if (res) return !res.ok;
   if (!cand || !cand.eligible) return !autoPass;
