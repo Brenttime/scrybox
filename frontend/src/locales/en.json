@@ -1228,6 +1228,7 @@
   "orderimport.tcgStep3": "Click the bookmark. Scrybox opens with every order on that page ready to review. Orders you already imported are skipped, so you can tap it any time.",
   "orderimport.tcgBookmarkName": "Send to Scrybox",
   "orderimport.tcgPhoneTitle": "On your phone",
+  "orderimport.tcgPwaNote": "Bookmarks live in your browser, not in the Scrybox app. Copy the code below, then add the bookmark in Safari or Chrome. When you tap it on TCGplayer, Scrybox opens in that browser (log in there once).",
   "orderimport.tcgCopyCode": "Copy bookmark code",
   "orderimport.tcgCopied": "Bookmark code copied.",
   "orderimport.tcgCopyFailed": "Could not copy. Long-press the Send to Scrybox button and copy its link instead.",
