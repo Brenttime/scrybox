@@ -48,6 +48,15 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
   // the user's logged-in TCGplayer page, so no cookie is needed or used.
   const [pageImport, setPageImport] = useState(null);   // {orders, lines}
   const bookmarkRef = useRef(null);
+  // Installed app (PWA) or touch device: there is no bookmarks bar to drag to,
+  // so lead with the copy-code steps instead of the drag button.
+  const [phoneSetup] = useState(() => {
+    try {
+      return !!(window.navigator.standalone
+        || window.matchMedia('(display-mode: standalone)').matches
+        || window.matchMedia('(pointer: coarse)').matches);
+    } catch { return false; }
+  });
   useEffect(() => {
     // React refuses javascript: hrefs in JSX; set it on the element directly.
     if (bookmarkRef.current) bookmarkRef.current.setAttribute('href', buildBookmarklet(window.location.origin));
@@ -225,6 +234,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
         {source === 'tcgplayer' && (
           <div className="tcg-bookmarklet" style={{ display: 'flex', flexDirection: 'column', gap: '.6rem', fontSize: '.82rem', color: 'var(--text-secondary)' }}>
             <div>{t('orderimport.tcgHow')}</div>
+            {!phoneSetup && (<>
             <ol style={{ margin: 0, paddingLeft: '1.2rem', display: 'flex', flexDirection: 'column', gap: '.3rem' }}>
               <li>{t('orderimport.tcgStep1')}</li>
               <li>{t('orderimport.tcgStep2')}</li>
@@ -235,7 +245,9 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
               style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: '.4rem', cursor: 'grab' }}>
               <Bookmark size={14} /> {t('orderimport.tcgBookmarkName')}
             </a>
-            <details className="tcg-phone-setup" style={{ fontSize: '.8rem' }}>
+            </>)}
+            {phoneSetup && <div className="tcg-pwa-note">{t('orderimport.tcgPwaNote')}</div>}
+            <details className="tcg-phone-setup" open={phoneSetup || undefined} style={{ fontSize: '.8rem' }}>
               <summary style={{ cursor: 'pointer', fontWeight: 700, color: 'var(--text-strong)', display: 'inline-flex', alignItems: 'center', gap: '.35rem' }}>
                 <Smartphone size={14} /> {t('orderimport.tcgPhoneTitle')}
               </summary>
