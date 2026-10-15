@@ -7,7 +7,7 @@ import { scrollToTop } from './utils/scrollRoot';
 import { pushBackGuard } from './utils/useBackGuard';
 import { getRememberedTab, rememberView, clearRememberedView, forgetOpenSubviews } from './utils/viewMemory';
 import { useT } from './utils/i18n';
-import { readTcgImportHash, TCG_IMPORT_KEY } from './utils/tcgBookmarklet';
+import { readTcgImportHash, TCG_IMPORT_KEY, hasPendingTcgImport } from './utils/tcgBookmarklet';
 
 // View components are code-split so heavy deps (recharts in the chart views)
 // load on demand instead of in the initial bundle.
@@ -241,7 +241,7 @@ function App() {
               localStorage.setItem('bindarr_token', oidcToken);
               localStorage.setItem('bindarr_user', JSON.stringify(data.user));
               showToast(t('toast.welcomeBack', { name: data.user.username }));
-              setActiveTab('dashboard');
+              setActiveTab(hasPendingTcgImport() ? 'add-cards' : 'dashboard');
             }
           })
           .catch(err => {
@@ -325,8 +325,11 @@ function App() {
     // logout only *tries* to clear the key (private mode can refuse
     // removeItem), so a stale entry must not drag a fresh login into the last
     // session's tab.
-    setActiveTab('dashboard');
-    rememberView('dashboard');
+    // A TCGplayer bookmark handoff that arrived logged-out was stashed; go
+    // straight to it instead of Dashboard.
+    const next = hasPendingTcgImport() ? 'add-cards' : 'dashboard';
+    setActiveTab(next);
+    rememberView(next);
   };
 
   const handleLogout = () => {
