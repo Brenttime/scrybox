@@ -120,7 +120,9 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
 
   const doPagePreview = async (handoff, includeImported = false) => {
     const seq = ++previewSeq.current;
-    setBusy(true); setError(''); setPreview(null);
+    // Keep the current preview on screen while re-previewing ("Include them
+    // anyway"): the preview view dereferences it, so nulling it mid-phase crashes.
+    setBusy(true); setError('');
     try {
       const res = await fetch('/api/marketplace/tcg-page/preview', {
         method: 'POST', headers: JSON_HEADERS,
