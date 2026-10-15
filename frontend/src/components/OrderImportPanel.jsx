@@ -118,18 +118,18 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
     }
   };
 
-  const doPagePreview = async (handoff) => {
+  const doPagePreview = async (handoff, includeImported = false) => {
     const seq = ++previewSeq.current;
     setBusy(true); setError(''); setPreview(null);
     try {
       const res = await fetch('/api/marketplace/tcg-page/preview', {
         method: 'POST', headers: JSON_HEADERS,
-        body: JSON.stringify({ orders: handoff.orders, lines: handoff.lines }),
+        body: JSON.stringify({ orders: handoff.orders, lines: handoff.lines, include_imported: includeImported }),
       });
       const data = await res.json().catch(() => ({}));
       if (seq !== previewSeq.current) return;
       if (!res.ok) { setError(data.error || t('orderimport.errPreview')); return; }
-      setPageImport(handoff);
+      setPageImport({ ...handoff, includeImported });
       setPreview(data);
       setPhase('preview');
     } catch {
@@ -152,7 +152,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
       try {
         const res = await fetch('/api/marketplace/tcg-page/add', {
           method: 'POST', headers: JSON_HEADERS,
-          body: JSON.stringify({ lines: pageImport.lines, printing_mode: printingMode, language }),
+          body: JSON.stringify({ lines: pageImport.lines, printing_mode: printingMode, language, include_imported: !!pageImport.includeImported }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) { setError(data.error || t('orderimport.errAdd')); return; }
@@ -372,7 +372,9 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
       <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
         <button type="button" className="btn btn-small btn-secondary" onClick={reset} disabled={busy}>{t('orderimport.back')}</button>
         <h3 style={{ margin: 0, color: 'var(--text-strong)', fontSize: '1.02rem' }}>
-          {t('orderimport.orderSummary', { number: preview.number || orderNumber, count: preview.totalListed ?? cards.length })}
+          {preview.orderCount > 1
+            ? t('orderimport.ordersSummary', { count: preview.orderCount })
+            : t('orderimport.orderSummary', { number: preview.number || orderNumber, count: preview.totalListed ?? cards.length })}
         </h3>
       </div>
 
@@ -397,8 +399,16 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
         </select>
       </div>
 
+      {pageImport && Array.isArray(preview.alreadyImported) && preview.alreadyImported.length > 0 && (
+        <div className="oi-already" style={{ display: 'flex', alignItems: 'center', gap: '.6rem', flexWrap: 'wrap', fontSize: '.8rem', color: 'var(--text-secondary)' }}>
+          <span>{t('orderimport.alreadyImported', { count: preview.alreadyImported.length })}</span>
+          <button type="button" className="btn btn-small btn-secondary" disabled={busy}
+            onClick={() => doPagePreview(pageImport, true)}>{t('orderimport.importAnyway')}</button>
+        </div>
+      )}
+
       {cards.length === 0 ? (
-        <p style={{ color: 'var(--text-secondary)', margin: 0 }}>{t('orderimport.noCards')}</p>
+        <p style={{ color: 'var(--text-secondary)', margin: 0 }}>{preview.allImported ? t('orderimport.allImported') : t('orderimport.noCards')}</p>
       ) : (
         <div className="sl-cardlist" style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '.5rem' }}>
           {cards.map((c, i) => (

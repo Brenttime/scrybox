@@ -1154,6 +1154,17 @@ async function initDb() {
     `);
   }
 
+  // TCGplayer orders already imported through the bookmarklet, so tapping it
+  // again on the same Order History page does not file the cards twice.
+  await run(`
+    CREATE TABLE IF NOT EXISTS tcg_imported_orders (
+      user_id INTEGER NOT NULL,
+      order_number TEXT NOT NULL,
+      imported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, order_number)
+    )
+  `);
+
   // --- PERFORMANCE INDEXES ---
   // `user_id` first, because it is the predicate on essentially every read in the
   // app. The collection page also reads newest-first; carrying that order in the

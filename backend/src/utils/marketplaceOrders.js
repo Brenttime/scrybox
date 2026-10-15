@@ -870,6 +870,27 @@ function cleanTcgPageLines(raw) {
   return out;
 }
 
+// TCGplayer order numbers already filed for this user. The bookmarklet can be
+// tapped on the same Order History page again and again; lines from an order
+// that was imported before are held back unless the user asks to re-import.
+const ORDER_NO_RE = /^[0-9A-F]{8}-[0-9A-F]{6}-[0-9A-F]{5}$/;
+async function importedTcgOrders(userId, orders, database = require('../db')) {
+  const list = [...new Set((orders || []).map((o) => String(o || '').toUpperCase()).filter((o) => ORDER_NO_RE.test(o)))];
+  if (!list.length) return new Set();
+  const rows = await database.all(
+    `SELECT order_number FROM tcg_imported_orders WHERE user_id = ? AND order_number IN (${list.map(() => '?').join(',')})`,
+    [userId, ...list]
+  );
+  return new Set(rows.map((r) => r.order_number));
+}
+async function recordTcgOrders(userId, orders, database = require('../db')) {
+  const list = [...new Set((orders || []).map((o) => String(o || '').toUpperCase()).filter((o) => ORDER_NO_RE.test(o)))];
+  for (const o of list) {
+    await database.run('INSERT OR IGNORE INTO tcg_imported_orders (user_id, order_number) VALUES (?, ?)', [userId, o]);
+  }
+  return list;
+}
+
 async function resolveTcgPageLines(rawLines, deps = {}) {
   const lines = cleanTcgPageLines(rawLines);
   const database = deps.db || require('../db');
@@ -908,6 +929,7 @@ async function resolveTcgPageLines(rawLines, deps = {}) {
       price_cents: l.price_cents,
       is_foil: l.is_foil,
       condition: l.condition,
+      order: l.order,
       year: null,
       sealed: false,
       // Unresolvable ids are not sent to the name resolver: TCGplayer product
@@ -926,6 +948,8 @@ module.exports = {
   MANAPOOL_BASE,
   cleanTcgPageLines,
   resolveTcgPageLines,
+  importedTcgOrders,
+  recordTcgOrders,
   RECENT_LIMIT,
   normalizeCookies,
   cookieCount,
