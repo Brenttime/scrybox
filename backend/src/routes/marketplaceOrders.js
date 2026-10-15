@@ -300,7 +300,7 @@ async function tcgPageLines(req, res) {
 
 function allImportedReply(skipped) {
   return {
-    number: skipped.orders.join(', '), lines: [], lineCount: 0, cards: [], resolvedCount: 0, totalCopies: 0,
+    number: skipped.orders.join(', '), orderCount: skipped.orders.length, lines: [], lineCount: 0, cards: [], resolvedCount: 0, totalCopies: 0,
     unresolved: 0, extras: 0, unmatchedNames: [], alreadyImported: skipped.orders, skippedLines: skipped.lines, allImported: true,
   };
 }
