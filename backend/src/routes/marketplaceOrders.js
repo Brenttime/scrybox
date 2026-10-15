@@ -19,7 +19,7 @@ const {
   normalizeCookies, cookieCount, maskSecret, maskEmail, customerIdHints,
   fetchManapoolOrder, fetchTcgOrder, parseOrderPayload, addOrderToCollection, previewOrder,
   fetchManapoolOrderList, manapoolRecentOrderSummaries, fetchTcgRecentOrders,
-  resolveTcgPageLines,
+  resolveTcgPageLines, importedTcgOrders, recordTcgOrders,
   recentOrderSummaries, RECENT_LIMIT,
 } = require('../utils/marketplaceOrders');
 
@@ -283,29 +283,47 @@ async function tcgPageLines(req, res) {
   const raw = req.body && req.body.lines;
   if (!Array.isArray(raw) || !raw.length) { res.status(400).json({ error: 'lines are required' }); return null; }
   try {
-    const lines = await resolveTcgPageLines(raw);
+    // Hold back lines from orders this user already imported, unless asked.
+    const imported = await importedTcgOrders(req.user.id, raw.map((l) => l && l.order));
+    const reimport = req.body.include_imported === true;
+    const kept = reimport ? raw : raw.filter((l) => !(l && l.order && imported.has(String(l.order).toUpperCase())));
+    const skipped = { orders: [...imported], lines: raw.length - kept.length };
+    if (!kept.length) return { lines: null, skipped };
+    const lines = await resolveTcgPageLines(kept);
     if (!lines.length) { res.status(400).json({ error: 'No TCGplayer product lines were readable' }); return null; }
-    return lines;
+    return { lines, skipped };
   } catch (err) {
     res.status(502).json({ error: 'Could not resolve the TCGplayer products' });
     return null;
   }
 }
 
+function allImportedReply(skipped) {
+  return {
+    number: skipped.orders.join(', '), lines: [], lineCount: 0, cards: [], resolvedCount: 0, totalCopies: 0,
+    unresolved: 0, extras: 0, unmatchedNames: [], alreadyImported: skipped.orders, skippedLines: skipped.lines, allImported: true,
+  };
+}
+
 router.post('/tcg-page/preview', async (req, res) => {
-  const lines = await tcgPageLines(req, res);
-  if (!lines) return;
+  const out = await tcgPageLines(req, res);
+  if (!out) return;
+  const { lines, skipped } = out;
+  if (!lines) return res.json(allImportedReply(skipped));
   try {
     const preview = await previewOrder({ lines, userId: req.user.id });
-    const orders = Array.isArray(req.body.orders) ? req.body.orders.map(String).slice(0, 50) : [];
+    const orders = [...new Set(lines.map((l) => l.order).filter(Boolean))].slice(0, 50);
     res.json({
       number: orders.join(', ') || null,
+      orderCount: orders.length,
       lines,
       lineCount: lines.length,
       unmatchedNames: lines.__unmatched,
       ...preview,
       unresolved: lines.__unmatched.length,
       extras: 0,
+      alreadyImported: req.body.include_imported === true ? [] : skipped.orders,
+      skippedLines: skipped.lines,
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Could not resolve the order lines' });
@@ -313,17 +331,22 @@ router.post('/tcg-page/preview', async (req, res) => {
 });
 
 router.post('/tcg-page/add', async (req, res) => {
-  const lines = await tcgPageLines(req, res);
-  if (!lines) return;
+  const out = await tcgPageLines(req, res);
+  if (!out) return;
+  const { lines, skipped } = out;
+  if (!lines) return res.json({ added: 0, resolved: 0, totalListed: 0, unresolved: 0, failed: 0, alreadyImported: skipped.orders, message: 'Those orders were already imported.' });
   const { condition, printing_mode, language } = req.body || {};
   try {
     const result = await addOrderToCollection({ user: req.user, lines, condition, printingMode: printing_mode, language });
+    const recorded = result.added ? await recordTcgOrders(req.user.id, lines.map((l) => l.order)) : [];
     res.json({
       added: result.added,
       resolved: result.resolved,
       totalListed: lines.length,
       unresolved: lines.__unmatched.length,
       failed: result.failed,
+      orders: recorded,
+      skippedLines: skipped.lines,
       message: result.added
         ? `Added ${result.added} card${result.added === 1 ? '' : 's'} from TCGplayer.`
         : 'Nothing to add — no cards on that page matched a known printing.',

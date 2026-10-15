@@ -3,7 +3,7 @@ const assert = require('assert');
 const os = require('os');
 const path = require('path');
 process.env.DB_PATH = path.join(os.tmpdir(), `scrybox-tcgpage-${process.pid}.db`);
-const { cleanTcgPageLines, resolveTcgPageLines } = require('../src/utils/marketplaceOrders');
+const { cleanTcgPageLines, resolveTcgPageLines, importedTcgOrders, recordTcgOrders } = require('../src/utils/marketplaceOrders');
 
 (async () => {
   const clean = cleanTcgPageLines([
@@ -35,5 +35,21 @@ const { cleanTcgPageLines, resolveTcgPageLines } = require('../src/utils/marketp
   assert.deepStrictEqual(lines.map((l) => [l.scryfall_id, l.junk]), [['aaaa', false], ['bbbb', false], [null, true], ['aaaa', false]]);
   assert.strictEqual(lines.__cardCopies, 4);
   assert.deepStrictEqual(lines.__unmatched, ['Booster Box']);
+  // Lines keep their order number through resolution (needed for dedupe).
+  const withOrder = await resolveTcgPageLines([{ tcgplayer_product_id: '111', order: '840c56de-131d59-3d8ef' }], { db: { all: async () => [{ id: 'mtg-aaaa', pid: 111 }] }, scryGet });
+  assert.strictEqual(withOrder[0].order, '840c56de-131d59-3d8ef');
+
+  // Imported-order ledger: per user, case-insensitive, junk ignored, idempotent.
+  const rows = [];
+  const fake = {
+    run: async (sql, [u, o]) => { if (!rows.some((r) => r.u === u && r.o === o)) rows.push({ u, o }); },
+    all: async (sql, [u, ...os]) => rows.filter((r) => r.u === u && os.includes(r.o)).map((r) => ({ order_number: r.o })),
+  };
+  assert.deepStrictEqual(await recordTcgOrders(2, ['840c56de-131d59-3d8ef', 'garbage', null, '840C56DE-131D59-3D8EF'], fake), ['840C56DE-131D59-3D8EF']);
+  await recordTcgOrders(2, ['840C56DE-131D59-3D8EF'], fake);
+  assert.strictEqual(rows.length, 1, 'recording twice is a no-op');
+  assert.deepStrictEqual([...await importedTcgOrders(2, ['840c56de-131d59-3d8ef', '0EF27E7A-563CB6-129E9'], fake)], ['840C56DE-131D59-3D8EF']);
+  assert.strictEqual((await importedTcgOrders(3, ['840C56DE-131D59-3D8EF'], fake)).size, 0, 'another user is unaffected');
+  assert.strictEqual((await importedTcgOrders(2, [], fake)).size, 0);
   console.log('tcgpageimport ok');
 })().catch((e) => { console.error(e); process.exit(1); });
