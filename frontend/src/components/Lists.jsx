@@ -233,10 +233,10 @@ function Lists({ showToast, handoff, onHandoffDone }) {
       });
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
-        if (data.unmatched && data.unmatched.length > 0) {
+        if ((data.unmatched && data.unmatched.length > 0) || (data.lines > 0 && !data.matched)) {
           showToast(t('lists.importedSummary', {
             matched: data.matched,
-            unmatched: t('lists.unmatched', {
+            unmatched: !(data.unmatched && data.unmatched.length) ? '' : t('lists.unmatched', {
               count: data.unmatched.length,
               names: data.unmatched.slice(0, 3).join(', ') + (data.unmatched.length > 3 ? '…' : ''),
             }),

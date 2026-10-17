@@ -38,7 +38,8 @@ axios.Axios.prototype.post = async function(url, body, config) {
     const card = resp.data.data && resp.data.data[0];
     // The GET branch falls back to Black Lotus for anything unrecognized; only
     // count it as a hit when the fixture actually matches what was asked for.
-    const matchesName = ident.name && card && card.name.toLowerCase() === ident.name.toLowerCase();
+    const matchesName = ident.name && card && (card.name.toLowerCase() === ident.name.toLowerCase()
+      || card.name.toLowerCase().split(' // ').includes(ident.name.toLowerCase())); // Scryfall matches either face
     const matchesSetNum = ident.set && card
       && card.set === ident.set && String(card.collector_number) === String(ident.collector_number);
     if (matchesName || matchesSetNum) data.push(card); else not_found.push(ident);

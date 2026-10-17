@@ -1,5 +1,7 @@
 const express = require('express');
 const db = require('../db');
+const { parseListText, findCachedCard } = require('../utils/listImport');
+const { bulkFetchByIdentifier, cacheCards } = require('../scryfallApi');
 const cardApi = require('../utils/cardApi');
 const { parseCardRow } = require('../utils/priceHelpers');
 const { buildCardListText } = require('../../../shared/cardListText.js');
@@ -81,42 +83,39 @@ router.post('/', async (req, res) => {
 
     let matched = 0;
     const unmatched = [];
-    if (typeof list_text === 'string' && list_text.trim()) {
-      for (const raw of list_text.split('\n')) {
-        const line = raw.trim();
-        if (!line) continue;
-        // MTGA / ManaBox line: QTY Name [ (SET) NUMBER ]. The set reference is
-        // stripped before the cache lookup — card names never carry parens with
-        // a set code inside — and recorded so unmatched cards are reportable.
-        const m = line.match(/^(\d+)\s+(.+)$/i);
-        if (!m) continue;
-        const qty = Math.max(1, parseInt(m[1], 10) || 1);
-        let cardName = m[2].trim();
-        let setRef = '';
-        const ref = cardName.match(/\s*\(([A-Za-z0-9]{2,13})\)\s*(\d+(?:\/\/\d+)?)?\s*$/i);
-        if (ref) {
-          setRef = ref[0].trim();
-          cardName = cardName.slice(0, cardName.length - ref[0].length).trim();
+    const lines = typeof list_text === 'string' ? parseListText(list_text) : [];
+    if (lines.length) {
+      // Cards this install has never seen are looked up on Scryfall in one
+      // batched /cards/collection pass and cached, then matched like the rest.
+      const missing = [];
+      for (const l of lines) if (!(await findCachedCard(db, l.name))) missing.push(l);
+      if (missing.length) {
+        try {
+          const seen = new Set();
+          const rows = missing.filter(l => !seen.has(l.name.toLowerCase()) && seen.add(l.name.toLowerCase()))
+            .map(l => ({ name: l.name }));
+          const { cards } = await bulkFetchByIdentifier(rows);
+          if (cards.length) await cacheCards(cards);
+        } catch (e) {
+          console.error('List import: Scryfall lookup failed:', e.message);
         }
-        if (!cardName) continue;
-        const card = await db.get(
-          `SELECT id FROM card_cache WHERE LOWER(name) = LOWER(?) LIMIT 1`,
-          [cardName]
-        );
+      }
+      for (const l of lines) {
+        const card = await findCachedCard(db, l.name);
         if (!card) {
-          unmatched.push(setRef ? `${cardName} (${setRef})` : cardName);
+          unmatched.push(l.setRef ? `${l.name} (${l.setRef})` : l.name);
           continue;
         }
         await db.run(
           `INSERT INTO list_cards (list_id, card_id, quantity) VALUES (?, ?, ?)
            ON CONFLICT(list_id, card_id) DO UPDATE SET quantity = quantity + EXCLUDED.quantity`,
-          [listId, card.id, qty]
+          [listId, card.id, l.qty]
         );
         matched++;
       }
     }
 
-    res.status(201).json({ message: 'List created', id: listId, matched, unmatched });
+    res.status(201).json({ message: 'List created', id: listId, matched, unmatched, lines: lines.length });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to create list' });
