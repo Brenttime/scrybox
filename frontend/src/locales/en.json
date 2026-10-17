@@ -1018,7 +1018,7 @@
   "lists.namePlaceholder": "e.g. Buy list, Missing from DDT, Trade wants",
   "lists.descPlaceholder": "Optional notes",
   "lists.importOptional": "Import from text (optional)",
-  "lists.importHint": "Paste in the ManaBox / MTG Arena shape — \"4 Lightning Bolt\" or \"4 Lightning Bolt (JUD) 124\". Lines without a matching card are skipped.",
+  "lists.importHint": "One card per line \u2014 \"Lightning Bolt\", \"4 Lightning Bolt\" or \"4 Lightning Bolt (JUD) 124\". Cards that can't be found are listed after import.",
   "lists.importPlaceholder": "4 Lightning Bolt\n2 Gaea's Cradle (JUP) 431",
   "lists.create": "Create List",
   "lists.importedSummary": "{matched} card line(s) imported{unmatched}",

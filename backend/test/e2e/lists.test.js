@@ -40,7 +40,7 @@ async function waitForDatabase() {
 }
 
 async function runTests() {
-  const server = spawn('node', [path.join(projectRoot, 'backend/src/server.js')], {
+  const server = spawn('node', ['-r', path.join(__dirname, 'scryfall-mock.js'), path.join(projectRoot, 'backend/src/server.js')], {
     env: { ...process.env, PORT: port, DB_PATH: tmpDb }
   });
   server.stderr.on('data', (d) => process.stderr.write(d.toString()));
@@ -92,6 +92,18 @@ async function runTests() {
     assert.strictEqual(created.matched, 3, 'three lines matched');
     assert.deepStrictEqual(created.unmatched, ['Card That Is Not Cached'], 'unmatched reported');
     const listId = created.id;
+
+    // --- Bare names (no qty), "2x", headers, and a Scryfall-only card ---
+    const resB = await fetch(`http://localhost:${port}/api/lists`, {
+      method: 'POST', headers: json,
+      body: JSON.stringify({ name: 'Bare names', list_text: 'Commander\nLightning Bolt\n2x Mox Diamond\nBlack Lotus\nDelver of Secrets\nNot A Real Card' })
+    });
+    assert.strictEqual(resB.status, 201);
+    const bare = await resB.json();
+    assert.strictEqual(bare.lines, 5, 'header skipped, five card lines');
+    assert.strictEqual(bare.matched, 4, 'bare names, 2x, uncached Scryfall card and DFC front face all match');
+    assert.deepStrictEqual(bare.unmatched, ['Not A Real Card']);
+    await fetch(`http://localhost:${port}/api/lists/${bare.id}`, { method: 'DELETE', headers: authHeaders });
 
     // --- List index: counts + accent + game ---
     const resL = await fetch(`http://localhost:${port}/api/lists`, { headers: authHeaders });
