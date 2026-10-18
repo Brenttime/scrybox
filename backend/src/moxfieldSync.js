@@ -44,6 +44,25 @@ async function markDeckCommanders(client, deckId, commanderKeys) {
   }
 }
 
+// Replace a deck's maybeboard rows. deck_maybe_cards is display-only: it never
+// feeds totals, stats, value or checkout allocation, so it is refreshed even
+// for checked-out decks.
+async function replaceMaybeboard(tx, deckId, maybeEntries) {
+  const qty = new Map();
+  for (const e of maybeEntries) {
+    const id = scryboxCardId(e.card);
+    qty.set(id, (qty.get(id) || 0) + e.quantity);
+  }
+  await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [deckId]);
+  for (const [cardId, quantity] of qty) {
+    await tx.run(
+      `INSERT INTO deck_maybe_cards (deck_id, card_id, quantity)
+       SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM card_cache WHERE id = ?)`,
+      [deckId, cardId, quantity, cardId]
+    );
+  }
+}
+
 function allocationConflict(message) {
   const error = new Error(message);
   error.code = 'ALLOCATION_CONFLICT';
@@ -410,7 +429,7 @@ async function pullDeckContent(author, publicId, knownRow = null) {
   // must never stall checkouts. From the first mirror-deck read through the final
   // reconciliation write, however, checkout and sync are one ordered operation.
   await backfillMissingCards([...entries, ...maybeEntries]);
-  return withAllocationLock(async () => db.withDedicatedTransaction(async tx => {
+  const result = await withAllocationLock(async () => db.withDedicatedTransaction(async tx => {
     // A content pull may spend seconds in remote/cache I/O. Re-read tracking
     // state only after acquiring the same lock used by disable/remove/retire so
     // stale work can never recreate a mirror that was paused or deleted while
@@ -436,7 +455,9 @@ async function pullDeckContent(author, publicId, knownRow = null) {
       `SELECT id, checked_out FROM decks WHERE id = ? AND source = 'moxfield'`, [targetDeckId]
     );
     if (alive && alive.checked_out) {
-      throw allocationConflict('Check this deck in before syncing Moxfield changes');
+      // Main/side boards stay frozen while built; the maybeboard still syncs.
+      await replaceMaybeboard(tx, targetDeckId, maybeEntries);
+      return { conflict: true };
     }
     if (!alive) {
       targetDeckId = null;
@@ -539,21 +560,8 @@ async function pullDeckContent(author, publicId, knownRow = null) {
     .filter(Boolean));
   await markDeckCommanders(tx, targetDeckId, commanderKeys);
 
-  // 2c. Maybeboard: replaced wholesale. Lives in its own table so it never
-  // touches deck totals, stats, value or checkout allocation.
-  const maybeQty = new Map();
-  for (const e of maybeEntries) {
-    const id = scryboxCardId(e.card);
-    maybeQty.set(id, (maybeQty.get(id) || 0) + e.quantity);
-  }
-  await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [targetDeckId]);
-  for (const [cardId, quantity] of maybeQty) {
-    await tx.run(
-      `INSERT INTO deck_maybe_cards (deck_id, card_id, quantity)
-       SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM card_cache WHERE id = ?)`,
-      [targetDeckId, cardId, quantity, cardId]
-    );
-  }
+  // 2c. Maybeboard: replaced wholesale (its own table, never in deck stats).
+  await replaceMaybeboard(tx, targetDeckId, maybeEntries);
 
   // 3. Refresh the tracking row: the stamp we just mirrored is now "current".
   const stamp = details.lastUpdatedAtUtc || null;
@@ -589,6 +597,8 @@ async function pullDeckContent(author, publicId, knownRow = null) {
     commanders: counts.commanders
   };
   }));
+  if (result && result.conflict) throw allocationConflict('Check this deck in before syncing Moxfield changes');
+  return result;
 }
 
 // Flip one deck's import switch. Disabling removes the local mirror (and its
