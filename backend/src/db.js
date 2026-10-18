@@ -324,6 +324,19 @@ async function initDb() {
     )
   `);
 
+  // Maybeboard: cards a deck might eventually run (mirrored from Moxfield's
+  // maybeboard). Kept OUT of deck_cards on purpose so totals, stats, value,
+  // checkout allocation and missing-card lists never count them.
+  await run(`
+    CREATE TABLE IF NOT EXISTS deck_maybe_cards (
+      deck_id INTEGER NOT NULL,
+      card_id TEXT NOT NULL,
+      quantity INTEGER DEFAULT 1,
+      PRIMARY KEY(deck_id, card_id),
+      FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
+    )
+  `);
+
   // Card lists: ManaBox-style wishlists / buylists / missing-card lists — cards
   // the user tracks but does not necessarily own. Deliberately NOT the
   // collection table (no location, condition or price bookkeeping) and NOT a

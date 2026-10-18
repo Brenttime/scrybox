@@ -34,6 +34,23 @@ function extractDeckCards(details) {
   return out;
 }
 
+// Maybeboard entries ({ board: 'maybeboard', card, quantity }), kept apart from
+// extractDeckCards so they never reach deck_cards (stats, checkout, value).
+function extractMaybeCards(details) {
+  const board = details && details.boards && details.boards.maybeboard;
+  const cards = board && board.cards;
+  if (!cards || typeof cards !== 'object') return [];
+  const out = [];
+  for (const entry of Object.values(cards)) {
+    const card = entry && entry.card;
+    if (!card || !card.scryfall_id) continue;
+    const quantity = Math.max(0, parseInt(entry.quantity, 10) || 0);
+    if (quantity === 0) continue;
+    out.push({ board: 'maybeboard', card, quantity });
+  }
+  return out;
+}
+
 // Sum of quantities per board, for the summary columns.
 function boardCounts(entries) {
   const counts = { mainboard: 0, sideboard: 0, maybeboard: 0, commanders: 0 };
@@ -115,6 +132,7 @@ function synthesizeMoxfieldCard(scryboxId, card) {
 module.exports = {
   MIRROR_BOARDS,
   extractDeckCards,
+  extractMaybeCards,
   boardCounts,
   scryboxCardId,
   mfxFormatLabel,

@@ -32,6 +32,9 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [viewMode, setViewMode] = useState('list'); // 'list' or 'detail'
   // Mobile-only editor tabs (CSS hides the inactive panes at <=768px).
   const [editorTab, setEditorTab] = useState('cards'); // 'cards' | 'add' | 'stats'
+  const [cardsBoard, setCardsBoard] = useState('main'); // 'main' | 'maybe'
+  const activeDeckId = activeDeck?.id;
+  useEffect(() => { setCardsBoard('main'); }, [activeDeckId]);
   
   // Deck View & Display Modes
   // Grid by default; the user's last explicit choice is remembered.
@@ -826,6 +829,11 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   const deckCards = activeDeck?.cards || EMPTY_DECK_CARDS;
   const deckDerived = useMemo(() => deriveDeckRenderData(deckCards), [deckCards]);
+  // Maybeboard: display only. Never fed into deckDerived/stats/value/checkout.
+  const maybeCards = activeDeck?.maybeboard || EMPTY_DECK_CARDS;
+  const showMaybe = cardsBoard === 'maybe' && maybeCards.length > 0;
+  const maybeTotal = useMemo(() => maybeCards.reduce((s, c) => s + (c.quantity || 0), 0), [maybeCards]);
+  const maybeOwnedTypes = useMemo(() => maybeCards.filter(c => (c.owned_qty || 0) >= c.quantity).length, [maybeCards]);
   const {
     countsByName,
     deckGroups,
@@ -1616,9 +1624,24 @@ function DeckBuilder({ showToast, onNavigate }) {
                 {/* Deck Cards Header & Display Mode Toggle */}
                 <div className="glass-panel deck-pane-cards" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
-                    <h3 style={{ fontSize: '1rem', color: 'var(--text-strong)', borderLeft: '3px solid var(--accent-red)', paddingLeft: '0.5rem', margin: 0 }}>
-                      Deck Cards ({totalDeckCardsCount} / {targetDeckCardsCount})
-                    </h3>
+                    {maybeCards.length > 0 ? (
+                      <div className="deck-board-tabs" role="tablist">
+                        <button type="button" role="tab" aria-selected={!showMaybe}
+                          className={`deck-board-tab${!showMaybe ? ' active' : ''}`}
+                          onClick={() => setCardsBoard('main')}>
+                          {t('deck.boardMain', { count: totalDeckCardsCount, target: targetDeckCardsCount })}
+                        </button>
+                        <button type="button" role="tab" aria-selected={showMaybe}
+                          className={`deck-board-tab${showMaybe ? ' active' : ''}`}
+                          onClick={() => setCardsBoard('maybe')}>
+                          {t('deck.boardMaybe', { count: maybeTotal })}
+                        </button>
+                      </div>
+                    ) : (
+                      <h3 style={{ fontSize: '1rem', color: 'var(--text-strong)', borderLeft: '3px solid var(--accent-red)', paddingLeft: '0.5rem', margin: 0 }}>
+                        Deck Cards ({totalDeckCardsCount} / {targetDeckCardsCount})
+                      </h3>
+                    )}
                     <div style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(0,0,0,0.2)', padding: '2px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
                       <button
                         type="button"
@@ -1639,7 +1662,58 @@ function DeckBuilder({ showToast, onNavigate }) {
                     </div>
                   </div>
                   
-                  {activeDeck.cards.length === 0 ? (
+                  {showMaybe ? (
+                    <div className="deck-maybe-list">
+                      <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: 0 }}>
+                        {t('deck.maybeSummary', { own: maybeOwnedTypes, missing: maybeCards.length - maybeOwnedTypes })}
+                      </p>
+                      {cardDisplayMode === 'list' ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '0.5rem' }}>
+                          {maybeCards.map(card => {
+                            const short = Math.max(0, card.quantity - (card.owned_qty || 0));
+                            return (
+                              <div key={card.id} className="deck-maybe-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.5rem 0.75rem', background: 'rgba(255,255,255,0.01)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', minWidth: 0 }}>
+                                  <CardImage card={card} loading="lazy" decoding="async" style={{ width: '32px', height: '44px', objectFit: 'cover', borderRadius: '2px' }} />
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-strong)' }}>{displayName(card)}</div>
+                                    <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{card.set_name} • #{card.number}</div>
+                                    {short > 0 ? (
+                                      <div className="deck-missing-note">{t('deck.rowMissing', { count: short })}</div>
+                                    ) : (
+                                      <div className="deck-owned-note">{t('deck.maybeOwned', { count: card.owned_qty || 0 })}</div>
+                                    )}
+                                  </div>
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                  <span className="deck-card-price" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
+                                  <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-strong)' }}>x{card.quantity}</span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '0.75rem', marginTop: '0.5rem' }}>
+                          {maybeCards.map(card => {
+                            const short = Math.max(0, card.quantity - (card.owned_qty || 0));
+                            return (
+                              <div key={card.id} className="deck-maybe-row deck-grid-card" style={{ position: 'relative', width: '100%', aspectRatio: '488 / 680', overflow: 'hidden', borderRadius: '6px', border: '1px solid var(--border-glass)', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
+                                <CardImage card={card} loading="lazy" decoding="async" style={{ position: 'absolute', inset: 0, display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
+                                <span style={{ position: 'absolute', top: '4px', right: '4px', background: 'rgba(0,0,0,0.85)', color: 'var(--accent-yellow)', fontSize: '0.75rem', fontWeight: 800, padding: '1px 6px', borderRadius: '10px', border: '1px solid var(--accent-yellow)' }}>x{card.quantity}</span>
+                                <span className="deck-card-price-chip" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
+                                {short > 0 ? (
+                                  <span className="deck-missing-chip">+{short}</span>
+                                ) : (
+                                  <span className="deck-owned-chip">{t('deck.maybeOwnChip')}</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  ) : activeDeck.cards.length === 0 ? (
                     <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'center', padding: '2rem 0' }}>{t('deck.emptyDeck')}</p>
                   ) : (
                     deckGroups.map(group => {
