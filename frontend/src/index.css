@@ -1828,6 +1828,13 @@ button, input, select, textarea {
   }
 }
 
+/* Deck / Maybeboard switch in the deck card pane (all layouts). */
+.deck-board-tabs { display: flex; gap: 4px; background: rgba(0,0,0,0.2); padding: 2px; border-radius: var(--radius-sm); border: 1px solid var(--border-glass); min-width: 0; flex-wrap: wrap; }
+.deck-board-tab { background: transparent; border: 0; color: var(--text-secondary); font-size: 0.8rem; font-weight: 700; padding: 0.3rem 0.6rem; border-radius: var(--radius-sm); cursor: pointer; white-space: nowrap; }
+.deck-board-tab.active { background: var(--accent-yellow); color: #111; }
+.deck-owned-note { font-size: 0.65rem; font-weight: 800; color: #4ade80; }
+.deck-owned-chip { position: absolute; top: 4px; left: 4px; background: rgba(20, 83, 45, 0.92); color: #bbf7d0; font-size: 0.7rem; font-weight: 800; padding: 1px 6px; border-radius: 10px; border: 1px solid #22c55e; }
+
 /* Per-row shortfall in the deck card list (list + grid views). */
 .deck-missing-note {
   font-size: 0.65rem;

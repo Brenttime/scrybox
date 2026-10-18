@@ -5,6 +5,7 @@ const assert = require('assert');
 const {
   MIRROR_BOARDS,
   extractDeckCards,
+  extractMaybeCards,
   boardCounts,
   scryboxCardId,
   mfxFormatLabel,
@@ -143,7 +144,27 @@ function testSynthesizeMoxfieldCard() {
   assert.strictEqual(bare.cmc, null);
 }
 
+function testExtractMaybe() {
+  const details = { boards: {
+    mainboard: { cards: { a: { quantity: 1, card: { scryfall_id: 'uuid-main', name: 'Main' } } } },
+    maybeboard: { count: 3, cards: {
+      m1: { quantity: 2, card: { scryfall_id: 'uuid-maybe', name: 'Maybe' } },
+      m2: { quantity: 1, card: { id: 'tok' } },
+      m3: { quantity: 0, card: { scryfall_id: 'uuid-z', name: 'Z' } },
+      m4: { quantity: 1, card: { scryfall_id: 'uuid-maybe2', name: 'Maybe 2' } }
+    } }
+  } };
+  const maybe = extractMaybeCards(details);
+  assert.deepStrictEqual(maybe.map(e => [e.board, e.card.scryfall_id, e.quantity]),
+    [['maybeboard', 'uuid-maybe', 2], ['maybeboard', 'uuid-maybe2', 1]]);
+  // Maybeboard never leaks into the mirrored deck boards.
+  assert.ok(!extractDeckCards(details).some(e => e.board === 'maybeboard'));
+  assert.deepStrictEqual(extractMaybeCards({}), []);
+  assert.deepStrictEqual(extractMaybeCards(null), []);
+}
+
 function main() {
+  testExtractMaybe();
   testExtract();
   testBoardCounts();
   testScryboxCardId();

@@ -52,6 +52,7 @@ function allocationConflict(message) {
 const {
   MIRROR_BOARDS,
   extractDeckCards,
+  extractMaybeCards,
   boardCounts,
   scryboxCardId,
   mfxFormatLabel,
@@ -218,6 +219,7 @@ async function retireDeck(author, publicId) {
     if (row.checked_out) throw allocationConflict('Check this deck in before removing its Moxfield mirror');
     if (row.bindarr_deck_id) {
       await tx.run(`DELETE FROM deck_cards WHERE deck_id = ?`, [row.bindarr_deck_id]);
+      await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [row.bindarr_deck_id]);
       await tx.run(`DELETE FROM decks WHERE id = ? AND source = 'moxfield'`, [row.bindarr_deck_id]);
     }
     await tx.run(`DELETE FROM moxfield_decks WHERE author_id = ? AND public_id = ?`, [author.id, publicId]);
@@ -402,11 +404,12 @@ async function pullDeckContent(author, publicId, knownRow = null) {
 
   const details = await moxfieldApi.getDeckDetails(publicId);
   const entries = extractDeckCards(details);
+  const maybeEntries = extractMaybeCards(details);
 
   // Fetch/cache provider metadata before taking the allocation lock; network I/O
   // must never stall checkouts. From the first mirror-deck read through the final
   // reconciliation write, however, checkout and sync are one ordered operation.
-  await backfillMissingCards(entries);
+  await backfillMissingCards([...entries, ...maybeEntries]);
   return withAllocationLock(async () => db.withDedicatedTransaction(async tx => {
     // A content pull may spend seconds in remote/cache I/O. Re-read tracking
     // state only after acquiring the same lock used by disable/remove/retire so
@@ -536,6 +539,22 @@ async function pullDeckContent(author, publicId, knownRow = null) {
     .filter(Boolean));
   await markDeckCommanders(tx, targetDeckId, commanderKeys);
 
+  // 2c. Maybeboard: replaced wholesale. Lives in its own table so it never
+  // touches deck totals, stats, value or checkout allocation.
+  const maybeQty = new Map();
+  for (const e of maybeEntries) {
+    const id = scryboxCardId(e.card);
+    maybeQty.set(id, (maybeQty.get(id) || 0) + e.quantity);
+  }
+  await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [targetDeckId]);
+  for (const [cardId, quantity] of maybeQty) {
+    await tx.run(
+      `INSERT INTO deck_maybe_cards (deck_id, card_id, quantity)
+       SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM card_cache WHERE id = ?)`,
+      [targetDeckId, cardId, quantity, cardId]
+    );
+  }
+
   // 3. Refresh the tracking row: the stamp we just mirrored is now "current".
   const stamp = details.lastUpdatedAtUtc || null;
   await tx.run(
@@ -619,6 +638,7 @@ async function setDeckEnabled(userId, publicId, enabled) {
     }
     if (current.bindarr_deck_id) {
       await tx.run(`DELETE FROM deck_cards WHERE deck_id = ?`, [current.bindarr_deck_id]);
+      await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [current.bindarr_deck_id]);
       await tx.run(`DELETE FROM decks WHERE id = ? AND source = 'moxfield'`, [current.bindarr_deck_id]);
       await tx.run(`UPDATE moxfield_decks SET enabled = 0, bindarr_deck_id = NULL, last_synced_updated_at = NULL, last_error = NULL WHERE id = ?`, [row.id]);
     } else {
@@ -690,6 +710,7 @@ async function removeAuthor(userId, authorId) {
     for (const row of tracked) {
       if (row.bindarr_deck_id) {
         await tx.run(`DELETE FROM deck_cards WHERE deck_id = ?`, [row.bindarr_deck_id]);
+        await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [row.bindarr_deck_id]);
         await tx.run(`DELETE FROM decks WHERE id = ? AND source = 'moxfield'`, [row.bindarr_deck_id]);
       }
     }
@@ -764,6 +785,7 @@ module.exports = {
   pullDeckContentByPublicId,
   // Re-exported from utils/mfxPayload so callers can import everything from one place.
   extractDeckCards,
+  extractMaybeCards,
   boardCounts,
   scryboxCardId,
   mfxFormatLabel,

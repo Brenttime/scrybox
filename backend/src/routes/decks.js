@@ -285,11 +285,34 @@ router.get('/:id', async (req, res) => {
       current_price: currentPrintingPrice(row),
     })));
 
+    // Maybeboard: shown on its own tab with own/missing, never in deck stats.
+    const maybeRows = await db.all(`
+      WITH owned AS (
+        SELECT ${sqlCardKey('owned_cc')} AS card_key, SUM(owned.quantity) AS owned_qty
+        FROM collection owned
+        JOIN card_cache owned_cc ON owned_cc.id = owned.card_id
+        WHERE owned.user_id = ? AND owned.quantity > 0
+        GROUP BY ${sqlCardKey('owned_cc')}
+      )
+      SELECT dm.quantity, ${sqlCardKey('cc')} AS card_key,
+        cc.id, cc.name, cc.printed_name, cc.supertype, cc.subtypes, cc.types, cc.rarity,
+        cc.set_id, cc.set_name, cc.number, cc.image_url,
+        cc.price_trend, cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_currency,
+        COALESCE(owned.owned_qty, 0) AS owned_qty
+      FROM deck_maybe_cards dm
+      JOIN card_cache cc ON cc.id = dm.card_id
+      LEFT JOIN owned ON owned.card_key = ${sqlCardKey('cc')}
+      WHERE dm.deck_id = ? AND dm.quantity > 0
+      ORDER BY cc.name
+    `, [req.user.id, id]);
+    const maybeboard = maybeRows.map(row => ({ ...parseCardRow(row), current_price: currentPrintingPrice(row) }));
+
     res.json({
       ...deck,
       ...(values.get(Number(deck.id)) || emptyDeckMinimumValue()),
       ...currentValues,
-      cards: formatted
+      cards: formatted,
+      maybeboard
     });
   } catch (error) {
     console.error(error);
@@ -387,6 +410,7 @@ router.delete('/:id', async (req, res) => {
       if (deck.checked_out) return { status: 409, error: 'Check this deck in before changing its cards.' };
 
       await tx.run(`DELETE FROM deck_cards WHERE deck_id = ?`, [id]);
+      await tx.run(`DELETE FROM deck_maybe_cards WHERE deck_id = ?`, [id]);
       const deleted = await tx.run(`DELETE FROM decks WHERE id = ? AND user_id = ?`, [id, req.user.id]);
       if (deleted.changes !== 1) throw new Error('Deck disappeared during deletion');
       return { status: 200 };
