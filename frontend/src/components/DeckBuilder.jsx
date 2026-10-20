@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart } from 'lucide-react';
+import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart } from 'lucide-react';
 import { shuffleArray } from '../utils/shuffle';
 import { displayName } from '../utils/languages';
 import CheckoutWizardModal from './CheckoutWizardModal';
@@ -11,6 +11,7 @@ import { useBackGuard } from '../utils/useBackGuard';
 import { getRememberedView, rememberOpen, clearOpen } from '../utils/viewMemory';
 import { buildDeckExport, parseDeckLine, missingEntries } from '../utils/deckText';
 import CardImage from './CardImage';
+import CardInspectorModal from './CardInspectorModal';
 import { useT } from '../utils/i18n';
 import { canRegisterDeckInCollection, deckRegistrationCardCount } from '../utils/deckCollectionRegistration';
 import { cardKey, findSameCard } from '../utils/cardIdentity';
@@ -45,7 +46,6 @@ function DeckBuilder({ showToast, onNavigate }) {
     setCardDisplayModeState(mode);
     try { localStorage.setItem('bindarr.deckCardDisplayMode', mode); } catch { /* storage unavailable */ }
   };
-  const [previewCard, setPreviewCard] = useState(null);
   // Deck page: one tap-to-open card sheet ({ id, board }), a desktop hover
   // preview for list rows, and prices behind a persisted $ toggle (off).
   const [sheetRef, setSheetRef] = useState(null);
@@ -55,7 +55,25 @@ function DeckBuilder({ showToast, onNavigate }) {
     setShowPricesState(on);
     localStorage.setItem('deckShowPrices', on ? '1' : '0');
   };
-  const openCardSheet = (card, board) => { setHoverCard(null); setSheetRef({ id: card.id, board }); };
+  // Same details the Collection shows: open the owned collection entry in the
+  // shared CardInspectorModal (read-only fallback when not owned). Deck
+  // quantity / remove ride along as extra controls for main-board cards.
+  const [inspectEntry, setInspectEntry] = useState(null);
+  const openCardSheet = async (card, board = null) => {
+    setHoverCard(null);
+    setSheetRef(board ? { id: card.id, board } : null);
+    const fallback = { ...card, card_id: card.id, entry_id: null, quantity: card.owned_qty || 0, __readOnly: true };
+    if (!(card.owned_qty > 0)) { setInspectEntry(fallback); return; }
+    try {
+      const res = await fetch(`/api/collection?card_id=${encodeURIComponent(card.id)}`);
+      const rows = res.ok ? await res.json() : [];
+      setInspectEntry(Array.isArray(rows) && rows.length ? rows[0] : fallback);
+    } catch {
+      setInspectEntry(fallback);
+    }
+  };
+  const setPreviewCard = (card) => { if (card) openCardSheet(card); };
+  const closeInspector = () => { setInspectEntry(null); setSheetRef(null); };
 
   // Deck Creation States & Constants
   const MTG_FORMATS = ['Commander / EDH', 'Standard', 'Modern', 'Pioneer', 'Legacy', 'Vintage', 'Pauper'];
@@ -2226,66 +2244,34 @@ function DeckBuilder({ showToast, onNavigate }) {
         </div>
       )}
 
-      {/* Card action sheet: one tap target per card; every per-card verb lives here. */}
-      {sheetCard && (
-        <div className="modal-overlay dk-sheet-overlay" onClick={() => setSheetRef(null)}>
-          <div className="glass-panel dk-sheet" onClick={e => e.stopPropagation()} role="dialog" aria-label={displayName(sheetCard)}>
-            <button className="modal-close btn btn-secondary btn-icon-only dk-sheet-close" onClick={() => setSheetRef(null)} aria-label={t('deck.closeResults')}>
-              <X size={16} />
-            </button>
-            <CardImage card={sheetCard} className="dk-sheet-img" />
-            <div className="dk-sheet-body">
-              <h3 className="dk-sheet-name">{displayName(sheetCard)}</h3>
-              <div className="dk-sheet-meta">
-                {(sheetCard.set_id || '').toUpperCase()} · #{sheetCard.number} · {cardPriceLabel(sheetCard)} · {t('deck.ownedCount', { count: sheetCard.owned_qty || 0 })}
+      {inspectEntry && (
+        <CardInspectorModal
+          card={inspectEntry}
+          readOnly={!!inspectEntry.__readOnly}
+          showToast={showToast}
+          onUpdate={() => { if (activeDeck) loadDeckDetails(activeDeck.id); }}
+          onDeleted={() => { closeInspector(); if (activeDeck) loadDeckDetails(activeDeck.id); }}
+          onClose={closeInspector}
+        >
+          {sheetCard && sheetRef?.board === 'main' && (
+            <div className="dk-inspector-deck">
+              <div className="dk-stepper">
+                <button type="button" className="btn btn-secondary" disabled={savingCard}
+                  onClick={() => { if (sheetCard.quantity <= 1) closeInspector(); handleUpdateCardQty(sheetCard.id, sheetCard.quantity - 1); }}
+                  aria-label={t(sheetCard.quantity === 1 ? 'deck.removeFromDeck' : 'deck.decreaseQty')}>−</button>
+                <b>{sheetCard.quantity}</b>
+                <button type="button" className="btn btn-secondary"
+                  disabled={savingCard || sheetCard.quantity >= (sheetCard.owned_qty || 0) || (!isBasicLand(sheetCard) && (countsByName.get(cardKey(sheetCard)) || 0) >= 4)}
+                  onClick={() => handleUpdateCardQty(sheetCard.id, sheetCard.quantity + 1)}
+                  aria-label={t('deck.increaseQty')}>+</button>
+                <span className="dk-stepper-l">{t('deck.inDeck')}</span>
               </div>
-              {sheetRef.board === 'main' ? (
-                <>
-                  <div className="dk-stepper">
-                    <button type="button" className="btn btn-secondary" disabled={savingCard}
-                      onClick={() => handleUpdateCardQty(sheetCard.id, sheetCard.quantity - 1)}
-                      aria-label={t(sheetCard.quantity === 1 ? 'deck.removeFromDeck' : 'deck.decreaseQty')}>−</button>
-                    <b>{sheetCard.quantity}</b>
-                    <button type="button" className="btn btn-secondary"
-                      disabled={savingCard || sheetCard.quantity >= (sheetCard.owned_qty || 0) || (!isBasicLand(sheetCard) && (countsByName.get(cardKey(sheetCard)) || 0) >= 4)}
-                      onClick={() => handleUpdateCardQty(sheetCard.id, sheetCard.quantity + 1)}
-                      aria-label={t('deck.increaseQty')}>+</button>
-                    <span className="dk-stepper-l">{t('deck.inDeck')}</span>
-                  </div>
-                  <button type="button" className="btn btn-secondary dk-sheet-btn" onClick={() => { setPreviewCard(sheetCard); setSheetRef(null); }}>
-                    <Eye size={14} /> {t('deck.viewDetails')}
-                  </button>
-                  <button type="button" className="dk-sheet-danger" onClick={() => { handleRemoveCard(sheetCard.id); setSheetRef(null); }}>
-                    {t('deck.removeFromDeck')}
-                  </button>
-                </>
-              ) : (
-                <button type="button" className="btn btn-secondary dk-sheet-btn" onClick={() => { setPreviewCard(sheetCard); setSheetRef(null); }}>
-                  <Eye size={14} /> {t('deck.viewDetails')}
-                </button>
-              )}
+              <button type="button" className="dk-sheet-danger" onClick={() => { handleRemoveCard(sheetCard.id); closeInspector(); }}>
+                {t('deck.removeFromDeck')}
+              </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* E. High-Res Card Art Preview Popover */}
-      {previewCard && (
-        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={() => setPreviewCard(null)}>
-          <div className="glass-panel" style={{ maxWidth: '340px', padding: '1rem', position: 'relative', textAlign: 'center', animation: 'draw-card-anim 0.25s ease-out forwards' }} onClick={e => e.stopPropagation()}>
-            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setPreviewCard(null)} style={{ position: 'absolute', top: '0.5rem', right: '0.5rem', borderRadius: '50%', zIndex: 10 }}>
-              <X size={16} />
-            </button>
-            <CardImage
-              card={previewCard}
-              style={{ width: '100%', borderRadius: '10px', boxShadow: '0 8px 24px rgba(0,0,0,0.6)' }}
-            />
-            <h4 style={{ color: 'var(--text-strong)', margin: '0.75rem 0 0.25rem 0', fontSize: '1rem' }}>{displayName(previewCard)}</h4>
-            <p style={{ color: 'var(--text-secondary)', margin: 0, fontSize: '0.75rem' }}>
-              {previewCard.set_name} • #{previewCard.number} ({previewCard.rarity || 'Common'})
-            </p>
-          </div>
-        </div>
+          )}
+        </CardInspectorModal>
       )}
 
       {/* Checkout Coverage Modal */}
