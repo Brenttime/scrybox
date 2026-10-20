@@ -1390,7 +1390,7 @@ function DeckBuilder({ showToast, onNavigate }) {
       {viewMode === 'detail' && activeDeck && (
         <div className="dk-page">
           {/* Header: art thumb, name, one grey facts line, one state-driven
-              primary verb, Draw hand, and everything else behind ⋯. */}
+              primary verb, and everything else (incl. Draw hand) behind ⋯. */}
           <div className="dk-head">
             <button className="btn btn-secondary btn-icon-only dk-back" onClick={closeDeck} aria-label={t('deck.backToDecks')}>
               <ChevronLeft size={16} />
@@ -1439,9 +1439,6 @@ function DeckBuilder({ showToast, onNavigate }) {
             </div>
 
             <div className="dk-head-actions">
-              <button className="btn btn-secondary" onClick={startSimulator}>
-                <Play size={14} /> {t('deck.drawHand')}
-              </button>
               {isOut ? (
                 <button className="btn btn-primary" onClick={() => handleReturn(activeDeck)} disabled={busy} title={t('deck.returnHint')}>
                   <PackageCheck size={14} /> {t('deck.returnAction')}
@@ -1456,6 +1453,9 @@ function DeckBuilder({ showToast, onNavigate }) {
                 </button>
               )}
               <OverflowMenu label={t('deck.moreActions')}>
+                <button role="menuitem" style={moreItem} onClick={startSimulator}>
+                  <Play size={14} /> {t('deck.drawHand')}
+                </button>
                 {isBuilding && (
                   <button role="menuitem" style={moreItem} onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
                     <LogOut size={14} /> {t('deck.checkoutAction')}
