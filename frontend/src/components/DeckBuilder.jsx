@@ -111,7 +111,6 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [deckSearchTerm, setDeckSearchTerm] = useState('');
   const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon' | 'no_moxfield' | 'moxfield'
   useEffect(() => { localStorage.setItem('deckSourceFilter', deckSourceFilter); }, [deckSourceFilter]);
-  const [deckStatusFilter, setDeckStatusFilter] = useState('all'); // 'all' | 'in_progress' | 'in_play'
   const [deckSortBy, setDeckSortBy] = useState('created_desc'); // 'created_desc' | 'created_asc' | 'name_asc' | 'cards_desc'
   const [deckSelectionViewMode, setDeckSelectionViewMode] = useState('grid'); // 'grid' | 'table'
 
@@ -953,10 +952,6 @@ function DeckBuilder({ showToast, onNavigate }) {
       deck.name.toLowerCase().includes(q) ||
       (deck.description && deck.description.toLowerCase().includes(q));
 
-    let matchesStatus = true;
-    if (deckStatusFilter === 'in_progress') matchesStatus = (deck.total_cards || 0) < (deck.target_size || 60);
-    else if (deckStatusFilter === 'in_play') matchesStatus = !!deck.checked_out;
-
     const src = deck.source === 'precon' || deck.source === 'moxfield' ? deck.source : null;
     const matchesSource = deckSourceFilter === 'all'
       || (deckSourceFilter === 'no_precon' && src !== 'precon')
@@ -964,7 +959,7 @@ function DeckBuilder({ showToast, onNavigate }) {
       || (deckSourceFilter === 'no_moxfield' && src !== 'moxfield')
       || (deckSourceFilter === 'moxfield' && src === 'moxfield');
 
-    return matchesSearch && matchesStatus && matchesSource;
+    return matchesSearch && matchesSource;
   }).sort((a, b) => {
     if (deckSortBy === 'name_asc') return a.name.localeCompare(b.name);
     if (deckSortBy === 'cards_desc') return (b.total_cards || 0) - (a.total_cards || 0);
@@ -1019,11 +1014,6 @@ function DeckBuilder({ showToast, onNavigate }) {
               )}
             </div>
             <div className="deck-toolbar-chips">
-              <select className="deck-chip" aria-label={t('deck.allStatuses')} value={deckStatusFilter} onChange={e => setDeckStatusFilter(e.target.value)}>
-                <option value="all">{t('deck.allStatuses')}</option>
-                <option value="in_progress">{t('deck.statusBuildingCount')}</option>
-                <option value="in_play">{t('deck.statusInPlayEmoji')}</option>
-              </select>
               <select className="deck-chip" aria-label={t('deck.sourceFilter')} value={deckSourceFilter} onChange={e => setDeckSourceFilter(e.target.value)}>
                 <option value="all">{t('deck.allDecks')}</option>
                 <option value="no_precon">{t('deck.hidePrecons')}</option>
@@ -1052,11 +1042,11 @@ function DeckBuilder({ showToast, onNavigate }) {
               <Layers size={36} style={{ color: 'var(--text-muted)', marginBottom: '0.75rem', opacity: 0.5 }} />
               <h3 style={{ color: 'var(--text-strong)', fontSize: '1.05rem', marginBottom: '0.25rem' }}>{t('deck.noMatches')}</h3>
               <p style={{ fontSize: '0.85rem' }}>{t('deck.noMatchesHint')}</p>
-              {(deckSearchTerm || deckStatusFilter !== 'all') && (
+              {(deckSearchTerm || deckSourceFilter !== 'all') && (
                 <button
                   className="btn btn-secondary"
                   style={{ marginTop: '1rem', fontSize: '0.8rem' }}
-                  onClick={() => { setDeckSearchTerm(''); setDeckStatusFilter('all'); }}
+                  onClick={() => { setDeckSearchTerm(''); setDeckSourceFilter('all'); }}
                 >
                   {t('deck.clearFilters')}
                 </button>
