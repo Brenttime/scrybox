@@ -154,10 +154,15 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
     );
   }
 
-  const { summary, types, rarities, sets, topValuable, recentAdditions = [], setProgress } = stats;
+  const { summary, types, rarities, sets, topValuable, recentAdditions = [], setProgress, colorValues = [] } = stats;
 
   return (
     <div>
+      {/* Hero: collection value by colour */}
+      <Suspense fallback={<DashboardChunkFallback style={{ marginBottom: '1.5rem', minHeight: '260px', padding: '1.5rem' }} />}>
+        <DashboardCharts section="colorValue" colorValues={colorValues} totalValue={summary?.totalValue} />
+      </Suspense>
+
       {/* Metrics Summary Grid */}
       <div className="metrics-grid">
         {/* Net Worth Card with historical switcher */}

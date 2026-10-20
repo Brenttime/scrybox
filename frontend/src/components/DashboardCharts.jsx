@@ -192,7 +192,66 @@ function AnalyticsCharts({ sets, types, rarities }) {
   );
 }
 
+// MTG-ish slice colours for the value-by-colour hero (readable on dark).
+const VALUE_COLORS = {
+  White: '#f3ecc8', Blue: '#4ea3e0', Black: '#8a7f86', Red: '#e8604c', Green: '#4fb06a',
+  Multicolor: '#e8c25b', Colorless: '#a7adb8', Land: '#b07a4a',
+};
+
+function ColorValueHero({ colorValues = [], totalValue = 0 }) {
+  const { t } = useT();
+  const total = colorValues.reduce((a, c) => a + (Number(c.value) || 0), 0) || totalValue || 0;
+  const data = colorValues.map((c) => ({
+    ...c,
+    label: c.name,
+    fill: VALUE_COLORS[c.name] || '#6b7280',
+  }));
+  const money = (v) => `$${Number(v || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return (
+    <div className="glass-panel dash-color-value">
+      <h3 className="chart-title">{t('dash.valueByColor')}</h3>
+      {data.length === 0 ? (
+        <div className="chart-empty">{t('dash.noTypeData')}</div>
+      ) : (
+        <div className="dash-cv-body">
+          <div className="dash-cv-chart">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={data} dataKey="value" nameKey="label" cx="50%" cy="50%" innerRadius="58%" outerRadius="92%" paddingAngle={2} stroke="none" isAnimationActive={false}>
+                  {data.map((d) => <Cell key={d.name} fill={d.fill} />)}
+                </Pie>
+                <Tooltip
+                  contentStyle={{ backgroundColor: 'var(--bg-secondary)', borderColor: 'var(--border-glass)' }}
+                  itemStyle={{ color: 'var(--text-strong)' }}
+                  formatter={(v, n) => [`${money(v)} · ${total ? Math.round((v / total) * 100) : 0}%`, n]}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            <div className="dash-cv-center">
+              <span className="dash-cv-total">{money(total)}</span>
+              <span className="dash-cv-sub">{t('dash.totalValue')}</span>
+            </div>
+          </div>
+          <ul className="dash-cv-legend">
+            {data.map((d) => (
+              <li key={d.name}>
+                <span className="dash-cv-dot" style={{ background: d.fill }} />
+                <span className="dash-cv-name">{d.label}</span>
+                <span className="dash-cv-val">{money(d.value)}</span>
+                <span className="dash-cv-pct">{total ? Math.round((d.value / total) * 100) : 0}%</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DashboardCharts({ section, ...props }) {
+  if (section === 'colorValue') {
+    return <ColorValueHero {...props} />;
+  }
   if (section === 'timeline') {
     return <TimelineChart {...props} />;
   }
