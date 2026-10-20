@@ -7,11 +7,13 @@ import {
   Legend,
   Pie,
   PieChart,
+  Sector,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from 'recharts';
+import { useState } from 'react';
 import { useT } from '../utils/i18n';
 
 const COLORS = [
@@ -192,56 +194,86 @@ function AnalyticsCharts({ sets, types, rarities }) {
   );
 }
 
-// MTG-ish slice colours for the value-by-colour hero (readable on dark).
+// ManaBox-style colour donut: mana-pip icon on each slice, tap a slice to
+// pop it out and fade the rest; the centre then shows that slice's value.
 const VALUE_COLORS = {
-  White: '#f3ecc8', Blue: '#4ea3e0', Black: '#8a7f86', Red: '#e8604c', Green: '#4fb06a',
-  Multicolor: '#e8c25b', Colorless: '#a7adb8', Land: '#b07a4a',
+  White: { fill: '#f8f3d8', ink: '#3a3524', pip: 'W' },
+  Blue: { fill: '#a9d6f2', ink: '#0f3552', pip: 'U' },
+  Black: { fill: '#b7aca8', ink: '#1c1616', pip: 'B' },
+  Red: { fill: '#f2a58c', ink: '#551a0b', pip: 'R' },
+  Green: { fill: '#9fd3a7', ink: '#0d3a1b', pip: 'G' },
+  Multicolor: { fill: '#e8c25b', ink: '#3d2f08', pip: 'M' },
+  Colorless: { fill: '#cfcccb', ink: '#2c2a2a', pip: 'C' },
+  Land: { fill: '#c9a27a', ink: '#3b2614', pip: 'L' },
 };
+const RAD = Math.PI / 180;
+
+function PipLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent, payload, faded }) {
+  if (percent < 0.035) return null;
+  const r = (innerRadius + outerRadius) / 2;
+  const x = cx + r * Math.cos(-midAngle * RAD);
+  const y = cy + r * Math.sin(-midAngle * RAD);
+  const c = VALUE_COLORS[payload.name] || { fill: '#6b7280', ink: '#fff', pip: '?' };
+  return (
+    <g style={{ pointerEvents: 'none', opacity: faded ? 0.3 : 1, transition: 'opacity .2s' }}>
+      <circle cx={x} cy={y} r={11} fill={c.fill} stroke="rgba(0,0,0,0.45)" strokeWidth={1.5} />
+      <text x={x} y={y} textAnchor="middle" dominantBaseline="central" fontSize={11} fontWeight={800} fill={c.ink}>{c.pip}</text>
+    </g>
+  );
+}
+
+function ActiveSlice(props) {
+  const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props;
+  return <Sector cx={cx} cy={cy} innerRadius={innerRadius - 2} outerRadius={outerRadius + 10} startAngle={startAngle} endAngle={endAngle} fill={fill} />;
+}
 
 function ColorValueHero({ colorValues = [], totalValue = 0 }) {
   const { t } = useT();
+  const [active, setActive] = useState(null);
   const total = colorValues.reduce((a, c) => a + (Number(c.value) || 0), 0) || totalValue || 0;
-  const data = colorValues.map((c) => ({
-    ...c,
-    label: c.name,
-    fill: VALUE_COLORS[c.name] || '#6b7280',
-  }));
+  const data = colorValues.map((c) => ({ ...c, fill: (VALUE_COLORS[c.name] || {}).fill || '#6b7280' }));
   const money = (v) => `$${Number(v || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const sel = active !== null ? data[active] : null;
+  const pct = (v) => (total ? Math.round((v / total) * 100) : 0);
   return (
     <div className="glass-panel dash-color-value">
       <h3 className="chart-title">{t('dash.valueByColor')}</h3>
       {data.length === 0 ? (
         <div className="chart-empty">{t('dash.noTypeData')}</div>
       ) : (
-        <div className="dash-cv-body">
-          <div className="dash-cv-chart">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={data} dataKey="value" nameKey="label" cx="50%" cy="50%" innerRadius="58%" outerRadius="92%" paddingAngle={2} stroke="none" isAnimationActive={false}>
-                  {data.map((d) => <Cell key={d.name} fill={d.fill} />)}
-                </Pie>
-                <Tooltip
-                  contentStyle={{ backgroundColor: 'var(--bg-secondary)', borderColor: 'var(--border-glass)' }}
-                  itemStyle={{ color: 'var(--text-strong)' }}
-                  formatter={(v, n) => [`${money(v)} · ${total ? Math.round((v / total) * 100) : 0}%`, n]}
-                />
-              </PieChart>
-            </ResponsiveContainer>
-            <div className="dash-cv-center">
-              <span className="dash-cv-total">{money(total)}</span>
-              <span className="dash-cv-sub">{t('dash.totalValue')}</span>
-            </div>
+        <div className="dash-cv-chart" onClick={() => setActive(null)}>
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie
+                data={data} dataKey="value" nameKey="name" cx="50%" cy="50%"
+                innerRadius="56%" outerRadius="86%" paddingAngle={1.5} stroke="none"
+                isAnimationActive={false}
+                activeIndex={active ?? undefined} activeShape={ActiveSlice}
+                label={(p) => <PipLabel {...p} faded={active !== null && p.index !== active} />}
+                labelLine={false}
+                onClick={(_, i, e) => { e?.stopPropagation?.(); setActive(a => (a === i ? null : i)); }}
+                style={{ cursor: 'pointer', outline: 'none' }}
+              >
+                {data.map((d, i) => (
+                  <Cell key={d.name} fill={d.fill} fillOpacity={active === null || active === i ? 1 : 0.22} style={{ transition: 'fill-opacity .2s', outline: 'none' }} />
+                ))}
+              </Pie>
+            </PieChart>
+          </ResponsiveContainer>
+          <div className="dash-cv-center">
+            {sel ? (
+              <>
+                <span className="dash-cv-name">{sel.name}</span>
+                <span className="dash-cv-total">{money(sel.value)}</span>
+                <span className="dash-cv-sub">{t('dash.colorSliceSub', { pct: pct(sel.value), count: Number(sel.count || 0).toLocaleString() })}</span>
+              </>
+            ) : (
+              <>
+                <span className="dash-cv-total">{money(total)}</span>
+                <span className="dash-cv-sub">{t('dash.tapSlice')}</span>
+              </>
+            )}
           </div>
-          <ul className="dash-cv-legend">
-            {data.map((d) => (
-              <li key={d.name}>
-                <span className="dash-cv-dot" style={{ background: d.fill }} />
-                <span className="dash-cv-name">{d.label}</span>
-                <span className="dash-cv-val">{money(d.value)}</span>
-                <span className="dash-cv-pct">{total ? Math.round((d.value / total) * 100) : 0}%</span>
-              </li>
-            ))}
-          </ul>
         </div>
       )}
     </div>
