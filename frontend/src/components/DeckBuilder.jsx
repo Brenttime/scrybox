@@ -1640,7 +1640,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                                   onMouseLeave={() => setHoverCard(null)}>
                                   <span className="dk-row-q">{card.quantity}</span>
                                   <span className="dk-row-name">{displayName(card)}</span>
-                                  {showShort && <span className="dk-row-short" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>−{short}</span>}
+                                  {showShort && <span className="dk-row-short" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>{t('deck.missingBadge', { count: short })}</span>}
                                   <span className="dk-row-pips" aria-hidden="true">
                                     {cardColorLetters(card).map(l => <span key={l} className={`dk-pip dk-pip-${l}`} />)}
                                     {card.cmc !== null && card.cmc !== undefined && !isLandCard(card) && <span className="dk-row-cmc">{card.cmc}</span>}
@@ -1659,11 +1659,11 @@ function DeckBuilder({ showToast, onNavigate }) {
                             {group.cards.map(card => {
                               const short = Math.max(0, card.quantity - (card.owned_qty || 0));
                               return (
-                                <button key={card.id} type="button" className="dk-tile" onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')} aria-label={displayName(card)}>
+                                <button key={card.id} type="button" className={`dk-tile${short > 0 && !isBasicLand(card) ? ' is-missing' : ''}`} onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')} aria-label={displayName(card)}>
                                   <CardImage card={card} loading="lazy" decoding="async" className="dk-tile-img" />
                                   {card.quantity > 1 && <span className="dk-tile-qty">×{card.quantity}</span>}
                                   {short > 0 && !isBasicLand(card) && (
-                                    <span className="deck-missing-chip" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>+{short}</span>
+                                    <span className="dk-tile-missing" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>{t('deck.missingBadge', { count: short })}</span>
                                   )}
                                   {showPrices && <span className="deck-card-price-chip">{cardPriceLabel(card)}</span>}
                                 </button>

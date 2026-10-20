@@ -225,6 +225,7 @@
   "deck.maybeOwnChip": "Own",
   "deck.rowMissing.one": "+{count} missing from collection",
   "deck.rowMissing.other": "+{count} missing from collection",
+  "deck.missingBadge": "Missing {count}",
   "deck.rowMissingTitle": "This deck needs {need} copies but your collection holds {have}",
   "deck.backToDecks": "Back to decks",
   "deck.deleteDeckHint": "Delete this deck",
