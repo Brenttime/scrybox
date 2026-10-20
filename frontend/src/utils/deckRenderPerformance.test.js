@@ -28,9 +28,9 @@ for (const thumbnailSection of [
     'search, list, and grid thumbnails must defer loading and decode work');
 }
 
-const previewSection = section('{/* E. High-Res Card Art Preview Popover */}', '{/* Checkout Coverage Modal */}');
-assert.doesNotMatch(previewSection, /loading="lazy"|decoding="async"/,
-  'an explicitly opened high-resolution preview must remain eager');
+// Card details use the same shared inspector as the Collection.
+assert.match(deckBuilder, /<CardInspectorModal[\s\S]*?card=\{inspectEntry\}/,
+  'deck card details must open the shared CardInspectorModal');
 
 assert.match(deckBuilder, /import \{[^}]*\buseMemo\b[^}]*\} from 'react';/,
   'deck-wide derived data must use React useMemo');

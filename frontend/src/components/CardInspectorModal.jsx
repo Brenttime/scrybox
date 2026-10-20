@@ -26,7 +26,7 @@ const MTG_COLOR_FG = {
 // Self-contained: owns its edit form (PUT) and delete (DELETE) so every screen
 // gets the same rich view + edit without duplicating the form. onUpdate() lets
 // the parent refetch after a change.
-function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false }) {
+function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false, children = null }) {
   const { t } = useT();
   const [mode, setMode] = useState('view');
   const [q, setQ] = useState(1);
@@ -498,6 +498,9 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                   {card.notes}
                 </div>
               )}
+
+              {/* Caller-specific controls (e.g. deck quantity) sit above Edit. */}
+              {children}
 
               {/* One clear entry point: every per-copy change lives in Edit. */}
               {!readOnly && (
