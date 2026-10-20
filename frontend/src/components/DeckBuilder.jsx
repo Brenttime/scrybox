@@ -111,7 +111,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [deckSearchTerm, setDeckSearchTerm] = useState('');
   const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon' | 'no_moxfield' | 'moxfield'
   useEffect(() => { localStorage.setItem('deckSourceFilter', deckSourceFilter); }, [deckSourceFilter]);
-  const [deckStatusFilter, setDeckStatusFilter] = useState('all'); // 'all' | 'ready' | 'in_progress' | 'in_play'
+  const [deckStatusFilter, setDeckStatusFilter] = useState('all'); // 'all' | 'in_progress' | 'in_play'
   const [deckSortBy, setDeckSortBy] = useState('created_desc'); // 'created_desc' | 'created_asc' | 'name_asc' | 'cards_desc'
   const [deckSelectionViewMode, setDeckSelectionViewMode] = useState('grid'); // 'grid' | 'table'
 
@@ -954,8 +954,7 @@ function DeckBuilder({ showToast, onNavigate }) {
       (deck.description && deck.description.toLowerCase().includes(q));
 
     let matchesStatus = true;
-    if (deckStatusFilter === 'ready') matchesStatus = deck.total_cards === (deck.target_size || 60);
-    else if (deckStatusFilter === 'in_progress') matchesStatus = (deck.total_cards || 0) < (deck.target_size || 60);
+    if (deckStatusFilter === 'in_progress') matchesStatus = (deck.total_cards || 0) < (deck.target_size || 60);
     else if (deckStatusFilter === 'in_play') matchesStatus = !!deck.checked_out;
 
     const src = deck.source === 'precon' || deck.source === 'moxfield' ? deck.source : null;
@@ -1022,7 +1021,6 @@ function DeckBuilder({ showToast, onNavigate }) {
             <div className="deck-toolbar-chips">
               <select className="deck-chip" aria-label={t('deck.allStatuses')} value={deckStatusFilter} onChange={e => setDeckStatusFilter(e.target.value)}>
                 <option value="all">{t('deck.allStatuses')}</option>
-                <option value="ready">{t('deck.statusBattleReady')}</option>
                 <option value="in_progress">{t('deck.statusBuildingCount')}</option>
                 <option value="in_play">{t('deck.statusInPlayEmoji')}</option>
               </select>
