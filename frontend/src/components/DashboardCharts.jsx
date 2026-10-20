@@ -194,33 +194,18 @@ function AnalyticsCharts({ sets, types, rarities }) {
   );
 }
 
-// ManaBox-style colour donut: mana-pip icon on each slice, tap a slice to
-// pop it out and fade the rest; the centre then shows that slice's value.
+// Minimal colour donut: tap a slice to pop it out and fade the rest; the
+// centre then shows that slice's value.
 const VALUE_COLORS = {
-  White: { fill: '#F4E7B5', ink: '#4A3F1C', pip: 'W' },
-  Blue: { fill: '#3A8FE3', ink: '#FFFFFF', pip: 'U' },
-  Black: { fill: '#7A5C99', ink: '#FFFFFF', pip: 'B' },
-  Red: { fill: '#E5533D', ink: '#FFFFFF', pip: 'R' },
-  Green: { fill: '#2EAA67', ink: '#FFFFFF', pip: 'G' },
-  Multicolor: { fill: '#E0A82E', ink: '#3A2A05', pip: 'M' },
-  Colorless: { fill: '#9BA6B4', ink: '#1E242C', pip: 'C' },
-  Land: { fill: '#8C6447', ink: '#FFFFFF', pip: 'L' },
+  White: { fill: '#F4E7B5' },
+  Blue: { fill: '#3A8FE3' },
+  Black: { fill: '#7A5C99' },
+  Red: { fill: '#E5533D' },
+  Green: { fill: '#2EAA67' },
+  Multicolor: { fill: '#E0A82E' },
+  Colorless: { fill: '#9BA6B4' },
+  Land: { fill: '#8C6447' },
 };
-const RAD = Math.PI / 180;
-
-function PipLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent, payload, faded }) {
-  if (percent < 0.035) return null;
-  const r = (innerRadius + outerRadius) / 2;
-  const x = cx + r * Math.cos(-midAngle * RAD);
-  const y = cy + r * Math.sin(-midAngle * RAD);
-  const c = VALUE_COLORS[payload.name] || { fill: '#6b7280', ink: '#fff', pip: '?' };
-  return (
-    <g style={{ pointerEvents: 'none', opacity: faded ? 0.3 : 1, transition: 'opacity .2s' }}>
-      <circle cx={x} cy={y} r={11} fill={c.fill} stroke="rgba(0,0,0,0.45)" strokeWidth={1.5} />
-      <text x={x} y={y} textAnchor="middle" dominantBaseline="central" fontSize={11} fontWeight={800} fill={c.ink}>{c.pip}</text>
-    </g>
-  );
-}
 
 function ActiveSlice(props) {
   const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props;
@@ -249,8 +234,6 @@ function ColorValueHero({ colorValues = [], totalValue = 0 }) {
                 innerRadius="56%" outerRadius="86%" paddingAngle={1.5} stroke="none"
                 isAnimationActive={false}
                 activeIndex={active ?? undefined} activeShape={ActiveSlice}
-                label={(p) => <PipLabel {...p} faded={active !== null && p.index !== active} />}
-                labelLine={false}
                 onClick={(_, i, e) => { e?.stopPropagation?.(); setActive(a => (a === i ? null : i)); }}
                 style={{ cursor: 'pointer', outline: 'none' }}
               >
