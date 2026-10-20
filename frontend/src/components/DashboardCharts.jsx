@@ -197,14 +197,14 @@ function AnalyticsCharts({ sets, types, rarities }) {
 // ManaBox-style colour donut: mana-pip icon on each slice, tap a slice to
 // pop it out and fade the rest; the centre then shows that slice's value.
 const VALUE_COLORS = {
-  White: { fill: '#f8f3d8', ink: '#3a3524', pip: 'W' },
-  Blue: { fill: '#a9d6f2', ink: '#0f3552', pip: 'U' },
-  Black: { fill: '#b7aca8', ink: '#1c1616', pip: 'B' },
-  Red: { fill: '#f2a58c', ink: '#551a0b', pip: 'R' },
-  Green: { fill: '#9fd3a7', ink: '#0d3a1b', pip: 'G' },
-  Multicolor: { fill: '#e8c25b', ink: '#3d2f08', pip: 'M' },
-  Colorless: { fill: '#cfcccb', ink: '#2c2a2a', pip: 'C' },
-  Land: { fill: '#c9a27a', ink: '#3b2614', pip: 'L' },
+  White: { fill: '#F4E7B5', ink: '#4A3F1C', pip: 'W' },
+  Blue: { fill: '#3A8FE3', ink: '#FFFFFF', pip: 'U' },
+  Black: { fill: '#7A5C99', ink: '#FFFFFF', pip: 'B' },
+  Red: { fill: '#E5533D', ink: '#FFFFFF', pip: 'R' },
+  Green: { fill: '#2EAA67', ink: '#FFFFFF', pip: 'G' },
+  Multicolor: { fill: '#E0A82E', ink: '#3A2A05', pip: 'M' },
+  Colorless: { fill: '#9BA6B4', ink: '#1E242C', pip: 'C' },
+  Land: { fill: '#8C6447', ink: '#FFFFFF', pip: 'L' },
 };
 const RAD = Math.PI / 180;
 
