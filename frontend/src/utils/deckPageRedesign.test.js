@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deckSidebarStats, findCommander, cardColorLetters } from './deckStats.js';
+import { deckSidebarStats, findCommander, cardColorLetters, landProduces } from './deckStats.js';
 
 const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const deckBuilder = readFileSync(join(srcDir, 'components', 'DeckBuilder.jsx'), 'utf8');
@@ -21,6 +21,18 @@ const s = deckSidebarStats(cards, 'cmd');
 assert.deepEqual(s.curve, [0, 2, 0, 0, 0, 0, 0, 2], 'lands and the commander stay off the curve; 7+ bucket');
 assert.equal(s.avgCmc, (1 + 1 + 18) / 4);
 assert.deepEqual(s.colors.map(c => [c.color, c.spells, c.lands]), [['W', 1, 1], ['U', 2, 11]]);
+// Utility lands count toward the colours they can actually make.
+const sorted = (set) => [...set].sort();
+const deckWU = ['W', 'U'];
+assert.deepEqual(sorted(landProduces({ name: 'Command Tower', subtypes: ['Land'], oracle_text: "{T}: Add one mana of any color in your commander's color identity." }, deckWU)), ['U', 'W']);
+assert.deepEqual(sorted(landProduces({ name: 'Unclaimed Territory', subtypes: ['Land'], oracle_text: '{T}: Add {C}.\n{T}: Add one mana of any color. Spend this mana only to cast a creature spell of the chosen type.' }, deckWU)), ['U', 'W']);
+assert.deepEqual(sorted(landProduces({ name: 'Fabled Passage', subtypes: ['Land'], oracle_text: '{T}, Sacrifice this land: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle.' }, deckWU)), ['U', 'W']);
+assert.deepEqual(sorted(landProduces({ name: 'Flooded Strand', subtypes: ['Land'], oracle_text: '{T}, Pay 1 life, Sacrifice this land: Search your library for a Plains or Island card, put it onto the battlefield, then shuffle.' }, ['W', 'U', 'B'])), ['U', 'W']);
+assert.deepEqual(sorted(landProduces({ name: 'Swarmyard', subtypes: ['Land'], oracle_text: '{T}: Add {C}.\n{T}: Regenerate target Insect.' }, deckWU)), []);
+assert.deepEqual(sorted(landProduces({ name: 'Breeding Pool', subtypes: ['Land', 'Forest', 'Island'], oracle_text: '({T}: Add {G} or {U}.)' }, deckWU)), ['G', 'U']);
+assert.deepEqual(sorted(landProduces({ name: 'Vault of the Archangel', subtypes: ['Land'], oracle_text: '{T}: Add {C}.\n{2}{W}{B}, {T}: Creatures you control gain deathtouch and lifelink until end of turn.' }, deckWU)), [], 'activation costs are not mana production');
+assert.deepEqual(sorted(landProduces({ name: 'Snow-Covered Island', subtypes: ['Basic', 'Snow', 'Land', 'Island'] }, deckWU)), ['U']);
+
 assert.deepEqual(cardColorLetters({ types: ['Blue', 'Red'] }), ['U', 'R']);
 
 assert.equal(findCommander({ cards }).id, 'cmd', 'declared commander wins');
