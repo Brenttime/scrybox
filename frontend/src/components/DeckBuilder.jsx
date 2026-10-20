@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, BarChart2, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ExternalLink, ShoppingCart } from 'lucide-react';
-import { ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip } from 'recharts';
+import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Eye, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart } from 'lucide-react';
 import { shuffleArray } from '../utils/shuffle';
 import { displayName } from '../utils/languages';
 import CheckoutWizardModal from './CheckoutWizardModal';
@@ -21,6 +20,7 @@ import { buildManapoolUrl } from '../utils/manapoolUrl';
 import { buildTcgMassEntryUrl } from '../utils/tcgMassEntryUrl';
 import { priceText } from '../utils/formatPrice';
 import { deriveDeckRenderData, isBasicLand } from '../utils/deckRenderData';
+import { deckSidebarStats, findCommander, cardColorLetters, isLandCard } from '../utils/deckStats';
 
 const EMPTY_DECK_CARDS = [];
 
@@ -46,6 +46,16 @@ function DeckBuilder({ showToast, onNavigate }) {
     try { localStorage.setItem('bindarr.deckCardDisplayMode', mode); } catch { /* storage unavailable */ }
   };
   const [previewCard, setPreviewCard] = useState(null);
+  // Deck page: one tap-to-open card sheet ({ id, board }), a desktop hover
+  // preview for list rows, and prices behind a persisted $ toggle (off).
+  const [sheetRef, setSheetRef] = useState(null);
+  const [hoverCard, setHoverCard] = useState(null);
+  const [showPrices, setShowPricesState] = useState(() => localStorage.getItem('deckShowPrices') === '1');
+  const setShowPrices = (on) => {
+    setShowPricesState(on);
+    localStorage.setItem('deckShowPrices', on ? '1' : '0');
+  };
+  const openCardSheet = (card, board) => { setHoverCard(null); setSheetRef({ id: card.id, board }); };
 
   // Deck Creation States & Constants
   const MTG_FORMATS = ['Commander / EDH', 'Standard', 'Modern', 'Pioneer', 'Legacy', 'Vintage', 'Pauper'];
@@ -833,16 +843,27 @@ function DeckBuilder({ showToast, onNavigate }) {
   const maybeCards = activeDeck?.maybeboard || EMPTY_DECK_CARDS;
   const showMaybe = cardsBoard === 'maybe' && maybeCards.length > 0;
   const maybeTotal = useMemo(() => maybeCards.reduce((s, c) => s + (c.quantity || 0), 0), [maybeCards]);
-  const maybeOwnedTypes = useMemo(() => maybeCards.filter(c => (c.owned_qty || 0) >= c.quantity).length, [maybeCards]);
   const {
     countsByName,
     deckGroups,
     totalDeckCardsCount,
-    supertypeData,
-    manaCurveData,
-    colorLandData,
   } = deckDerived;
   const targetDeckCardsCount = activeDeck?.target_size || 60;
+  const commanderCard = useMemo(() => findCommander(activeDeck), [activeDeck]);
+  const maybeGroups = useMemo(() => deriveDeckRenderData(maybeCards).deckGroups, [maybeCards]);
+  // The commander gets its own featured block, so it leaves its type section.
+  const mainGroups = useMemo(() => deckGroups
+    .map(g => {
+      if (!commanderCard || !g.cards.some(c => c.id === commanderCard.id)) return g;
+      const cards = g.cards.filter(c => c.id !== commanderCard.id);
+      return { ...g, cards, count: g.count - (commanderCard.quantity || 0) };
+    })
+    .filter(g => g.cards.length > 0), [deckGroups, commanderCard]);
+  const visibleGroups = showMaybe ? maybeGroups : mainGroups;
+  const sidebarStats = useMemo(() => deckSidebarStats(deckCards, commanderCard?.id), [deckCards, commanderCard]);
+  const sheetCard = sheetRef
+    ? (sheetRef.board === 'maybe' ? maybeCards : deckCards).find(c => c.id === sheetRef.id) || null
+    : null;
 
   // One source of truth for which half of the component paints. Deriving it
   // from BOTH pieces of view state (instead of gating the two blocks on
@@ -863,14 +884,6 @@ function DeckBuilder({ showToast, onNavigate }) {
   const isOut = !!activeDeck?.checked_out;
   const isBuilding = !isOut && missingCount > 0;
   const busy = checkingOut || registeringDeck;
-  const deckStatus = isOut
-    ? t('deck.statusOut')
-    : (missingCount > 0
-      ? t('deck.statusMissing', { count: missingCount })
-      : t('deck.statusComplete'));
-  const statusColor = isOut ? '#eab308' : (missingCount > 0 ? 'var(--accent-red)' : 'var(--success)');
-  const btnStack = { display: 'flex', alignItems: 'center', gap: '0.4rem' };
-  const quietBtn = { ...btnStack, border: '1px solid var(--border-glass)', color: 'var(--text-secondary)' };
   const moreItem = { display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', padding: '0.5rem 0.65rem', borderRadius: '8px', background: 'none', border: 'none', color: 'var(--text-primary)', fontSize: '0.82rem', cursor: 'pointer', textAlign: 'left' };
   // Per-card value: the deck's own printing (same current_price the Value
   // panel sums), one copy. Em dash when the printing has no USD price.
@@ -893,8 +906,6 @@ function DeckBuilder({ showToast, onNavigate }) {
     : currentUnpricedCards > 0
       ? t('deck.valueCurrentIncomplete', { count: currentUnpricedCards })
       : t('deck.valueCurrentComplete');
-
-  const PIE_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#64748b'];
 
   const renderSourceBadge = (source) => {
     if (source !== 'precon' && source !== 'moxfield') return null;
@@ -1377,143 +1388,90 @@ function DeckBuilder({ showToast, onNavigate }) {
 
       {/* 2. DECK EDITOR / DETAIL VIEW */}
       {viewMode === 'detail' && activeDeck && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-          {/* Header */}
-          <div className={`glass-panel deck-editor-header${activeDeck.commander_image_url ? ' has-art' : ''}`} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem', position: 'relative', overflow: 'visible' }}>
-            {/* Commander art banner. Hidden by default (index.css); themes that
-                want a hero header (ManaBox) reveal it. Decorative only. */}
+        <div className="dk-page">
+          {/* Header: art thumb, name, one grey facts line, one state-driven
+              primary verb, Draw hand, and everything else behind ⋯. */}
+          <div className="dk-head">
+            <button className="btn btn-secondary btn-icon-only dk-back" onClick={closeDeck} aria-label={t('deck.backToDecks')}>
+              <ChevronLeft size={16} />
+            </button>
             {activeDeck.commander_image_url && (
-              <div className="deck-editor-header-art" aria-hidden="true">
-                <CardImage
-                  card={{ id: activeDeck.commander_card_id, name: activeDeck.commander_name }}
-                  src={activeDeck.commander_image_url.replace('/normal/front/', '/art_crop/front/')}
-                  fallbackSrc={activeDeck.commander_image_url}
-                  loading="lazy"
-                  decoding="async"
-                  alt=""
-                />
-              </div>
+              <CardImage
+                className="dk-head-art"
+                card={{ id: activeDeck.commander_card_id, name: activeDeck.commander_name }}
+                src={activeDeck.commander_image_url.replace('/normal/front/', '/art_crop/front/')}
+                fallbackSrc={activeDeck.commander_image_url}
+                alt=""
+              />
             )}
-
-            {/* Checked out banner */}
-            {activeDeck.checked_out ? (
-              <div style={{
-                position: 'absolute',
-                top: 0, left: 0, right: 0,
-                height: '4px',
-                background: 'linear-gradient(90deg, #eab308, #f59e0b, #eab308)',
-                borderRadius: 'var(--radius-md) var(--radius-md) 0 0',
-                backgroundSize: '200% auto',
-                animation: 'shimmer-gold 2s linear infinite'
-              }} />
-            ) : null}
-
-            <div className="deck-editor-header-id" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', minWidth: 0 }}>
-              <button className="btn btn-secondary btn-icon-only" onClick={closeDeck} aria-label={t('deck.backToDecks')} style={{ borderRadius: '50%', flex: 'none' }}>
-                <ChevronLeft size={16} />
-              </button>
-              <div style={{ minWidth: 0 }}>
-                <h2 style={{ fontSize: '1.2rem', color: 'var(--text-strong)', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', margin: 0 }}>
-                  {activeDeck.name}
-                  {renderSourceBadge(activeDeck.source)}
-                  <span style={{ fontSize: '0.78rem', color: totalDeckCardsCount === targetDeckCardsCount ? 'var(--success)' : 'var(--accent-yellow)', fontWeight: 600 }}>
-                    ({totalDeckCardsCount}/{targetDeckCardsCount} cards)
+            <div className="dk-head-id">
+              <h2 className="dk-title">
+                <span className="dk-title-text">{activeDeck.name}</span>
+                {renderSourceBadge(activeDeck.source)}
+              </h2>
+              <div className="dk-facts">
+                {!!activeDeck.format && <span>{String(activeDeck.format).split(' / ')[0]}</span>}
+                {isOut ? (
+                  <span className="dk-ok" title={activeDeck.checked_out_at ? t('deck.checkedOutSince', { when: new Date(activeDeck.checked_out_at).toLocaleString() }) : t('deck.checkedOutHint')}>
+                    {t('deck.statusBuilt')}
                   </span>
-                  <span
-                    title={deckMinimumValueHint(activeDeck, t)}
-                    tabIndex={0}
-                    aria-label={`${t('deck.minimumValue')}: ${deckMinimumValueText(activeDeck)}. ${deckMinimumValueHint(activeDeck, t)}`}
-                    style={{ fontSize: '0.75rem', color: 'var(--accent-yellow)', fontWeight: 800, display: 'inline-flex', alignItems: 'center', gap: '2px' }}
-                  >
-                    <DollarSign size={13} /> {t('deck.minimumValue')}: {deckMinimumValueText(activeDeck)}
-                    {Number(activeDeck.unpriced_cards) > 0 && (
-                      <small style={{ color: 'var(--text-muted)', fontWeight: 600 }}>({deckUnpricedCountText(activeDeck, t)})</small>
-                    )}
+                ) : missingCount > 0 ? (
+                  <span className="dk-warn">{t('deck.factsMissing', { count: missingCount })}</span>
+                ) : (
+                  <span className={totalDeckCardsCount >= targetDeckCardsCount ? 'dk-ok' : 'dk-warn'}>
+                    {t('deck.factsOwned', { count: totalDeckCardsCount, target: targetDeckCardsCount })}
                   </span>
-                </h2>
-                <p style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.82rem', margin: '4px 0 0', color: 'var(--text-secondary)', flexWrap: 'wrap', minWidth: 0 }}>
-                  <span aria-hidden={'true'} style={{ width: '7px', height: '7px', borderRadius: '50%', background: statusColor, flex: 'none' }} />
-                  <span style={{ color: statusColor, fontWeight: 650 }}>{deckStatus}</span>
-                  {!!activeDeck.description && (
-                    <span style={{ color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>
-                      {activeDeck.description}
-                    </span>
-                  )}
-                  {!!isOut && activeDeck.checked_out_at && (
-                    <span style={{ color: 'var(--text-muted)', flex: 'none' }}>
-                      {t('deck.checkedOutSince', { when: new Date(activeDeck.checked_out_at).toLocaleString() })}
-                    </span>
-                  )}
-                </p>
-              </div>
-
-            {/* The deck's state picks the one filled verb; the other card-movement
-                verbs stay quiet outlines so the row never reshuffles under a click.
-                Register is hidden while a deck is out because the endpoint refuses it
-                then. Housekeeping sits behind one overflow so only the three verbs
-                that move cards across a boundary compete for attention. */}
-            <div className="deck-editor-header-actions" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', position: 'relative', flexWrap: 'wrap', justifyContent: 'flex-end', flex: '0 1 auto', minWidth: 0 }}>
-              {!isOut && isBuilding && (
-                <button
-                  className="btn btn-primary"
-                  onClick={openMissing}
-                  disabled={busy}
-                  title={t('deck.missingHint')}
-                  style={btnStack}
+                )}
+                <span
+                  title={deckMinimumValueHint(activeDeck, t)}
+                  tabIndex={0}
+                  aria-label={`${t('deck.minimumValue')}: ${deckMinimumValueText(activeDeck)}. ${deckMinimumValueHint(activeDeck, t)}`}
                 >
+                  {deckMinimumValueText(activeDeck)}
+                  {Number(activeDeck.unpriced_cards) > 0 && (
+                    <small> ({deckUnpricedCountText(activeDeck, t)})</small>
+                  )}
+                </span>
+                {moxfieldDeckUrl(activeDeck) && (
+                  <a className="dk-facts-link" href={moxfieldDeckUrl(activeDeck)} target="_blank" rel="noreferrer">{t('deck.moxfieldLink')}</a>
+                )}
+              </div>
+            </div>
+
+            <div className="dk-head-actions">
+              <button className="btn btn-secondary" onClick={startSimulator}>
+                <Play size={14} /> {t('deck.drawHand')}
+              </button>
+              {isOut ? (
+                <button className="btn btn-primary" onClick={() => handleReturn(activeDeck)} disabled={busy} title={t('deck.returnHint')}>
+                  <PackageCheck size={14} /> {t('deck.returnAction')}
+                </button>
+              ) : isBuilding ? (
+                <button className="btn btn-primary" onClick={openMissing} disabled={busy} title={t('deck.missingHint')}>
                   <ClipboardList size={14} /> {t('deck.exportMissingCount', { count: missingCount })}
                 </button>
-              )}
-              {!isOut && (
-                <button
-                  className={'btn ' + (isBuilding ? 'btn-secondary' : 'btn-primary')}
-                  onClick={() => handleCheckout(activeDeck)}
-                  disabled={busy}
-                  title={t('deck.checkoutHint')}
-                  style={isBuilding ? quietBtn : btnStack}
-                >
+              ) : (
+                <button className="btn btn-primary" onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
                   <LogOut size={14} /> {t('deck.checkoutAction')}
                 </button>
               )}
-              {isOut && (
-                <button
-                  className="btn btn-primary"
-                  onClick={() => handleReturn(activeDeck)}
-                  disabled={busy}
-                  title={t('deck.returnHint')}
-                  style={btnStack}
-                >
-                  <PackageCheck size={14} /> {t('deck.returnAction')}
-                </button>
-              )}
-              {!isOut && canRegister && (
-                <button
-                  className="btn btn-secondary"
-                  onClick={handleRegisterInCollection}
-                  disabled={busy}
-                  title={t('deck.registerCollectionHint')}
-                  style={{ ...btnStack, color: '#4ade80', borderColor: 'rgba(74, 222, 128, 0.38)' }}
-                >
-                  <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
-                </button>
-              )}
               <OverflowMenu label={t('deck.moreActions')}>
-                <button role="menuitem" style={moreItem} onClick={() => { startSimulator(); }}>
-                  <Play size={14} /> {t('deck.drawSimulator')}
-                </button>
-                <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.35rem' }} />
+                {isBuilding && (
+                  <button role="menuitem" style={moreItem} onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
+                    <LogOut size={14} /> {t('deck.checkoutAction')}
+                  </button>
+                )}
+                {canRegister && (
+                  <button role="menuitem" style={moreItem} onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
+                    <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
+                  </button>
+                )}
                 <button role="menuitem" style={moreItem} onClick={() => setShowExportModal(true)}>
                   <Download size={14} /> {t('deck.exportDeckList')}
                 </button>
                 <button role="menuitem" style={moreItem} onClick={() => setShowImportModal(true)}>
                   <Upload size={14} /> {t('deck.importDeckList')}
                 </button>
-                {moxfieldDeckUrl(activeDeck) && (
-                  <a role="menuitem" style={{ ...moreItem, textDecoration: 'none' }}
-                    href={moxfieldDeckUrl(activeDeck)} target="_blank" rel="noreferrer">
-                    <ExternalLink size={14} /> {t('mfx.openOnMoxfield')}
-                  </a>
-                )}
                 <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.35rem' }} />
                 <button
                   role="menuitem"
@@ -1527,437 +1485,246 @@ function DeckBuilder({ showToast, onNavigate }) {
               </OverflowMenu>
             </div>
           </div>
-        </div>
 
           {/* Checked out info banner */}
-          {!!activeDeck.checked_out && (
-            <div style={{
-              background: 'rgba(234,179,8,0.06)',
-              border: '1px solid rgba(234,179,8,0.25)',
-              borderRadius: 'var(--radius-md)',
-              padding: '0.85rem 1.25rem',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.75rem',
-              fontSize: '0.85rem',
-              color: '#eab308'
-            }}>
-              <span style={{ fontSize: '1.25rem' }}>🎮</span>
-              <div>
-                <strong>{t('deck.checkedOutBanner')}</strong>
-                <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                  {t('deck.checkedOutHint')}
-                </div>
-              </div>
-            </div>
-          )}
+          {/* (folded into the facts line: "Built", since-date on hover) */}
 
           <div className="deck-editor-tabs" role="tablist">
-            {[['cards', t('deck.tabCards')], ['add', t('deck.tabAdd')], ['stats', t('deck.tabStats')]].map(([k, label]) => (
+            {[['cards', t('deck.tabCards')], ['stats', t('deck.tabStats')]].map(([k, label]) => (
               <button key={k} role="tab" type="button" aria-selected={editorTab === k}
                 className={`deck-editor-tab${editorTab === k ? ' active' : ''}`}
                 onClick={() => setEditorTab(k)}>{label}</button>
             ))}
           </div>
 
-          <div className="deck-editor-body" data-tab={editorTab} style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1.5rem', alignItems: 'start' }}>
-            <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: '1.5rem' }}>
-              
-              {/* Left Column: Deck Card List */}
-              <div className="deck-editor-main" style={{ flex: '2 1 500px', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-                
-                {/* Search & Quick Add to Deck */}
-                <div className="glass-panel deck-pane-add">
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', gap: '0.5rem', flexWrap: 'wrap' }}>
-                    <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', margin: 0 }}>{t('deck.addCardsTitle')}</h3>
-                  </div>
-                  <form onSubmit={handleSearchCards} style={{ display: 'flex', gap: '0.5rem' }}>
-                    <input
-                      type="text"
-                      className="input-control"
-                      placeholder={t('deck.searchPlaceholder')}
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      style={{ flex: 1 }}
-                    />
-                    <button type="submit" className="btn btn-primary" style={{ padding: '0.5rem 1rem' }} title={t('shared.search')}>
-                      <Search size={16} />
+          <div className="deck-editor-body dk-layout" data-tab={editorTab === 'stats' ? 'stats' : 'cards'}>
+            <div className="deck-editor-main dk-main">
+              {/* Toolbar: board tabs, inline add search, view toggle, $ chip. */}
+              <div className="dk-toolbar">
+                <div className="dk-seg" role="tablist">
+                  <button type="button" role="tab" aria-selected={!showMaybe}
+                    className={`deck-board-tab${!showMaybe ? ' active' : ''}`}
+                    onClick={() => setCardsBoard('main')}>
+                    {t('deck.boardDeck', { count: totalDeckCardsCount })}
+                  </button>
+                  {maybeCards.length > 0 && (
+                    <button type="button" role="tab" aria-selected={showMaybe}
+                      className={`deck-board-tab${showMaybe ? ' active' : ''}`}
+                      onClick={() => setCardsBoard('maybe')}>
+                      {t('deck.boardMaybeShort', { count: maybeTotal })}
                     </button>
-                  </form>
-
+                  )}
+                </div>
+                <form className="dk-add" onSubmit={handleSearchCards}>
+                  <Plus size={14} className="dk-add-icon" aria-hidden="true" />
+                  <input
+                    type="search"
+                    className="dk-add-input"
+                    placeholder={t('deck.addCardPlaceholder')}
+                    aria-label={t('deck.addCardPlaceholder')}
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
                   {/* Search Results list */}
-                  {searching ? (
-                    <div className="spinner" style={{ margin: '1rem auto' }}></div>
-                  ) : searchResults.length > 0 && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '1rem', maxHeight: '240px', overflowY: 'auto', background: 'rgba(0,0,0,0.15)', padding: '0.5rem', borderRadius: 'var(--radius-sm)' }}>
-                      {searchResults.map(card => {
-                          const qtyInDeck = countsByName.get(cardKey(card)) || 0;
-                          const ownedQty = card.owned_qty || 0;
-                          const isAtMaxOwned = qtyInDeck >= ownedQty;
-                          const isAtRuleMax = !isBasicLand(card) && qtyInDeck >= 4;
-                          const disabledAdd = savingCard || isAtMaxOwned || isAtRuleMax;
-
-                          return (
-                            <div key={card.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.35rem 0.5rem', background: 'rgba(255,255,255,0.02)', borderRadius: '4px', border: '1px solid var(--border-glass)' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
-                                <CardImage card={card} loading="lazy" decoding="async" style={{ width: '24px', height: '33px', objectFit: 'cover', borderRadius: '2px' }} />
-                                <div style={{ display: 'flex', flexDirection: 'column' }}>
-                                  <span style={{ fontSize: '0.8rem', color: 'var(--text-strong)' }}>{displayName(card)} ({card.set_name} • #{card.number})</span>
-                                  <span style={{ fontSize: '0.65rem', color: isAtMaxOwned ? 'var(--accent-red)' : 'var(--text-secondary)' }}>Owned: {ownedQty} | In Deck: {qtyInDeck}</span>
-                                </div>
-                              </div>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                                <button className="btn btn-secondary btn-icon-only" style={{ padding: '0.2rem' }} onClick={() => setPreviewCard(card)} title={t('deck.previewArt')}>
-                                  <Eye size={12} />
+                  {(searching || searchResults.length > 0) && (
+                    <div className="dk-add-results">
+                      {searching ? (
+                        <div className="spinner" style={{ margin: '1rem auto' }}></div>
+                      ) : (
+                        <>
+                          <button type="button" className="dk-add-close" onClick={() => setSearchResults([])} aria-label={t('deck.closeResults')}>
+                            <X size={14} />
+                          </button>
+                          {searchResults.map(card => {
+                            const qtyInDeck = countsByName.get(cardKey(card)) || 0;
+                            const ownedQty = card.owned_qty || 0;
+                            const isAtMaxOwned = qtyInDeck >= ownedQty;
+                            const isAtRuleMax = !isBasicLand(card) && qtyInDeck >= 4;
+                            const disabledAdd = savingCard || isAtMaxOwned || isAtRuleMax;
+                            return (
+                              <div key={card.id} className="dk-add-row">
+                                <button type="button" className="dk-add-row-id" onClick={() => setPreviewCard(card)} title={t('deck.previewArt')}>
+                                  <CardImage card={card} loading="lazy" decoding="async" style={{ width: '24px', height: '33px', objectFit: 'cover', borderRadius: '2px', flex: 'none' }} />
+                                  <span className="dk-add-row-text">
+                                    <span className="dk-add-row-name">{displayName(card)}</span>
+                                    <span className={isAtMaxOwned ? 'dk-add-row-meta dk-short' : 'dk-add-row-meta'}>
+                                      {t('deck.addRowMeta', { set: (card.set_id || '').toUpperCase(), owned: ownedQty, inDeck: qtyInDeck })}
+                                    </span>
+                                  </span>
                                 </button>
-                                <button className="btn btn-primary btn-icon-only" style={{ padding: '0.2rem' }} disabled={disabledAdd} onClick={() => handleAddCardToDeck(card)} title={isAtRuleMax ? "4-copy limit reached" : isAtMaxOwned ? "Not enough owned copies" : "Add to deck"}>
+                                <button type="button" className="btn btn-primary btn-icon-only" style={{ padding: '0.25rem' }} disabled={disabledAdd}
+                                  onClick={() => handleAddCardToDeck(card)}
+                                  title={isAtRuleMax ? t('deck.addBlockedCopyLimit') : isAtMaxOwned ? t('deck.addBlockedOwned') : t('deck.addToDeck')}>
                                   <Plus size={12} />
                                 </button>
                               </div>
-                            </div>
-                          );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {/* Deck Cards Header & Display Mode Toggle */}
-                <div className="glass-panel deck-pane-cards" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
-                    {maybeCards.length > 0 ? (
-                      <div className="deck-board-tabs" role="tablist">
-                        <button type="button" role="tab" aria-selected={!showMaybe}
-                          className={`deck-board-tab${!showMaybe ? ' active' : ''}`}
-                          onClick={() => setCardsBoard('main')}>
-                          {t('deck.boardMain', { count: totalDeckCardsCount, target: targetDeckCardsCount })}
-                        </button>
-                        <button type="button" role="tab" aria-selected={showMaybe}
-                          className={`deck-board-tab${showMaybe ? ' active' : ''}`}
-                          onClick={() => setCardsBoard('maybe')}>
-                          {t('deck.boardMaybe', { count: maybeTotal })}
-                        </button>
-                      </div>
-                    ) : (
-                      <h3 style={{ fontSize: '1rem', color: 'var(--text-strong)', borderLeft: '3px solid var(--accent-red)', paddingLeft: '0.5rem', margin: 0 }}>
-                        Deck Cards ({totalDeckCardsCount} / {targetDeckCardsCount})
-                      </h3>
-                    )}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(0,0,0,0.2)', padding: '2px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
-                      <button
-                        type="button"
-                        className={`btn ${cardDisplayMode === 'list' ? 'btn-primary' : 'btn-secondary'}`}
-                        style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '4px' }}
-                        onClick={() => setCardDisplayMode('list')}
-                      >
-                        <List size={12} /> List
-                      </button>
-                      <button
-                        type="button"
-                        className={`btn ${cardDisplayMode === 'grid' ? 'btn-primary' : 'btn-secondary'}`}
-                        style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '4px' }}
-                        onClick={() => setCardDisplayMode('grid')}
-                      >
-                        <LayoutGrid size={12} /> Grid
-                      </button>
-                    </div>
-                  </div>
-                  
-                  {showMaybe ? (
-                    <div className="deck-maybe-list">
-                      <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: 0 }}>
-                        {t('deck.maybeSummary', { own: maybeOwnedTypes, missing: maybeCards.length - maybeOwnedTypes })}
-                      </p>
-                      {cardDisplayMode === 'list' ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '0.5rem' }}>
-                          {maybeCards.map(card => {
-                            const short = Math.max(0, card.quantity - (card.owned_qty || 0));
-                            return (
-                              <div key={card.id} className="deck-maybe-row" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.5rem 0.75rem', background: 'rgba(255,255,255,0.01)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', minWidth: 0 }}>
-                                  <CardImage card={card} loading="lazy" decoding="async" style={{ width: '32px', height: '44px', objectFit: 'cover', borderRadius: '2px' }} />
-                                  <div style={{ minWidth: 0 }}>
-                                    <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-strong)' }}>{displayName(card)}</div>
-                                    <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{card.set_name} • #{card.number}</div>
-                                    {short > 0 ? (
-                                      <div className="deck-missing-note">{t('deck.rowMissing', { count: short })}</div>
-                                    ) : (
-                                      <div className="deck-owned-note">{t('deck.maybeOwned', { count: card.owned_qty || 0 })}</div>
-                                    )}
-                                  </div>
-                                </div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                                  <span className="deck-card-price" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
-                                  <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-strong)' }}>x{card.quantity}</span>
-                                </div>
-                              </div>
                             );
                           })}
-                        </div>
-                      ) : (
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '0.75rem', marginTop: '0.5rem' }}>
-                          {maybeCards.map(card => {
-                            const short = Math.max(0, card.quantity - (card.owned_qty || 0));
-                            return (
-                              <div key={card.id} className="deck-maybe-row deck-grid-card" style={{ position: 'relative', width: '100%', aspectRatio: '488 / 680', overflow: 'hidden', borderRadius: '6px', border: '1px solid var(--border-glass)', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
-                                <CardImage card={card} loading="lazy" decoding="async" style={{ position: 'absolute', inset: 0, display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
-                                <span style={{ position: 'absolute', top: '4px', right: '4px', background: 'rgba(0,0,0,0.85)', color: 'var(--accent-yellow)', fontSize: '0.75rem', fontWeight: 800, padding: '1px 6px', borderRadius: '10px', border: '1px solid var(--accent-yellow)' }}>x{card.quantity}</span>
-                                <span className="deck-card-price-chip" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
-                                {short > 0 ? (
-                                  <span className="deck-missing-chip">+{short}</span>
-                                ) : (
-                                  <span className="deck-owned-chip">{t('deck.maybeOwnChip')}</span>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
+                        </>
                       )}
                     </div>
-                  ) : activeDeck.cards.length === 0 ? (
-                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textAlign: 'center', padding: '2rem 0' }}>{t('deck.emptyDeck')}</p>
-                  ) : (
-                    deckGroups.map(group => {
-                      const { name: supertype, cards: list, count: sum } = group;
-
-                      return (
-                        <div key={supertype} style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                          <h4 style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', borderBottom: '1px solid var(--border-glass)', paddingBottom: '0.25rem', display: 'flex', justifyContent: 'space-between' }}>
-                            <span>{supertype}s</span>
-                            <span style={{ color: 'var(--text-strong)', fontWeight: 600 }}>{sum}</span>
-                          </h4>
-
-                          {/* 1. COMPACT LIST VIEW */}
-                          {cardDisplayMode === 'list' && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-                              {list.map(card => (
-                                <div key={card.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.5rem 0.75rem', background: 'rgba(255,255,255,0.01)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-glass)' }}>
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
-                                    <CardImage card={card} loading="lazy" decoding="async" style={{ width: '32px', height: '44px', objectFit: 'cover', borderRadius: '2px' }} />
-                                    <div style={{ minWidth: 0 }}>
-                                      <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-strong)' }}>{displayName(card)}</div>
-                                      <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{card.set_name} • #{card.number}</div>
-                                      {(card.owned_qty || 0) < card.quantity && !isBasicLand(card) && (
-                                        <div className="deck-missing-note" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>
-                                          {t('deck.rowMissing', { count: card.quantity - (card.owned_qty || 0) })}
-                                        </div>
-                                      )}
-                                    </div>
-                                  </div>
-
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                                    <span className="deck-card-price" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(0,0,0,0.2)', padding: '2px', borderRadius: '4px', border: '1px solid var(--border-glass)' }}>
-                                      <button
-                                        className={`btn ${card.quantity === 1 ? 'btn-danger' : 'btn-secondary'} btn-icon-only`}
-                                        style={{ width: '22px', height: '22px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                                        disabled={savingCard}
-                                        onClick={() => handleUpdateCardQty(card.id, card.quantity - 1)}
-                                        title={t(card.quantity === 1 ? 'deck.removeFromDeck' : 'deck.decreaseQty')}
-                                      >
-                                        {card.quantity === 1 ? <Trash2 size={11} /> : '-'}
-                                      </button>
-                                      <span style={{ padding: '0 0.4rem', fontSize: '0.85rem', fontWeight: 700, minWidth: '18px', textAlign: 'center', color: 'var(--text-strong)' }}>{card.quantity}</span>
-                                      <button
-                                        className="btn btn-secondary btn-icon-only"
-                                        style={{ width: '22px', height: '22px', padding: 0 }}
-                                        disabled={savingCard || card.quantity >= (card.owned_qty || 0) || (!isBasicLand(card) && (countsByName.get(cardKey(card)) || 0) >= 4)}
-                                        onClick={() => handleUpdateCardQty(card.id, card.quantity + 1)}
-                                      >
-                                        +
-                                      </button>
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-
-                          {/* 2. VISUAL CARD GRID VIEW */}
-                          {cardDisplayMode === 'grid' && (
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '0.75rem' }}>
-                              {list.map(card => (
-                                <div key={card.id} style={{ position: 'relative', borderRadius: '6px', overflow: 'hidden', border: '1px solid var(--border-glass)', background: 'rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', transition: 'transform 0.15s' }}>
-                                  <div className="deck-grid-card" style={{ position: 'relative', width: '100%', aspectRatio: '488 / 680', overflow: 'hidden', cursor: 'pointer' }} onClick={() => setPreviewCard(card)}>
-                                    <CardImage card={card} loading="lazy" decoding="async" style={{ position: 'absolute', inset: 0, display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
-                                    <span style={{ position: 'absolute', top: '4px', right: '4px', background: 'rgba(0,0,0,0.85)', color: 'var(--accent-yellow)', fontSize: '0.75rem', fontWeight: 800, padding: '1px 6px', borderRadius: '10px', border: '1px solid var(--accent-yellow)' }}>
-                                      x{card.quantity}
-                                    </span>
-                                    <span className="deck-card-price-chip" title={t('deck.cardPriceTitle')}>{cardPriceLabel(card)}</span>
-                                    {(card.owned_qty || 0) < card.quantity && !isBasicLand(card) && (
-                                      <span className="deck-missing-chip" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>
-                                        +{card.quantity - (card.owned_qty || 0)}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div style={{ padding: '4px', display: 'flex', justifyContent: 'center', background: 'rgba(0,0,0,0.5)' }}>
-                                    <div style={{ display: 'flex', gap: '2px' }}>
-                                      <button className={`btn ${card.quantity === 1 ? 'btn-danger' : 'btn-secondary'} btn-icon-only`} style={{ width: '20px', height: '20px', fontSize: '0.7rem', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }} disabled={savingCard} onClick={() => handleUpdateCardQty(card.id, card.quantity - 1)} title={t(card.quantity === 1 ? 'deck.removeFromDeck' : 'deck.decreaseQty')}>
-                                        {card.quantity === 1 ? <Trash2 size={10} /> : '-'}
-                                      </button>
-                                      <button className="btn btn-secondary btn-icon-only" style={{ width: '20px', height: '20px', fontSize: '0.7rem', padding: 0 }} disabled={savingCard || card.quantity >= (card.owned_qty || 0) || (!isBasicLand(card) && (countsByName.get(cardKey(card)) || 0) >= 4)} onClick={() => handleUpdateCardQty(card.id, card.quantity + 1)}>+</button>
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-
-                        </div>
-                      );
-                    })
                   )}
+                </form>
+                <div className="dk-seg" role="group" aria-label={t('deck.viewMode')}>
+                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'grid' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'grid'} onClick={() => setCardDisplayMode('grid')}>
+                    <LayoutGrid size={13} /> <span className="dk-seg-label">{t('deck.viewGrid')}</span>
+                  </button>
+                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'list' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'list'} onClick={() => setCardDisplayMode('list')}>
+                    <List size={13} /> <span className="dk-seg-label">{t('deck.viewList')}</span>
+                  </button>
                 </div>
+                <button type="button" className={`deck-chip deck-chip-btn${showPrices ? ' on' : ''}`} aria-pressed={showPrices}
+                  title={t('deck.togglePrices')} aria-label={t('deck.togglePrices')} onClick={() => setShowPrices(!showPrices)}>
+                  $
+                </button>
               </div>
 
-              {/* Right Column: Statistics, Mana Curve & Deck Health */}
-              <div className="deck-pane-stats" style={{ flex: '1 1 320px', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-
-                {/* Value: what the deck's OWN printings cost vs the cheapest
-                    printings floor. Two axes answer two different questions —
-                    sell-this-deck (current) vs build-it-cheap (floor); the
-                    printings the deck actually holds are one representative
-                    per logical card, so an unpriced representative hides a
-                    priced reprint. Buy sends the whole deck to ManaPool or
-                    TCGplayer exactly like a list does. */}
-                <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                    <DollarSign size={14} style={{ color: 'var(--accent-yellow)' }} /> {t('deck.valueTitle')}
-                    <button className="btn btn-primary btn-icon-only" onClick={openBuy}
-                      title={t('deck.buyDeck')} aria-label={t('deck.buyDeck')}
-                      style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <ShoppingCart size={16} />
-                    </button>
-                  </h3>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', fontSize: '0.8rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-secondary)' }}>
-                      <span title={currentValueHint} tabIndex={0}
-                        aria-label={`${t('deck.valueCurrent')}: ${currentValueText}. ${currentValueHint}`}
-                        style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                        {t('deck.valueCurrent')}
-                        {Number(activeDeck?.current_unpriced_cards) > 0 && (
-                          <small style={{ color: 'var(--text-muted)', fontWeight: 600 }}>({t('deck.unpricedCount', { count: currentUnpricedCards })})</small>
-                        )}
-                      </span>
-                      <strong style={{ color: 'var(--text-strong)' }}>{currentValueText}</strong>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-secondary)' }}>
-                      <span title={deckMinimumValueHint(activeDeck, t)} tabIndex={0}
-                        aria-label={`${t('deck.valueCheapest')}: ${deckMinimumValueText(activeDeck)}. ${deckMinimumValueHint(activeDeck, t)}`}>
-                        {t('deck.valueCheapest')}
-                      </span>
-                      <strong style={{ color: 'var(--accent-yellow)' }}>{deckMinimumValueText(activeDeck)}</strong>
-                    </div>
-                  </div>
-                </div>
-                
-                {/* Moxfield: mirrored decks get their own one-action section —
-                    just the exit to the upstream listing, promoted out of the
-                    (now gone) Deck Health panel. Unmirrored decks have nothing
-                    to point at, so the section doesn't render for them. */}
-                {moxfieldDeckUrl(activeDeck) && (
-                  <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                    <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <ExternalLink size={14} style={{ color: '#3b82f6' }} /> {t('deck.moxfieldTitle')}
-                    </h3>
-                    <a
-                      className="btn btn-secondary"
-                      href={moxfieldDeckUrl(activeDeck)}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ justifyContent: 'center', fontSize: '0.8rem', padding: '0.5rem 0.9rem' }}
-                    >
-                      <ExternalLink size={13} /> {t('mfx.openOnMoxfield')}
-                    </a>
-                  </div>
-                )}
-
-                {/* Bar Chart: Mana Cost Curve */}
-                {manaCurveData.some(d => d.count > 0) && (
-                  <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <BarChart2 size={14} style={{ color: '#3b82f6' }} /> Mana Cost Curve
-                    </h3>
-                    <div style={{ width: '100%', height: '180px' }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={manaCurveData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-                          <XAxis dataKey="cost" stroke="var(--text-muted)" fontSize={10} tickLine={false} />
-                          <YAxis stroke="var(--text-muted)" fontSize={10} tickLine={false} />
-                          <Tooltip contentStyle={{ background: 'rgba(0,0,0,0.8)', border: '1px solid var(--border-glass)', borderRadius: '4px', fontSize: '0.8rem', color: 'var(--text-strong)' }} />
-                          <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                )}
-
-                {/* Pie Chart: Supertypes */}
-                {supertypeData.length > 0 && (
-                  <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <BarChart2 size={14} style={{ color: 'var(--accent-red)' }} /> Supertype Breakdown
-                    </h3>
-                    <div style={{ width: '100%', height: '180px' }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                          <Pie
-                            data={supertypeData}
-                            cx="50%"
-                            cy="50%"
-                            innerRadius={50}
-                            outerRadius={70}
-                            paddingAngle={3}
-                            dataKey="value"
-                          >
-                            {supertypeData.map((entry, index) => (
-                              <Cell key={`cell-${index}`} fill={PIE_COLORS[index % PIE_COLORS.length]} />
-                            ))}
-                          </Pie>
-                          <Tooltip contentStyle={{ background: 'rgba(0,0,0,0.8)', border: '1px solid var(--border-glass)', borderRadius: '4px', fontSize: '0.8rem', color: 'var(--text-strong)' }} />
-                        </PieChart>
-                      </ResponsiveContainer>
-                    </div>
-                    {/* Legend */}
-                    <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', flexWrap: 'wrap', marginTop: '0.25rem' }}>
-                      {supertypeData.map((d, index) => (
-                        <div key={d.name} style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '0.75rem' }}>
-                          <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }}></div>
-                          <span style={{ color: 'var(--text-secondary)' }}>{d.name}: <strong>{d.value}</strong></span>
-                        </div>
+              {/* Deck Cards Header & Display Mode Toggle */}
+              <div className={`deck-pane-cards dk-cards${showPrices ? ' dk-prices' : ''}`}>
+                {!showMaybe && activeDeck.cards.length === 0 ? (
+                  <p className="dk-empty">{t('deck.emptyDeck')}</p>
+                ) : (
+                  <>
+                    <div className="dk-jump">
+                      {visibleGroups.map(g => (
+                        <button key={g.name} type="button" className="dk-jump-chip"
+                          onClick={() => document.getElementById(`dk-sec-${g.name}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
+                          {t(`deck.group.${g.name}`)} <span>{g.count}</span>
+                        </button>
                       ))}
                     </div>
-                  </div>
-                )}
 
-                {/* Bar Chart: Color & Land Distribution */}
-                {colorLandData.length > 0 && (
-                  <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <h3 style={{ fontSize: '0.95rem', color: 'var(--text-strong)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <BarChart2 size={14} style={{ color: 'var(--accent-yellow)' }} /> {t('deck.colorLandDist')}
-                    </h3>
-                    <div style={{ width: '100%', height: '220px' }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={colorLandData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-                          <XAxis dataKey="name" stroke="var(--text-muted)" fontSize={10} tickLine={false} />
-                          <YAxis stroke="var(--text-muted)" fontSize={10} tickLine={false} />
-                          <Tooltip contentStyle={{ background: 'rgba(0,0,0,0.8)', border: '1px solid var(--border-glass)', borderRadius: '4px', fontSize: '0.8rem', color: 'var(--text-strong)' }} />
-                          <Bar dataKey="value" fill="var(--accent-yellow)" radius={[4, 4, 0, 0]}>
-                            {colorLandData.map((entry, idx) => {
-                              const colorMap = {
-                                'White': '#fef08a', 'Blue': '#3b82f6', 'Black': '#475569', 'Red': '#ef4444', 'Green': '#10b981', 'Colorless': '#cbd5e1',
-                                'Land (Plains)': '#fef08a', 'Land (Island)': '#60a5fa', 'Land (Swamp)': '#475569', 'Land (Mountain)': '#f87171', 'Land (Forest)': '#4ade80', 'Land (Nonbasic)': '#d97706'
-                              };
-                              return <Cell key={`cell-${idx}`} fill={colorMap[entry.name] || 'var(--accent-yellow)'} />;
+                    {!showMaybe && commanderCard && (
+                      <button type="button" className="dk-commander" onClick={() => openCardSheet(commanderCard, 'main')}>
+                        <CardImage card={commanderCard} loading="lazy" decoding="async" className="dk-commander-img" />
+                        <span className="dk-commander-text">
+                          <span className="dk-commander-k">{t('deck.commanderLabel')}</span>
+                          <span className="dk-commander-name">{displayName(commanderCard)}</span>
+                          <span className="dk-commander-meta">{(commanderCard.set_id || '').toUpperCase()} · #{commanderCard.number}</span>
+                        </span>
+                      </button>
+                    )}
+
+                    {visibleGroups.map(group => (
+                      <details key={group.name} id={`dk-sec-${group.name}`} className="dk-sec" open>
+                        <summary>{t(`deck.group.${group.name}`)} <span className="dk-sec-n">{group.count}</span></summary>
+
+                        {/* 1. COMPACT LIST VIEW */}
+                        {cardDisplayMode === 'list' && (
+                          <div className="dk-list">
+                            {group.cards.map(card => {
+                              const short = Math.max(0, card.quantity - (card.owned_qty || 0));
+                              const showShort = short > 0 && !isBasicLand(card);
+                              return (
+                                <button key={card.id} type="button" className="dk-row"
+                                  onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')}
+                                  onMouseMove={(e) => setHoverCard({ card, x: e.clientX, y: e.clientY })}
+                                  onMouseLeave={() => setHoverCard(null)}>
+                                  <span className="dk-row-q">{card.quantity}</span>
+                                  <span className="dk-row-name">{displayName(card)}</span>
+                                  {showShort && <span className="dk-row-short" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>−{short}</span>}
+                                  <span className="dk-row-pips" aria-hidden="true">
+                                    {cardColorLetters(card).map(l => <span key={l} className={`dk-pip dk-pip-${l}`} />)}
+                                    {card.cmc !== null && card.cmc !== undefined && !isLandCard(card) && <span className="dk-row-cmc">{card.cmc}</span>}
+                                  </span>
+                                  <span className="dk-row-set">{(card.set_id || '').toUpperCase()}</span>
+                                  {showPrices && <span className="dk-row-price">{cardPriceLabel(card)}</span>}
+                                </button>
+                              );
                             })}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
+                          </div>
+                        )}
+
+                        {/* 2. VISUAL CARD GRID VIEW */}
+                        {cardDisplayMode === 'grid' && (
+                          <div className="dk-grid">
+                            {group.cards.map(card => {
+                              const short = Math.max(0, card.quantity - (card.owned_qty || 0));
+                              return (
+                                <button key={card.id} type="button" className="dk-tile" onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')} aria-label={displayName(card)}>
+                                  <CardImage card={card} loading="lazy" decoding="async" className="dk-tile-img" />
+                                  {card.quantity > 1 && <span className="dk-tile-qty">×{card.quantity}</span>}
+                                  {short > 0 && !isBasicLand(card) && (
+                                    <span className="deck-missing-chip" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>+{short}</span>
+                                  )}
+                                  {showPrices && <span className="deck-card-price-chip">{cardPriceLabel(card)}</span>}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </details>
+                    ))}
+                  </>
                 )}
               </div>
+            </div>
 
+            {/* Right Column: Statistics, Mana Curve & Deck Health */}
+            <div className="deck-pane-stats dk-side">
+              {sidebarStats.curve.some(n => n > 0) && (
+                <div className="glass-panel dk-panel">
+                  <h3 className="dk-panel-h"><span>{t('deck.manaCurve')}</span><span>{t('deck.avgCmc', { value: sidebarStats.avgCmc.toFixed(2) })}</span></h3>
+                  <div className="dk-curve">
+                    {sidebarStats.curve.map((n, i) => (
+                      <div key={i} className="dk-curve-col">
+                        <span className="dk-curve-n">{n || ''}</span>
+                        <div className="dk-curve-bar" style={{ height: `${(n / Math.max(1, ...sidebarStats.curve)) * 64}px` }} />
+                        <span className="dk-curve-x">{i === 7 ? '7+' : i}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {sidebarStats.colors.length > 0 && (
+                <div className="glass-panel dk-panel">
+                  <h3 className="dk-panel-h"><span>{t('deck.colorsTitle')}</span><span>{t('deck.colorsSub')}</span></h3>
+                  {sidebarStats.colors.map(c => (
+                    <div key={c.color} className="dk-crow">
+                      <span className={`dk-pip dk-pip-${c.color}`} aria-label={c.color} />
+                      <div className="dk-crow-bars">
+                        <div className={`dk-crow-bar dk-pipbg-${c.color}`} style={{ width: `${c.share * 100}%` }} />
+                        <div className="dk-crow-bar dk-crow-land" style={{ width: `${(c.lands / sidebarStats.maxLands) * 100}%` }} />
+                      </div>
+                      <span className="dk-crow-v">{Math.round(c.share * 100)}% · {t('deck.colorLands', { count: c.lands })}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Value: the deck's own printings vs the cheapest printings
+                  floor; Buy sends the whole deck to ManaPool or TCGplayer. */}
+              <div className="glass-panel dk-panel">
+                <h3 className="dk-panel-h"><span>{t('deck.valueTitle')}</span></h3>
+                <div className="dk-kv">
+                  <span title={currentValueHint} tabIndex={0}
+                    aria-label={`${t('deck.valueCurrent')}: ${currentValueText}. ${currentValueHint}`}>
+                    {t('deck.valueCurrent')}
+                    {Number(activeDeck?.current_unpriced_cards) > 0 && (
+                      <small> ({t('deck.unpricedCount', { count: currentUnpricedCards })})</small>
+                    )}
+                  </span>
+                  <strong>{currentValueText}</strong>
+                </div>
+                <div className="dk-kv">
+                  <span title={deckMinimumValueHint(activeDeck, t)} tabIndex={0}
+                    aria-label={`${t('deck.valueCheapest')}: ${deckMinimumValueText(activeDeck)}. ${deckMinimumValueHint(activeDeck, t)}`}>
+                    {t('deck.valueCheapest')}
+                  </span>
+                  <strong>{deckMinimumValueText(activeDeck)}</strong>
+                </div>
+                <button className="btn btn-secondary dk-buy" onClick={openBuy}>
+                  <ShoppingCart size={14} /> {t('deck.buyDeck')}
+                </button>
+              </div>
             </div>
           </div>
+
+          {hoverCard && (
+            <CardImage card={hoverCard.card} className="dk-hover" alt=""
+              style={{ left: `${Math.min(hoverCard.x + 20, window.innerWidth - 250)}px`, top: `${Math.max(8, Math.min(hoverCard.y - 40, window.innerHeight - 330))}px` }} />
+          )}
         </div>
       )}
 
@@ -2453,6 +2220,49 @@ function DeckBuilder({ showToast, onNavigate }) {
                 <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleCompareImport} disabled={!importText.trim()}>{t('deck.compare')}</button>
               ) : (
                 <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleImportDeck}>{t('deck.importMatched')}</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Card action sheet: one tap target per card; every per-card verb lives here. */}
+      {sheetCard && (
+        <div className="modal-overlay dk-sheet-overlay" onClick={() => setSheetRef(null)}>
+          <div className="glass-panel dk-sheet" onClick={e => e.stopPropagation()} role="dialog" aria-label={displayName(sheetCard)}>
+            <button className="modal-close btn btn-secondary btn-icon-only dk-sheet-close" onClick={() => setSheetRef(null)} aria-label={t('deck.closeResults')}>
+              <X size={16} />
+            </button>
+            <CardImage card={sheetCard} className="dk-sheet-img" />
+            <div className="dk-sheet-body">
+              <h3 className="dk-sheet-name">{displayName(sheetCard)}</h3>
+              <div className="dk-sheet-meta">
+                {(sheetCard.set_id || '').toUpperCase()} · #{sheetCard.number} · {cardPriceLabel(sheetCard)} · {t('deck.ownedCount', { count: sheetCard.owned_qty || 0 })}
+              </div>
+              {sheetRef.board === 'main' ? (
+                <>
+                  <div className="dk-stepper">
+                    <button type="button" className="btn btn-secondary" disabled={savingCard}
+                      onClick={() => handleUpdateCardQty(sheetCard.id, sheetCard.quantity - 1)}
+                      aria-label={t(sheetCard.quantity === 1 ? 'deck.removeFromDeck' : 'deck.decreaseQty')}>−</button>
+                    <b>{sheetCard.quantity}</b>
+                    <button type="button" className="btn btn-secondary"
+                      disabled={savingCard || sheetCard.quantity >= (sheetCard.owned_qty || 0) || (!isBasicLand(sheetCard) && (countsByName.get(cardKey(sheetCard)) || 0) >= 4)}
+                      onClick={() => handleUpdateCardQty(sheetCard.id, sheetCard.quantity + 1)}
+                      aria-label={t('deck.increaseQty')}>+</button>
+                    <span className="dk-stepper-l">{t('deck.inDeck')}</span>
+                  </div>
+                  <button type="button" className="btn btn-secondary dk-sheet-btn" onClick={() => { setPreviewCard(sheetCard); setSheetRef(null); }}>
+                    <Eye size={14} /> {t('deck.viewDetails')}
+                  </button>
+                  <button type="button" className="dk-sheet-danger" onClick={() => { handleRemoveCard(sheetCard.id); setSheetRef(null); }}>
+                    {t('deck.removeFromDeck')}
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="btn btn-secondary dk-sheet-btn" onClick={() => { setPreviewCard(sheetCard); setSheetRef(null); }}>
+                  <Eye size={14} /> {t('deck.viewDetails')}
+                </button>
               )}
             </div>
           </div>

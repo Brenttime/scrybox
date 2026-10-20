@@ -16,9 +16,12 @@ const section = (start, end) => {
   return deckBuilder.slice(startIndex, endIndex);
 };
 
+// The list view is one text line per card (image on hover only), so it has
+// no thumbnails to defer.
+assert.doesNotMatch(section('{/* 1. COMPACT LIST VIEW */}', '{/* 2. VISUAL CARD GRID VIEW */}'), /<CardImage/,
+  'list rows are text-only; the image preview is the hover/sheet');
 for (const thumbnailSection of [
   section('{/* Search Results list */}', '{/* Deck Cards Header & Display Mode Toggle */}'),
-  section('{/* 1. COMPACT LIST VIEW */}', '{/* 2. VISUAL CARD GRID VIEW */}'),
   section('{/* 2. VISUAL CARD GRID VIEW */}', '{/* Right Column: Statistics, Mana Curve & Deck Health */}'),
 ]) {
   assert.match(thumbnailSection, /<CardImage[\s\S]*?loading="lazy"[\s\S]*?decoding="async"[\s\S]*?\/>/,

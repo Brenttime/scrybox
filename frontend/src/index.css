@@ -2167,3 +2167,146 @@ select optgroup,
 .deck-chip-btn { display: inline-flex; align-items: center; gap: .35rem; background-image: none; padding-right: .75rem; cursor: pointer; }
 .deck-chip-btn.on { border-color: var(--accent-yellow, #f5a623); color: var(--accent-yellow, #f5a623); }
 .deck-chip-count { background: var(--accent-red); color: #fff; font-size: .65rem; font-weight: 900; border-radius: 999px; padding: 0 6px; }
+
+/* ------------------------------------------------------------------ deck page
+   Deck detail redesign: header facts line, sticky toolbar, jump chips,
+   collapsible type sections, dense grid / one-line list, sidebar stats and a
+   single per-card action sheet. Colours come from theme variables only. */
+.dk-page { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+.dk-head { display: flex; align-items: center; gap: 0.9rem; min-width: 0; }
+.dk-back { border-radius: 50%; flex: none; }
+.dk-head-art { width: 64px; height: 64px; border-radius: 14px; object-fit: cover; object-position: 50% 25%; flex: none; }
+.dk-head-id { min-width: 0; flex: 1 1 auto; }
+.dk-title { margin: 0; font-size: 1.4rem; color: var(--text-strong); display: flex; align-items: center; gap: 8px; min-width: 0; letter-spacing: -0.01em; }
+.dk-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.dk-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.45rem; margin-top: 3px; font-size: 0.82rem; color: var(--text-secondary); }
+.dk-facts > * + *::before { content: "·"; margin-right: 0.45rem; color: var(--text-muted); }
+.dk-facts small { color: var(--text-muted); }
+.dk-ok { color: var(--success); font-weight: 650; }
+.dk-warn { color: var(--accent-yellow); font-weight: 650; }
+.dk-facts-link { color: var(--text-secondary); text-decoration: none; border-bottom: 1px dotted var(--text-muted); }
+.dk-facts-link:hover { color: var(--text-primary); }
+.dk-head-actions { display: flex; gap: 0.5rem; align-items: center; flex: none; margin-left: auto; }
+.dk-head-actions .btn { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+
+.dk-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 1.25rem; align-items: start; }
+.dk-main { display: flex; flex-direction: column; min-width: 0; }
+.dk-toolbar { position: sticky; top: 0; z-index: 20; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; padding: 0.5rem 0 0.6rem; background: var(--bg-primary, var(--mb-bg)); }
+.dk-seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px; border: 1px solid var(--border-glass); background: var(--bg-secondary, rgba(255,255,255,0.04)); flex: none; }
+.dk-seg .deck-board-tab { border-radius: 999px; display: inline-flex; align-items: center; gap: 4px; }
+.dk-add { position: relative; flex: 1 1 180px; min-width: 0; display: flex; align-items: center; }
+.dk-add-icon { position: absolute; left: 12px; color: var(--text-secondary); pointer-events: none; }
+.dk-add-input { width: 100%; min-width: 0; border-radius: 999px; border: 1px solid var(--border-glass); background: var(--input-bg, var(--bg-secondary)); color: var(--text-primary); font: inherit; font-size: 0.85rem; padding: 0.42rem 0.9rem 0.42rem 2rem; }
+.dk-add-input:focus { outline: none; border-color: var(--border-glass-hover); }
+.dk-add-results { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 40; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 2px; padding: 0.4rem; border-radius: 12px; border: 1px solid var(--border-glass-hover); background: var(--bg-secondary, var(--mb-card)); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5); }
+.dk-add-close { align-self: flex-end; background: none; border: 0; color: var(--text-secondary); cursor: pointer; padding: 2px; }
+.dk-add-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0.35rem; border-radius: 8px; }
+.dk-add-row:hover { background: rgba(255, 255, 255, 0.04); }
+.dk-add-row-id { display: flex; align-items: center; gap: 0.5rem; flex: 1; min-width: 0; background: none; border: 0; color: inherit; cursor: pointer; text-align: left; padding: 0; font: inherit; }
+.dk-add-row-text { display: flex; flex-direction: column; min-width: 0; }
+.dk-add-row-name { font-size: 0.82rem; color: var(--text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dk-add-row-meta { font-size: 0.68rem; color: var(--text-secondary); }
+.dk-add-row-meta.dk-short { color: var(--accent-red); }
+
+.dk-jump { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; padding-bottom: 0.5rem; margin-bottom: 0.25rem; border-bottom: 1px solid var(--border-glass); }
+.dk-jump-chip { flex: none; background: none; border: 0; border-radius: 999px; padding: 3px 9px; font: inherit; font-size: 0.75rem; font-weight: 600; color: var(--text-secondary); cursor: pointer; white-space: nowrap; }
+.dk-jump-chip span { color: var(--text-muted); }
+.dk-jump-chip:hover { background: rgba(255, 255, 255, 0.06); color: var(--text-primary); }
+
+.dk-commander { display: flex; align-items: center; gap: 1rem; width: 100%; margin: 0.75rem 0 1rem; padding: 0.75rem; border-radius: 16px; border: 1px solid var(--border-glass); background: var(--bg-secondary, rgba(255,255,255,0.03)); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.dk-commander:hover { border-color: var(--border-glass-hover); }
+.dk-commander-img { width: 96px; border-radius: 6px; flex: none; }
+.dk-commander-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dk-commander-k { font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); }
+.dk-commander-name { font-size: 1.1rem; font-weight: 700; color: var(--text-strong); }
+.dk-commander-meta { font-size: 0.78rem; color: var(--text-secondary); }
+
+.dk-sec { margin-bottom: 1rem; scroll-margin-top: 60px; }
+.dk-sec > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 0.5rem; padding: 0.4rem 0; font-weight: 700; font-size: 0.95rem; color: var(--text-strong); }
+.dk-sec > summary::-webkit-details-marker { display: none; }
+.dk-sec > summary::before { content: "▾"; color: var(--text-secondary); font-size: 0.7rem; width: 10px; }
+.dk-sec:not([open]) > summary::before { content: "▸"; }
+.dk-sec-n { color: var(--text-secondary); font-weight: 600; font-size: 0.8rem; }
+.dk-empty { font-size: 0.85rem; color: var(--text-secondary); text-align: center; padding: 2rem 0; }
+
+.dk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 10px; }
+.dk-tile { position: relative; display: block; padding: 0; border: 0; background: none; cursor: pointer; border-radius: 6px; aspect-ratio: 488 / 680; }
+.dk-tile-img { width: 100%; height: 100%; object-fit: cover; display: block; border-radius: 5.5% / 4%; transition: transform 0.12s; }
+.dk-tile:hover .dk-tile-img { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0, 0, 0, 0.55); }
+.dk-tile-qty { position: absolute; top: 6px; right: 6px; background: rgba(0, 0, 0, 0.82); color: var(--text-strong); font-weight: 800; font-size: 0.72rem; border-radius: 999px; padding: 1px 7px; }
+.dk-tile .deck-card-price-chip { color: var(--text-strong); }
+
+.dk-list { columns: 2 320px; column-gap: 28px; }
+.dk-row { display: flex; align-items: center; gap: 0.6rem; width: 100%; padding: 4px 8px; border: 0; border-radius: 8px; background: none; color: var(--text-primary); font: inherit; font-size: 0.85rem; text-align: left; cursor: pointer; break-inside: avoid; }
+.dk-row:hover { background: rgba(255, 255, 255, 0.05); }
+.dk-row-q { color: var(--text-secondary); width: 18px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+.dk-row-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dk-row-short { color: var(--accent-red); font-size: 0.7rem; font-weight: 800; flex: none; }
+.dk-row-pips { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.dk-row-cmc { color: var(--text-secondary); font-size: 0.7rem; margin-left: 3px; font-variant-numeric: tabular-nums; }
+.dk-row-set { color: var(--text-secondary); font-size: 0.68rem; font-weight: 700; width: 36px; flex: none; }
+.dk-row-price { color: var(--text-secondary); font-size: 0.75rem; width: 52px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+.dk-hover { position: fixed; width: 230px; pointer-events: none; z-index: 60; border-radius: 11px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.75); }
+@media (hover: none) { .dk-hover { visibility: hidden; } }
+
+/* Mana pips: the five MTG colours are game data, not palette. */
+.dk-pip { width: 12px; height: 12px; border-radius: 50%; display: inline-block; flex: none; }
+.dk-pip-W, .dk-pipbg-W { background: #f8f3d8; }
+.dk-pip-U, .dk-pipbg-U { background: #a9d6f2; }
+.dk-pip-B, .dk-pipbg-B { background: #b7aca8; }
+.dk-pip-R, .dk-pipbg-R { background: #f2a58c; }
+.dk-pip-G, .dk-pipbg-G { background: #9fd3a7; }
+
+.dk-side { display: flex; flex-direction: column; gap: 0.75rem; position: sticky; top: 12px; min-width: 0; }
+.dk-panel { display: flex; flex-direction: column; gap: 0.35rem; padding: 0.9rem 1rem; }
+.dk-panel-h { margin: 0 0 0.4rem; display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; font-weight: 700; color: var(--text-secondary); }
+.dk-panel-h span + span { font-weight: 600; color: var(--text-muted); }
+.dk-curve { display: flex; align-items: flex-end; gap: 5px; height: 100px; }
+.dk-curve-col { flex: 1; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-end; gap: 2px; min-width: 0; text-align: center; }
+.dk-curve-bar { background: var(--border-glass-hover); border-radius: 4px 4px 0 0; min-height: 2px; }
+.dk-curve-n { font-size: 0.65rem; color: var(--text-primary); }
+.dk-curve-x { font-size: 0.65rem; color: var(--text-secondary); }
+.dk-crow { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+.dk-crow-bars { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dk-crow-bar { height: 6px; border-radius: 3px; }
+.dk-crow-land { background: var(--text-muted); }
+.dk-crow-v { color: var(--text-secondary); width: 92px; text-align: right; flex: none; }
+.dk-kv { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; color: var(--text-secondary); }
+.dk-kv strong { color: var(--text-strong); }
+.dk-kv small { color: var(--text-muted); }
+.dk-buy { margin-top: 0.4rem; justify-content: center; display: inline-flex; align-items: center; gap: 0.4rem; }
+
+.dk-sheet-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(4px); padding: 1rem; }
+.dk-sheet { position: relative; display: flex; gap: 1.1rem; width: min(640px, 100%); max-height: 92vh; overflow-y: auto; padding: 1.1rem; border-radius: 20px; }
+.dk-sheet-close { position: absolute; top: 0.6rem; right: 0.6rem; border-radius: 50%; }
+.dk-sheet-img { width: 240px; border-radius: 12px; align-self: flex-start; flex: none; }
+.dk-sheet-body { display: flex; flex-direction: column; gap: 0.5rem; flex: 1; min-width: 0; }
+.dk-sheet-name { margin: 0; padding-right: 2rem; font-size: 1.15rem; color: var(--text-strong); }
+.dk-sheet-meta { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.3rem; }
+.dk-stepper { display: flex; align-items: center; gap: 0.75rem; }
+.dk-stepper .btn { width: 38px; height: 38px; padding: 0; justify-content: center; font-size: 1.1rem; }
+.dk-stepper b { min-width: 20px; text-align: center; font-size: 1.1rem; color: var(--text-strong); }
+.dk-stepper-l { color: var(--text-secondary); font-size: 0.8rem; }
+.dk-sheet-btn { justify-content: flex-start; display: inline-flex; align-items: center; gap: 0.5rem; }
+.dk-sheet-danger { margin-top: auto; padding: 0.7rem; border-radius: 12px; border: 1px solid var(--border-glass); background: none; color: var(--mb-red, var(--accent-red)); font: inherit; font-weight: 600; cursor: pointer; }
+
+@media (max-width: 900px) {
+  .dk-layout { grid-template-columns: minmax(0, 1fr); }
+  .dk-side { position: static; }
+}
+@media (max-width: 768px) {
+  .dk-head { flex-wrap: wrap; gap: 0.6rem; }
+  .dk-head-art { width: 52px; height: 52px; border-radius: 12px; }
+  .dk-head-id { flex: 1 1 0; }
+  .dk-title { font-size: 1.15rem; }
+  .dk-head-actions { width: 100%; margin-left: 0; }
+  .dk-head-actions .btn-primary { flex: 1; justify-content: center; }
+  .dk-toolbar { position: static; }
+  .dk-add { order: 5; flex-basis: 100%; }
+  .dk-seg-label { font-size: 0.75rem; }
+  .dk-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .dk-list { columns: 1; }
+  .dk-sheet-overlay { align-items: flex-end; padding: 0; }
+  .dk-sheet { flex-direction: column; border-radius: 20px 20px 0 0; width: 100%; }
+  .dk-sheet-img { width: 150px; align-self: center; }
+}

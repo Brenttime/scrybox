@@ -216,7 +216,8 @@ router.get('/:id', async (req, res) => {
         SELECT
           ${sqlCardKey('deck_cc')} AS card_key,
           MIN(dc.card_id) AS representative_id,
-          SUM(dc.quantity) AS quantity
+          SUM(dc.quantity) AS quantity,
+          MAX(COALESCE(dc.is_commander, 0)) AS is_commander
         FROM deck_cards dc
         JOIN card_cache deck_cc ON deck_cc.id = dc.card_id
         WHERE dc.deck_id = ? AND dc.quantity > 0
@@ -232,6 +233,9 @@ router.get('/:id', async (req, res) => {
       SELECT
         requested.quantity,
         requested.card_key,
+        requested.is_commander,
+        cc.cmc,
+        cc.color_identity,
         cc.id,
         cc.name, cc.printed_name,
         cc.supertype,
@@ -296,7 +300,7 @@ router.get('/:id', async (req, res) => {
       )
       SELECT dm.quantity, ${sqlCardKey('cc')} AS card_key,
         cc.id, cc.name, cc.printed_name, cc.supertype, cc.subtypes, cc.types, cc.rarity,
-        cc.set_id, cc.set_name, cc.number, cc.image_url,
+        cc.set_id, cc.set_name, cc.number, cc.image_url, cc.cmc, cc.color_identity,
         cc.price_trend, cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_currency,
         COALESCE(owned.owned_qty, 0) AS owned_qty
       FROM deck_maybe_cards dm
