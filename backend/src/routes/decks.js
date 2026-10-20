@@ -236,6 +236,8 @@ router.get('/:id', async (req, res) => {
         requested.is_commander,
         cc.cmc,
         cc.color_identity,
+        cc.oracle_text,
+        cc.oracle_faces,
         cc.id,
         cc.name, cc.printed_name,
         cc.supertype,
