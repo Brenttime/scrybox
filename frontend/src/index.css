@@ -556,6 +556,11 @@ button, input, select, textarea {
   background: var(--input-bg-focus);
 }
 
+/* Native <select> popups (Windows/Linux desktop) paint option backgrounds;
+   transparent options + light text render white-on-white in dark mode. */
+select { color-scheme: dark; }
+select option,
+select optgroup,
 .select-control option {
   background: var(--bg-secondary);
   color: var(--text-primary);
