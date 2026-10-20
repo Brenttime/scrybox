@@ -1031,7 +1031,6 @@
   "catalog.stopping": "Stopping…",
   "common.stop": "Stop",
   "common.rename": "Rename",
-  "deck.statusBattleReady": "Battle Ready (60 Cards)",
   "deck.statusBuildingCount": "Building (< 60 Cards)",
   "deck.statusInPlayEmoji": "Deck Built",
   "deck.targetDeckSize": "Target Deck Size:",
