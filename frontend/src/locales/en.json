@@ -138,6 +138,8 @@
   "dash.value": "Value",
   "dash.cards": "Cards",
   "dash.typeDistribution": "Color Distribution",
+  "dash.valueByColor": "Collection value by color",
+  "dash.totalValue": "total value",
   "dash.colorDistribution": "Color Distribution",
   "dash.noTypeData": "No type data for this filter yet.",
   "dash.rarityDistribution": "Rarity Distribution",

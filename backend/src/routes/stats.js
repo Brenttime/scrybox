@@ -101,6 +101,19 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
         FROM type_rows
         GROUP BY name
       ),
+      color_value_stats AS (
+        -- Collection value by colour: every card counted once so the slices
+        -- add up to the total (gold cards are 'Multicolor').
+        SELECT CASE
+                 WHEN type_class = 'land' THEN 'Land'
+                 WHEN type_class = 'colorless' THEN 'Colorless'
+                 WHEN json_array_length(types) > 1 THEN 'Multicolor'
+                 ELSE json_extract(types, '$[0]')
+               END AS name,
+               SUM(current_value) AS value, SUM(qty) AS count
+        FROM typed_cards
+        GROUP BY 1
+      ),
       change_owned AS (
         SELECT card_id,
                SUM(CASE WHEN julianday(added_at) <= julianday(?) THEN qty ELSE 0 END) AS qty7,
@@ -135,6 +148,8 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
                       FROM set_stats ORDER BY first_order)) AS sets,
              (SELECT json_group_array(json_object('name', name, 'value', value))
                 FROM (SELECT name, value FROM type_stats ORDER BY first_position)) AS types,
+             (SELECT json_group_array(json_object('name', name, 'value', ROUND(value, 2), 'count', count))
+                FROM (SELECT name, value, count FROM color_value_stats WHERE value > 0 ORDER BY value DESC)) AS color_values,
              (SELECT COALESCE(SUM(CASE WHEN qty7 <> 0 AND history7 IS NOT NULL AND current_history IS NOT NULL
                                       THEN qty7 * history7 ELSE 0 END), 0) FROM change_prices) AS value7_ago,
              (SELECT COALESCE(SUM(CASE WHEN qty7 <> 0 AND history7 IS NOT NULL AND current_history IS NOT NULL
@@ -152,6 +167,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
     const totalSpent = aggregate.total_spent;
     const nearMintCount = aggregate.near_mint_count;
     const types = JSON.parse(aggregate.types || '[]');
+    const colorValues = JSON.parse(aggregate.color_values || '[]');
     const rarities = JSON.parse(aggregate.rarities || '[]');
     const allSets = JSON.parse(aggregate.sets || '[]');
     const vintageCount = allSets.reduce((sum, set) => sum + (isVintageSet(set.id) ? set.count : 0), 0);
@@ -266,6 +282,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
         change5y: { available: false, abs: null, pct: null }
       },
       types,
+      colorValues,
       rarities,
       sets: allSets.map(set => ({
         id: set.id,
