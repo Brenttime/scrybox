@@ -8,6 +8,7 @@ import OverflowMenu from './OverflowMenu';
 import AddDeckChoiceModal from './AddDeckChoiceModal';
 import PreconSearchModal from './PreconSearchModal';
 import { useBackGuard } from '../utils/useBackGuard';
+import { useSwipeBack } from '../utils/useSwipeBack';
 import { getRememberedView, rememberOpen, clearOpen } from '../utils/viewMemory';
 import { buildDeckExport, parseDeckLine, missingEntries } from '../utils/deckText';
 import CardImage from './CardImage';
@@ -176,6 +177,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   };
 
   useBackGuard(!!activeDeck, closeDeck);
+  useSwipeBack(!!activeDeck, closeDeck);
   useBackGuard(showBuy, () => setShowBuy(false));
 
   // Escape closes the deck buy modal (the overlay itself is never focused).

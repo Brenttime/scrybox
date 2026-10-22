@@ -10,6 +10,7 @@ import OverflowMenu from './OverflowMenu';
 import CardImage from './CardImage';
 import CardInspectorModal from './CardInspectorModal';
 import { useBackGuard } from '../utils/useBackGuard';
+import { useSwipeBack } from '../utils/useSwipeBack';
 import { getRememberedView, rememberOpen, clearOpen } from '../utils/viewMemory';
 import { displayName, setReference } from '../utils/languages';
 import { useT } from '../utils/i18n';
@@ -154,6 +155,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   useBackGuard(showBuy, () => setShowBuy(false));
   useBackGuard(showCopy, () => setShowCopy(false));
   useBackGuard(!!activeList, () => leaveList());
+  useSwipeBack(!!activeList, () => leaveList());
 
   // Leaving a list clears BOTH detail states and the remembered open id —
   // missing one of them is how a back gesture used to leave the next refresh
