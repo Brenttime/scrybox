@@ -157,11 +157,15 @@ function Lists({ showToast, handoff, onHandoffDone }) {
     setActiveList(null);
     setListDetail(null);
     clearOpen('lists');
+    // Tile values/counts are computed server-side; edits made inside the
+    // list (adds, qty changes) must show on the overview we return to.
+    // Quiet refetch: keep the current tiles up instead of a spinner flash.
+    fetchLists({ quiet: true });
   };
 
-  const fetchLists = async () => {
+  const fetchLists = async ({ quiet = false } = {}) => {
     try {
-      setLoading(true);
+      if (!quiet) setLoading(true);
       const res = await fetch('/api/lists');
       if (res.ok) {
         const rows = await res.json();
@@ -288,7 +292,6 @@ function Lists({ showToast, handoff, onHandoffDone }) {
       if (res.ok) {
         showToast(t('lists.deleted'));
         leaveList();
-        fetchLists();
       } else {
         showToast(t('lists.errDelete'));
       }
