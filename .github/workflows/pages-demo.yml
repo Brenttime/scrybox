@@ -21,6 +21,8 @@ concurrency:
 
 jobs:
   build:
+    # Opt-in: set repo variable PAGES_ENABLED=true after enabling Pages (Source: GitHub Actions).
+    if: vars.PAGES_ENABLED == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
