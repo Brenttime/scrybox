@@ -2318,3 +2318,7 @@ select optgroup,
 /* Lists: missing cards keep full colour; red frame + pill at the bottom */
 .list-grid-card.is-missing .tcg-card-inner::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 2px var(--mb-red, var(--accent-red)); pointer-events: none; }
 .list-grid-card .dk-tile-missing { z-index: 1; top: auto; bottom: 8px; transform: translateX(-50%); }
+
+/* Swipe-right-to-go-back hint (utils/useSwipeBack.js) */
+.swipe-back-indicator { position: fixed; left: 0; top: 50%; z-index: 2000; width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.25); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); pointer-events: none; transition: background-color .12s; }
+.swipe-back-indicator.ready { background: var(--accent-blue); }
