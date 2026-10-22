@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
 import {
   Plus, Trash2, X, ChevronLeft, Search, ListChecks, Copy, Pencil,
-  Layers, Minus, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
+  Layers, Minus, CheckCircle2, ArrowRightLeft, CheckSquare, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
   Star, Heart, Gift, Flame, Crown, Gem, Swords, Shield, Sparkles, Bookmark, Trophy, Skull, Zap, Target, Package, Coins,
 } from 'lucide-react';
 import SwipeToDelete from './SwipeToDelete';
@@ -153,7 +153,132 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   // Leaving a list clears BOTH detail states and the remembered open id —
   // missing one of them is how a back gesture used to leave the next refresh
   // restoring a list the user had already walked out of.
+  // --- Multi-select (press and hold a card to start) ---
+  const [selected, setSelected] = useState(() => new Set());
+  const [showMove, setShowMove] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const holdRef = useRef({ timer: null, fired: false, x: 0, y: 0 });
+  const selecting = selected.size > 0;
+  const clearSelection = () => { setSelected(new Set()); setShowMove(false); };
+  const toggleSelected = (id) => setSelected(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const cancelHold = () => { clearTimeout(holdRef.current.timer); holdRef.current.timer = null; };
+  const holdHandlers = (card) => ({
+    onPointerDown: (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      holdRef.current.fired = false;
+      holdRef.current.x = e.clientX; holdRef.current.y = e.clientY;
+      cancelHold();
+      holdRef.current.timer = setTimeout(() => {
+        holdRef.current.fired = true;
+        holdRef.current.timer = null;
+        if (navigator.vibrate) { try { navigator.vibrate(15); } catch { /* ignore */ } }
+        toggleSelected(card.id);
+      }, 450);
+    },
+    onPointerMove: (e) => {
+      if (!holdRef.current.timer) return;
+      if (Math.abs(e.clientX - holdRef.current.x) > 10 || Math.abs(e.clientY - holdRef.current.y) > 10) cancelHold();
+    },
+    onPointerUp: cancelHold,
+    onPointerCancel: cancelHold,
+    onPointerLeave: cancelHold,
+    onContextMenu: (e) => { if (holdRef.current.fired || selecting) e.preventDefault(); },
+  });
+  const onCardClick = (card) => {
+    if (holdRef.current.fired) { holdRef.current.fired = false; return; }
+    if (selecting) toggleSelected(card.id); else openCardDetails(card);
+  };
+  const selectedRows = () => (listDetail?.cards || []).filter(c => selected.has(c.id) && c.quantity > 0);
+  const chunked = (rows) => { const out = []; for (let i = 0; i < rows.length; i += 250) out.push(rows.slice(i, i + 250)); return out; };
+  const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  const removeSelected = async () => {
+    const rows = selectedRows();
+    if (!rows.length || bulkBusy) return;
+    if (!window.confirm(t('lists.selRemoveConfirm', { count: rows.length }))) return;
+    setBulkBusy(true);
+    try {
+      for (const chunk of chunked(rows)) {
+        const res = await postJson(`/api/lists/${activeList.id}/cards/bulk-remove`, { cards: chunk.map(c => ({ card_id: c.id, quantity: c.quantity })) });
+        if (!res.ok) throw new Error(`remove ${res.status}`);
+      }
+      showToast(t('lists.selRemoved', { count: rows.length }));
+      clearSelection();
+    } catch (err) {
+      console.error(err);
+      showToast(t('lists.errCard'));
+    } finally {
+      setBulkBusy(false);
+      await loadList(activeList.id);
+    }
+  };
+
+  const addSelectedToCollection = async () => {
+    const rows = selectedRows();
+    const total = rows.reduce((n, c) => n + c.quantity, 0);
+    if (!total || bulkBusy) return;
+    if (!window.confirm(t('lists.registerConfirm', { count: total, name: activeList.name }))) return;
+    setBulkBusy(true);
+    let added = 0, failed = 0;
+    try {
+      for (const chunk of chunked(rows)) {
+        const res = await postJson('/api/collection/bulk-add', { card_ids: chunk.map(c => ({ card_id: c.id, quantity: c.quantity })) });
+        const body = await res.json().catch(() => ({}));
+        const ok = new Set((body.entries || []).map(e => e.card_id));
+        added += chunk.filter(c => ok.has(c.id)).reduce((n, c) => n + c.quantity, 0);
+        failed += Array.isArray(body.failed) ? body.failed.length : (res.ok ? 0 : chunk.length);
+      }
+      showToast(failed ? t('lists.registerPartial', { count: added, failed }) : t('lists.registerDone', { count: added }));
+      clearSelection();
+    } catch (err) {
+      console.error(err);
+      showToast(t('lists.registerError'));
+    } finally {
+      setBulkBusy(false);
+      await loadList(activeList.id);
+    }
+  };
+
+  // Move = add to the target list, then decrement exactly what was added here.
+  // Only rows the target accepted are removed, so a failure never loses cards.
+  const moveSelected = async (target) => {
+    const rows = selectedRows();
+    if (!rows.length || bulkBusy || !target) return;
+    setBulkBusy(true);
+    let moved = 0, failedTotal = 0;
+    try {
+      for (const chunk of chunked(rows)) {
+        const res = await postJson(`/api/lists/${target.id}/cards/bulk`, { cards: chunk.map(c => ({ card_id: c.id, quantity: c.quantity })) });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok && !body.added) { failedTotal += chunk.length; continue; }
+        const failed = new Set(body.failed || []);
+        const ok = chunk.filter(c => !failed.has(c.id));
+        failedTotal += chunk.length - ok.length;
+        if (ok.length) {
+          const rm = await postJson(`/api/lists/${activeList.id}/cards/bulk-remove`, { cards: ok.map(c => ({ card_id: c.id, quantity: c.quantity })) });
+          if (!rm.ok) throw new Error(`remove ${rm.status}`);
+          moved += ok.length;
+        }
+      }
+      showToast(failedTotal
+        ? t('lists.selMovedPartial', { count: moved, failed: failedTotal, name: target.name })
+        : t('lists.selMoved', { count: moved, name: target.name }));
+      clearSelection();
+    } catch (err) {
+      console.error(err);
+      showToast(t('lists.errCard'));
+    } finally {
+      setBulkBusy(false);
+      await loadList(activeList.id);
+    }
+  };
+
   const leaveList = () => {
+    clearSelection();
     setActiveList(null);
     setListDetail(null);
     clearOpen('lists');
@@ -372,6 +497,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   };
 
   const openList = async (list) => {
+    clearSelection();
     setActiveList(list);
     setCardFilter('all');
     setSearchQuery('');
@@ -964,11 +1090,22 @@ function Lists({ showToast, handoff, onHandoffDone }) {
           {cards.map(card => {
             const missing = Math.max(0, card.quantity - (card.owned_qty || 0));
             return (
-              <div key={card.id} className="tcg-card list-grid-card" role="button" tabIndex={0}
-                style={{ cursor: 'pointer' }}
-                onClick={() => openCardDetails(card)}
-                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openCardDetails(card); } }}>
+              <div key={card.id} className={`tcg-card list-grid-card${selected.has(card.id) ? ' is-selected' : ''}`} role="button" tabIndex={0}
+                aria-pressed={selecting ? selected.has(card.id) : undefined}
+                style={{ cursor: 'pointer', WebkitTouchCallout: 'none', WebkitUserSelect: 'none', userSelect: 'none',
+                  outline: selected.has(card.id) ? '3px solid var(--accent-primary, #f59e0b)' : 'none', outlineOffset: '2px',
+                  transform: selected.has(card.id) ? 'scale(0.97)' : 'none', transition: 'transform 120ms ease' }}
+                {...holdHandlers(card)}
+                onClick={() => onCardClick(card)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onCardClick(card); } }}>
                 <div className="tcg-card-inner">
+                  {selecting && (
+                    <div aria-hidden="true" style={{ position: 'absolute', top: '8px', right: '8px', zIndex: 2, width: '24px', height: '24px', borderRadius: '50%',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      background: selected.has(card.id) ? 'var(--accent-primary, #f59e0b)' : 'rgba(0,0,0,0.55)', border: '2px solid #fff' }}>
+                      {selected.has(card.id) && <CheckCircle2 size={16} color="#fff" />}
+                    </div>
+                  )}
                   <CardImage card={card} className="tcg-card-image" loading="lazy" alt={displayName(card)} />
                   <div className="list-grid-qty" style={{ position: 'absolute', top: '8px', left: '8px', background: 'rgba(0,0,0,0.85)', color: 'var(--text-strong)', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 800 }}>x{card.quantity}</div>
                   <div className="list-grid-owned" style={{ position: 'absolute', bottom: '8px', right: '8px', background: 'rgba(0,0,0,0.85)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.65rem', fontWeight: 800 }}>
@@ -987,7 +1124,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70%' }}>{setReference(card) || card.set_name || ''}</span>
                     <span className="tcg-card-price">{card.price_trend > 0 ? `$${card.price_trend.toFixed(2)}` : ''}</span>
                   </div>
-                  <div className="list-grid-actions" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.3rem', marginTop: '0.4rem' }}>
+                  {!selecting && <div className="list-grid-actions" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.3rem', marginTop: '0.4rem' }}>
                     <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
                       <button className="btn btn-secondary btn-icon-only" onClick={() => setQty(card.id, card.quantity - 1)} aria-label="-1"
                         style={{ width: '24px', height: '24px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Minus size={13} /></button>
@@ -999,11 +1136,54 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                     </div>
                     <button className="btn btn-secondary btn-icon-only" onClick={() => removeCard(card.id)} title={t('lists.removeCard')} aria-label={t('lists.removeCard')}
                       style={{ width: '26px', height: '26px', padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Trash2 size={14} /></button>
-                  </div>
+                  </div>}
                 </div>
               </div>
             );
           })}
+        </div>
+      )}
+
+      {selecting && (
+        <div className="glass-panel list-select-bar" role="toolbar" aria-label={t('lists.selCount', { count: selected.size })}
+          style={{ position: 'fixed', left: '50%', transform: 'translateX(-50%)', bottom: 'calc(env(safe-area-inset-bottom, 0px) + 84px)', zIndex: 900,
+            display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.6rem', borderRadius: '999px', maxWidth: 'calc(100vw - 16px)', flexWrap: 'wrap', justifyContent: 'center',
+            boxShadow: '0 8px 30px rgba(0,0,0,0.45)' }}>
+          <button type="button" className="btn btn-secondary btn-icon-only" onClick={clearSelection} title={t('lists.selCancel')} aria-label={t('lists.selCancel')}><X size={16} /></button>
+          <span style={{ fontWeight: 800, fontSize: '0.85rem', padding: '0 0.25rem', whiteSpace: 'nowrap' }}>{t('lists.selCount', { count: selected.size })}</span>
+          <button type="button" className="btn btn-secondary btn-icon-only" disabled={bulkBusy}
+            onClick={() => setSelected(selected.size === cards.length ? new Set() : new Set(cards.map(c => c.id)))}
+            title={t('lists.selAll')} aria-label={t('lists.selAll')}><CheckSquare size={16} /></button>
+          <button type="button" className="btn btn-secondary" disabled={bulkBusy} onClick={() => setShowMove(true)} title={t('lists.selMove')}>
+            <ArrowRightLeft size={15} /> {t('lists.selMove')}</button>
+          <button type="button" className="btn btn-secondary" disabled={bulkBusy} onClick={addSelectedToCollection} title={t('lists.selToCollection')}>
+            <PackagePlus size={15} /> {t('lists.selToCollection')}</button>
+          <button type="button" className="btn btn-secondary btn-icon-only" disabled={bulkBusy} onClick={removeSelected}
+            title={t('lists.selRemove')} aria-label={t('lists.selRemove')} style={{ color: 'var(--accent-red)' }}><Trash2 size={16} /></button>
+        </div>
+      )}
+
+      {showMove && (
+        <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowMove(false); }}>
+          <div className="glass-panel modal-content" style={{ maxWidth: '420px', width: '100%', position: 'relative' }}>
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowMove(false)} aria-label={t('lists.cancel')}
+              style={{ position: 'absolute', top: '0.75rem', right: '0.75rem' }}><X size={18} /></button>
+            <h3 style={{ margin: '0 0 0.75rem' }}>{t('lists.selMoveTitle', { count: selected.size })}</h3>
+            {lists.filter(l => l.id !== activeList.id).length === 0 ? (
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{t('lists.selNoOtherLists')}</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '60vh', overflowY: 'auto' }}>
+                {lists.filter(l => l.id !== activeList.id).map(l => (
+                  <button key={l.id} type="button" style={{ ...menuItem, padding: '0.7rem 0.8rem', background: 'rgba(255,255,255,0.05)', fontSize: '0.9rem' }}
+                    disabled={bulkBusy} onClick={() => moveSelected(l)}>
+                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: l.accent_color || '#10b981', flex: '0 0 auto' }} />
+                    <span style={{ flex: 1, fontWeight: 600 }}>{l.name}</span>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{l.total_cards ?? ''}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
