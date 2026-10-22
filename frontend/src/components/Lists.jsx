@@ -19,7 +19,7 @@ import { buildTcgMassEntryUrl } from '../utils/tcgMassEntryUrl';
 import { deckMinimumValueText, deckMinimumValueHint } from '../utils/deckMinimumValue';
 import { priceText } from '../utils/formatPrice';
 
-export const LIST_ICONS = [
+const LIST_ICONS = [
   ['list-checks', ListChecks], ['star', Star], ['heart', Heart], ['shopping-cart', ShoppingCart],
   ['gift', Gift], ['flame', Flame], ['crown', Crown], ['gem', Gem], ['swords', Swords],
   ['shield', Shield], ['sparkles', Sparkles], ['wand', Wand2], ['bookmark', Bookmark],
