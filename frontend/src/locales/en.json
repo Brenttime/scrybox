@@ -1605,15 +1605,15 @@
   "lists.registerError": "Could not add the cards to your collection.",
   "deck.cardPriceTitle": "Value of one copy of this printing",
   "lists.selCount": "{count} selected",
-  "lists.selCancel": "Cancel selection",
-  "lists.selAll": "Select all",
   "lists.selMove": "Move",
   "lists.selMoveTitle": "Move {count} card(s) to...",
   "lists.selNoOtherLists": "No other lists yet. Create one first.",
   "lists.selMoved": "Moved {count} card(s) to {name}.",
   "lists.selMovedPartial": "Moved {count} card(s) to {name}; {failed} failed and stayed here.",
   "lists.selToCollection": "Add to collection",
+  "lists.selCollectionShort": "Collection",
   "lists.selRemove": "Remove from list",
+  "lists.selRemoveShort": "Remove",
   "lists.selRemoveConfirm": "Remove {count} card(s) from this list?",
   "lists.selRemoved": "Removed {count} card(s) from the list."
 }

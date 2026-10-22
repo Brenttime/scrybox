@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
 import {
   Plus, Trash2, X, ChevronLeft, Search, ListChecks, Copy, Pencil,
-  Layers, Minus, CheckCircle2, ArrowRightLeft, CheckSquare, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
+  Layers, Minus, CheckCircle2, ArrowRightLeft, ShoppingCart, Wand2, DollarSign, PackageMinus, PackagePlus,
   Star, Heart, Gift, Flame, Crown, Gem, Swords, Shield, Sparkles, Bookmark, Trophy, Skull, Zap, Target, Package, Coins,
 } from 'lucide-react';
 import SwipeToDelete from './SwipeToDelete';
@@ -1086,25 +1086,33 @@ function Lists({ showToast, handoff, onHandoffDone }) {
           <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>{t('lists.emptyListHint')}</div>
         </div>
       ) : (
-        <div className="card-grid list-card-grid">
+        <>
+        {/* Select mode mirrors the Collection: slim sticky header (Cancel | N
+            selected | Select All) + a bottom icon action bar. */}
+        {selecting && (
+          <div className="coll-selbar list-select-bar" role="toolbar" aria-label={t('lists.selCount', { count: selected.size })}>
+            <button type="button" className="coll-textbtn" onClick={clearSelection}>{t('common.cancel')}</button>
+            <strong>{t('lists.selCount', { count: selected.size })}</strong>
+            {selected.size === cards.length ? (
+              <button type="button" className="coll-textbtn" disabled={bulkBusy} onClick={() => setSelected(new Set())}>{t('collection.deselectAll')}</button>
+            ) : (
+              <button type="button" className="coll-textbtn" disabled={bulkBusy} onClick={() => setSelected(new Set(cards.map(c => c.id)))}>{t('collection.selectAllShort')}</button>
+            )}
+          </div>
+        )}
+        <div className="card-grid list-card-grid" style={selecting ? { paddingBottom: '6rem' } : undefined}>
           {cards.map(card => {
             const missing = Math.max(0, card.quantity - (card.owned_qty || 0));
             return (
               <div key={card.id} className={`tcg-card list-grid-card${selected.has(card.id) ? ' is-selected' : ''}`} role="button" tabIndex={0}
                 aria-pressed={selecting ? selected.has(card.id) : undefined}
-                style={{ cursor: 'pointer', WebkitTouchCallout: 'none', WebkitUserSelect: 'none', userSelect: 'none',
-                  outline: selected.has(card.id) ? '3px solid var(--accent-primary, #f59e0b)' : 'none', outlineOffset: '2px',
-                  transform: selected.has(card.id) ? 'scale(0.97)' : 'none', transition: 'transform 120ms ease' }}
+                style={{ cursor: 'pointer', WebkitTouchCallout: 'none', WebkitUserSelect: 'none', userSelect: 'none' }}
                 {...holdHandlers(card)}
                 onClick={() => onCardClick(card)}
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onCardClick(card); } }}>
-                <div className="tcg-card-inner">
+                <div className="tcg-card-inner" style={selecting ? { transition: 'transform .15s ease, opacity .15s ease', transform: selected.has(card.id) ? 'scale(.94)' : 'none', opacity: selected.has(card.id) ? 1 : .85 } : undefined}>
                   {selecting && (
-                    <div aria-hidden="true" style={{ position: 'absolute', top: '8px', right: '8px', zIndex: 2, width: '24px', height: '24px', borderRadius: '50%',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      background: selected.has(card.id) ? 'var(--accent-primary, #f59e0b)' : 'rgba(0,0,0,0.55)', border: '2px solid #fff' }}>
-                      {selected.has(card.id) && <CheckCircle2 size={16} color="#fff" />}
-                    </div>
+                    <div className={`coll-check ${selected.has(card.id) ? 'on' : ''}`} aria-hidden="true">{selected.has(card.id) && <CheckCircle2 size={24} strokeWidth={2.4} />}</div>
                   )}
                   <CardImage card={card} className="tcg-card-image" loading="lazy" alt={displayName(card)} />
                   <div className="list-grid-qty" style={{ position: 'absolute', top: '8px', left: '8px', background: 'rgba(0,0,0,0.85)', color: 'var(--text-strong)', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 800 }}>x{card.quantity}</div>
@@ -1142,47 +1150,35 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             );
           })}
         </div>
+        </>
       )}
 
-      {selecting && (
-        <div className="glass-panel list-select-bar" role="toolbar" aria-label={t('lists.selCount', { count: selected.size })}
-          style={{ position: 'fixed', left: '50%', transform: 'translateX(-50%)', bottom: 'calc(env(safe-area-inset-bottom, 0px) + 84px)', zIndex: 900,
-            display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.6rem', borderRadius: '999px', maxWidth: 'calc(100vw - 16px)', flexWrap: 'wrap', justifyContent: 'center',
-            boxShadow: '0 8px 30px rgba(0,0,0,0.45)' }}>
-          <button type="button" className="btn btn-secondary btn-icon-only" onClick={clearSelection} title={t('lists.selCancel')} aria-label={t('lists.selCancel')}><X size={16} /></button>
-          <span style={{ fontWeight: 800, fontSize: '0.85rem', padding: '0 0.25rem', whiteSpace: 'nowrap' }}>{t('lists.selCount', { count: selected.size })}</span>
-          <button type="button" className="btn btn-secondary btn-icon-only" disabled={bulkBusy}
-            onClick={() => setSelected(selected.size === cards.length ? new Set() : new Set(cards.map(c => c.id)))}
-            title={t('lists.selAll')} aria-label={t('lists.selAll')}><CheckSquare size={16} /></button>
-          <button type="button" className="btn btn-secondary" disabled={bulkBusy} onClick={() => setShowMove(true)} title={t('lists.selMove')}>
-            <ArrowRightLeft size={15} /> {t('lists.selMove')}</button>
-          <button type="button" className="btn btn-secondary" disabled={bulkBusy} onClick={addSelectedToCollection} title={t('lists.selToCollection')}>
-            <PackagePlus size={15} /> {t('lists.selToCollection')}</button>
-          <button type="button" className="btn btn-secondary btn-icon-only" disabled={bulkBusy} onClick={removeSelected}
-            title={t('lists.selRemove')} aria-label={t('lists.selRemove')} style={{ color: 'var(--accent-red)' }}><Trash2 size={16} /></button>
+      {selecting && !showMove && (
+        <div className="coll-actionbar" role="toolbar">
+          <button type="button" disabled={bulkBusy} onClick={() => setShowMove(true)} title={t('lists.selMove')}><ArrowRightLeft size={20} /><span>{t('lists.selMove')}</span></button>
+          <button type="button" disabled={bulkBusy} onClick={addSelectedToCollection} title={t('lists.selToCollection')}><PackagePlus size={20} /><span>{t('lists.selCollectionShort')}</span></button>
+          <button type="button" className="danger" disabled={bulkBusy} onClick={removeSelected} title={t('lists.selRemove')}><Trash2 size={20} /><span>{t('lists.selRemoveShort')}</span></button>
         </div>
       )}
 
       {showMove && (
-        <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowMove(false); }}>
-          <div className="glass-panel modal-content" style={{ maxWidth: '420px', width: '100%', position: 'relative' }}>
-            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowMove(false)} aria-label={t('lists.cancel')}
-              style={{ position: 'absolute', top: '0.75rem', right: '0.75rem' }}><X size={18} /></button>
-            <h3 style={{ margin: '0 0 0.75rem' }}>{t('lists.selMoveTitle', { count: selected.size })}</h3>
+        <div className="fs-sheet-backdrop" onClick={() => setShowMove(false)}>
+          <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+            <div className="fs-sheet-head">
+              <strong>{t('lists.selMoveTitle', { count: selected.size })}</strong>
+              <button type="button" className="coll-textbtn" onClick={() => setShowMove(false)}>{t('common.cancel')}</button>
+            </div>
             {lists.filter(l => l.id !== activeList.id).length === 0 ? (
               <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{t('lists.selNoOtherLists')}</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '60vh', overflowY: 'auto' }}>
-                {lists.filter(l => l.id !== activeList.id).map(l => (
-                  <button key={l.id} type="button" style={{ ...menuItem, padding: '0.7rem 0.8rem', background: 'rgba(255,255,255,0.05)', fontSize: '0.9rem' }}
-                    disabled={bulkBusy} onClick={() => moveSelected(l)}>
-                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: l.accent_color || '#10b981', flex: '0 0 auto' }} />
-                    <span style={{ flex: 1, fontWeight: 600 }}>{l.name}</span>
-                    <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{l.total_cards ?? ''}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+            ) : lists.filter(l => l.id !== activeList.id).map(l => (
+              <button key={l.id} type="button" className="coll-more-row" disabled={bulkBusy} onClick={() => moveSelected(l)}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: l.accent_color || '#10b981', flex: '0 0 auto' }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l.name}</span>
+                </span>
+                <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{l.total_cards ?? ''}</span>
+              </button>
+            ))}
           </div>
         </div>
       )}
