@@ -2315,7 +2315,6 @@ select optgroup,
 .dash-cv-total { font-size: 1.45rem; font-weight: 800; color: var(--text-strong); font-variant-numeric: tabular-nums; }
 .dash-cv-sub { font-size: 0.72rem; color: var(--text-secondary); }
 
-/* Lists: missing cards match deck tiles (greyed, red frame, centred pill) */
-.list-grid-card.is-missing .tcg-card-image { filter: grayscale(0.85) brightness(0.55); }
+/* Lists: missing cards keep full colour; red frame + pill at the bottom */
 .list-grid-card.is-missing .tcg-card-inner::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 2px var(--mb-red, var(--accent-red)); pointer-events: none; }
-.list-grid-card .dk-tile-missing { z-index: 1; }
+.list-grid-card .dk-tile-missing { z-index: 1; top: auto; bottom: 8px; transform: translateX(-50%); }
