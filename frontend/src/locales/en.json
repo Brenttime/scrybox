@@ -612,6 +612,7 @@
   "shared.specTypes": "Types:",
   "shared.specSubtypes": "Subtypes:",
   "inspector.zoomHint": "Click to view full screen",
+  "inspector.flip": "Flip",
   "zoom.copyImage": "Copy image",
   "zoom.copied": "Copied",
   "zoom.saved": "Saved",

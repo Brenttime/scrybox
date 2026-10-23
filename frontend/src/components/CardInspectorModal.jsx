@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Maximize2 } from 'lucide-react';
+import { X, Maximize2, RefreshCw } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
@@ -39,6 +39,26 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   // stays lean. null = not loaded / none.
   const [oracle, setOracle] = useState(null);
   const oracleCardId = card?.card_id || null;
+
+  // Double-faced cards (transform, MDFC, battles...): Scryfall serves the back
+  // face at the same path with /back/ instead of /front/. Rows only store the
+  // front URL, and split/adventure cards also say /front/ with no back, so
+  // probe it: the Flip control appears only once the back image really loads.
+  const [backUrl, setBackUrl] = useState(null);
+  const [flipped, setFlipped] = useState(false);
+  const frontUrl = card?.image_url || '';
+  useEffect(() => {
+    setBackUrl(null);
+    setFlipped(false);
+    const m = /^(https:\/\/cards\.scryfall\.io\/[a-z_]+\/)front(\/.+)$/.exec(frontUrl);
+    if (!m) return undefined;
+    let cancelled = false;
+    const url = `${m[1]}back${m[2]}`;
+    const probe = new Image();
+    probe.onload = () => { if (!cancelled) setBackUrl(url); };
+    probe.src = url;
+    return () => { cancelled = true; probe.onload = null; };
+  }, [frontUrl]);
 
   useEffect(() => {
     setOracle(null);
@@ -268,17 +288,41 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 through the editor below was never shown in the very view that
                 uploads it, and a card with no provider art rendered as a broken
                 image icon here alone. */}
-            <CardImage
-              card={card}
-              style={{
-                width: '100%',
-                aspectRatio: 0.718,
-                objectFit: 'cover',
-                borderRadius: 'var(--radius-md)',
-                boxShadow: '0 12px 36px rgba(0,0,0,0.6), 0 0 20px rgba(255,255,255,0.05)',
-                transition: 'transform 0.2s ease'
-              }}
-            />
+            <div className={`ci-flip${flipped ? ' is-flipped' : ''}`}>
+              <CardImage
+                card={card}
+                className="ci-face ci-face-front"
+                aria-hidden={flipped || undefined}
+                style={{
+                  width: '100%',
+                  aspectRatio: 0.718,
+                  objectFit: 'cover',
+                  borderRadius: 'var(--radius-md)',
+                  boxShadow: '0 12px 36px rgba(0,0,0,0.6), 0 0 20px rgba(255,255,255,0.05)'
+                }}
+              />
+              {backUrl && (
+                <img
+                  src={backUrl}
+                  alt=""
+                  crossOrigin="anonymous"
+                  className="ci-face ci-face-back"
+                  aria-hidden={!flipped || undefined}
+                />
+              )}
+            </div>
+            {backUrl && (
+              <button
+                type="button"
+                className="ci-flip-btn"
+                onClick={(e) => { e.stopPropagation(); setFlipped(f => !f); }}
+                aria-pressed={flipped}
+                title={t('inspector.flip')}
+              >
+                <RefreshCw size={13} />
+                <span>{t('inspector.flip')}</span>
+              </button>
+            )}
             <div style={{
               position: 'absolute',
               bottom: '0.6rem',
@@ -300,7 +344,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               <span>{t('inspector.fullScreen')}</span>
             </div>
           </div>
-          <CardImageActions card={card} compact getSrc={() => document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
+          <CardImageActions card={card} compact getSrc={() => (flipped && backUrl) || document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
         </div>
 
         {/* Right side: Information / Edit */}
@@ -515,7 +559,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
       </div>
 
       {isFullScreen && (
-        <CardImageZoom card={card} onClose={() => setIsFullScreen(false)} />
+        <CardImageZoom card={flipped && backUrl ? { ...card, card_id: null, id: null, image_url: backUrl } : card} onClose={() => setIsFullScreen(false)} />
       )}
     </div>
   );
