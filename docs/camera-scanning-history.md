@@ -320,6 +320,45 @@ way wins". Never guess.
   Measure how often the picker appears, and consider a bottom-left
   corner-symbol stage if it is frequent.
 
+## List stamp absence + digital-only List originals (stampabsent build, 2026-10-23)
+Brent's Windows session `rzybpvwc` (2026-10-23): 14 adds went through the
+printing picker. 7 were SOS cards (Sneering Shadewriter, Send in the Pest,
+Leech Collector) whose footer proved {sos N, plst SOS-N} and whose stamp
+scored 'absent' (ncc -0.05..0.31). The rest: Ghired (stamp 0.8/0.7 on most
+frames), Humble Defector (unknown 0.78/0.68), Nylea's Presence / Crimson
+Wisps / Fatestitcher (footer never read; title picker after SHEET_ESCAPE).
+
+Shipped:
+- Digital-only List originals: `plst` numbers naming a set the client index
+  lacks (VMA, ME2-4, TPR, TD0/TD2, PZ2; 16 printings) join the footer code
+  lookup. Predatory Nightstalker (plst VMA-134) read `VMA·EN` + `134/325` on
+  ~25 frames and never resolved; it now proves plst VMA-134 at stage 0.
+  Saved-frame replay (473 frames 10-07..10-23, `--stream --auto`): +2
+  (both Nightstalker), 0 lost, 0 changed, 0 wrong.
+- Shadow telemetry: `timings.stamp.o` (skin/glare share over the stamp spot);
+  `ca` and `w` (wide search) only when the experiment flag is on (~13 ms).
+
+Built and reviewed but OFF (`env.stampAbsentPick === true`):
+- A two-frame "clear absent" pick of the original (ncc/contrast < 0.35,
+  crop sharp >= 80, +-30 px wide search, no skin/glare over the stamp, own
+  frame reads the set code AND number, two distinct decoded frames of one
+  presentation, presentation-long veto on any other verdict, never for
+  own-numbered stamp sets). Astra R1/R2 found covered-stamp, pooled-footer,
+  veto-expiry and frame-id holes, all fixed. It is still unsafe: a quad
+  fitted a few % off (cards in a pile) moves a REAL stamp outside the search
+  window. Predatory Nightstalker (a List card) scored 0.29 / 0.29, sharp 94,
+  no occluder; a Scryfall quad-offset sweep (4% / 2%) gave stamped corners
+  that pass even with the wide search, while the wide search rejects the
+  unstamped SOS original (collector glyphs, 0.47 / 0.64). Rule: absence of
+  the stamp is not evidence until stamp registration is verified (e.g.
+  anchor the search to the collector-line position).
+- Astra R3: SHIP (flag off). Open: `TPR·EN` parses as `ren` (missed
+  resolution, not wrong).
+
+Next: verify stamp registration against the footer text line, then re-run
+the sweep with offsets; ask Brent for a scan round with frame retention on
+SOS / List cards to calibrate from real frames.
+
 ## Known open items
 - Measure the new build on the PC and a phone (target < 1 s).
 - Targeted OCR-confusion handling (Icy Reception). The frame still

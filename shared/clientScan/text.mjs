@@ -118,6 +118,20 @@ export function loadIndex(raw) {
     if (/^\d+$/.test(p[2])) setMax.set(p[1], Math.max(setMax.get(p[1]) || 0, Number(p[2])));
   }
   const setLookup = new Set(raw.sets);
+  // Reprint-sheet numbers naming an original set the index does not hold
+  // (digital-only originals: Vintage Masters 'VMA-134', MTGO Masters 'ME4-',
+  // Tempest Remastered 'TPR-', ...). The paper List card still prints that
+  // set's code and number (2026-10-23: Predatory Nightstalker plst VMA-134
+  // read 'VMA·EN' + '134/325' on every frame and never resolved). Those codes
+  // join the footer lookup, ranked after every real set; a footer naming one
+  // can only be the List printing, since the original was never on paper.
+  const sheetOnly = new Set();
+  for (const p of raw.printings) {
+    const m = p[1] === 'plst' && /^([a-z][a-z0-9]{1,5})-\d/i.exec(String(p[2] ?? ''));
+    if (m && !setLookup.has(m[1].toLowerCase())) sheetOnly.add(m[1].toLowerCase());
+  }
+  const allSets = [...raw.sets, ...sheetOnly];
+  for (const c of sheetOnly) setLookup.add(c);
   // Physical footer key per printing (see physicalKey). Data-driven: any
   // reprint-sheet set numbering its cards '<ORIGINAL SET>-<num>' collides
   // with that original automatically, with no per-set code.
@@ -140,9 +154,9 @@ export function loadIndex(raw) {
     names, nameIx, canonOf, setMax, phys, prefixOfLonger,
     excluded: new Set(raw.excluded),
     sets: raw.sets,
-    setRank: new Map(raw.sets.map((c, i) => [c, i])),
+    setRank: new Map(allSets.map((c, i) => [c, i])),
     setLookup,
-    setLengths: [...new Set(raw.sets.map(c => c.length))].sort((a, b) => b - a),
+    setLengths: [...new Set(allSets.map(c => c.length))].sort((a, b) => b - a),
     printings: raw.printings,          // [id, set, num]
     byTitle: raw.byTitle,              // normalized title -> printing indices
     uniqueAlias: raw.uniqueAlias,      // canonical norm -> [[alias, printing]]

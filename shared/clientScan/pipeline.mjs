@@ -21,7 +21,7 @@ import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
   footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
-import { readListStamp, STAMP_RECT } from './stamp.mjs';
+import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -408,6 +408,15 @@ export function createReader(env) {
   // is still one printing for title + number (+ set), or nothing.
   let evidence = null;  // {sig, name, frames: [raws per frame], age}
   const EVIDENCE_SIM = 0.92, EVIDENCE_FRAMES = 8, EVIDENCE_KEEP = 6;
+  // List-stamp state of the current PRESENTATION (review R2): cleared only
+  // where tracking and pooled evidence are explicitly dropped (no card,
+  // blurred / clipped / moving / jumping / near-edge frame, reset), never by
+  // a successful read or evidence ageing. veto: some frame of it read a
+  // stamp verdict other than 'clear absent'. confirm: the first clear-absent
+  // frame {name, pick, frameId, src}; cleared when the frame-id source changes
+  // or an id is missing, so two DISTINCT decoded frames are always provable.
+  let stampPres = null;
+  let curFrameId = null;
 
   async function detect(small, channels, frameW, frameH) {
     const out = await env.cornelius.run({ image: corneliusTensor(env.ort, small, channels) });
@@ -425,13 +434,15 @@ export function createReader(env) {
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
     const { smallChannels = 4, requireStill = false, quad: known, frameId = null } = opts;
+    curFrameId = frameId;
+    if (stampPres?.confirm && (frameId == null || typeof frameId !== stampPres.confirm.src)) stampPres.confirm = null;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -516,7 +527,7 @@ export function createReader(env) {
     // one uninterrupted presentation.
     // 'settling' is a still card waiting out its window: nothing about it
     // suggests a swap, so tracking and pooled evidence survive it.
-    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; evidence = null; }
+    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; evidence = null; stampPres = null; }
     if (!cand.eligible) return base;
 
     // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
@@ -556,7 +567,7 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     const recBefore = env.stats.recCalls;
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad, requireStill && frameId != null);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -566,7 +577,7 @@ export function createReader(env) {
     // Only a title-proven answer is carried: a card swapped for a same-art
     // reprint between two frames at the same spot is invisible to tracking,
     // so a printing that needed its footer is re-read every time.
-    if (nearEdge) { evidence = null; tracked = null; }
+    if (nearEdge) { evidence = null; tracked = null; stampPres = null; }
     else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
     else if (result.title && (result.footer_ocr?.length || result.deferred || result.held?.length)) {
       // Validated old-frame numbers are stored per frame, aligned with the
@@ -583,7 +594,7 @@ export function createReader(env) {
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto) {
     const tA = now();
     // Near the frame edge, a strip that reaches off-frame would be read from
     // clamped, repeated edge pixels. The stage is re-projected with the
@@ -665,10 +676,11 @@ export function createReader(env) {
     // original) -> the footer cannot decide, and no later footer stage can
     // either. The cascade stops and the user picks; never a guess.
     // The List / MB2 stamp (stamp.mjs), read at most once per frame and only
-    // for a title with a reprint-sheet printing. Only a PRESENT stamp is
-    // evidence: a stamp that is not seen may be covered, glared or outside
-    // the crop (review R1-B1), so 'absent' never selects anything.
-    let stamp;
+    // for a title with a reprint-sheet printing. A PRESENT stamp is evidence
+    // on one frame. A stamp that is not seen may be covered, glared or outside
+    // the crop (review R1-B1), so plain 'absent' never selects anything; only
+    // the guarded two-frame 'clear absent' rule in settle() may pick the original.
+    let stamp, stampObs;
     const listStamp = () => {
       if (stamp !== undefined) return stamp;
       stamp = null;
@@ -676,22 +688,71 @@ export function createReader(env) {
       const mq = cardToFrame(quad);
       if (!stripInFrame(mq, STAMP_RECT, w, h)) return stamp;
       const ts = now();
-      const st = (env.stampReader || readListStamp)(rgba, w, h, mq);
+      const st = (env.stampReader || readListStamp)(rgba, w, h, mq, { wide: env.stampAbsentPick === true });
       const strong = st.verdict === 'present' && st.ncc >= STAMP_SOLO.ncc && st.contrast >= STAMP_SOLO.contrast;
-      stamp = { ...st, present: strong };
-      timings.stamp = { v: st.verdict, strong, ncc: Math.round(st.ncc * 100) / 100, c: Math.round(st.contrast * 100) / 100, s: st.sharp, ms: Math.round(now() - ts) };
+      const clearAbsent = !strong && stampClearAbsent(st);
+      stamp = { ...st, present: strong, clearAbsent };
+      stampObs = clearAbsent ? 'ca' : 'x';
+      if (!clearAbsent) (stampPres ||= {}).veto = true;
+      timings.stamp = { v: st.verdict, strong, ca: clearAbsent || undefined, w: st.wide ? [Math.round(st.wide.ncc * 100) / 100, Math.round(st.wide.contrast * 100) / 100] : undefined, o: st.occl ? [st.occl.skin, st.occl.glare] : undefined, ncc: Math.round(st.ncc * 100) / 100, c: Math.round(st.contrast * 100) / 100, s: st.sharp, ms: Math.round(now() - ts) };
       return stamp;
     };
     const ph = ix.phys;
     const sheetOf = (g) => g.filter(o => ph[o].sheet);
     // Footer twins (an original and its reprint-sheet copy) with a strong
     // present stamp: the sheet printing, if the group has exactly one.
-    const settle = (group, via, footer, stage = -1) => {
+    const settle = (group, via, footer, stage = -1, own = false) => {
       if (group.length === 1) return done(group[0], via, footer, stage);
       const sheet = sheetOf(group);
       if (sheet.length === 1 && sheet.length < group.length && listStamp()?.present) return done(sheet[0], `${via} + list stamp`, footer, stage);
+      // OFF by default (env.stampAbsentPick === true enables it; shadow
+      // telemetry records ca / wide / occluder scores either way). 2026-10-23
+      // calibration: a quad fitted 4% off (cards in a pile) puts a REAL stamp
+      // outside the search window, so a List card scores 'clear absent'
+      // (Predatory Nightstalker plst VMA-134: 0.29 / 0.29, sharp 94), while the
+      // wide +-30 px search that catches it also rejects every unstamped SOS
+      // original (collector glyphs score 0.47 / 0.64). No threshold separates
+      // them yet; the picker stays until stamp registration is verified.
+      // A CLEARLY absent stamp (stamp.mjs stampClearAbsent) may pick the
+      // original, never on one frame: a finger or glare over the corner also
+      // hides the stamp. Only when the footer has already narrowed the card to
+      // exactly {original, its one plst twin}, the title has no printing from
+      // a set that stamps under its own numbering, the card is not near the
+      // frame edge, and two DISTINCT auto frames of this same card in
+      // continuous view (pooled evidence, same reset rules) both read clear
+      // absent with no other stamp verdict in between. The first such frame
+      // defers (no server, no picker); anything else is the picker.
+      const orig = group.filter(o => !ph[o].sheet);
+      const titleOwn = (ix.byTitle[name] || []).some(o => STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
+      const same = prior && prior.name === name;
+      const conf = stampPres?.confirm;
+      // Copyright-line (retro) proofs carry no set code and stay with the picker.
+      const ownProof = () => {
+        if (!own || orig.length !== 1) return false;
+        const p = ix.printings[orig[0]];
+        const nums = new Set([...footerNumbers(footer), ...strongNumbers(footer).keys()].map(normalizeCollector));
+        return footerCodes(ix, footer).includes(p[1]) && nums.has(ph[orig[0]].num);
+      };
+      if (env.stampAbsentPick === true && autoMode && curFrameId != null && !nearEdge && group.length === 2 && sheet.length === 1 && orig.length === 1 && !titleOwn
+        && !stampPres?.veto && (!conf || (conf.name === name && conf.pick === orig[0]))
+        && ownProof() && listStamp()?.clearAbsent && !stampPres?.veto) {
+        if (conf && same && conf.frameId !== curFrameId) {
+          timings.stamp_absent_frames = 2;
+          return done(orig[0], `${via} + no list stamp`, footer, stage);
+        }
+        (stampPres ||= {}).confirm = { name, pick: orig[0], frameId: curFrameId, src: typeof curFrameId };
+        // First clear-absent frame: wait for a second distinct frame. Not
+        // 'deferred' (that flag skips deep footer stages on the next frame,
+        // review S1); stamp_wait only keeps the server out. The escape picker
+        // (FastScanner SHEET_ESCAPE) offers this pair, not the whole title.
+        timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
+        const pair = group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; });
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', stamp_wait: true, sheet_like: true, title_choices: pair,
+          title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw, stamp_obs: stampObs, absent_pick: orig[0],
+          held: held.length ? held : undefined, rescued: rescued || undefined };
+      }
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-      return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage,
+      return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage, stamp_obs: stampObs,
         choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
         title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw };
     };
@@ -820,7 +881,7 @@ export function createReader(env) {
       // Holds for every later stage too: the rescue reads stay in raws.
       if (stage === 'rescue' || stage === 'tall') rescued = true;
       if (g != null && (rescued || held.length || priorHeld.length) && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
-      if (g != null) return settle(g, 'title+set+collector', raws, si);
+      if (g != null) return settle(g, 'title+set+collector', raws, si, true);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
       // Title + strong stamp after the first footer batch did not resolve:
@@ -870,24 +931,24 @@ export function createReader(env) {
           }
         }
         timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined };
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined, stamp_obs: stampObs };
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined, stamp_obs: stampObs };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; }
     return quad;
   }
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; }, resetCache() { tracked = null; } };
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; }, resetCache() { tracked = null; } };
 }
 
 export { normName };

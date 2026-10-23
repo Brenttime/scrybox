@@ -425,7 +425,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         // the server has never split these (2026-10-08/09 telemetry, 0 of
         // ~120 tries), so offer the title's printings as a one-tap picker.
         if (autoPass && r0 && !r0.ok && r0.sheet_like && r0.title_choices?.length > 1 && sheetRunRef.current >= SHEET_ESCAPE) {
-          local = { ...local, results: local.results.map((x, i) => (i === 0 ? { ...x, retry: false, error: 'printing needs a choice', choices: x.title_choices, via: 'title (printing picker)' } : x)) };
+          local = { ...local, results: local.results.map((x, i) => (i === 0 ? { ...x, retry: false, stamp_wait: undefined, error: 'printing needs a choice', choices: x.title_choices, via: 'title (printing picker)' } : x)) };
           tel.set({ sheet_picker: true });
         }
         if (!needsServer(local, { autoPass, noTitleRun: noTitleRunRef.current, edgeRun: edgeRunRef.current?.count || 0, sheetRun: sheetRunRef.current, titledRun: titledRunRef.current })) {
