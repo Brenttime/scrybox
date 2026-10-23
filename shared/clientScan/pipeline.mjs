@@ -688,7 +688,7 @@ export function createReader(env) {
       const mq = cardToFrame(quad);
       if (!stripInFrame(mq, STAMP_RECT, w, h)) return stamp;
       const ts = now();
-      const st = (env.stampReader || readListStamp)(rgba, w, h, mq);
+      const st = (env.stampReader || readListStamp)(rgba, w, h, mq, { wide: env.stampAbsentPick === true });
       const strong = st.verdict === 'present' && st.ncc >= STAMP_SOLO.ncc && st.contrast >= STAMP_SOLO.contrast;
       const clearAbsent = !strong && stampClearAbsent(st);
       stamp = { ...st, present: strong, clearAbsent };

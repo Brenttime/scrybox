@@ -105,14 +105,16 @@ export function cropSharpness(g, W, H) {
   return d;
 }
 
-// 'Clear absent': far below the absent thresholds on a crisp crop. Used
-// only to let footer-proven {original, plst twin} pairs pick the ORIGINAL,
-// and only after two distinct frames of the same card agree (pipeline.mjs).
-// Calibration (2026-10-23): 67 Scryfall pairs x 4 sizes x blur 0-8, no
-// stamped reference scored ncc < 0.35 AND contrast < 0.35 at any blur below
-// 8 (crop sharp <= 49 there); the only stamped webcam frame in the 2026-10-07
-// / 10-23 corpus to score that low (a tilted Twisted Image in a moving pile)
-// had sharp 70. Unstamped SOS webcam frames of 2026-10-23 scored sharp 84-104.
+// 'Clear absent' (EXPERIMENT, disabled in production: pipeline.mjs only
+// uses it when env.stampAbsentPick === true). Far below the absent
+// thresholds on a crisp, unoccluded crop, also over a +-30 px search.
+// 2026-10-23 calibration: with an exact quad, 67 Scryfall pairs x 4 sizes x
+// blur 0-8 gave no stamped corner below ncc 0.35 AND contrast 0.35 above
+// blur 8. With the quad 4% / 2% off (a card in a pile), stamped corners DO
+// score clear absent (65 sweep rows even with the wide search; a real
+// webcam frame, plst VMA-134: 0.29 / 0.29, sharp 94), and the wide search
+// rejects the unstamped SOS original (0.47 / 0.64). Not safe until stamp
+// registration is verified.
 // It also needs the occluder check (cornerOccluders): no skin-like or
 // blown-out pixels over the stamp spot. Without that measurement it is false.
 export const STAMP_CLEAR_ABSENT = Object.freeze({ ncc: 0.35, contrast: 0.35, sharp: 80, skin: 0.02, glare: 0.02 });
@@ -123,7 +125,7 @@ export function stampClearAbsent({ ncc, contrast, sharp = 0, occl = null, wide =
 }
 
 // m: homography of the card's TRUE outline (unpadded quad) into the frame.
-export function readListStamp(rgba, w, h, m) {
+export function readListStamp(rgba, w, h, m, { wide: wantWide = true } = {}) {
   const strip = sampleStrip(rgba, w, h, m, STAMP_RECT[0], STAMP_RECT[1], STAMP_RECT[2], STAMP_RECT[3], CROP_H);
   const g = gray(strip);
   const s = { ...stampScores(g, strip.w, strip.h), sharp: cropSharpness(g, strip.w, strip.h) };
@@ -133,7 +135,8 @@ export function readListStamp(rgba, w, h, m) {
   // loose outline shifts the stamp out of the +-12 px window (2026-10-23
   // Predatory Nightstalker, plst VMA-134 on a stack: ncc 0.29 at +-12, the
   // stamp sat 17 px right of the template position).
-  const wide = verdict === 'absent' ? stampScores(g, strip.w, strip.h, WIDE_SHIFT) : null;
+  // ~13 ms on the host CPU: only when the (experimental) pick may use it.
+  const wide = wantWide && verdict === 'absent' ? stampScores(g, strip.w, strip.h, WIDE_SHIFT) : null;
   return { ...s, verdict, occl: cornerOccluders(strip), wide };
 }
 
