@@ -28,6 +28,7 @@ const TEMPLATE = [[1,1,0,1,1,1,1,1,1,1,1,1,0,0,1,1,1,2,6,10,8,7,12,11,11,11,11,9
 const MASK = [[55,28,29],[58,23,24],[58,27,28],[59,19,20],[59,23,25],[59,26,28],[60,18,25],[60,26,28],[61,15,16],[61,18,28],[61,30,31],[62,15,17],[62,18,31],[63,12,13],[63,15,31],[64,12,13],[64,15,30],[65,12,30],[66,12,30],[67,13,30],[68,14,30],[68,31,32],[69,15,29],[70,16,29],[71,17,29],[72,17,21],[72,22,25],[72,26,28],[73,18,20],[73,23,25],[73,26,28],[74,18,20],[74,26,27],[75,19,20],[76,26,27]];
 const BAND = [[49,28,29],[50,27,30],[51,26,31],[52,23,24],[52,25,28],[52,29,32],[53,19,20],[53,22,27],[53,30,33],[54,18,26],[54,31,34],[55,15,16],[55,17,23],[55,24,25],[55,32,35],[56,14,19],[56,20,22],[56,25,26],[56,31,34],[57,12,18],[57,30,33],[58,11,15],[58,16,17],[58,31,34],[59,10,14],[59,32,35],[60,9,12],[60,33,36],[61,8,11],[61,34,37],[62,7,10],[62,34,37],[63,6,9],[63,34,37],[64,6,9],[64,33,36],[65,6,9],[65,33,36],[66,6,9],[66,33,36],[67,7,10],[67,34,37],[68,8,11],[68,35,38],[69,9,12],[69,34,37],[70,10,13],[70,33,36],[71,11,14],[71,32,35],[72,11,14],[72,31,34],[73,12,15],[73,31,34],[74,12,15],[74,30,33],[75,13,16],[75,29,32],[76,14,17],[76,22,23],[76,30,33],[77,15,18],[77,21,24],[77,29,32],[78,16,19],[78,20,25],[78,28,31],[79,17,22],[79,23,26],[79,27,30],[80,18,21],[80,24,29],[81,19,20],[81,25,28],[82,26,27]];
 const SHIFT = 12;   // search +-12 px for quad error
+const WIDE_SHIFT = 30;   // 'clear absent' must also hold over +-30 px
 export const STAMP_PRESENT = Object.freeze({ ncc: 0.60, contrast: 0.90 });
 export const STAMP_ABSENT = Object.freeze({ ncc: 0.50, contrast: 0.80 });
 
@@ -51,10 +52,10 @@ function gray(strip) {
 }
 
 // Pure scoring of the gray corner crop (exported for tests).
-export function stampScores(g, W, H) {
+export function stampScores(g, W, H, shift = SHIFT) {
   let ncc = -1, contrast = -Infinity;
-  for (let dy = -SHIFT; dy <= SHIFT; dy++) {
-    for (let dx = -SHIFT; dx <= SHIFT; dx++) {
+  for (let dy = -shift; dy <= shift; dy++) {
+    for (let dx = -shift; dx <= shift; dx++) {
       const y = T_ROW + dy, x = T_COL + dx;
       if (y >= 0 && x >= 0 && y + TH <= H && x + TW <= W) {
         let s = 0, s2 = 0;
@@ -115,8 +116,9 @@ export function cropSharpness(g, W, H) {
 // It also needs the occluder check (cornerOccluders): no skin-like or
 // blown-out pixels over the stamp spot. Without that measurement it is false.
 export const STAMP_CLEAR_ABSENT = Object.freeze({ ncc: 0.35, contrast: 0.35, sharp: 80, skin: 0.02, glare: 0.02 });
-export function stampClearAbsent({ ncc, contrast, sharp = 0, occl = null }) {
-  return Number.isFinite(ncc) && Number.isFinite(contrast) && ncc < STAMP_CLEAR_ABSENT.ncc && contrast < STAMP_CLEAR_ABSENT.contrast && sharp >= STAMP_CLEAR_ABSENT.sharp
+export function stampClearAbsent({ ncc, contrast, sharp = 0, occl = null, wide = null }) {
+  const low = (a, b) => Number.isFinite(a) && Number.isFinite(b) && a < STAMP_CLEAR_ABSENT.ncc && b < STAMP_CLEAR_ABSENT.contrast;
+  return low(ncc, contrast) && !!wide && low(wide.ncc, wide.contrast) && sharp >= STAMP_CLEAR_ABSENT.sharp
     && !!occl && occl.skin <= STAMP_CLEAR_ABSENT.skin && occl.glare <= STAMP_CLEAR_ABSENT.glare;
 }
 
@@ -125,7 +127,14 @@ export function readListStamp(rgba, w, h, m) {
   const strip = sampleStrip(rgba, w, h, m, STAMP_RECT[0], STAMP_RECT[1], STAMP_RECT[2], STAMP_RECT[3], CROP_H);
   const g = gray(strip);
   const s = { ...stampScores(g, strip.w, strip.h), sharp: cropSharpness(g, strip.w, strip.h) };
-  return { ...s, verdict: stampVerdict(s), occl: cornerOccluders(strip) };
+  const verdict = stampVerdict(s);
+  // An absence claim must hold over a wider neighbourhood than the presence
+  // search: a quad fitted to a card UNDER the scanned one (a pile) or to a
+  // loose outline shifts the stamp out of the +-12 px window (2026-10-23
+  // Predatory Nightstalker, plst VMA-134 on a stack: ncc 0.29 at +-12, the
+  // stamp sat 17 px right of the template position).
+  const wide = verdict === 'absent' ? stampScores(g, strip.w, strip.h, WIDE_SHIFT) : null;
+  return { ...s, verdict, occl: cornerOccluders(strip), wide };
 }
 
 // Occluder check for 'clear absent' (review a5cd399 B1): a stamp that is
