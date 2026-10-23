@@ -556,7 +556,7 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     const recBefore = env.stats.recCalls;
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad, requireStill);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad, requireStill && frameId != null);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -583,6 +583,9 @@ export function createReader(env) {
         // per frame that read the stamp ('ca' = clear absent, 'x' = any other
         // verdict), and the original printing a clear-absent frame pointed at.
         stampObs: [...(same ? prior.stampObs || [] : []), ...(result.stamp_obs ? [result.stamp_obs] : [])].slice(-EVIDENCE_KEEP),
+        // Any other stamp verdict on this card vetoes the clear-absent pick
+        // until the presentation ends (not only while it is in the window).
+        stampVeto: result.stamp_obs === 'x' || !!(same && prior.stampVeto),
         absentPick: result.absent_pick ?? (same ? prior.absentPick : undefined) };
     }
     return base;
@@ -670,9 +673,10 @@ export function createReader(env) {
     // original) -> the footer cannot decide, and no later footer stage can
     // either. The cascade stops and the user picks; never a guess.
     // The List / MB2 stamp (stamp.mjs), read at most once per frame and only
-    // for a title with a reprint-sheet printing. Only a PRESENT stamp is
-    // evidence: a stamp that is not seen may be covered, glared or outside
-    // the crop (review R1-B1), so 'absent' never selects anything.
+    // for a title with a reprint-sheet printing. A PRESENT stamp is evidence
+    // on one frame. A stamp that is not seen may be covered, glared or outside
+    // the crop (review R1-B1), so plain 'absent' never selects anything; only
+    // the guarded two-frame 'clear absent' rule in settle() may pick the original.
     let stamp, stampObs;
     const listStamp = () => {
       if (stamp !== undefined) return stamp;
@@ -693,7 +697,7 @@ export function createReader(env) {
     const sheetOf = (g) => g.filter(o => ph[o].sheet);
     // Footer twins (an original and its reprint-sheet copy) with a strong
     // present stamp: the sheet printing, if the group has exactly one.
-    const settle = (group, via, footer, stage = -1) => {
+    const settle = (group, via, footer, stage = -1, own = false) => {
       if (group.length === 1) return done(group[0], via, footer, stage);
       const sheet = sheetOf(group);
       if (sheet.length === 1 && sheet.length < group.length && listStamp()?.present) return done(sheet[0], `${via} + list stamp`, footer, stage);
@@ -708,15 +712,33 @@ export function createReader(env) {
       // defers (no server, no picker); anything else is the picker.
       const orig = group.filter(o => !ph[o].sheet);
       const titleOwn = (ix.byTitle[name] || []).some(o => STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
-      const obs = prior && prior.name === name ? prior.stampObs || [] : [];
+      const same = prior && prior.name === name;
+      const obs = same ? prior.stampObs || [] : [];
+      // This frame's OWN footer reads must name the original's set code AND
+      // its number (Shadewriter: 'SOS·EN' + 'C 0101'): pooled reads from an
+      // earlier frame never count here, because a same-art swap between
+      // frames is invisible to tracking (review a5cd399 B2). Copyright-line
+      // (retro) proofs carry no set code and stay with the picker.
+      const ownProof = () => {
+        if (!own || orig.length !== 1) return false;
+        const p = ix.printings[orig[0]];
+        const nums = new Set([...footerNumbers(footer), ...strongNumbers(footer).keys()].map(normalizeCollector));
+        return footerCodes(ix, footer).includes(p[1]) && nums.has(ph[orig[0]].num);
+      };
       if (autoMode && !nearEdge && group.length === 2 && sheet.length === 1 && orig.length === 1 && !titleOwn
-        && obs.every(o => o === 'ca') && listStamp()?.clearAbsent) {
+        && !(same && prior.stampVeto) && obs.every(o => o === 'ca') && (!same || prior.absentPick == null || prior.absentPick === orig[0])
+        && ownProof() && listStamp()?.clearAbsent) {
         if (obs.length >= 1 && prior.absentPick === orig[0]) {
           timings.stamp_absent_frames = obs.length + 1;
           return done(orig[0], `${via} + no list stamp`, footer, stage);
         }
+        // First clear-absent frame: wait for a second distinct frame. Not
+        // 'deferred' (that flag skips deep footer stages on the next frame,
+        // review S1); stamp_wait only keeps the server out. The escape picker
+        // (FastScanner SHEET_ESCAPE) offers this pair, not the whole title.
         timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: true, title_choices: titleChoices,
+        const pair = group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; });
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', stamp_wait: true, sheet_like: true, title_choices: pair,
           title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw, stamp_obs: stampObs, absent_pick: orig[0],
           held: held.length ? held : undefined, rescued: rescued || undefined };
       }
@@ -850,7 +872,7 @@ export function createReader(env) {
       // Holds for every later stage too: the rescue reads stay in raws.
       if (stage === 'rescue' || stage === 'tall') rescued = true;
       if (g != null && (rescued || held.length || priorHeld.length) && strongConflict(ix, name, g[0], raws, veto())) { timings.rescue_conflict = 1; g = null; }
-      if (g != null) return settle(g, 'title+set+collector', raws, si);
+      if (g != null) return settle(g, 'title+set+collector', raws, si, true);
       const pooledHit = tryPooled(si);
       if (pooledHit) return pooledHit;
       // Title + strong stamp after the first footer batch did not resolve:

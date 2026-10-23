@@ -409,10 +409,10 @@ test('needsServer: a titled but unproven card stays on-device for TITLED_ESCAPE 
 // Pest / Leech Collector (SOS 101/100/88, plst SOS-N twins) proved their
 // footer and scored ncc -0.05..0.31 / contrast 0..0.25 / sharp 84-104 on
 // every frame, yet always went to the Original-or-List picker.
-const clearAbsent = () => ({ verdict: 'absent', ncc: 0.05, contrast: 0.04, sharp: 98 });
-function twoFrameReader(stampFor) {
+const clearAbsent = () => ({ verdict: 'absent', ncc: 0.05, contrast: 0.04, sharp: 98, occl: { skin: 0, glare: 0 } });
+function twoFrameReader(stampFor, footerFor = () => 'ody 129/350 c') {
   let frame = 1, base = 0;
-  const d = reader((c) => (c - base === 1 ? 'diabolic tutor' : '129/350 c'), { listStamp: true, stampReader: () => stampFor(frame) });
+  const d = reader((c) => (c - base === 1 ? 'diabolic tutor' : footerFor(frame)), { listStamp: true, stampReader: () => stampFor(frame) });
   return { ...d, next: () => { frame++; base = d.calls(); } };
 }
 const autoRead = (d, id) => d.r.read(sharpFrame(), small, { requireStill: true, frameId: id }).then(o => o.results[0]);
@@ -421,7 +421,10 @@ test('clear-absent stamp: two distinct auto frames of the same card -> the origi
   const d = twoFrameReader(clearAbsent);
   const r1 = await autoRead(d, 1);
   assert.equal(r1.ok, false, JSON.stringify(r1));
-  assert.equal(r1.deferred, true, 'first clear-absent frame defers (no picker, no server)');
+  assert.equal(r1.stamp_wait, true, 'first clear-absent frame waits (no picker, no server)');
+  assert.notEqual(r1.deferred, true, 'not a deferred footer read: the next frame keeps the cheap path (review S1)');
+  assert.equal(needsServer({ candidates: [{ eligible: true }], results: [r1] }, { autoPass: true, sheetRun: 99, titledRun: 99 }), false);
+  assert.deepEqual(r1.title_choices.map(c => c.scryfallId), ['id-ody', 'id-plst-ody'], 'escape picker offers the footer pair');
   assert.notEqual(r1.scryfallId, 'id-ody');
   d.next();
   const r2 = await autoRead(d, 2);
@@ -446,15 +449,20 @@ test('clear-absent stamp: shutter (non-auto) reads and a repeated decoded frame 
 
 test('clear-absent stamp: any non-clear stamp read on the card in view keeps the picker', async () => {
   // Frame 1 clear, frame 2 'absent' but soft (sharp 60, or contrast 0.40): picker.
-  for (const soft of [{ verdict: 'absent', ncc: 0.1, contrast: 0.1, sharp: 60 }, { verdict: 'absent', ncc: 0.26, contrast: 0.40, sharp: 84 }, { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90 }]) {
+  const oc = { skin: 0, glare: 0 };
+  for (const soft of [{ verdict: 'absent', ncc: 0.1, contrast: 0.1, sharp: 60, occl: oc }, { verdict: 'absent', ncc: 0.26, contrast: 0.40, sharp: 84, occl: oc },
+    { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90, occl: oc }, { ...clearAbsent(), occl: { skin: 0.3, glare: 0 } }, { ...clearAbsent(), occl: { skin: 0, glare: 0.2 } }, { ...clearAbsent(), occl: undefined }]) {
     const d = twoFrameReader((f) => (f === 1 ? clearAbsent() : soft));
     await autoRead(d, 1); d.next();
     const r2 = await autoRead(d, 2);
     assert.equal(r2.error, 'printing needs a choice', JSON.stringify(r2));
-    // ... and once seen, a later clear frame of the same card does not override it.
-    d.next();
-    const r3 = await autoRead(d, 3);
-    assert.notEqual(r3.ok, true, JSON.stringify(r3));
+    // ... and once seen, no later run of clear frames of the same card
+    // overrides it, also after it left the 6-frame evidence window (S3).
+    for (let k = 3; k <= 11; k++) {
+      d.next();
+      const rk = await autoRead(d, k);
+      assert.notEqual(rk.ok, true, `frame ${k}: ${JSON.stringify(rk)}`);
+    }
   }
   // Ghired-like: unknown first, then clear absent: picker, never the original.
   const g = twoFrameReader((f) => (f === 1 ? { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90 } : clearAbsent()));
@@ -469,7 +477,7 @@ test('clear-absent stamp: a frame without a card (finger, lift) between the two 
   d.next();
   const r2 = await autoRead(d, 2);
   assert.notEqual(r2.ok, true, JSON.stringify(r2));
-  assert.equal(r2.deferred, true);
+  assert.equal(r2.stamp_wait, true);
 });
 
 test('clear-absent stamp: never for a title with an own-numbered stamp set (mb2/cmb...) or a 3-way group', async () => {
@@ -500,12 +508,63 @@ test('stampClearAbsent: real stamped webcam corners (sharp or hand-blurred) are 
   const { stampClearAbsent } = await import('../../../shared/clientScan/stamp.mjs');
   const sc = (c) => { const g = Float32Array.from(c.g); return { ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) }; };
   for (const k of ['present_hatchet', 'present_smog', 'unknown_blur_smog']) assert.equal(stampClearAbsent(sc(CROPS[k])), false, k);
-  // A covered stamp (border tone painted over it) is a flat patch: never sharp enough.
+  // Painting the stamp out with the border tone yields exactly an unstamped
+  // corner (the stamp is printed in the black border), which no detector can
+  // tell apart; it must at least never read present. Real occluders (skin,
+  // glare) are covered by the cornerOccluders test below.
   const c = CROPS.present_hatchet, g = Float32Array.from(c.g);
   for (let y = 48; y < 84; y++) for (let x = 6; x < 42; x++) g[y * c.w + x] = 20;
   const cov = { ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) };
   assert.ok(!(cov.ncc >= 0.6 && cov.contrast >= 0.9));
-  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 79 }), false);
-  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 80 }), true);
-  assert.equal(stampClearAbsent({ ncc: 0.36, contrast: 0.1, sharp: 99 }), false);
+  const oc = { skin: 0, glare: 0 };
+  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 79, occl: oc }), false);
+  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 80, occl: oc }), true);
+  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 80 }), false, 'no occluder measurement, no claim');
+  assert.equal(stampClearAbsent({ ncc: 0.36, contrast: 0.1, sharp: 99, occl: oc }), false);
+});
+
+test('clear-absent stamp: the second frame must prove the footer itself, never from pooled reads (review B2)', async () => {
+  // Frame 2 reads no footer at all: the pair is only 'proven' by frame 1's pooled reads.
+  const d = twoFrameReader(clearAbsent, (f) => (f === 1 ? 'ody 129/350 c' : 'zz'));
+  await autoRead(d, 1); d.next();
+  const r2 = await autoRead(d, 2);
+  assert.notEqual(r2.scryfallId, 'id-ody', JSON.stringify(r2));
+  // A number without the set code (or a set code without the number) is no proof either.
+  for (const text of ['129/350 c', 'ody zz']) {
+    const e = twoFrameReader(clearAbsent, () => text);
+    await autoRead(e, 1); e.next();
+    assert.notEqual((await autoRead(e, 2)).scryfallId, 'id-ody', text);
+  }
+});
+
+test('clear-absent stamp: no decoded-frame id (cannot prove two distinct frames) keeps the picker', async () => {
+  const d = twoFrameReader(clearAbsent);
+  for (let k = 0; k < 3; k++) {
+    const r = (await d.r.read(sharpFrame(), small, { requireStill: true })).results[0];
+    assert.notEqual(r.ok, true, JSON.stringify(r));
+    d.next();
+  }
+});
+
+test('stampClearAbsent: a skin-coloured or blown-out patch over a real stamped corner is never clear absent', async () => {
+  const { cornerOccluders, stampClearAbsent } = await import('../../../shared/clientScan/stamp.mjs');
+  const c = CROPS.present_hatchet;
+  for (const rgb of [[205, 150, 125], [250, 248, 245]]) {
+    const W = c.w, H = c.h, data = new Uint8Array(W * H * 3), g = Float32Array.from(c.g);
+    for (let i = 0; i < W * H; i++) data[3 * i] = data[3 * i + 1] = data[3 * i + 2] = c.g[i];
+    for (let y = 40; y < 92; y++) for (let x = 0; x < 48; x++) { const i = y * W + x; data[3 * i] = rgb[0]; data[3 * i + 1] = rgb[1]; data[3 * i + 2] = rgb[2]; g[i] = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]; }
+    const occl = cornerOccluders({ w: W, h: H, data });
+    const sc = { ...stampScores(g, W, H), sharp: cropSharpness(g, W, H), occl };
+    assert.equal(stampClearAbsent(sc), false, JSON.stringify(sc));
+  }
+});
+
+test('clear-absent stamp: a non-clear verdict vetoes for the whole presentation, not just the evidence window (review S3)', async () => {
+  const d = twoFrameReader((f) => (f === 2 ? { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90, occl: { skin: 0, glare: 0 } } : clearAbsent()),
+    (f) => (f >= 3 && f <= 10 ? 'zz' : 'ody 129/350 c'));
+  for (let k = 1; k <= 12; k++) {
+    const r = await autoRead(d, k);
+    assert.notEqual(r.scryfallId, 'id-ody', `frame ${k}: ${JSON.stringify(r)}`);
+    d.next();
+  }
 });

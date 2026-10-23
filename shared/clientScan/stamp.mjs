@@ -112,9 +112,12 @@ export function cropSharpness(g, W, H) {
 // 8 (crop sharp <= 49 there); the only stamped webcam frame in the 2026-10-07
 // / 10-23 corpus to score that low (a tilted Twisted Image in a moving pile)
 // had sharp 70. Unstamped SOS webcam frames of 2026-10-23 scored sharp 84-104.
-export const STAMP_CLEAR_ABSENT = Object.freeze({ ncc: 0.35, contrast: 0.35, sharp: 80 });
-export function stampClearAbsent({ ncc, contrast, sharp = 0 }) {
-  return Number.isFinite(ncc) && Number.isFinite(contrast) && ncc < STAMP_CLEAR_ABSENT.ncc && contrast < STAMP_CLEAR_ABSENT.contrast && sharp >= STAMP_CLEAR_ABSENT.sharp;
+// It also needs the occluder check (cornerOccluders): no skin-like or
+// blown-out pixels over the stamp spot. Without that measurement it is false.
+export const STAMP_CLEAR_ABSENT = Object.freeze({ ncc: 0.35, contrast: 0.35, sharp: 80, skin: 0.02, glare: 0.02 });
+export function stampClearAbsent({ ncc, contrast, sharp = 0, occl = null }) {
+  return Number.isFinite(ncc) && Number.isFinite(contrast) && ncc < STAMP_CLEAR_ABSENT.ncc && contrast < STAMP_CLEAR_ABSENT.contrast && sharp >= STAMP_CLEAR_ABSENT.sharp
+    && !!occl && occl.skin <= STAMP_CLEAR_ABSENT.skin && occl.glare <= STAMP_CLEAR_ABSENT.glare;
 }
 
 // m: homography of the card's TRUE outline (unpadded quad) into the frame.
@@ -122,5 +125,25 @@ export function readListStamp(rgba, w, h, m) {
   const strip = sampleStrip(rgba, w, h, m, STAMP_RECT[0], STAMP_RECT[1], STAMP_RECT[2], STAMP_RECT[3], CROP_H);
   const g = gray(strip);
   const s = { ...stampScores(g, strip.w, strip.h), sharp: cropSharpness(g, strip.w, strip.h) };
-  return { ...s, verdict: stampVerdict(s) };
+  return { ...s, verdict: stampVerdict(s), occl: cornerOccluders(strip) };
+}
+
+// Occluder check for 'clear absent' (review a5cd399 B1): a stamp that is
+// not seen because something lies over the corner must not count. The things
+// that cover a corner while a card is scanned are fingers (skin) and glare
+// (blown-out white); a black border with white collector text is neither.
+// Share of stamp-area pixels (crop rows 44-88, cols 2-44 = the template
+// position +-6 px) that are skin-like (classic RGB rule) or near-saturated.
+const AREA = [44, 88, 2, 44];
+export function cornerOccluders(strip) {
+  const W = strip.w, d = strip.data;
+  let skin = 0, glare = 0, n = 0;
+  for (let y = AREA[0]; y < Math.min(AREA[1], strip.h); y++) for (let x = AREA[2]; x < Math.min(AREA[3], W); x++) {
+    const i = 3 * (y * W + x), R = d[i], G = d[i + 1], B = d[i + 2];
+    const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+    if (R > 95 && G > 40 && B > 20 && mx - mn > 15 && R - G > 15 && R > B) skin++;
+    if (mn >= 235) glare++;
+    n++;
+  }
+  return { skin: n ? Math.round(1000 * skin / n) / 1000 : 1, glare: n ? Math.round(1000 * glare / n) / 1000 : 1 };
 }

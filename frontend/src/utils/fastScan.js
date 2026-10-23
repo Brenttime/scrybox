@@ -68,6 +68,8 @@ export function needsServer(out, { autoPass, noTitleRun = 0, edgeRun = 0, sheetR
   if (res && !res.ok && res.choices?.length > 1) return false;
   if (res && !res.ok && autoPass) {
     if (res.deferred) return false;
+    // Waiting for a second frame to confirm a clearly absent List stamp.
+    if (res.stamp_wait) return false;
     if (res.error === 'no confident card title' && noTitleRun < NO_TITLE_ESCAPE) return false;
     if (res.near_edge_partial && edgeRun < EDGE_ESCAPE) return false;
     if (res.sheet_like && res.title && sheetRun < SHEET_ESCAPE) return false;
