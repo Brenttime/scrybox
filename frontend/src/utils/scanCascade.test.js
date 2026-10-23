@@ -403,3 +403,109 @@ test('needsServer: a titled but unproven card stays on-device for TITLED_ESCAPE 
   assert.equal(needsServer(out, { autoPass: true, titledRun: TITLED_ESCAPE }), true);
   assert.equal(needsServer(out, { autoPass: false, titledRun: 1 }), true, 'shutter presses still ask the server');
 });
+
+// ---- 2026-10-23: a CLEARLY absent stamp on two distinct frames picks the original ----
+// Windows telemetry (session rzybpvwc): Sneering Shadewriter / Send in the
+// Pest / Leech Collector (SOS 101/100/88, plst SOS-N twins) proved their
+// footer and scored ncc -0.05..0.31 / contrast 0..0.25 / sharp 84-104 on
+// every frame, yet always went to the Original-or-List picker.
+const clearAbsent = () => ({ verdict: 'absent', ncc: 0.05, contrast: 0.04, sharp: 98 });
+function twoFrameReader(stampFor) {
+  let frame = 1, base = 0;
+  const d = reader((c) => (c - base === 1 ? 'diabolic tutor' : '129/350 c'), { listStamp: true, stampReader: () => stampFor(frame) });
+  return { ...d, next: () => { frame++; base = d.calls(); } };
+}
+const autoRead = (d, id) => d.r.read(sharpFrame(), small, { requireStill: true, frameId: id }).then(o => o.results[0]);
+
+test('clear-absent stamp: two distinct auto frames of the same card -> the original, one frame never', async () => {
+  const d = twoFrameReader(clearAbsent);
+  const r1 = await autoRead(d, 1);
+  assert.equal(r1.ok, false, JSON.stringify(r1));
+  assert.equal(r1.deferred, true, 'first clear-absent frame defers (no picker, no server)');
+  assert.notEqual(r1.scryfallId, 'id-ody');
+  d.next();
+  const r2 = await autoRead(d, 2);
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  assert.equal(r2.scryfallId, 'id-ody');
+  assert.match(r2.via, /no list stamp/);
+});
+
+test('clear-absent stamp: shutter (non-auto) reads and a repeated decoded frame never pick the original', async () => {
+  const s = twoFrameReader(clearAbsent);
+  for (let k = 0; k < 2; k++) {
+    const r = (await s.r.read(sharpFrame(), small)).results[0];
+    assert.equal(r.error, 'printing needs a choice', JSON.stringify(r));
+    s.next();
+  }
+  const d = twoFrameReader(clearAbsent);
+  await autoRead(d, 7);
+  d.next();
+  const dup = await d.r.read(sharpFrame(), small, { requireStill: true, frameId: 7 });
+  assert.notEqual(dup.results[0]?.ok, true, 'the same decoded frame is not a second observation');
+});
+
+test('clear-absent stamp: any non-clear stamp read on the card in view keeps the picker', async () => {
+  // Frame 1 clear, frame 2 'absent' but soft (sharp 60, or contrast 0.40): picker.
+  for (const soft of [{ verdict: 'absent', ncc: 0.1, contrast: 0.1, sharp: 60 }, { verdict: 'absent', ncc: 0.26, contrast: 0.40, sharp: 84 }, { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90 }]) {
+    const d = twoFrameReader((f) => (f === 1 ? clearAbsent() : soft));
+    await autoRead(d, 1); d.next();
+    const r2 = await autoRead(d, 2);
+    assert.equal(r2.error, 'printing needs a choice', JSON.stringify(r2));
+    // ... and once seen, a later clear frame of the same card does not override it.
+    d.next();
+    const r3 = await autoRead(d, 3);
+    assert.notEqual(r3.ok, true, JSON.stringify(r3));
+  }
+  // Ghired-like: unknown first, then clear absent: picker, never the original.
+  const g = twoFrameReader((f) => (f === 1 ? { verdict: 'unknown', ncc: 0.8, contrast: 0.7, sharp: 90 } : clearAbsent()));
+  await autoRead(g, 1); g.next();
+  assert.notEqual((await autoRead(g, 2)).ok, true);
+});
+
+test('clear-absent stamp: a frame without a card (finger, lift) between the two frames restarts the count', async () => {
+  const d = twoFrameReader(clearAbsent);
+  await autoRead(d, 1);
+  d.r.reset();   // what a no-card / blurred / moved frame does to pooled evidence
+  d.next();
+  const r2 = await autoRead(d, 2);
+  assert.notEqual(r2.ok, true, JSON.stringify(r2));
+  assert.equal(r2.deferred, true);
+});
+
+test('clear-absent stamp: never for a title with an own-numbered stamp set (mb2/cmb...) or a 3-way group', async () => {
+  const base = ix();
+  const i0 = base.printings.length;
+  const raw = { names: [...base.names, 'pick your poison'], canon: {}, excluded: [], sets: [...SETS, 'mkm', 'cmb1'],
+    printings: [...base.printings, ['id-pyp-mkm', 'mkm', '170'], ['id-pyp-plst', 'plst', 'MKM-170'], ['id-pyp-cmb1', 'cmb1', '97'], ['f-mkm', 'mkm', '286']],
+    byTitle: { ...base.byTitle, 'pick your poison': [i0, i0 + 1, i0 + 2] }, uniqueAlias: {} };
+  const ort = { Tensor: class { constructor(t, d, s) { this.data = d; this.dims = s; } } };
+  const cornelius = { run: async () => ({ corners: { data: [0.2, 0.1, 0.8, 0.1, 0.8, 0.9, 0.2, 0.9] }, sharpness: { data: [0.9] } }) };
+  const chars = ['', ...'abcdefghijklmnopqrstuvwxyz0123456789/ ©'];
+  let calls = 0, base0 = 0;
+  const rec = { inputNames: ['x'], outputNames: ['y'], run: async ({ x }) => {
+    calls++; const n = x.dims[0], texts = Array.from({ length: n }, () => (calls - base0 === 1 ? 'pick your poison' : 'mkm 170/286 c'));
+    const steps = Math.max(...texts.map(t => t.length)) * 2 + 1, classes = chars.length, data = new Float32Array(n * steps * classes);
+    for (let b = 0; b < n; b++) for (let s = 0; s < steps; s++) data[(b * steps + s) * classes + (s % 2 ? chars.indexOf(texts[b][(s - 1) / 2] ?? '') : 0)] = 1;
+    return { y: { data, dims: [n, steps, classes] } };
+  } };
+  const r = createReader({ ort, cornelius, rec, chars, index: loadIndex(raw), refineCorners: false, clock: () => 0, stampReader: clearAbsent });
+  for (let k = 1; k <= 3; k++) {
+    const res = (await r.read(sharpFrame(), small, { requireStill: true, frameId: k })).results[0];
+    assert.notEqual(res.scryfallId, 'id-pyp-mkm', JSON.stringify(res));
+    base0 = calls;
+  }
+});
+
+test('stampClearAbsent: real stamped webcam corners (sharp or hand-blurred) are never clear absent', async () => {
+  const { stampClearAbsent } = await import('../../../shared/clientScan/stamp.mjs');
+  const sc = (c) => { const g = Float32Array.from(c.g); return { ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) }; };
+  for (const k of ['present_hatchet', 'present_smog', 'unknown_blur_smog']) assert.equal(stampClearAbsent(sc(CROPS[k])), false, k);
+  // A covered stamp (border tone painted over it) is a flat patch: never sharp enough.
+  const c = CROPS.present_hatchet, g = Float32Array.from(c.g);
+  for (let y = 48; y < 84; y++) for (let x = 6; x < 42; x++) g[y * c.w + x] = 20;
+  const cov = { ...stampScores(g, c.w, c.h), sharp: cropSharpness(g, c.w, c.h) };
+  assert.ok(!(cov.ncc >= 0.6 && cov.contrast >= 0.9));
+  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 79 }), false);
+  assert.equal(stampClearAbsent({ ncc: 0.1, contrast: 0.1, sharp: 80 }), true);
+  assert.equal(stampClearAbsent({ ncc: 0.36, contrast: 0.1, sharp: 99 }), false);
+});

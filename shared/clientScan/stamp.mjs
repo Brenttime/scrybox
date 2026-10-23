@@ -104,6 +104,19 @@ export function cropSharpness(g, W, H) {
   return d;
 }
 
+// 'Clear absent': far below the absent thresholds on a crisp crop. Used
+// only to let footer-proven {original, plst twin} pairs pick the ORIGINAL,
+// and only after two distinct frames of the same card agree (pipeline.mjs).
+// Calibration (2026-10-23): 67 Scryfall pairs x 4 sizes x blur 0-8, no
+// stamped reference scored ncc < 0.35 AND contrast < 0.35 at any blur below
+// 8 (crop sharp <= 49 there); the only stamped webcam frame in the 2026-10-07
+// / 10-23 corpus to score that low (a tilted Twisted Image in a moving pile)
+// had sharp 70. Unstamped SOS webcam frames of 2026-10-23 scored sharp 84-104.
+export const STAMP_CLEAR_ABSENT = Object.freeze({ ncc: 0.35, contrast: 0.35, sharp: 80 });
+export function stampClearAbsent({ ncc, contrast, sharp = 0 }) {
+  return Number.isFinite(ncc) && Number.isFinite(contrast) && ncc < STAMP_CLEAR_ABSENT.ncc && contrast < STAMP_CLEAR_ABSENT.contrast && sharp >= STAMP_CLEAR_ABSENT.sharp;
+}
+
 // m: homography of the card's TRUE outline (unpadded quad) into the frame.
 export function readListStamp(rgba, w, h, m) {
   const strip = sampleStrip(rgba, w, h, m, STAMP_RECT[0], STAMP_RECT[1], STAMP_RECT[2], STAMP_RECT[3], CROP_H);

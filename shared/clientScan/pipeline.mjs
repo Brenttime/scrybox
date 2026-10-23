@@ -21,7 +21,7 @@ import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
   footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
-import { readListStamp, STAMP_RECT } from './stamp.mjs';
+import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -556,7 +556,7 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     const recBefore = env.stats.recCalls;
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad);
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad, requireStill);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -578,12 +578,17 @@ export function createReader(env) {
       evidence = { sig, name: result.title, frames: [...keep, result.footer_ocr || []].slice(-EVIDENCE_KEEP),
         heldFrames: [...keepHeld, result.held || []].slice(-EVIDENCE_KEEP), age: 0,
         deferred: !!result.deferred || !!(same && prior.deferred),
-        rescued: !!result.rescued || !!(same && prior.rescued) };
+        rescued: !!result.rescued || !!(same && prior.rescued),
+        // List-stamp observations of this same card in continuous view, one
+        // per frame that read the stamp ('ca' = clear absent, 'x' = any other
+        // verdict), and the original printing a clear-absent frame pointed at.
+        stampObs: [...(same ? prior.stampObs || [] : []), ...(result.stamp_obs ? [result.stamp_obs] : [])].slice(-EVIDENCE_KEEP),
+        absentPick: result.absent_pick ?? (same ? prior.absentPick : undefined) };
     }
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto) {
     const tA = now();
     // Near the frame edge, a strip that reaches off-frame would be read from
     // clamped, repeated edge pixels. The stage is re-projected with the
@@ -668,7 +673,7 @@ export function createReader(env) {
     // for a title with a reprint-sheet printing. Only a PRESENT stamp is
     // evidence: a stamp that is not seen may be covered, glared or outside
     // the crop (review R1-B1), so 'absent' never selects anything.
-    let stamp;
+    let stamp, stampObs;
     const listStamp = () => {
       if (stamp !== undefined) return stamp;
       stamp = null;
@@ -678,8 +683,10 @@ export function createReader(env) {
       const ts = now();
       const st = (env.stampReader || readListStamp)(rgba, w, h, mq);
       const strong = st.verdict === 'present' && st.ncc >= STAMP_SOLO.ncc && st.contrast >= STAMP_SOLO.contrast;
-      stamp = { ...st, present: strong };
-      timings.stamp = { v: st.verdict, strong, ncc: Math.round(st.ncc * 100) / 100, c: Math.round(st.contrast * 100) / 100, s: st.sharp, ms: Math.round(now() - ts) };
+      const clearAbsent = !strong && stampClearAbsent(st);
+      stamp = { ...st, present: strong, clearAbsent };
+      stampObs = clearAbsent ? 'ca' : 'x';
+      timings.stamp = { v: st.verdict, strong, ca: clearAbsent || undefined, ncc: Math.round(st.ncc * 100) / 100, c: Math.round(st.contrast * 100) / 100, s: st.sharp, ms: Math.round(now() - ts) };
       return stamp;
     };
     const ph = ix.phys;
@@ -690,8 +697,31 @@ export function createReader(env) {
       if (group.length === 1) return done(group[0], via, footer, stage);
       const sheet = sheetOf(group);
       if (sheet.length === 1 && sheet.length < group.length && listStamp()?.present) return done(sheet[0], `${via} + list stamp`, footer, stage);
+      // A CLEARLY absent stamp (stamp.mjs stampClearAbsent) may pick the
+      // original, never on one frame: a finger or glare over the corner also
+      // hides the stamp. Only when the footer has already narrowed the card to
+      // exactly {original, its one plst twin}, the title has no printing from
+      // a set that stamps under its own numbering, the card is not near the
+      // frame edge, and two DISTINCT auto frames of this same card in
+      // continuous view (pooled evidence, same reset rules) both read clear
+      // absent with no other stamp verdict in between. The first such frame
+      // defers (no server, no picker); anything else is the picker.
+      const orig = group.filter(o => !ph[o].sheet);
+      const titleOwn = (ix.byTitle[name] || []).some(o => STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
+      const obs = prior && prior.name === name ? prior.stampObs || [] : [];
+      if (autoMode && !nearEdge && group.length === 2 && sheet.length === 1 && orig.length === 1 && !titleOwn
+        && obs.every(o => o === 'ca') && listStamp()?.clearAbsent) {
+        if (obs.length >= 1 && prior.absentPick === orig[0]) {
+          timings.stamp_absent_frames = obs.length + 1;
+          return done(orig[0], `${via} + no list stamp`, footer, stage);
+        }
+        timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: true, title_choices: titleChoices,
+          title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw, stamp_obs: stampObs, absent_pick: orig[0],
+          held: held.length ? held : undefined, rescued: rescued || undefined };
+      }
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-      return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage,
+      return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage, stamp_obs: stampObs,
         choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
         title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw };
     };
@@ -870,11 +900,11 @@ export function createReader(env) {
           }
         }
         timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined };
+        return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined, stamp_obs: stampObs };
       }
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined };
+    return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined, stamp_obs: stampObs };
   }
 
   // Corners only, from the 384px copy. A null here is a definite "no card" and

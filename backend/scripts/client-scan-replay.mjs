@@ -6,6 +6,7 @@
 // (CARDSCAN_DEBUG_DIR writes <stamp>.jpg + <stamp>.json).
 //
 //   node scripts/client-scan-replay.mjs <assets dir> <frames dir> [--limit N] [--threads 1] [--json out.json]
+//   --stream --auto: consecutive frames pool evidence as in Auto mode (requireStill, distinct frame ids)
 //
 // <assets dir> holds manifest.json + the files it names (cardscan
 // tools/build_client_index.py). Cornelius comes from CV_MODEL_DIR/data/models.
@@ -76,7 +77,7 @@ for (const f of files) {
   const t0 = performance.now();
   const out = await reader.read(
     { data: new Uint8ClampedArray(full.data.buffer, full.data.byteOffset, full.data.length), width: full.info.width, height: full.info.height },
-    small, { smallChannels: 3 });
+    small, { smallChannels: 3, ...(args.includes('--auto') ? { requireStill: true, frameId: rows.length + 1 } : {}) });
   const ms = performance.now() - t0;
   const r = out.results[0];
   const cand = out.candidates[0];
