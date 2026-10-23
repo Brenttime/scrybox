@@ -6,14 +6,9 @@ const { generateExportCSV } = require('../utils/csvExporters');
 const { resolveCardPrice } = require('../utils/priceHelpers');
 const { bulkFetchByIdentifier, cacheCards } = require('../scryfallApi');
 
-// Export endpoint
-router.get('/export', async (req, res) => {
-  const { format = 'csv', ecosystem = 'internal' } = req.query;
-  const targetFormat = (ecosystem || format || 'internal').toLowerCase();
-
-  try {
-    const query = `
-      SELECT 
+const EXPORT_SELECT = `
+      SELECT
+        c.id as entry_id,
         c.quantity,
         c.condition,
         c.printing,
@@ -35,32 +30,69 @@ router.get('/export', async (req, res) => {
         cc.price_holofoil
       FROM collection c
       JOIN card_cache cc ON c.card_id = cc.id
-      WHERE c.user_id = ?
-    `;
-    const raw = await db.all(query, [req.user.id]);
-    // market_price used to be cc.price_trend flat, which exported the wrong number
-    // for every foil — the same case resolveCardPrice exists to get right. An
-    // export that disagrees with the dashboard is worse than no export: it is a
-    // spreadsheet someone will trust.
-    // price_trend is destructured OUT along with the per-printing columns: the CSV
-    // strategies read `item.price_trend || item.market_price`, so leaving it in
-    // would win over the resolved number and export the raw price anyway.
-    const rows = raw.map(({ price_trend, price_normal, price_holofoil, ...keep }) => ({
-      ...keep,
-      market_price: resolveCardPrice({ price_trend, price_normal, price_holofoil, ...keep }),
-    }));
+      WHERE c.user_id = ?`;
 
-    if (format.toLowerCase() === 'json') {
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', `attachment; filename=scrybox_collection_${targetFormat}.json`);
-      return res.json(rows);
+// Collection rows for an export. With entryIds, only those rows (the user's
+// own; foreign ids just drop out) in the order given, so "export current
+// view" matches what is on screen.
+async function exportRows(userId, entryIds = null) {
+  let raw;
+  if (entryIds) {
+    raw = [];
+    for (let i = 0; i < entryIds.length; i += 500) {
+      const chunk = entryIds.slice(i, i + 500);
+      raw.push(...await db.all(`${EXPORT_SELECT} AND c.id IN (${chunk.map(() => '?').join(',')})`, [userId, ...chunk]));
     }
+    const order = new Map(entryIds.map((id, i) => [String(id), i]));
+    raw.sort((a, b) => order.get(String(a.entry_id)) - order.get(String(b.entry_id)));
+  } else {
+    raw = await db.all(EXPORT_SELECT, [userId]);
+  }
+  // market_price used to be cc.price_trend flat, which exported the wrong number
+  // for every foil — the same case resolveCardPrice exists to get right.
+  // price_trend is destructured OUT along with the per-printing columns: the CSV
+  // strategies read `item.price_trend || item.market_price`, so leaving it in
+  // would win over the resolved number and export the raw price anyway.
+  return raw.map(({ entry_id, price_trend, price_normal, price_holofoil, ...keep }) => ({
+    ...keep,
+    market_price: resolveCardPrice({ price_trend, price_normal, price_holofoil, ...keep }),
+  }));
+}
 
-    const csvContent = generateExportCSV(rows, targetFormat);
+function sendExport(res, rows, format, targetFormat, base) {
+  if (String(format).toLowerCase() === 'json') {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename=${base}_${targetFormat}.json`);
+    return res.json(rows);
+  }
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename=${base}_${targetFormat}.csv`);
+  return res.send(generateExportCSV(rows, targetFormat));
+}
 
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=scrybox_collection_${targetFormat}.csv`);
-    res.send(csvContent);
+// Export endpoint
+router.get('/export', async (req, res) => {
+  const { format = 'csv', ecosystem = 'internal' } = req.query;
+  const targetFormat = (ecosystem || format || 'internal').toLowerCase();
+  try {
+    return sendExport(res, await exportRows(req.user.id), format, targetFormat, 'scrybox_collection');
+  } catch (error) {
+    res.status(500).json({ error: 'Export failed', message: error.message });
+  }
+});
+
+// Export just some rows (Collection's "Export view"): body
+// { entry_ids: [...], ecosystem: 'internal'|'manabox'|'tcgplayer'|..., format: 'csv'|'json' }.
+router.post('/export', async (req, res) => {
+  const { entry_ids: ids, format = 'csv', ecosystem = 'internal' } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 200000) {
+    return res.status(400).json({ error: 'entry_ids must be a non-empty array' });
+  }
+  const entryIds = [...new Set(ids.map(Number).filter(Number.isInteger))];
+  if (!entryIds.length) return res.status(400).json({ error: 'entry_ids must be integers' });
+  const targetFormat = String(ecosystem || 'internal').toLowerCase();
+  try {
+    return sendExport(res, await exportRows(req.user.id, entryIds), format, targetFormat, 'scrybox_view');
   } catch (error) {
     res.status(500).json({ error: 'Export failed', message: error.message });
   }

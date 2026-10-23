@@ -1,5 +1,5 @@
 import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Share, Layers, MoreHorizontal, CheckCircle2 } from 'lucide-react';
+import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Share, Layers, MoreHorizontal, CheckCircle2, Download } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
@@ -181,6 +181,8 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     pressHandlers, longPressFired, runBulk,
   } = useMultiSelect({ showToast, onChanged: onUpdate });
   const [moreOpen, setMoreOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
   useEffect(() => { if (!selectMode) setMoreOpen(false); }, [selectMode]);
 
   const collectionSessionQuery = useMemo(() => makeCollectionSessionQuery({
@@ -416,6 +418,51 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     } catch (err) {
       console.error(err);
       showToast(t('collection.errExportList'));
+    }
+  };
+
+  // Export exactly the cards the current view shows: every filter, search and
+  // sort applied (stacks are expanded back to their copies). Files go through
+  // POST /api/export so they use the same CSV shapes as Settings -> Export;
+  // the text lists are built here like the selection export.
+  const handleExportView = async (kind) => {
+    const rows = filteredCollection;
+    if (!rows.length) return;
+    if (kind === 'plain' || kind === 'detailed') {
+      const text = buildCardListText(rows, kind);
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast(t('collection.copiedList'));
+        setExportOpen(false);
+      } catch (err) {
+        console.error(err);
+        showToast(t('collection.errExportList'));
+      }
+      return;
+    }
+    setExporting(true);
+    try {
+      const response = await fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entry_ids: rows.map(i => i.entry_id), ecosystem: kind, format: 'csv' }),
+      });
+      if (!response.ok) { showToast(t('settings.errExport')); return; }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `scrybox_view_${kind}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setExportOpen(false);
+    } catch (err) {
+      console.error(err);
+      showToast(t('settings.errExport'));
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -1263,6 +1310,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
             {!resultsIncomplete && (
               <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>${formatPrice(totalValue)}</strong></span>
             )}
+            <button type="button" className="coll-textbtn" disabled={resultsIncomplete || !filteredCollection.length} onClick={() => setExportOpen(true)} title={t('collection.exportViewHint')}>{t('collection.exportView')}</button>
             <button type="button" className="coll-textbtn" onClick={() => setSelectMode(true)} title={t('collection.selectHint')}>{t('collection.select')}</button>
           </span>
         </div>
@@ -1312,6 +1360,22 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
           <button type="button" className="danger" disabled={!selectedIds.size} onClick={() => runBulk('delete', null, t('bulk.confirmDelete', { count: selectedIds.size }))}><Trash2 size={20} /><span>{t('bulk.delete')}</span></button>
         </div>
       )}
+      {exportOpen && !selectMode && (
+        <div className="fs-sheet-backdrop" onClick={() => setExportOpen(false)}>
+          <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" aria-label={t('collection.exportView')} onClick={e => e.stopPropagation()}>
+            <div className="fs-sheet-head">
+              <strong>{t('collection.exportViewTitle', { count: filteredCollection.reduce((n, i) => n + (Number(i.quantity) || 0), 0) })}</strong>
+              <button type="button" className="coll-textbtn" onClick={() => setExportOpen(false)}>{t('bulk.done')}</button>
+            </div>
+            <button type="button" className="coll-more-row" disabled={exporting} onClick={() => handleExportView('internal')}><Download size={16} /> {t('collection.exportCsvScrybox')}</button>
+            <button type="button" className="coll-more-row" disabled={exporting} onClick={() => handleExportView('manabox')}><Download size={16} /> {t('collection.exportCsvManabox')}</button>
+            <button type="button" className="coll-more-row" disabled={exporting} onClick={() => handleExportView('tcgplayer')}><Download size={16} /> {t('collection.exportCsvTcgplayer')}</button>
+            <button type="button" className="coll-more-row" onClick={() => handleExportView('plain')}>{t('collection.exportListPlain')}</button>
+            <button type="button" className="coll-more-row" onClick={() => handleExportView('detailed')}>{t('collection.exportListDetailed')}</button>
+          </div>
+        </div>
+      )}
+
       {selectMode && moreOpen && (
         <div className="fs-sheet-backdrop" onClick={() => setMoreOpen(false)}>
           <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
