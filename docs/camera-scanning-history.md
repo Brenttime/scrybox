@@ -335,8 +335,8 @@ Shipped:
   ~25 frames and never resolved; it now proves plst VMA-134 at stage 0.
   Saved-frame replay (473 frames 10-07..10-23, `--stream --auto`): +2
   (both Nightstalker), 0 lost, 0 changed, 0 wrong.
-- Shadow telemetry: `timings.stamp.ca` (clear-absent predicate) and `o`
-  (skin/glare share over the stamp spot) on every stamp read.
+- Shadow telemetry: `timings.stamp.o` (skin/glare share over the stamp spot);
+  `ca` and `w` (wide search) only when the experiment flag is on (~13 ms).
 
 Built and reviewed but OFF (`env.stampAbsentPick === true`):
 - A two-frame "clear absent" pick of the original (ncc/contrast < 0.35,
