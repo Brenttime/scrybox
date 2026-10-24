@@ -272,6 +272,11 @@ test('tray: presence records are per card place and survive the first candidate 
   assert.equal(updatePresence(recs, rightOnly, [{ number: 1, card: { name: 'Opt' } }]).length, 0);
   assert.equal(updatePresence(recs, { ...rightOnly, results: [{ number: 1, ok: false, title: 'opt' }] }).length, 0);
   assert.equal(updatePresence(recs, { ...rightOnly, results: [{ number: 1, ok: false, title: 'shock' }] }).length, 1);
+  // A double-faced card read on its back face, hydrated under its front name.
+  const dfc = notePresenceCommit([], { name: 'Delver of Secrets' }, { rowKey: 'd', guess: true, wasGuess: true }, null, 'insectile aberration');
+  assert.equal(updatePresence(dfc, { ...rightOnly, results: [{ number: 1, title: 'insectile aberration' }] }).length, 1);
+  assert.equal(presenceDecision(dfc, { title: 'insectile aberration', card: { name: 'Delver of Secrets', id: 'b' } }).action, 'fix');
+  assert.equal(presenceDecision(notePresenceCommit([], { name: 'Bala Ged Recovery // Bala Ged Sanctuary' }, { rowKey: 'x', guess: true }), { card: { name: 'Bala Ged Sanctuary', id: 'z' } }).action, 'fix');
   // Sustained hand motion at its place ends it (a swap without a lift).
   const shaky = { frame, candidates: [{ ...R, number: 1, status: 'too blurry' }] };
   let m = recs;

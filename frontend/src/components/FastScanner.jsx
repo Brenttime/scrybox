@@ -666,7 +666,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (autoPass) {
           for (const row of rows) {
             const tentative = !!(row.guess || row.needsChoice);
-            committedRef.current = notePresenceCommit(committedRef.current, row.card, { rowKey: row.key, guess: tentative, wasGuess: tentative }, hitCentre(out, row.hit));
+            committedRef.current = notePresenceCommit(committedRef.current, row.card, { rowKey: row.key, guess: tentative, wasGuess: tentative }, hitCentre(out, row.hit), row.hit?.title);
           }
         }
         setResults(prev => [...rows, ...prev]);

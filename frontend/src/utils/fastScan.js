@@ -383,8 +383,17 @@ export function guessChoiceHit(hit, sets) {
 // candidate only): it stays while a candidate is seen at its place and ends
 // when that place is empty (a no-card pass, or the card moved away) or holds
 // another title.
-const presenceName = (card) => String(card?.name || '').split(' // ')[0].toLowerCase().replace(/\u2019/g, "'")
+const normPresence = (n) => String(n || '').toLowerCase().replace(/\u2019/g, "'")
   .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+// Every name a card answers to: each face of its name, its faces' names and
+// the title the scanner read (a double-faced card read on its back face is
+// hydrated under its front name: review R11).
+const presenceNames = (card, title) => [...new Set([
+  ...String(card?.name || '').split(' // '),
+  ...((card?.card_faces || card?.faces || []).map(f => f?.name)),
+  title,
+].map(normPresence).filter(Boolean))];
+const sameName = (a, b) => a.some(n => b.includes(n));
 export const PRESENCE_KEEP = 50;
 const boxCentre = (out, c) => {
   if (!c?.box) return null;
@@ -410,23 +419,23 @@ export function updatePresence(records, out, hits = []) {
   const cands = out.candidates || [];
   if (!cands.length) return [];
   const placed = cands.map(c => ({ centre: boxCentre(out, c), shaky: c.status === 'moving' || c.status === 'too blurry' })).filter(c => c.centre);
-  const reads = [...hits.map(h => ({ name: presenceName(h.card), centre: hitCentre(out, h) })),
-    ...(out.results || []).filter(x => x?.title).map(x => ({ name: presenceName({ name: x.title }), centre: hitCentre(out, x) }))]
-    .filter(r => r.centre && r.name);
+  const reads = [...hits.map(h => ({ names: presenceNames(h.card, h.title), centre: hitCentre(out, h) })),
+    ...(out.results || []).filter(x => x?.title).map(x => ({ names: presenceNames(null, x.title), centre: hitCentre(out, x) }))]
+    .filter(r => r.centre && r.names.length);
   const next = [];
   for (const r of records) {
     const here = r.centre ? placed.filter(c => samePlace(r.centre, c.centre)) : placed;
     if (r.centre && placed.length && !here.length) continue;
-    if (r.centre && reads.some(x => x.name !== r.name && samePlace(r.centre, x.centre))) continue;
+    if (r.centre && reads.some(x => !sameName(x.names, r.names) && samePlace(r.centre, x.centre))) continue;
     const motion = here.length && here.every(c => c.shaky) ? (r.motion || 0) + 1 : 0;
     if (motion >= MOTION_BREAK) continue;
     next.push(motion === (r.motion || 0) ? r : { ...r, motion });
   }
   return next;
 }
-export function notePresenceCommit(records, card, rec, centre = null) {
+export function notePresenceCommit(records, card, rec, centre = null, title = null) {
   if (!card) return records;
-  const next = [...records, { ...rec, name: presenceName(card), centre }];
+  const next = [...records, { ...rec, names: presenceNames(card, title), centre }];
   return next.slice(-PRESENCE_KEEP);
 }
 // Pure: what a hit means for a card already committed at the same place
@@ -439,8 +448,8 @@ export function notePresenceCommit(records, card, rec, centre = null) {
 // place is another card: 'add'.
 export function presenceDecision(records, hit, centre = null) {
   if (!hit?.card) return { action: 'add' };
-  const name = presenceName(hit.card);
-  const rec = records.find(r => r.name === name && samePlace(r.centre, centre));
+  const names = presenceNames(hit.card, hit.title);
+  const rec = records.find(r => sameName(r.names, names) && samePlace(r.centre, centre));
   if (!rec) return { action: 'add' };
   const tentative = !!(hit.guess || hit.choose);
   if (rec.guess && !tentative) return { action: 'fix', rec };
