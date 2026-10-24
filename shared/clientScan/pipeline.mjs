@@ -937,7 +937,10 @@ export function createReader(env) {
       // title's printings, so guess now instead of looping (Brent,
       // 2026-10-24: < 1 s per card). Not over a strong List stamp (that
       // card's own stamp exit above decides), and only a guess with a basis.
-      if (curGuess && si === 0 && !(sheetLike && listStamp()?.present)) {
+      // The title must clear the bar a unique-printing title clears: a title
+      // that starts a longer one ('flicker' / 'flickering hound') is never
+      // proven by its OCR alone, so it gets no title-only guess either.
+      if (curGuess && si === 0 && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
         const hold = veto();
         const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
         const gp = guessed(cands, 'title', pooled ? [...pooled.flat(), ...raws] : raws, si, true);
@@ -965,7 +968,7 @@ export function createReader(env) {
     }
     // Every stage ran and nothing split the printings: guess (fallback
     // allowed), unless a validated copyright-line number contradicts it.
-    if (curGuess && !(sheetLike && listStamp()?.present)) {
+    if (curGuess && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
       const all = pooled ? [...pooled.flat(), ...raws] : raws;
       const hold = veto();
       const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));

@@ -11,9 +11,9 @@ import { recentSets, guessFromChoices, guessChoiceHit, guessedRowFor, canChangeP
 
 // Real printings (Scryfall, 2026-10) with the index's appended columns
 // [released yyyymmdd, flags: 1 variant, 2 promo/reprint product].
-const SETS = ['sos', 'soa', 'plst', 'psos', 'woe', 'mar', 'pw25', 'ody', 'som', 'a25'];
+const SETS = ['sos', 'soa', 'plst', 'psos', 'woe', 'mar', 'pw25', 'ody', 'som', 'a25', 'mh2'];
 const ix = () => loadIndex({
-  names: ['artistic process', 'wildgrowth archaic', 'monstrous rage', 'diabolic tutor', 'twisted image'], canon: {}, excluded: [], sets: SETS,
+  names: ['artistic process', 'wildgrowth archaic', 'monstrous rage', 'diabolic tutor', 'twisted image', 'mine collapse'], canon: {}, excluded: [], sets: SETS,
   printings: [
     ['ap-plst', 'plst', 'SOS-108', 20261109, 2], ['ap-sos', 'sos', '108', 20260424, 0],
     ['wa-sos', 'sos', '168', 20260424, 0], ['wa-sos-sc', 'sos', '297', 20260424, 1], ['wa-psos', 'psos', '168p', 20260424, 2],
@@ -22,9 +22,10 @@ const ix = () => loadIndex({
     ['dt-ody', 'ody', '129', 20011001, 0], ['dt-plst', 'plst', 'ODY-129', 20200901, 2],
     ['ti-som', 'som', '50', 20101001, 0], ['ti-plst', 'plst', 'SOM-50', 20200901, 2], ['ti-a25', 'a25', '75', 20180316, 0],
     ['f-ody', 'ody', '350'], ['f-som', 'som', '249'], ['f-sos', 'sos', '300'], ['f-soa', 'soa', '180'],
+    ['mc-135', 'mh2', '135', 20210618, 0], ['mc-408', 'mh2', '408', 20210618, 5],
   ],
   byTitle: { 'artistic process': [0, 1], 'wildgrowth archaic': [2, 3, 4], 'monstrous rage': [5, 6, 7, 8, 9, 10],
-    'diabolic tutor': [11, 12], 'twisted image': [13, 14, 15] },
+    'diabolic tutor': [11, 12], 'twisted image': [13, 14, 15], 'mine collapse': [20, 21] },
   uniqueAlias: {},
 });
 const id = (x, g) => x.printings[g.pi][0];
@@ -63,6 +64,16 @@ test('guess: older adds of the session break ties the last 3 cannot; the last 3 
   assert.equal(id(x, g), 'mr-soa45'); assert.equal(g.guess, 'context');
   // A set in the last 3 beats a more frequent older one.
   assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['woe', 'sos', 'sos', 'soa', 'soa', 'soa'] })), 'mr-woe');
+});
+
+test('guess: a same-set old-frame twin (mh2 135 / retro 408) is not a first-look guess', () => {
+  const x = ix();
+  const g = guessPrinting(x, x.byTitle['mine collapse'], { sets: ['mh2', 'mh2', 'mh2'] });
+  assert.equal(id(x, g), 'mc-135'); assert.equal(g.sure, false);
+  // A same-set variant with the same frame era does not block (sos 168 / 297).
+  assert.equal(guessPrinting(x, x.byTitle['wildgrowth archaic'], { sets: ['sos'] }).sure, true);
+  // Variant-only sets (soa) are never a first-look guess.
+  assert.equal(guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['soa'] }).sure, false);
 });
 
 test('guess: a fallback over several regular printings is not sure (first look keeps the cascade)', () => {
@@ -130,6 +141,17 @@ test('pipeline: a footer-proven printing is never overridden by context', async 
   const { r } = reader((c) => (c === 1 ? 'twisted image' : 'a25 075/249'));
   const res = (await r.read(sharpFrame(), small, { guess: { sets: ['som', 'som', 'som'] } })).results[0];
   assert.equal(res.scryfallId, 'ti-a25', JSON.stringify(res)); assert.equal(res.guess, undefined);
+});
+
+test('pipeline: a title that starts a longer title gets no title-only guess (replay: Flicker vs Flickering Hound)', async () => {
+  // 'monstrous rage' is a prefix of 'monstrous rage tribute' in this index.
+  const x = ix();
+  x.prefixOfLonger.add('monstrous rage');
+  const { r } = reader(() => 'monstrous rage', { index: x });
+  for (const frameId of [1, 2, 3]) {
+    const res = (await r.read(sharpFrame(), small, { requireStill: true, frameId, guess: { sets: ['soa', 'soa', 'soa'] } })).results[0];
+    assert.notEqual(res.ok, true, JSON.stringify(res));
+  }
 });
 
 test('pipeline: no guess option keeps the old picker', async () => {

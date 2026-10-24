@@ -12,8 +12,9 @@
 //      variant treatment), newest first.
 // Within the chosen set: regular before variant, then the lowest number.
 // Index rows are [id, set, num, released yyyymmdd?, flags?] (flags: 1 =
-// variant treatment, 2 = promo / reprint product); older indexes without the
-// extra columns still guess, only without the newest-first tie-break.
+// variant treatment, 2 = promo / reprint product, 4 = old card frame);
+// older indexes without the extra columns still guess, only without the
+// newest-first tie-break and with fewer first-look guesses.
 import { normalizeCollector, strongNumbers } from './text.mjs';
 
 const YEAR = /^(19|20)\d\d$/;
@@ -89,9 +90,21 @@ export function guessPrinting(ix, cands, { footer = [], sets = [] } = {}) {
     if (inSet.length) { if (inSet.length < pool.length || basis === 'fallback') basis = 'context'; pool = inSet; break; }
   }
   const ranked = rank(ix, pool);
-  const regular = pool.filter(o => !isSheet(ix, o) && !(flagsOf(ix, o) & 3));
-  // Several printings of one set (sos 168 / sos 297 showcase) still have a
-  // single regular one; a fallback over several sets is a weaker guess.
-  const sure = basis !== 'fallback' || regular.length === 1 || (regular.length === 0 && pool.filter(o => !isSheet(ix, o)).length === 1);
-  return { pi: ranked[0], guess: basis === 'fallback' ? 'fallback' : basis, sure };
+  // `sure` (a guess safe to make on the first look, before the deeper footer
+  // stages): the pick is a regular printing (no sheet, promo or variant
+  // flag) and the only one of its set with its treatment, and no printing of
+  // that set uses another frame era. The deeper stages are what split two
+  // regular printings of one set (fra 213 / 298) and a modern card from its
+  // old-frame twin (mh2 135 / retro mh2 408, number on the copyright line):
+  // 2026-10-24 replay, a first-look guess there lost 17 retro-frame proofs.
+  // Those keep the cascade and guess only after it.
+  const pick = ranked[0];
+  const all = [...new Set(cands)].filter(o => ix.printings[o]);
+  const regular = (o) => !isSheet(ix, o) && !(flagsOf(ix, o) & 3);
+  const sameSet = all.filter(o => ix.printings[o][1] === ix.printings[pick][1]);
+  const sure = regular(pick)
+    && sameSet.filter(o => (flagsOf(ix, o) & 3) === (flagsOf(ix, pick) & 3) && !isSheet(ix, o)).length === 1
+    && sameSet.every(o => (flagsOf(ix, o) & 4) === (flagsOf(ix, pick) & 4))
+    && (basis !== 'fallback' || all.filter(regular).length === 1);
+  return { pi: pick, guess: basis, sure };
 }
