@@ -1012,7 +1012,9 @@ export function createReader(env) {
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, resetCache() { tracked = null; guessed = null; } };
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, // A pending verify survives (it IS a real read); a verified guess is a
+    // cached answer and goes, like tracked.
+    resetCache() { tracked = null; if (guessed?.verified) guessed = null; } };
 }
 
 export { normName };

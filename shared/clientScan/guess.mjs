@@ -34,7 +34,7 @@ export function guessNumbers(raws) {
   }
   for (const raw of raws) {
     // Not after a '/': a padded set total ('050/0249') is never a number.
-    for (const run of String(raw).match(/(?<![\d/])0\d{3}(?![\d/])/g) || []) {
+    for (const run of String(raw).replace(/\s*\/\s*/g, '/').match(/(?<![\d/])0\d{3}(?![\d/])/g) || []) {
       const n = normalizeCollector(run);
       if (!out.has(n)) out.set(n, 0);
     }

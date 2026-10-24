@@ -68,6 +68,8 @@ test('guess: only the last 3 adds are context; footer numbers keep the set-total
   // A copyright year is never a number; denominators are never numbers.
   assert.deepEqual([...guessNumbers(['© 2003/2010', '050/249']).keys()], ['50']);
   assert.deepEqual([...guessNumbers(['050/0249']).keys()], ['50'], 'a padded total is not a number');
+  assert.deepEqual([...guessNumbers(['050/ 0249']).keys()], ['50']);
+  assert.deepEqual([...guessNumbers(['0999 /0303']).keys()], []);
 });
 
 test('guess: a same-set old-frame twin (mh2 135 / retro 408) is not a first-look guess', () => {
@@ -232,5 +234,12 @@ test('pipeline: a verify read that misses the title verifies nothing (review R2-
   const n = calls();
   const third = (await r.read(sharpFrame(), small, opts(3))).results[0];
   assert.ok(calls() > n, 'the next frame reads again'); assert.ok(!third?.cached);
-  r.resetCache?.();
+});
+
+test('pipeline: resetCache keeps a pending verify, drops a verified guess (review R3)', async () => {
+  const { r } = reader((c) => (c === 1 || c === 3 ? 'twisted image' : c === 5 ? 'a25 075/249' : 'zz'));
+  const opts = (frameId) => ({ requireStill: true, frameId, guess: { sets: ['som', 'som', 'som'] } });
+  assert.equal((await r.read(sharpFrame(), small, opts(1))).results[0].guess, 'context');
+  r.resetCache();
+  assert.equal((await r.read(sharpFrame(), small, opts(2))).results[0].scryfallId, 'ti-a25', 'the verify still ran');
 });

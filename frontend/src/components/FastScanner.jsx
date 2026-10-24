@@ -361,7 +361,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const next = moved();
         if (next) { hydrateRow(next); return; }
         wantHitRef.current.delete(row.key);
-        setResults(prev => prev.map(x => (x.key === row.key && (!x.hit || x.hit.scryfallId === h.scryfallId) ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
+        // Only a row still waiting for THIS printing (not one the user picked
+        // another printing for meanwhile: review R3).
+        setResults(prev => prev.map(x => (x.key === row.key && x.pending && x.hit?.scryfallId === h.scryfallId ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
         scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th), usable_enqueue_ms: row.t0 != null ? Math.round(performance.now() - row.t0) : undefined });
       })
       .catch((e) => {
@@ -397,7 +399,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     };
     const old = row.card;
     const moved = [];
-    for (const id of row.entryIds || []) {
+    if (!row.entryIds?.length) throw new Error('no collection entries to change');
+    for (const id of row.entryIds) {
       if (await put(id, card.id)) { moved.push(id); continue; }
       let split = false;
       for (const back of moved) if (!await put(back, old.id)) split = true;
@@ -850,6 +853,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const key = editKey, req = printsReqRef.current;
     const row = resultsRef.current.find(x => x.key === key);
     if (!row || sendingRef.current || fixingRef.current.has(key)) return;
+    // Re-check at selection time: the row may have been sent (to a list, or
+    // without entry ids) while this sheet was open (review R3-S4).
+    if (!row.needsChoice && !canChangePrinting({ ...row, pending: false })) { closePrintings(); return; }
     if (row.sent && card.id !== row.card.id) {
       if (card.name !== row.card.name) return;
       fixingRef.current.add(key);
@@ -860,8 +866,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // A choice row only accepts one of its own candidates.
       if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined } : x;
       // The user's pick is no longer a guess, and no later proof overrides it.
-      return card.name === x.card.name ? { ...x, card, guess: undefined, userPicked: true } : x;
+      return card.name === x.card.name ? { ...x, card, guess: undefined, userPicked: true, pending: false, hit: undefined } : x;
     }));
+    wantHitRef.current.delete(key);
     if (req === printsReqRef.current) closePrintings();
   };
   const editing = results.find(r => r.key === editKey);
