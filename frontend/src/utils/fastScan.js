@@ -392,13 +392,17 @@ export function notePresenceCommit(committed, epoch, card, rec) {
 // presentation with the same title. A footer-proven hit after a GUESSED
 // commit corrects (or confirms) that row: 'fix'. Any other pairing with a
 // guess on either side is a 'repeat': a guess never adds a second copy of a
-// card still in view. Two proofs keep the old rules: 'add' (id de-dupe).
+// card still in view. A proof of the committed printing is a 'repeat'; a
+// proof of another printing keeps the old rules: 'add' (id de-dupe).
 export function presenceDecision(committed, hit, epoch) {
   if (epoch == null || !hit?.card) return { action: 'add' };
   const rec = committed.get(presenceKey(epoch, hit.card));
   if (!rec) return { action: 'add' };
   if (rec.guess && !hit.guess) return { action: 'fix', rec };
   if (rec.guess || hit.guess) return { action: 'repeat', rec };
+  // The printing this presentation already committed (or was corrected
+  // to) is a repeat, whatever the id de-dupe window says (review R4-B5).
+  if (rec.cardId != null && String(rec.cardId) === String(hit.card.id)) return { action: 'repeat', rec };
   return { action: 'add' };
 }
 // Change printing is offered on every row whose title has more than one

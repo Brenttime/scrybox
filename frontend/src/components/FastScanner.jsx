@@ -372,7 +372,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         if (next) { life.delete(row.key); hydrateRow(next); return; }
         scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrate-failed', row: row.key, pres: row.pres, attempt, error: e?.message || String(e) });
         let still = false;
-        setResults(prev => prev.map(x => { if (x.key !== row.key) return x; still = true; return { ...x, hydrateFailed: true }; }));
+        setResults(prev => prev.map(x => { if (x.key !== row.key || !x.pending || x.hit?.scryfallId !== h.scryfallId) return x; still = true; return { ...x, hydrateFailed: true }; }));
         const delay = HYDRATE_RETRY_MS[Math.min(attempt, HYDRATE_RETRY_MS.length - 1)];
         const timer = setTimeout(() => {
           life.delete(row.key);
@@ -424,10 +424,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const row = resultsRef.current.find(x => x.key === rowKey);
     // The commit is acknowledged as proven only when the correction lands;
     // a failed one is retried by a later proof after a pause (review R2-NS1).
-    if (!row || row.userPicked) { rec.guess = false; return; }
+    if (!row || row.userPicked) { rec.guess = false; if (row) rec.cardId = row.card.id; return; }
     if (fixingRef.current.has(rowKey) || (rec.retryAt && Date.now() < rec.retryAt)) return;
     if (sendingRef.current) { pendingFixRef.current.set(rowKey, [rec, h]); return; }
-    if (row.card.id === h.card.id) { rec.guess = false; setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
+    if (row.card.id === h.card.id) { rec.guess = false; rec.cardId = h.card.id; setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
     fixingRef.current.add(rowKey);
     try {
       if (row.sent) {
@@ -440,7 +440,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (aliveRef.current) showToast?.(t(e?.split ? 'fastscan.changeSplit' : 'fastscan.changeFailed'));
       return;
     } finally { fixingRef.current.delete(rowKey); }
-    rec.guess = false;
+    rec.guess = false; rec.cardId = h.card.id;
     if (!aliveRef.current) return;
     const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
     if (next.pending) wantHitRef.current.set(rowKey, h); else wantHitRef.current.delete(rowKey);
@@ -654,7 +654,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
           alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
-        if (pres) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess });
+        if (pres) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, cardId: row.card.id });
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
@@ -866,7 +866,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // A choice row only accepts one of its own candidates.
       if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined } : x;
       // The user's pick is no longer a guess, and no later proof overrides it.
-      return card.name === x.card.name ? { ...x, card, guess: undefined, userPicked: true, pending: false, hit: undefined } : x;
+      return card.name === x.card.name ? { ...x, card, guess: undefined, userPicked: true, pending: false, hit: undefined, hydrateFailed: false } : x;
     }));
     wantHitRef.current.delete(key);
     if (req === printsReqRef.current) closePrintings();
