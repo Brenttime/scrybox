@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting, sentEntryIds } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -442,7 +442,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     } finally { fixingRef.current.delete(rowKey); }
     rec.guess = false;
     if (!aliveRef.current) return;
-    const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, hydrateFailed: false, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
+    const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, hydrateFailed: false, guess: undefined, altCards: undefined, needsChoice: false, choose: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
     if (next.pending) wantHitRef.current.set(rowKey, h); else wantHitRef.current.delete(rowKey);
     setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, ...next } : x)));
     if (next.pending) hydrateRow({ ...row, ...next });
@@ -582,10 +582,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // (Brent, 2026-10-24): no blocking picker; the row is marked and its
       // printing can be changed from the tray.
       const ctxSets = recentSets(resultsRef.current);
-      // Printing guesses are a single-card policy: a presentation (and its
-      // guess/correction bookkeeping) is one card. With several cards in the
-      // frame a guess is dropped (the proof path or the tray picker still
-      // apply) and server twins keep the tray's choice row (review R7).
+      // Printing guesses are made on single-card frames only: with several
+      // cards in the frame a guess is dropped (proofs still add) and server
+      // twins keep the tray's choice row. The bookkeeping below runs on
+      // every pass, per card place, so rows stay owned across single/multi
+      // transitions (review R7/R8).
       const multi = (out.candidates?.length || 0) > 1;
       const hits = multi
         ? [...out.results.filter(x => x.ok && x.card && !x.guess), ...choiceHits(out.results)]
@@ -629,7 +630,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const fixes = [];
       const fresh = hits.filter((h) => {
         const dup = autoPass && !dedupeFresh(seenIdsRef.current, h.card.id, now);
-        const d = autoPass && pres && !multi ? presenceDecision(committedRef.current, h, pres.epoch) : { action: 'add' };
+        const d = autoPass && pres ? presenceDecision(committedRef.current, h, pres.epoch, hitCentre(out, h)) : { action: 'add' };
         if (d.action === 'fix') fixes.push([d.rec, h]);
         if (d.action !== 'add') return false;
         return !dup;
@@ -661,7 +662,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
           alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
-        if (pres && !multi) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, wasGuess: !!row.guess });
+        if (pres) {
+          for (const row of rows) {
+            const tentative = !!(row.guess || row.needsChoice);
+            notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: tentative, wasGuess: tentative }, hitCentre(out, row.hit));
+          }
+        }
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
@@ -871,7 +877,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     setResults(prev => prev.map((x) => {
       if (x.key !== key) return x;
       // A choice row only accepts one of its own candidates.
-      if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined } : x;
+      if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined, userPicked: true } : x;
       // The user's pick is no longer a guess, and no later proof overrides it.
       return card.name === x.card.name ? { ...x, card, guess: undefined, userPicked: true, pending: false, hit: undefined, hydrateFailed: false } : x;
     }));

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { loadIndex } from '../../../shared/clientScan/text.mjs';
 import { guessPrinting, guessCodes, guessNumbers } from '../../../shared/clientScan/guess.mjs';
 import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
-import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting, sentEntryIds } from './fastScan.js';
+import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, hitCentre, canChangePrinting, sentEntryIds } from './fastScan.js';
 
 // Real printings (Scryfall, 2026-10) with the index's appended columns
 // [released yyyymmdd, flags: 1 variant, 2 promo/reprint product].
@@ -251,4 +251,20 @@ test('pipeline: resetCache keeps a pending verify, drops a verified guess (revie
   assert.equal((await r.read(sharpFrame(), small, opts(1))).results[0].guess, 'context');
   r.resetCache();
   assert.equal((await r.read(sharpFrame(), small, opts(2))).results[0].scryfallId, 'ti-a25', 'the verify still ran');
+});
+
+test('tray: presence records are per card place; choices count as tentative (review R7/R8)', () => {
+  const out = { frame: { width: 1000, height: 0 }, candidates: [{ number: 1, box: [0, 0, 100, 100] }, { number: 2, box: [600, 0, 100, 100] }] };
+  const left = hitCentre(out, { number: 1 }), right = hitCentre(out, { number: 2 });
+  assert.ok(left && right && right.cx > left.cx);
+  const committed = new Map();
+  notePresenceCommit(committed, 1, { name: 'Shock' }, { rowKey: 'l', guess: true, wasGuess: true }, left);
+  // The same title proven at another place is another card.
+  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'b' } }, 1, right).action, 'add');
+  // At the guessed card's place it corrects it; a choice there repeats.
+  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'b' } }, 1, left).action, 'fix');
+  assert.equal(presenceDecision(committed, { choose: [{}, {}], card: { name: 'Shock', id: 'k' } }, 1, left).action, 'repeat');
+  // A choice row at the right is tentative too: a proof there resolves it.
+  notePresenceCommit(committed, 1, { name: 'Shock' }, { rowKey: 'r', guess: true, wasGuess: true }, right);
+  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'c' } }, 1, right).rec.rowKey, 'r');
 });

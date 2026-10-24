@@ -383,26 +383,41 @@ const presenceName = (card) => String(card?.name || '').split(' // ')[0].toLower
   .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
 export function presenceKey(epoch, card) { return `${epoch}|${presenceName(card)}`; }
 export const PRESENCE_KEEP = 200;
-export function notePresenceCommit(committed, epoch, card, rec) {
+// Pure: the centre of the candidate a hit was read from (fraction of the
+// frame diagonal, like nextPresentation), or null when unknown.
+export function hitCentre(out, hit) {
+  const cands = out?.candidates || [];
+  const c = cands.find(x => x.number != null && x.number === hit?.number) || (cands.length === 1 ? cands[0] : null);
+  if (!c?.box) return null;
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  return { cx: (c.box[0] + c.box[2] / 2) / diag, cy: (c.box[1] + c.box[3] / 2) / diag };
+}
+const samePlace = (a, b) => !a || !b || Math.hypot(a.cx - b.cx, a.cy - b.cy) <= SAME_PLACE;
+// One record per committed card: presentation + title + where it lay, so
+// two same-title cards on the table are two records (review R7/R8).
+export function notePresenceCommit(committed, epoch, card, rec, centre = null) {
   if (epoch == null || !card) return;
-  committed.set(presenceKey(epoch, card), rec);
+  const key = presenceKey(epoch, card);
+  const list = committed.get(key) || [];
+  list.push({ ...rec, centre });
+  committed.set(key, list);
   while (committed.size > PRESENCE_KEEP) committed.delete(committed.keys().next().value);
 }
-// Pure: what a hit means for the card already committed in this
-// presentation with the same title. A footer-proven hit after a GUESSED
-// commit corrects (or confirms) that row: 'fix'. A guess on either side is
-// otherwise a 'repeat'; two proofs keep the old rules ('add', id de-dupe).
-export function presenceDecision(committed, hit, epoch) {
+// Pure: what a hit means for a card already committed in this presentation
+// with the same title at the same place. A footer-proven hit after a
+// GUESSED (or still-choosing) commit corrects that row: 'fix'. A commit
+// that started as a guess or choice is one physical card: whatever happened
+// to its row since (corrected, picked, dismissed, sent) it is not added
+// again, and a guess or choice never adds beside it: 'repeat' (review
+// R5-B5). Two proofs keep the old rules: 'add' with the id de-dupe (a
+// proven reprint swap, review R6). Another place is another card: 'add'.
+export function presenceDecision(committed, hit, epoch, centre = null) {
   if (epoch == null || !hit?.card) return { action: 'add' };
-  const rec = committed.get(presenceKey(epoch, hit.card));
+  const rec = (committed.get(presenceKey(epoch, hit.card)) || []).find(r => samePlace(r.centre, centre));
   if (!rec) return { action: 'add' };
-  if (rec.guess && !hit.guess) return { action: 'fix', rec };
-  // A presentation that started as a guess is one physical card: whatever
-  // happened to its row since (corrected, picked, dismissed, sent) it is
-  // not added again (review R5-B5). Between two proofs the old rules hold
-  // (id de-dupe): a proven reprint swap or a second same-title card on the
-  // table is a new copy (review R6).
-  if (rec.wasGuess || hit.guess) return { action: 'repeat', rec };
+  const tentative = !!(hit.guess || hit.choose);
+  if (rec.guess && !tentative) return { action: 'fix', rec };
+  if (rec.wasGuess || tentative) return { action: 'repeat', rec };
   return { action: 'add' };
 }
 // Change printing is offered on every row whose title has more than one
