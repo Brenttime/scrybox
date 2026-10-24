@@ -963,7 +963,9 @@ export function createReader(env) {
       // The title must clear the bar a unique-printing title clears: a title
       // that starts a longer one ('flicker' / 'flickering hound') is never
       // proven by its OCR alone, so it gets no title-only guess either.
-      if (curGuess && si === 0 && !verify && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
+      // Not near the frame edge: that read is never cached or verified, so
+      // a first-look guess there would never meet the deeper stages (R7).
+      if (curGuess && si === 0 && !verify && !nearEdge && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
         const hold = veto();
         const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
         const gp = guessed(cands, 'title', pooled ? [...pooled.flat(), ...raws] : raws, si, true);

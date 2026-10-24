@@ -582,7 +582,14 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // (Brent, 2026-10-24): no blocking picker; the row is marked and its
       // printing can be changed from the tray.
       const ctxSets = recentSets(resultsRef.current);
-      const hits = [...out.results.filter(x => x.ok && x.card), ...choiceHits(out.results).map(h => guessChoiceHit(h, ctxSets))];
+      // Printing guesses are a single-card policy: a presentation (and its
+      // guess/correction bookkeeping) is one card. With several cards in the
+      // frame a guess is dropped (the proof path or the tray picker still
+      // apply) and server twins keep the tray's choice row (review R7).
+      const multi = (out.candidates?.length || 0) > 1;
+      const hits = multi
+        ? [...out.results.filter(x => x.ok && x.card && !x.guess), ...choiceHits(out.results)]
+        : [...out.results.filter(x => x.ok && x.card), ...choiceHits(out.results).map(h => guessChoiceHit(h, ctxSets))];
       const eligible = out.candidates.filter(c => c.eligible).length;
       if (!out.candidates.length) firstSeenRef.current = null;
       else if (firstSeenRef.current == null) firstSeenRef.current = t0;
@@ -622,7 +629,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const fixes = [];
       const fresh = hits.filter((h) => {
         const dup = autoPass && !dedupeFresh(seenIdsRef.current, h.card.id, now);
-        const d = autoPass && pres ? presenceDecision(committedRef.current, h, pres.epoch) : { action: 'add' };
+        const d = autoPass && pres && !multi ? presenceDecision(committedRef.current, h, pres.epoch) : { action: 'add' };
         if (d.action === 'fix') fixes.push([d.rec, h]);
         if (d.action !== 'add') return false;
         return !dup;
@@ -654,7 +661,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
           alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
-        if (pres) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, wasGuess: !!row.guess });
+        if (pres && !multi) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, wasGuess: !!row.guess });
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {
