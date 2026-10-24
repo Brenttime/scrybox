@@ -33,6 +33,9 @@ function AdminPanel({ showToast }) {
   const [publicBaseUrl, setPublicBaseUrl] = useState('');
   const [priceRefreshDays, setPriceRefreshDays] = useState(1);
   const [settingsLoading, setSettingsLoading] = useState(false);
+  // Env-gated sidecar portal link (LOCAL_WEB_PORTAL_ENABLED) — hidden unless
+  // the backend reports the portal actually mounted.
+  const [scryfallPortal, setScryfallPortal] = useState(false);
   const mountedRef = useRef(true);
 
   // Database backup states
@@ -161,6 +164,7 @@ function AdminPanel({ showToast }) {
         if (!mountedRef.current) return;
         setPublicBaseUrl(data.public_base_url || '');
         setPriceRefreshDays(data.price_refresh_days ?? 1);
+        setScryfallPortal(!!data.scryfall_portal_enabled);
       }
     } catch (err) {
       console.error(err);
@@ -455,6 +459,13 @@ function AdminPanel({ showToast }) {
                 {t('admin.priceRefreshHint')}
               </p>
             </div>
+            {scryfallPortal && (
+              <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-secondary)', lineHeight: 1.4 }}>
+                <a href="/scryfall-portal/" target="_blank" rel="noopener noreferrer">
+                  {t('admin.scryfallPortalLink')}
+                </a>
+              </p>
+            )}
             <button type="submit" className="btn btn-primary" style={{ padding: '0.6rem', fontWeight: 700, alignSelf: 'flex-start' }} disabled={settingsLoading}>
               {settingsLoading ? <div className="spinner" style={{ width: '14px', height: '14px', margin: 0, borderWidth: '2px' }}></div> : t('admin.saveSettings')}
             </button>

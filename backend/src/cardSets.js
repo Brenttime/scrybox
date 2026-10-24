@@ -43,7 +43,8 @@ async function getScryfallSets() {
   }
   const scryfallApi = require('./scryfallApi');
   try {
-    const r = await scryfallApi.scryGetRetried('https://api.scryfall.com/sets');
+    // scryUrl makes the sidecar swap work for hardcoded absolute URLs too.
+    const r = await scryfallApi.scryGetRetried(scryfallApi.scryUrl('https://api.scryfall.com/sets'));
     scryfallSetsCache = r.data.data || [];
     scryfallSetsCacheAt = Date.now();
   } catch {
@@ -138,7 +139,10 @@ async function mtgSetFamilyQuery(set, lang, { excludeChildCodes = [] } = {}) {
 // include_multilingual so the query stays exactly what it was before languages.
 function mtgSearchUrl(query, lang, extra = '') {
   const multilingual = languages.resolve(lang).scryfall === 'en' ? '' : '&include_multilingual=true';
-  return `https://api.scryfall.com/cards/search?q=${encodeURIComponent(query)}${extra}${multilingual}`;
+  // scryUrl: with the sidecar on this absolute URL must land there; with it
+  // off scryUrl is the identity, so the string is byte-identical to before.
+  // Lazy require per this file's rule (scryfallApi pulls in the DB module).
+  return require('./scryfallApi').scryUrl(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(query)}${extra}${multilingual}`);
 }
 
 // Every set worth building a global index from, as set codes in build order.

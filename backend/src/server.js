@@ -446,6 +446,93 @@ app.use('/api/cardscan', cardscanRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/manabox-sync', manaboxSyncRoutes);
 
+// ---- Local Scryfall card portal (LOCAL_WEB_PORTAL_ENABLED) ----------------
+// Serves the sidecar's card UI (local-scryfall/static/) under
+// /scryfall-portal/* so one public origin exposes both the app and the card
+// browser. GET-only reverse proxy on node fetch — no new deps, no deps that
+// need auditing for a proxy. Off unless LOCAL_WEB_PORTAL_ENABLED=true; with
+// it off these routes do not exist.
+//
+// Security note: the portal is read-only public data (the same card search
+// the sidecar serves internally; no user data, no tokens, nothing that
+// /api/auth gates), so it sits OUTSIDE the /api authenticateToken mount on
+// purpose. It reaches ONLY the sidecar URL — never a caller-supplied host.
+if (process.env.LOCAL_WEB_PORTAL_ENABLED === 'true') {
+  const { LOCAL_SCRYFALL_URL } = require('./scryfallApi');
+  const PORTAL_PREFIX = '/scryfall-portal';
+  const upstreamBase = LOCAL_SCRYFALL_URL;
+
+  // The portal HTML/JS/CSS use root-absolute URLs (href="/sets.html",
+  // fetch('/api/…')), which would escape the prefix. Under the proxy they
+  // must be rewritten to /scryfall-portal/…; small text bodies are buffered
+  // for that (they're <100 KB), everything binary (fonts, images) streams
+  // through untouched.
+  const rewriteText = (body) => body
+    .replace(/(href|src)="\/(?!\/)/g, `$1="${PORTAL_PREFIX}/`)
+    .replace(/(["'])(\/(?:api\/|sets(?:$|[./?])|\?))/g, `$1${PORTAL_PREFIX}$2`);
+  const TEXTY = /^text\/(html|css)|javascript|^application\/json/;
+
+  const portalHandler = async (req, res) => {
+    if (req.method !== 'GET') {
+      return res.status(405).json({ error: 'Method not allowed — the card portal is read-only' });
+    }
+    // /scryfall-portal (no trailing slash) has no base for relative assets.
+    if (req.path === PORTAL_PREFIX) {
+      return res.redirect(301, PORTAL_PREFIX + '/');
+    }
+    const sub = req.path.slice(PORTAL_PREFIX.length) || '/';
+    const target = upstreamBase + sub + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+    let upstream;
+    try {
+      // identity encoding: we may need to rewrite the body, and a 429-style
+      // cooldown is meaningless here — this is the local sidecar, not Scryfall.
+      upstream = await fetch(target, {
+        method: 'GET',
+        headers: { 'User-Agent': 'Scrybox/1.0', 'Accept': req.get('accept') || '*/*', 'Accept-Encoding': 'identity' },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch (error) {
+      console.warn(`scryfall-portal: upstream ${target} unreachable: ${error.message}`);
+      return res.status(502).json({
+        error: 'Card portal unavailable',
+        details: 'The local Scryfall service (LOCAL_SCRYFALL_URL) is not reachable. Start the scryfall-local container or unset LOCAL_WEB_PORTAL_ENABLED.',
+      });
+    }
+    const headers = {};
+    if (upstream.headers.get('content-type')) headers['Content-Type'] = upstream.headers.get('content-type');
+    if (upstream.headers.get('cache-control')) headers['Cache-Control'] = upstream.headers.get('cache-control');
+    if (upstream.status >= 300 && upstream.status < 400) {
+      // Prefix any root-absolute redirect target (e.g. /sets → /sets.html).
+      const loc = upstream.headers.get('location') || '';
+      headers.Location = loc.startsWith('/') && !loc.startsWith('//') ? PORTAL_PREFIX + loc : loc;
+    }
+    // helmet's CSP/COEP were written for the Scrybox SPA, not the portal's
+    // own asset model; and the portal loads cross-origin card art under a
+    // COEP that Scryfall's image hosts do not send CORP for. Drop them for
+    // this subtree only — CSP stays on for the whole real app.
+    res.removeHeader('Content-Security-Policy');
+    res.removeHeader('Content-Security-Policy-Report-Only');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    const isText = TEXTY.test(headers['Content-Type'] || '');
+    if (!isText || !upstream.ok) {
+      res.status(upstream.status).set(headers);
+      if (!upstream.body) return res.end();
+      // stream pipe, no buffering
+      const nodeStream = await import('node:stream').then(m => m.Readable.fromWeb(upstream.body));
+      res.on('close', () => { try { upstream.body.cancel(); } catch { /* already done */ } });
+      nodeStream.pipe(res);
+      return;
+    }
+    const body = await upstream.text();
+    res.status(upstream.status).set(headers).send(headers['Content-Type'].startsWith('application/json') ? body : rewriteText(body));
+  };
+
+  app.get(PORTAL_PREFIX, portalHandler);
+  app.get(PORTAL_PREFIX + '/*', portalHandler);
+  console.log(`Card portal mounted at ${PORTAL_PREFIX}/* -> ${upstreamBase}`);
+}
+
 // The live overlay runs the SAME corner model the scan does, in the browser, so
 // what the user aims with and what the server matches cannot disagree. That
 // means the browser has to be able to fetch the model — unauthenticated, because

@@ -475,6 +475,7 @@
   "admin.createAccount": "Create Account",
   "admin.instanceTitle": "Instance Settings",
   "admin.instanceHint": "If this app runs behind a reverse proxy, the browser's own address may not be the one others should use to reach a collection share link. Set the public URL here to override it. Leave blank to use the browser's address (or the {envVar} environment variable, if set).",
+  "admin.scryfallPortalLink": "Local Scryfall card portal (search the full card index offline)",
   "admin.publicBaseUrl": "Public Base URL",
   "admin.saveSettings": "Save Settings",
   "admin.setIndexTitle": "Set Scan Indexes",

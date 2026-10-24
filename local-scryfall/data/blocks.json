@@ -1,0 +1,2350 @@
+{
+ "object": "list",
+ "uri": "(derived from api.scryfall.com/sets `block` field; /blocks 404s on this deployment)",
+ "blocks": [
+  {
+   "id": "288bd996-960e-448b-a187-9504c1930c2c",
+   "name": "Core Set",
+   "sets": [
+    {
+     "code": "lea",
+     "name": "Limited Edition Alpha",
+     "id": "288bd996-960e-448b-a187-9504c1930c2c"
+    },
+    {
+     "code": "leb",
+     "name": "Limited Edition Beta",
+     "id": "5307bd88-637c-4a5c-9801-a0d887715302"
+    },
+    {
+     "code": "2ed",
+     "name": "Unlimited Edition",
+     "id": "cd7694b9-339c-405d-a991-14413d4f6d5c"
+    },
+    {
+     "code": "fbb",
+     "name": "Foreign Black Border",
+     "id": "60648044-9f6a-4961-81af-47a0a94dfac9"
+    },
+    {
+     "code": "3ed",
+     "name": "Revised Edition",
+     "id": "45a69797-8adf-468e-a4e1-ba81fd9d66ac"
+    },
+    {
+     "code": "sum",
+     "name": "Summer Magic / Edgar",
+     "id": "7993c591-1361-4dcb-b2af-ac94dd8e86e8"
+    },
+    {
+     "code": "4ed",
+     "name": "Fourth Edition",
+     "id": "2dd259d4-dc13-4956-a2dc-3e1d70b4a743"
+    },
+    {
+     "code": "5ed",
+     "name": "Fifth Edition",
+     "id": "5afd2f4b-8309-4f45-a2b2-3785018474cb"
+    },
+    {
+     "code": "6ed",
+     "name": "Classic Sixth Edition",
+     "id": "78ee1957-d5d4-4551-acae-b1b418e8a50b"
+    },
+    {
+     "code": "7ed",
+     "name": "Seventh Edition",
+     "id": "230f38aa-9511-4db8-a3aa-aeddbc3f7bb9"
+    },
+    {
+     "code": "8ed",
+     "name": "Eighth Edition",
+     "id": "cae8d29d-5979-4d8f-884d-7f3183bcc886"
+    },
+    {
+     "code": "p8ed",
+     "name": "Eighth Edition Promos",
+     "id": "ff1b44ae-5f8b-4bb2-b87a-b27f53f2b0c9"
+    },
+    {
+     "code": "9ed",
+     "name": "Ninth Edition",
+     "id": "e70c8572-4732-4e92-a140-b4e3c1c84c93"
+    },
+    {
+     "code": "p9ed",
+     "name": "Ninth Edition Promos",
+     "id": "e55f6145-ebd1-4e6d-b72a-7aab9ed7b058"
+    },
+    {
+     "code": "10e",
+     "name": "Tenth Edition",
+     "id": "a66a6124-0d81-488d-b080-91f5ba7fbad0"
+    },
+    {
+     "code": "m10",
+     "name": "Magic 2010",
+     "id": "0dba38a9-6b9d-4768-9831-4e03e8970a0b"
+    },
+    {
+     "code": "m11",
+     "name": "Magic 2011",
+     "id": "485d2468-18c8-42a4-9482-ca1c51e0470e"
+    },
+    {
+     "code": "m12",
+     "name": "Magic 2012",
+     "id": "5cdd2643-229c-4441-a62a-c34e4b531e1c"
+    },
+    {
+     "code": "m13",
+     "name": "Magic 2013",
+     "id": "f9b0c6f4-8a4f-4f36-ad3c-e1e16fb8535d"
+    },
+    {
+     "code": "m14",
+     "name": "Magic 2014",
+     "id": "e03ee1c0-ecd2-4fcc-ac3c-e8fdb103a847"
+    },
+    {
+     "code": "m15",
+     "name": "Magic 2015",
+     "id": "6ce49890-3b37-42a5-8932-dbeef1d7b62c"
+    },
+    {
+     "code": "ori",
+     "name": "Magic Origins",
+     "id": "0eeb9a9a-20ac-404d-b55f-aeb7a43a7f62"
+    },
+    {
+     "code": "m19",
+     "name": "Core Set 2019",
+     "id": "2f5f2509-56db-414d-9a7e-6e312ec3760c"
+    },
+    {
+     "code": "m20",
+     "name": "Core Set 2020",
+     "id": "4a787360-9767-4f44-80b1-2405dc5e39c7"
+    },
+    {
+     "code": "ppp1",
+     "name": "M20 Promo Packs",
+     "id": "32bb437f-76d4-48d6-a888-8a3491198b46"
+    },
+    {
+     "code": "m21",
+     "name": "Core Set 2021",
+     "id": "bc94aba1-7376-4e02-a12d-3a2efb66ab0f"
+    },
+    {
+     "code": "fdn",
+     "name": "Foundations",
+     "id": "a7ecb771-d1b6-4dec-8cf5-8d45179f21e0"
+    }
+   ]
+  },
+  {
+   "id": "b0e08eea-5c01-4406-a6e2-dcd09c5e5b67",
+   "name": "Ice Age",
+   "sets": [
+    {
+     "code": "ice",
+     "name": "Ice Age",
+     "id": "b0e08eea-5c01-4406-a6e2-dcd09c5e5b67"
+    },
+    {
+     "code": "all",
+     "name": "Alliances",
+     "id": "64987b06-4a5c-443d-b560-ff5691744582"
+    },
+    {
+     "code": "csp",
+     "name": "Coldsnap",
+     "id": "1f4f105f-73e4-4f03-849e-82a204807847"
+    },
+    {
+     "code": "pcsp",
+     "name": "Coldsnap Promos",
+     "id": "77cab0a2-267d-47b0-b5ef-2ccdc692f198"
+    },
+    {
+     "code": "cst",
+     "name": "Coldsnap Theme Decks",
+     "id": "fd92cc13-e08d-4793-ae51-c4bd5e98210f"
+    }
+   ]
+  },
+  {
+   "id": "2767f6e4-4a9c-4515-a5c1-51dd95660fc4",
+   "name": "Arena League",
+   "sets": [
+    {
+     "code": "parl",
+     "name": "Arena League 1996",
+     "id": "2767f6e4-4a9c-4515-a5c1-51dd95660fc4"
+    },
+    {
+     "code": "pal99",
+     "name": "Arena League 1999",
+     "id": "01f0deac-9fcc-4c2b-a932-92c705fb558f"
+    },
+    {
+     "code": "pal00",
+     "name": "Arena League 2000",
+     "id": "a004c98d-1423-443f-b51c-1c8f5dc21b0d"
+    },
+    {
+     "code": "pal01",
+     "name": "Arena League 2001",
+     "id": "8571b7e5-3c24-4a26-a936-31549a18a2c3"
+    },
+    {
+     "code": "pal02",
+     "name": "Arena League 2002",
+     "id": "25e5166c-7c44-4c69-ad78-3f1668ab3156"
+    },
+    {
+     "code": "pal03",
+     "name": "Arena League 2003",
+     "id": "bf8bc347-ae11-43d4-98da-3625566668dd"
+    },
+    {
+     "code": "pal04",
+     "name": "Arena League 2004",
+     "id": "2afca034-842a-4488-af35-c79df13eb21d"
+    },
+    {
+     "code": "pal05",
+     "name": "Arena League 2005",
+     "id": "16b62eb1-0cab-47c9-a0c2-be6e781ece03"
+    },
+    {
+     "code": "pal06",
+     "name": "Arena League 2006",
+     "id": "db0343a8-d158-41dc-bef4-38477d42a579"
+    }
+   ]
+  },
+  {
+   "id": "5f06acf3-8123-4a78-b2e7-089b0b775a4a",
+   "name": "Mirage",
+   "sets": [
+    {
+     "code": "mir",
+     "name": "Mirage",
+     "id": "5f06acf3-8123-4a78-b2e7-089b0b775a4a"
+    },
+    {
+     "code": "vis",
+     "name": "Visions",
+     "id": "2c32f1a9-7921-4826-bea0-80bbac70532c"
+    },
+    {
+     "code": "wth",
+     "name": "Weatherlight",
+     "id": "700997ac-add2-4ce2-992e-5efa0fdfc0e9"
+    }
+   ]
+  },
+  {
+   "id": "478c47df-5058-4ce6-830e-7e80732b2ca9",
+   "name": "Portal",
+   "sets": [
+    {
+     "code": "por",
+     "name": "Portal",
+     "id": "478c47df-5058-4ce6-830e-7e80732b2ca9"
+    },
+    {
+     "code": "p02",
+     "name": "Portal Second Age",
+     "id": "ac67f18a-4f0e-407e-bab1-a9fe4f659565"
+    },
+    {
+     "code": "ptk",
+     "name": "Portal Three Kingdoms",
+     "id": "2676ff2e-9d86-4b5b-b935-e84e41b0755e"
+    },
+    {
+     "code": "pptk",
+     "name": "Portal Three Kingdoms Promos",
+     "id": "27b4f670-a760-4783-9f5a-4986c3a50e86"
+    }
+   ]
+  },
+  {
+   "id": "10df3a67-178e-4363-8668-34f0e6edf2a7",
+   "name": "Tempest",
+   "sets": [
+    {
+     "code": "tmp",
+     "name": "Tempest",
+     "id": "10df3a67-178e-4363-8668-34f0e6edf2a7"
+    },
+    {
+     "code": "ptmp",
+     "name": "Tempest Promos",
+     "id": "1645fb19-71a7-4634-99b8-bf703e861b6b"
+    },
+    {
+     "code": "sth",
+     "name": "Stronghold",
+     "id": "5c83396a-d386-4367-926b-571a75b086a3"
+    },
+    {
+     "code": "psth",
+     "name": "Stronghold Promos",
+     "id": "726bc009-a94a-4fd2-acb2-58d8c70b8f1c"
+    },
+    {
+     "code": "exo",
+     "name": "Exodus",
+     "id": "1401f7af-2e71-476d-9813-991084ed0bb9"
+    },
+    {
+     "code": "pexo",
+     "name": "Exodus Promos",
+     "id": "a4bfc8e0-22bb-463b-8f7d-5dc926438dca"
+    }
+   ]
+  },
+  {
+   "id": "804c01dd-4714-440a-950e-2f2130d781f3",
+   "name": "Judge Gift Cards",
+   "sets": [
+    {
+     "code": "jgp",
+     "name": "Judge Gift Cards 1998",
+     "id": "804c01dd-4714-440a-950e-2f2130d781f3"
+    },
+    {
+     "code": "g99",
+     "name": "Judge Gift Cards 1999",
+     "id": "08041686-693b-4b57-9e87-76ba81f3b1a3"
+    },
+    {
+     "code": "g00",
+     "name": "Judge Gift Cards 2000",
+     "id": "0964514c-cf50-468d-9cf7-a388aff65de9"
+    },
+    {
+     "code": "g01",
+     "name": "Judge Gift Cards 2001",
+     "id": "b704de85-87bd-4fa4-8bf0-df7380c83af8"
+    },
+    {
+     "code": "g02",
+     "name": "Judge Gift Cards 2002",
+     "id": "a3dc11d1-f22b-44fe-81db-3470aecb6bbc"
+    },
+    {
+     "code": "g03",
+     "name": "Judge Gift Cards 2003",
+     "id": "d77319c6-78a1-48d4-bc87-cbf4b1baed07"
+    },
+    {
+     "code": "g04",
+     "name": "Judge Gift Cards 2004",
+     "id": "68b258e6-d659-457c-a3d6-9da5d7cd6aa1"
+    },
+    {
+     "code": "g05",
+     "name": "Judge Gift Cards 2005",
+     "id": "0a722d87-0ce5-46e5-94e1-6f58f931a381"
+    },
+    {
+     "code": "g06",
+     "name": "Judge Gift Cards 2006",
+     "id": "be42d9f4-d1af-4b58-8efa-99484f478022"
+    },
+    {
+     "code": "g07",
+     "name": "Judge Gift Cards 2007",
+     "id": "4624619f-b5bf-4822-b364-8385a09a69da"
+    },
+    {
+     "code": "g08",
+     "name": "Judge Gift Cards 2008",
+     "id": "587e3ddb-7ffd-4e17-85e0-7846846d677f"
+    },
+    {
+     "code": "g09",
+     "name": "Judge Gift Cards 2009",
+     "id": "cf3a6c7e-f8e1-4c3f-95da-8b4ad094f489"
+    },
+    {
+     "code": "g10",
+     "name": "Judge Gift Cards 2010",
+     "id": "f9a512bb-f2ab-4805-8480-16decaacab3a"
+    },
+    {
+     "code": "g11",
+     "name": "Judge Gift Cards 2011",
+     "id": "e9ec9f60-333b-48f7-8e73-5db562638a54"
+    },
+    {
+     "code": "j12",
+     "name": "Judge Gift Cards 2012",
+     "id": "d2de9024-04a9-487c-8ca7-9111fb2a0fe0"
+    },
+    {
+     "code": "j13",
+     "name": "Judge Gift Cards 2013",
+     "id": "e9d7337b-b74e-43ae-820e-a6d26b23c9f3"
+    },
+    {
+     "code": "j14",
+     "name": "Judge Gift Cards 2014",
+     "id": "27b3e564-c016-47d4-8a63-55b0034f9e30"
+    },
+    {
+     "code": "j15",
+     "name": "Judge Gift Cards 2015",
+     "id": "6f528eed-2bc2-4a27-bb27-937c211754b3"
+    },
+    {
+     "code": "j16",
+     "name": "Judge Gift Cards 2016",
+     "id": "a3490e7b-791b-4ed3-bd0c-6fb19b819150"
+    },
+    {
+     "code": "j17",
+     "name": "Judge Gift Cards 2017",
+     "id": "6c69afe8-bb1e-466f-a46a-4a3e92351b25"
+    },
+    {
+     "code": "j18",
+     "name": "Judge Gift Cards 2018",
+     "id": "71da38d2-c15a-45c4-97b2-a791a2fd695b"
+    },
+    {
+     "code": "j19",
+     "name": "Judge Gift Cards 2019",
+     "id": "0fbc0a38-0462-47d1-b0a2-dcd401d044bd"
+    },
+    {
+     "code": "j20",
+     "name": "Judge Gift Cards 2020",
+     "id": "1b90366b-7692-44ea-bd55-f17fa92869a5"
+    },
+    {
+     "code": "pj21",
+     "name": "Judge Gift Cards 2021",
+     "id": "44c67c2c-7c14-4853-8dad-943a60816a05"
+    },
+    {
+     "code": "p22",
+     "name": "Judge Gift Cards 2022",
+     "id": "a8c14f2c-e917-4919-9eb7-32c7cc37107a"
+    },
+    {
+     "code": "p23",
+     "name": "Judge Gift Cards 2023",
+     "id": "0ccafe7e-c9ee-4742-89fd-06f1e14eacb0"
+    }
+   ]
+  },
+  {
+   "id": "c330df40-51db-4caf-bde6-48df6c181001",
+   "name": "Urza",
+   "sets": [
+    {
+     "code": "usg",
+     "name": "Urza's Saga",
+     "id": "c330df40-51db-4caf-bde6-48df6c181001"
+    },
+    {
+     "code": "pusg",
+     "name": "Urza's Saga Promos",
+     "id": "fa0c6488-475f-4e88-8149-e131619bd215"
+    },
+    {
+     "code": "ulg",
+     "name": "Urza's Legacy",
+     "id": "78ced61b-4b8a-4b33-b6b2-f5bd66f1a75a"
+    },
+    {
+     "code": "pulg",
+     "name": "Urza's Legacy Promos",
+     "id": "533dd7ca-2128-4d21-911a-a12f9b7b369e"
+    },
+    {
+     "code": "uds",
+     "name": "Urza's Destiny",
+     "id": "44f17b37-dcf8-4239-baab-1efc00cd3480"
+    },
+    {
+     "code": "puds",
+     "name": "Urza's Destiny Promos",
+     "id": "1cec5029-d9b9-4cbb-8a50-9c3a0f95d677"
+    }
+   ]
+  },
+  {
+   "id": "385e11a4-492b-4d07-b4a6-a1409ef829b8",
+   "name": "Masques",
+   "sets": [
+    {
+     "code": "mmq",
+     "name": "Mercadian Masques",
+     "id": "385e11a4-492b-4d07-b4a6-a1409ef829b8"
+    },
+    {
+     "code": "pmmq",
+     "name": "Mercadian Masques Promos",
+     "id": "98161b77-01f1-492d-80f2-7fb44f3dd260"
+    },
+    {
+     "code": "nem",
+     "name": "Nemesis",
+     "id": "fa5d1fdb-f781-473d-b14d-50396d40d43f"
+    },
+    {
+     "code": "pnem",
+     "name": "Nemesis Promos",
+     "id": "b302372a-fff8-43bf-95cf-e3d1d2bca9c9"
+    },
+    {
+     "code": "pcy",
+     "name": "Prophecy",
+     "id": "c233bd36-57c0-4aa2-ae6c-7aeabfb4e3ce"
+    },
+    {
+     "code": "ppcy",
+     "name": "Prophecy Promos",
+     "id": "34e39301-d557-47d1-bcc1-1ab44c02bc04"
+    }
+   ]
+  },
+  {
+   "id": "b9c0c822-3cac-46ec-801d-0ec322913387",
+   "name": "Friday Night Magic",
+   "sets": [
+    {
+     "code": "fnm",
+     "name": "Friday Night Magic 2000",
+     "id": "b9c0c822-3cac-46ec-801d-0ec322913387"
+    },
+    {
+     "code": "f01",
+     "name": "Friday Night Magic 2001",
+     "id": "1edf0887-20de-4e75-bce3-45d842f0066d"
+    },
+    {
+     "code": "f02",
+     "name": "Friday Night Magic 2002",
+     "id": "1037d505-8080-4f98-92c6-c9816735c172"
+    },
+    {
+     "code": "f03",
+     "name": "Friday Night Magic 2003",
+     "id": "338dca3f-bcaf-43f8-a5a8-0aeaa241dec5"
+    },
+    {
+     "code": "f04",
+     "name": "Friday Night Magic 2004",
+     "id": "10b8cbe8-4beb-496b-97d7-889a81dde83b"
+    },
+    {
+     "code": "f05",
+     "name": "Friday Night Magic 2005",
+     "id": "ff1a761c-57d0-45b5-be9f-16019ce0f652"
+    },
+    {
+     "code": "f06",
+     "name": "Friday Night Magic 2006",
+     "id": "40b38065-0746-4679-89c4-172197bba904"
+    },
+    {
+     "code": "f07",
+     "name": "Friday Night Magic 2007",
+     "id": "1afde513-cf57-40a6-9e4b-aab815dad104"
+    },
+    {
+     "code": "f08",
+     "name": "Friday Night Magic 2008",
+     "id": "1d9c28af-5035-4b6d-9944-62b51cfd688d"
+    },
+    {
+     "code": "f09",
+     "name": "Friday Night Magic 2009",
+     "id": "a540bc4f-d0c3-4758-9636-547ec9df7fc9"
+    },
+    {
+     "code": "f10",
+     "name": "Friday Night Magic 2010",
+     "id": "0790f41d-e012-46b7-b97c-bfeda3489a4f"
+    },
+    {
+     "code": "f11",
+     "name": "Friday Night Magic 2011",
+     "id": "757ed42f-384b-450d-ab70-217cadca2847"
+    },
+    {
+     "code": "f12",
+     "name": "Friday Night Magic 2012",
+     "id": "6df07fcb-8b2a-43a6-82bc-97e92312a921"
+    },
+    {
+     "code": "f13",
+     "name": "Friday Night Magic 2013",
+     "id": "4f0f5416-2f39-4339-8b9a-5454d94a4ca6"
+    },
+    {
+     "code": "f14",
+     "name": "Friday Night Magic 2014",
+     "id": "ed1404ce-ac05-4d93-8283-163a50bfc9b5"
+    },
+    {
+     "code": "f15",
+     "name": "Friday Night Magic 2015",
+     "id": "b34e3169-310e-4161-82c8-868b38b9cc91"
+    },
+    {
+     "code": "f16",
+     "name": "Friday Night Magic 2016",
+     "id": "820ba719-0234-4ca7-9d72-e0f8d56460bb"
+    },
+    {
+     "code": "f17",
+     "name": "Friday Night Magic 2017",
+     "id": "690dae5c-2de4-4071-b77c-19883791f987"
+    },
+    {
+     "code": "f18",
+     "name": "Friday Night Magic 2018",
+     "id": "3a1c398c-c72b-4617-acae-3e6b06ae08d5"
+    }
+   ]
+  },
+  {
+   "id": "b9ae5e02-7726-47ca-b5e4-5ec402b41cd1",
+   "name": "Invasion",
+   "sets": [
+    {
+     "code": "inv",
+     "name": "Invasion",
+     "id": "b9ae5e02-7726-47ca-b5e4-5ec402b41cd1"
+    },
+    {
+     "code": "pinv",
+     "name": "Invasion Promos",
+     "id": "907dbba9-bb5e-4d07-b681-ab8641cb1ada"
+    },
+    {
+     "code": "pls",
+     "name": "Planeshift",
+     "id": "82dc193b-bd5f-4883-a93f-a4155b467ee0"
+    },
+    {
+     "code": "ppls",
+     "name": "Planeshift Promos",
+     "id": "7110534f-7944-45f8-9b93-19240253201b"
+    },
+    {
+     "code": "apc",
+     "name": "Apocalypse",
+     "id": "e4e00913-d08d-4899-86ea-5cf631e09ce0"
+    },
+    {
+     "code": "papc",
+     "name": "Apocalypse Promos",
+     "id": "3267d03d-12cd-41ae-9d4d-80af0493f138"
+    }
+   ]
+  },
+  {
+   "id": "84cd4f76-a638-41ac-8c60-3a82d8708b5c",
+   "name": "Magic Player Rewards",
+   "sets": [
+    {
+     "code": "mpr",
+     "name": "Magic Player Rewards 2001",
+     "id": "84cd4f76-a638-41ac-8c60-3a82d8708b5c"
+    },
+    {
+     "code": "pr2",
+     "name": "Magic Player Rewards 2002",
+     "id": "b3978acb-8a06-4362-b835-dbda8611a48c"
+    },
+    {
+     "code": "p03",
+     "name": "Magic Player Rewards 2003",
+     "id": "dfa906ff-63d8-4065-abef-809988337288"
+    },
+    {
+     "code": "p04",
+     "name": "Magic Player Rewards 2004",
+     "id": "5ba81c6d-2344-4760-bb13-b7276205e73e"
+    },
+    {
+     "code": "p05",
+     "name": "Magic Player Rewards 2005",
+     "id": "e7f182b7-cd28-46de-bce8-223e83a78ae0"
+    },
+    {
+     "code": "p06",
+     "name": "Magic Player Rewards 2006",
+     "id": "619f656b-94dc-4772-bc99-62bac48f1eb9"
+    },
+    {
+     "code": "p07",
+     "name": "Magic Player Rewards 2007",
+     "id": "c1a38fe6-73f4-4414-897b-f1215a7c948f"
+    },
+    {
+     "code": "p08",
+     "name": "Magic Player Rewards 2008",
+     "id": "6c1d0a31-b5d2-421d-95f4-5816382f764f"
+    },
+    {
+     "code": "p09",
+     "name": "Magic Player Rewards 2009",
+     "id": "824eec08-e609-41db-8de4-4e58d8aeb37d"
+    },
+    {
+     "code": "p10",
+     "name": "Magic Player Rewards 2010",
+     "id": "d871e33b-7086-4549-89d6-fedd4422161f"
+    },
+    {
+     "code": "p11",
+     "name": "Magic Player Rewards 2011",
+     "id": "ba0f80c9-7a21-425b-8a02-cb17c2a50e36"
+    }
+   ]
+  },
+  {
+   "id": "b0d90d2d-494a-4224-bfa0-36ce5ee281b1",
+   "name": "Odyssey",
+   "sets": [
+    {
+     "code": "ody",
+     "name": "Odyssey",
+     "id": "b0d90d2d-494a-4224-bfa0-36ce5ee281b1"
+    },
+    {
+     "code": "pody",
+     "name": "Odyssey Promos",
+     "id": "52dc2f6b-0895-483d-8a15-3c6052612a79"
+    },
+    {
+     "code": "tor",
+     "name": "Torment",
+     "id": "e0b3fda1-a6ca-4996-849b-08b463d39484"
+    },
+    {
+     "code": "ptor",
+     "name": "Torment Promos",
+     "id": "f64d8b9e-bff0-4247-8113-7fd799c997c2"
+    },
+    {
+     "code": "jud",
+     "name": "Judgment",
+     "id": "cd82de1a-36fd-4618-bfe8-b45532a582d9"
+    },
+    {
+     "code": "pjud",
+     "name": "Judgment Promos",
+     "id": "a1aed70a-561a-4766-97ce-ad56bef407c0"
+    }
+   ]
+  },
+  {
+   "id": "b8385212-69cb-4b73-a013-d6d4e9efa261",
+   "name": "Onslaught",
+   "sets": [
+    {
+     "code": "pons",
+     "name": "Onslaught Promos",
+     "id": "b8385212-69cb-4b73-a013-d6d4e9efa261"
+    },
+    {
+     "code": "ons",
+     "name": "Onslaught",
+     "id": "914a6c6d-cb3b-45e8-a2db-9978a2339faf"
+    },
+    {
+     "code": "lgn",
+     "name": "Legions",
+     "id": "c2d60a18-1a81-4784-8e0c-e1de2f43c5cf"
+    },
+    {
+     "code": "plgn",
+     "name": "Legions Promos",
+     "id": "33d36849-7710-4766-90c6-728c3f625003"
+    },
+    {
+     "code": "scg",
+     "name": "Scourge",
+     "id": "5133c3a1-1412-4ce6-a1f0-73b695966ded"
+    },
+    {
+     "code": "pscg",
+     "name": "Scourge Promos",
+     "id": "48e783b7-4219-4348-aacb-86ea5c491af2"
+    }
+   ]
+  },
+  {
+   "id": "1d4f90ba-8d4a-4ee5-bc2f-e2d6bffe4955",
+   "name": "Mirrodin",
+   "sets": [
+    {
+     "code": "mrd",
+     "name": "Mirrodin",
+     "id": "1d4f90ba-8d4a-4ee5-bc2f-e2d6bffe4955"
+    },
+    {
+     "code": "dst",
+     "name": "Darksteel",
+     "id": "e29cb2dd-1345-4032-abfe-e52e8c8ce074"
+    },
+    {
+     "code": "pdst",
+     "name": "Darksteel Promos",
+     "id": "b586f845-b8dd-455f-ae21-817d0c09ec61"
+    },
+    {
+     "code": "5dn",
+     "name": "Fifth Dawn",
+     "id": "e4bc1b87-5476-463c-8640-4c414ecf1763"
+    },
+    {
+     "code": "p5dn",
+     "name": "Fifth Dawn Promos",
+     "id": "ff5503b1-ac4c-4164-b7e4-6bca31640493"
+    },
+    {
+     "code": "pmrd",
+     "name": "Mirrodin Promos",
+     "id": "387eb35e-18ae-4162-9332-2c2d3a1d16c1"
+    }
+   ]
+  },
+  {
+   "id": "6183d21f-a0af-4118-ba58-aca1d8719c01",
+   "name": "Kamigawa",
+   "sets": [
+    {
+     "code": "chk",
+     "name": "Champions of Kamigawa",
+     "id": "6183d21f-a0af-4118-ba58-aca1d8719c01"
+    },
+    {
+     "code": "pchk",
+     "name": "Champions of Kamigawa Promos",
+     "id": "57b23d04-034d-4d04-ba0e-524b6ba03eb7"
+    },
+    {
+     "code": "bok",
+     "name": "Betrayers of Kamigawa",
+     "id": "d4b88587-a1f5-4b47-9e24-78ec9e57bd0e"
+    },
+    {
+     "code": "pbok",
+     "name": "Betrayers of Kamigawa Promos",
+     "id": "34e1a029-1103-4e95-aafb-02949a6780b4"
+    },
+    {
+     "code": "sok",
+     "name": "Saviors of Kamigawa",
+     "id": "4db16ad3-2b95-442f-bb6b-e9aa7fe7f769"
+    },
+    {
+     "code": "psok",
+     "name": "Saviors of Kamigawa Promos",
+     "id": "31daa10a-9490-42aa-a630-1a9c2d9ae492"
+    }
+   ]
+  },
+  {
+   "id": "15fccbe8-2825-41ca-9d0a-67aebdf91c4a",
+   "name": "Ravnica",
+   "sets": [
+    {
+     "code": "rav",
+     "name": "Ravnica: City of Guilds",
+     "id": "15fccbe8-2825-41ca-9d0a-67aebdf91c4a"
+    },
+    {
+     "code": "prav",
+     "name": "Ravnica: City of Guilds Promos",
+     "id": "bc3c3b61-352b-4dc4-8383-415b9ad1845b"
+    },
+    {
+     "code": "gpt",
+     "name": "Guildpact",
+     "id": "594b4d09-8ce1-494d-bdb2-842c124bd087"
+    },
+    {
+     "code": "pgpt",
+     "name": "Guildpact Promos",
+     "id": "a77ddc05-da91-4dce-b564-bfb13766d23b"
+    },
+    {
+     "code": "dis",
+     "name": "Dissension",
+     "id": "fdebeda1-b95f-4343-8a94-d125821e6b5c"
+    },
+    {
+     "code": "pdis",
+     "name": "Dissension Promos",
+     "id": "7dba077a-f97b-4308-b39f-9a1132550f27"
+    }
+   ]
+  },
+  {
+   "id": "c1d109bc-ffd8-428f-8d7d-3f8d7e648046",
+   "name": "Time Spiral",
+   "sets": [
+    {
+     "code": "tsp",
+     "name": "Time Spiral",
+     "id": "c1d109bc-ffd8-428f-8d7d-3f8d7e648046"
+    },
+    {
+     "code": "ptsp",
+     "name": "Time Spiral Promos",
+     "id": "666d27e3-224d-4782-8a00-663c9c352837"
+    },
+    {
+     "code": "tsb",
+     "name": "Time Spiral Timeshifted",
+     "id": "6519be58-b8cb-4cd7-9f5b-4db23364715b"
+    },
+    {
+     "code": "plc",
+     "name": "Planar Chaos",
+     "id": "5a1b571c-73e9-4c14-b9d4-a62507d85789"
+    },
+    {
+     "code": "pplc",
+     "name": "Planar Chaos Promos",
+     "id": "f4e4582f-0ae8-42d7-acb7-49c29958a25e"
+    },
+    {
+     "code": "fut",
+     "name": "Future Sight",
+     "id": "bf951ddb-4445-4923-87cb-3fe4ac3c6b9a"
+    },
+    {
+     "code": "pfut",
+     "name": "Future Sight Promos",
+     "id": "9d290d54-2aec-4d5e-8ffc-c9714f4437d4"
+    }
+   ]
+  },
+  {
+   "id": "30ec97cb-dca9-4bf4-a98b-310f9d8ceaff",
+   "name": "Lorwyn",
+   "sets": [
+    {
+     "code": "lrw",
+     "name": "Lorwyn",
+     "id": "30ec97cb-dca9-4bf4-a98b-310f9d8ceaff"
+    },
+    {
+     "code": "plrw",
+     "name": "Lorwyn Promos",
+     "id": "091fc340-30ea-4054-a013-44bc345b9c9e"
+    },
+    {
+     "code": "tlrw",
+     "name": "Lorwyn Tokens",
+     "id": "bfd36a58-a297-44e8-9421-3010f541eec9"
+    },
+    {
+     "code": "mor",
+     "name": "Morningtide",
+     "id": "c41550df-7b41-41a3-85ab-8612eb2f168f"
+    },
+    {
+     "code": "pmor",
+     "name": "Morningtide Promos",
+     "id": "9bd20131-fe8c-4a5d-9841-7347024ca54a"
+    },
+    {
+     "code": "tmor",
+     "name": "Morningtide Tokens",
+     "id": "cf25354d-817d-4756-b786-604ac93ba3b7"
+    }
+   ]
+  },
+  {
+   "id": "c18c0ba1-2081-4808-9b2e-549bc3a666f3",
+   "name": "Shadowmoor",
+   "sets": [
+    {
+     "code": "shm",
+     "name": "Shadowmoor",
+     "id": "c18c0ba1-2081-4808-9b2e-549bc3a666f3"
+    },
+    {
+     "code": "pshm",
+     "name": "Shadowmoor Promos",
+     "id": "785c5919-8fbc-4ab9-a59f-51ee189b84d2"
+    },
+    {
+     "code": "tshm",
+     "name": "Shadowmoor Tokens",
+     "id": "2dd7782a-5e58-4338-81ff-0841c66ee647"
+    },
+    {
+     "code": "eve",
+     "name": "Eventide",
+     "id": "86b4dfef-f2d1-49d6-825d-7df6bda44357"
+    },
+    {
+     "code": "peve",
+     "name": "Eventide Promos",
+     "id": "67920ddd-5260-42c0-831e-acbd7e135dd3"
+    },
+    {
+     "code": "teve",
+     "name": "Eventide Tokens",
+     "id": "107e2bde-bf04-42e9-ab9d-44175d1bebe7"
+    }
+   ]
+  },
+  {
+   "id": "c1cec8aa-5906-41d9-ae01-cbdde2e776fb",
+   "name": "From the Vault",
+   "sets": [
+    {
+     "code": "drb",
+     "name": "From the Vault: Dragons",
+     "id": "c1cec8aa-5906-41d9-ae01-cbdde2e776fb"
+    },
+    {
+     "code": "v09",
+     "name": "From the Vault: Exiled",
+     "id": "6254693f-c620-4e47-8bab-01085f8c3ffb"
+    },
+    {
+     "code": "v10",
+     "name": "From the Vault: Relics",
+     "id": "3e3ea3e8-3d63-481f-b3ec-03c4f50b602e"
+    },
+    {
+     "code": "v11",
+     "name": "From the Vault: Legends",
+     "id": "b83c0908-ae67-47eb-9099-7a1791ada84a"
+    },
+    {
+     "code": "v12",
+     "name": "From the Vault: Realms",
+     "id": "b9259658-67bf-451b-b78b-f5545129e9bd"
+    },
+    {
+     "code": "v13",
+     "name": "From the Vault: Twenty",
+     "id": "815577c6-652f-4171-8298-c1063c5bced1"
+    },
+    {
+     "code": "v14",
+     "name": "From the Vault: Annihilation",
+     "id": "21dd7ae2-1196-46d4-9acf-4ff9d82797be"
+    },
+    {
+     "code": "v15",
+     "name": "From the Vault: Angels",
+     "id": "bd5cb4e5-8090-4bd9-bcd4-89741056689b"
+    },
+    {
+     "code": "v16",
+     "name": "From the Vault: Lore",
+     "id": "599b33cd-678b-4149-9e68-2a59da7d7f81"
+    },
+    {
+     "code": "v17",
+     "name": "From the Vault: Transform",
+     "id": "63c89a12-d115-4084-a4af-fceef40ca02f"
+    }
+   ]
+  },
+  {
+   "id": "d667aaec-09b7-4406-b6fa-60795132dc11",
+   "name": "Alara",
+   "sets": [
+    {
+     "code": "ala",
+     "name": "Shards of Alara",
+     "id": "d667aaec-09b7-4406-b6fa-60795132dc11"
+    },
+    {
+     "code": "pala",
+     "name": "Shards of Alara Promos",
+     "id": "f31d9028-0a82-4d31-b874-4fdde618948e"
+    },
+    {
+     "code": "tala",
+     "name": "Shards of Alara Tokens",
+     "id": "835956e2-d0ea-4219-b77e-b439208d0655"
+    },
+    {
+     "code": "con",
+     "name": "Conflux",
+     "id": "76b2db58-904c-4e49-8580-9f62f7b3cca4"
+    },
+    {
+     "code": "pcon",
+     "name": "Conflux Promos",
+     "id": "0ce7fd53-7c14-4d16-a4c3-5c47ad8a8e5b"
+    },
+    {
+     "code": "tcon",
+     "name": "Conflux Tokens",
+     "id": "a7f9ec0e-e886-46d2-9857-4546c8e6fd32"
+    },
+    {
+     "code": "arb",
+     "name": "Alara Reborn",
+     "id": "db486ec5-141d-4781-9ee5-5456926934c1"
+    },
+    {
+     "code": "parb",
+     "name": "Alara Reborn Promos",
+     "id": "352a7433-5b06-4381-99e9-fc3b6282dd2c"
+    },
+    {
+     "code": "tarb",
+     "name": "Alara Reborn Tokens",
+     "id": "f1c5bbc9-2b74-443f-8b26-f495f2b4de18"
+    }
+   ]
+  },
+  {
+   "id": "eb16a2bd-a218-4e4e-8339-4aa1afc0c8d2",
+   "name": "Zendikar",
+   "sets": [
+    {
+     "code": "zen",
+     "name": "Zendikar",
+     "id": "eb16a2bd-a218-4e4e-8339-4aa1afc0c8d2"
+    },
+    {
+     "code": "pzen",
+     "name": "Zendikar Promos",
+     "id": "b643670d-7a22-4869-b49c-89cdf9c9b627"
+    },
+    {
+     "code": "tzen",
+     "name": "Zendikar Tokens",
+     "id": "f97260a2-5fb8-4261-aedc-ce0836b01400"
+    },
+    {
+     "code": "wwk",
+     "name": "Worldwake",
+     "id": "2f248ce6-c2a5-4c6f-a2be-0c593fbe173c"
+    },
+    {
+     "code": "pwwk",
+     "name": "Worldwake Promos",
+     "id": "7fe6f402-6e57-476c-8f7b-500fd08e3099"
+    },
+    {
+     "code": "twwk",
+     "name": "Worldwake Tokens",
+     "id": "066f22e0-c762-4222-8d99-ff262ead231e"
+    },
+    {
+     "code": "roe",
+     "name": "Rise of the Eldrazi",
+     "id": "eadb8a82-ec56-4623-b50e-42e7e60cb535"
+    },
+    {
+     "code": "proe",
+     "name": "Rise of the Eldrazi Promos",
+     "id": "3af1f1ab-7b96-4535-912c-3a225b1783bc"
+    },
+    {
+     "code": "troe",
+     "name": "Rise of the Eldrazi Tokens",
+     "id": "855dd9b4-d26a-42e0-b693-81aade8affa8"
+    }
+   ]
+  },
+  {
+   "id": "761e8299-b38f-49b6-b6c4-f0315576f631",
+   "name": "Scars of Mirrodin",
+   "sets": [
+    {
+     "code": "psom",
+     "name": "Scars of Mirrodin Promos",
+     "id": "761e8299-b38f-49b6-b6c4-f0315576f631"
+    },
+    {
+     "code": "som",
+     "name": "Scars of Mirrodin",
+     "id": "8f403072-9b22-4e69-8d59-22dc4c97fd8d"
+    },
+    {
+     "code": "tsom",
+     "name": "Scars of Mirrodin Tokens",
+     "id": "1ea34c50-24cc-4e12-bdf5-12ef7d8a522f"
+    },
+    {
+     "code": "pmbs",
+     "name": "Mirrodin Besieged Promos",
+     "id": "8a59d98a-4e13-4943-b06c-b35868e954ba"
+    },
+    {
+     "code": "mbs",
+     "name": "Mirrodin Besieged",
+     "id": "f46c57e3-9301-4006-a6ca-06f3f65961fb"
+    },
+    {
+     "code": "tmbs",
+     "name": "Mirrodin Besieged Tokens",
+     "id": "ab9695ca-ca49-46c2-9bc4-c18e50f8689b"
+    },
+    {
+     "code": "pnph",
+     "name": "New Phyrexia Promos",
+     "id": "659f3361-e6e9-4891-925f-1d6795bab6ab"
+    },
+    {
+     "code": "nph",
+     "name": "New Phyrexia",
+     "id": "e8e356d8-6d01-4dab-aa07-d0999dc9359f"
+    },
+    {
+     "code": "tnph",
+     "name": "New Phyrexia Tokens",
+     "id": "7b5e3883-6588-412a-b979-7de44d50b3de"
+    }
+   ]
+  },
+  {
+   "id": "84ff1a64-4e69-4ed2-8c08-26206e3b97a0",
+   "name": "Commander",
+   "sets": [
+    {
+     "code": "cmd",
+     "name": "Commander 2011",
+     "id": "84ff1a64-4e69-4ed2-8c08-26206e3b97a0"
+    },
+    {
+     "code": "pcmd",
+     "name": "Commander 2011 Launch Party",
+     "id": "ee4cadbc-d155-4355-a7c2-8fcf19af0cb6"
+    },
+    {
+     "code": "ocmd",
+     "name": "Commander 2011 Oversized",
+     "id": "0dc30b69-bcba-4d06-a211-59b9b5624f2d"
+    },
+    {
+     "code": "cm1",
+     "name": "Commander's Arsenal",
+     "id": "bf95efbe-b991-4f7c-b9e9-04f0bc59969a"
+    },
+    {
+     "code": "ocm1",
+     "name": "Commander's Arsenal Oversized",
+     "id": "80c3b403-1eaa-41b0-9f26-72b8d448c122"
+    },
+    {
+     "code": "c13",
+     "name": "Commander 2013",
+     "id": "c62e6d4f-af8c-4f27-9bc8-361291890146"
+    },
+    {
+     "code": "oc13",
+     "name": "Commander 2013 Oversized",
+     "id": "03542833-6773-414f-992d-be88b65238af"
+    },
+    {
+     "code": "c14",
+     "name": "Commander 2014",
+     "id": "0980a6e2-eb78-4ad2-8396-cef08fce365e"
+    },
+    {
+     "code": "oc14",
+     "name": "Commander 2014 Oversized",
+     "id": "bee6ac71-9fbf-417a-a623-6393c984fdbb"
+    },
+    {
+     "code": "tc14",
+     "name": "Commander 2014 Tokens",
+     "id": "58172859-996d-49d0-9016-460714a8ae01"
+    },
+    {
+     "code": "c15",
+     "name": "Commander 2015",
+     "id": "ea6c99f9-5489-4504-b30c-c819fa3b1fd3"
+    },
+    {
+     "code": "oc15",
+     "name": "Commander 2015 Oversized",
+     "id": "7198001d-6617-485e-aa5d-41be3a7cd77c"
+    },
+    {
+     "code": "tc15",
+     "name": "Commander 2015 Tokens",
+     "id": "75af5bab-521e-47f4-b3b6-655ebddf5cb2"
+    },
+    {
+     "code": "c16",
+     "name": "Commander 2016",
+     "id": "3e0d713a-b5cb-4287-81b9-a57d4dcaf415"
+    },
+    {
+     "code": "oc16",
+     "name": "Commander 2016 Oversized",
+     "id": "caa8f8c4-d0bf-4848-9c66-e2fcabd1585c"
+    },
+    {
+     "code": "tc16",
+     "name": "Commander 2016 Tokens",
+     "id": "b8c05f6f-ae4b-436b-a475-09e768ca6a2e"
+    },
+    {
+     "code": "cma",
+     "name": "Commander Anthology",
+     "id": "fd4d8463-0156-4c60-a40e-778762bb90e4"
+    },
+    {
+     "code": "tcma",
+     "name": "Commander Anthology Tokens",
+     "id": "87645e3f-e06e-4cda-9f2c-5ea9232674bc"
+    },
+    {
+     "code": "c17",
+     "name": "Commander 2017",
+     "id": "5caec427-0c78-4c37-b4ec-30f7e0ba9abf"
+    },
+    {
+     "code": "oc17",
+     "name": "Commander 2017 Oversized",
+     "id": "276c644b-3aaa-43ce-b46c-47675fbf720c"
+    },
+    {
+     "code": "tc17",
+     "name": "Commander 2017 Tokens",
+     "id": "d6402450-8ab0-4ae6-b909-87ef6464a637"
+    },
+    {
+     "code": "cm2",
+     "name": "Commander Anthology Volume II",
+     "id": "2ba5b1a3-40ed-422e-981d-56753004dfc6"
+    },
+    {
+     "code": "tcm2",
+     "name": "Commander Anthology Volume II Tokens",
+     "id": "fa6a256f-bad4-495d-a2f7-007c0a773307"
+    },
+    {
+     "code": "tc18",
+     "name": "Commander 2018 Tokens",
+     "id": "8d858150-d438-49cb-81d6-8fc5b8feccc4"
+    },
+    {
+     "code": "c18",
+     "name": "Commander 2018",
+     "id": "06ce6bc2-85cd-4cca-85b1-8c620d3e0902"
+    },
+    {
+     "code": "oc18",
+     "name": "Commander 2018 Oversized",
+     "id": "5e72b6d5-d7ff-436d-a0c6-35d40e836ed9"
+    },
+    {
+     "code": "tc19",
+     "name": "Commander 2019 Tokens",
+     "id": "3e10647f-a051-4790-af9d-7501544fac73"
+    },
+    {
+     "code": "c19",
+     "name": "Commander 2019",
+     "id": "0fa3ccbb-d86d-4a2e-a55e-c4979c4feeb2"
+    },
+    {
+     "code": "oc19",
+     "name": "Commander 2019 Oversized",
+     "id": "d7be92fd-4b4b-44f3-99bc-536cda58a4c3"
+    },
+    {
+     "code": "c20",
+     "name": "Commander 2020",
+     "id": "f60ec786-1f8d-42f7-9abc-0d880fe243f6"
+    },
+    {
+     "code": "tc20",
+     "name": "Commander 2020 Tokens",
+     "id": "bc7f97a6-1fd5-43cf-98f9-9f0d4872b2d1"
+    },
+    {
+     "code": "znc",
+     "name": "Zendikar Rising Commander",
+     "id": "25c6bd9b-4e10-40a4-b9b5-0f4d9b5852a1"
+    },
+    {
+     "code": "cmr",
+     "name": "Commander Legends",
+     "id": "39de6fbf-1f11-48d0-8f04-f0407f6a0732"
+    },
+    {
+     "code": "khc",
+     "name": "Kaldheim Commander",
+     "id": "d532ef25-e52b-4276-941a-3a1c095544b0"
+    },
+    {
+     "code": "c21",
+     "name": "Commander 2021",
+     "id": "27bf6dbd-a9e1-4904-afa7-d28fc7745c4f"
+    },
+    {
+     "code": "afc",
+     "name": "Forgotten Realms Commander",
+     "id": "db1b46f9-893c-4623-9465-985ff6e4472c"
+    },
+    {
+     "code": "mic",
+     "name": "Midnight Hunt Commander",
+     "id": "7f9a4deb-715e-47d2-afac-3843ef92f39b"
+    },
+    {
+     "code": "omic",
+     "name": "Midnight Hunt Commander Display Commanders",
+     "id": "ba38f256-89cf-4af3-8c6c-d3efe196aef1"
+    },
+    {
+     "code": "tmic",
+     "name": "Midnight Hunt Commander Tokens",
+     "id": "56d23ab2-9edd-4250-bf33-3225c183cc1a"
+    },
+    {
+     "code": "voc",
+     "name": "Crimson Vow Commander",
+     "id": "b2e444f7-41e6-4172-ba01-47d91d5e7bbc"
+    },
+    {
+     "code": "nec",
+     "name": "Neon Dynasty Commander",
+     "id": "5b4d929d-bdf9-4bbf-858e-e248f53325ad"
+    },
+    {
+     "code": "ncc",
+     "name": "New Capenna Commander",
+     "id": "c51de34b-d4d6-4179-a432-573744ded119"
+    },
+    {
+     "code": "clb",
+     "name": "Commander Legends: Battle for Baldur's Gate",
+     "id": "5e4c3fe8-fd57-4b20-ad56-c03790a16cea"
+    },
+    {
+     "code": "dmc",
+     "name": "Dominaria United Commander",
+     "id": "78076b27-f888-4723-b27c-44074accd261"
+    },
+    {
+     "code": "40k",
+     "name": "Warhammer 40,000 Commander",
+     "id": "f35f5dd8-5b95-4f52-bbe7-1c62909a8d08"
+    },
+    {
+     "code": "brc",
+     "name": "The Brothers' War Commander",
+     "id": "81d56780-1efc-4487-9803-43d634ca13d0"
+    },
+    {
+     "code": "scd",
+     "name": "Starter Commander Decks",
+     "id": "adc5d965-43ea-46bc-aebd-8a39282ce168"
+    },
+    {
+     "code": "onc",
+     "name": "Phyrexia: All Will Be One Commander",
+     "id": "8c5e86d4-ae2d-42f7-a0e5-0e4141eb953d"
+    },
+    {
+     "code": "moc",
+     "name": "March of the Machine Commander",
+     "id": "6bba5de9-5afb-42af-a7eb-24ac854bf671"
+    },
+    {
+     "code": "ltc",
+     "name": "Tales of Middle-earth Commander",
+     "id": "e567c19c-0fe4-446e-a7bf-fce8a150cd2e"
+    },
+    {
+     "code": "cmm",
+     "name": "Commander Masters",
+     "id": "cd05036f-2698-43e6-a48e-5c8d82f0a551"
+    },
+    {
+     "code": "woc",
+     "name": "Wilds of Eldraine Commander",
+     "id": "51c0814a-2db2-4182-9aac-77340e9a540d"
+    },
+    {
+     "code": "who",
+     "name": "Doctor Who",
+     "id": "efdfdd99-cee7-4c11-a5e9-03d60f88bdd6"
+    },
+    {
+     "code": "lcc",
+     "name": "The Lost Caverns of Ixalan Commander",
+     "id": "d253edc3-5bc7-4cf1-9446-a8540dedffa5"
+    },
+    {
+     "code": "mkc",
+     "name": "Murders at Karlov Manor Commander",
+     "id": "286c37ca-ba65-4d3e-8c5d-d1878d88fd95"
+    },
+    {
+     "code": "pip",
+     "name": "Fallout",
+     "id": "d84d7a49-2ef4-4808-83b4-8c65b4aa0e2d"
+    },
+    {
+     "code": "otc",
+     "name": "Outlaws of Thunder Junction Commander",
+     "id": "d6548798-0c10-4509-b71a-2d8b1d14665a"
+    },
+    {
+     "code": "m3c",
+     "name": "Modern Horizons 3 Commander",
+     "id": "f5e00721-cf99-43ba-bf16-b22d56d12c73"
+    },
+    {
+     "code": "blc",
+     "name": "Bloomburrow Commander",
+     "id": "c0f860b9-a2d0-4fd7-bfac-a49ac60c84f1"
+    },
+    {
+     "code": "dsc",
+     "name": "Duskmourn: House of Horror Commander",
+     "id": "4c822528-83c3-42c7-8708-dd1d37166819"
+    },
+    {
+     "code": "drc",
+     "name": "Aetherdrift Commander",
+     "id": "d33ef7a4-41bb-4f16-bad3-b3ee13c257e6"
+    },
+    {
+     "code": "tdc",
+     "name": "Tarkir: Dragonstorm Commander",
+     "id": "bca9779c-0a0b-4ac1-8794-f3fc25549cf4"
+    },
+    {
+     "code": "fic",
+     "name": "Final Fantasy Commander",
+     "id": "30659956-4558-4cbf-a65f-34cd00c89579"
+    },
+    {
+     "code": "eoc",
+     "name": "Edge of Eternities Commander",
+     "id": "b6ec8c6b-b4e6-4cb4-84d6-06234ace3b44"
+    },
+    {
+     "code": "ecc",
+     "name": "Lorwyn Eclipsed Commander",
+     "id": "805b5a0c-f8bb-4555-86ea-eb9ec36a011a"
+    },
+    {
+     "code": "tmc",
+     "name": "Teenage Mutant Ninja Turtles Eternal",
+     "id": "178a07bb-cd54-4443-8b62-675e0c52cfe3"
+    },
+    {
+     "code": "soc",
+     "name": "Secrets of Strixhaven Commander",
+     "id": "97fab8d1-480a-419d-ab14-663968e29b9c"
+    },
+    {
+     "code": "msc",
+     "name": "Marvel Super Heroes Commander",
+     "id": "9d739461-c5ac-43a1-af41-3d5a585b5c8d"
+    },
+    {
+     "code": "trc",
+     "name": "Star Trek Commander",
+     "id": "a38c10be-90b1-4bb9-bd74-46784a751ac3"
+    },
+    {
+     "code": "mdc",
+     "name": "Darkhold Destiny Commander",
+     "id": "4e7f31db-cf1b-4719-9ff9-2b9a3b3957f4"
+    }
+   ]
+  },
+  {
+   "id": "94d2e8a2-5ae8-4b7e-a7db-6770d5cfa6fd",
+   "name": "Innistrad",
+   "sets": [
+    {
+     "code": "pisd",
+     "name": "Innistrad Promos",
+     "id": "94d2e8a2-5ae8-4b7e-a7db-6770d5cfa6fd"
+    },
+    {
+     "code": "isd",
+     "name": "Innistrad",
+     "id": "d1026945-2969-42b9-be53-f941405a58cb"
+    },
+    {
+     "code": "tisd",
+     "name": "Innistrad Tokens",
+     "id": "a91850e1-a8b4-49dd-a5dc-2a73ea4f9e40"
+    },
+    {
+     "code": "pdka",
+     "name": "Dark Ascension Promos",
+     "id": "f784e27e-4af8-4b11-8d45-826388d63604"
+    },
+    {
+     "code": "dka",
+     "name": "Dark Ascension",
+     "id": "8052750a-aaf2-46fc-b46d-633f14124017"
+    },
+    {
+     "code": "tdka",
+     "name": "Dark Ascension Tokens",
+     "id": "5b70a0fa-6968-4e29-b9a1-62d3be626b65"
+    },
+    {
+     "code": "pavr",
+     "name": "Avacyn Restored Promos",
+     "id": "b933d4a1-3d0a-45fb-a73c-a9ae2ba928b0"
+    },
+    {
+     "code": "avr",
+     "name": "Avacyn Restored",
+     "id": "039810a9-92d7-4f2d-b2d0-ca661ac586c0"
+    },
+    {
+     "code": "tavr",
+     "name": "Avacyn Restored Tokens",
+     "id": "c362c2a9-2782-4cbc-917f-05334cb81c5b"
+    }
+   ]
+  },
+  {
+   "id": "80b2374d-c5f1-403e-9772-f6c806fd275e",
+   "name": "Return to Ravnica",
+   "sets": [
+    {
+     "code": "rtr",
+     "name": "Return to Ravnica",
+     "id": "80b2374d-c5f1-403e-9772-f6c806fd275e"
+    },
+    {
+     "code": "prtr",
+     "name": "Return to Ravnica Promos",
+     "id": "4e3ab176-9a9c-41cf-8b74-8c7d5e6731f7"
+    },
+    {
+     "code": "trtr",
+     "name": "Return to Ravnica Tokens",
+     "id": "56289aec-fc72-4bc1-ad67-fac850de5b4e"
+    },
+    {
+     "code": "pgtc",
+     "name": "Gatecrash Promos",
+     "id": "2a51bc89-cf7c-4c31-af17-f46bd45fef40"
+    },
+    {
+     "code": "gtc",
+     "name": "Gatecrash",
+     "id": "035a05f7-e020-4f50-a141-ed16ba704bd2"
+    },
+    {
+     "code": "tgtc",
+     "name": "Gatecrash Tokens",
+     "id": "4a5fbb89-2871-4c06-9b55-0a7911857118"
+    },
+    {
+     "code": "pdgm",
+     "name": "Dragon's Maze Promos",
+     "id": "d29698eb-32e4-448f-977f-aa9b31c408b5"
+    },
+    {
+     "code": "dgm",
+     "name": "Dragon's Maze",
+     "id": "c8bd8520-cd98-45cd-b533-8d40c2087426"
+    },
+    {
+     "code": "tdgm",
+     "name": "Dragon's Maze Tokens",
+     "id": "73406582-d0f6-4c0b-a23d-465485e5a05c"
+    }
+   ]
+  },
+  {
+   "id": "ae24da1d-4b3e-4eff-8860-0d69b2754175",
+   "name": "Theros",
+   "sets": [
+    {
+     "code": "pths",
+     "name": "Theros Promos",
+     "id": "ae24da1d-4b3e-4eff-8860-0d69b2754175"
+    },
+    {
+     "code": "ths",
+     "name": "Theros",
+     "id": "69093d6f-e25a-41a4-8cf5-688d7f11c0fb"
+    },
+    {
+     "code": "thp1",
+     "name": "Theros Hero's Path",
+     "id": "d1b5d85e-f18a-4e47-8305-de8b6661cfbe"
+    },
+    {
+     "code": "tths",
+     "name": "Theros Tokens",
+     "id": "fbed88b2-db9b-4606-8202-8ff746f0513f"
+    },
+    {
+     "code": "tfth",
+     "name": "Face the Hydra",
+     "id": "7d4d5ad5-9936-419c-a278-529d560589e7"
+    },
+    {
+     "code": "pbng",
+     "name": "Born of the Gods Promos",
+     "id": "6733ed2b-f650-4db7-8d7d-d1fba3f60928"
+    },
+    {
+     "code": "bng",
+     "name": "Born of the Gods",
+     "id": "50a80fe4-a757-408f-ad23-52c5cc5f45cc"
+    },
+    {
+     "code": "thp2",
+     "name": "Born of the Gods Hero's Path",
+     "id": "6320d123-ac8b-4119-8bb6-93fb8f92ed5c"
+    },
+    {
+     "code": "tbng",
+     "name": "Born of the Gods Tokens",
+     "id": "81dd6941-9598-43ab-abd7-fd5f2b71b171"
+    },
+    {
+     "code": "tbth",
+     "name": "Battle the Horde",
+     "id": "7dd30d1d-f481-4f68-9383-6ddb51bbe21b"
+    },
+    {
+     "code": "pjou",
+     "name": "Journey into Nyx Promos",
+     "id": "e401cbac-165b-433b-a42b-3f00ffc46652"
+    },
+    {
+     "code": "jou",
+     "name": "Journey into Nyx",
+     "id": "204d2dca-1887-4721-9558-164aa7bbeb4f"
+    },
+    {
+     "code": "thp3",
+     "name": "Journey into Nyx Hero's Path",
+     "id": "6fae3972-2ed8-4203-95b7-7f1229a91468"
+    },
+    {
+     "code": "tjou",
+     "name": "Journey into Nyx Tokens",
+     "id": "6e8a17bb-5e09-475f-9832-4369ee84e1e4"
+    },
+    {
+     "code": "tdag",
+     "name": "Defeat a God",
+     "id": "a8487d2b-228c-4f6b-aebb-00cc06085ddb"
+    }
+   ]
+  },
+  {
+   "id": "7d4ebb59-a50b-45b8-8fff-ab70767819a5",
+   "name": "Conspiracy",
+   "sets": [
+    {
+     "code": "cns",
+     "name": "Conspiracy",
+     "id": "7d4ebb59-a50b-45b8-8fff-ab70767819a5"
+    },
+    {
+     "code": "pcns",
+     "name": "Conspiracy Promos",
+     "id": "f57afd70-7944-47d6-83fb-264d05442710"
+    },
+    {
+     "code": "tcns",
+     "name": "Conspiracy Tokens",
+     "id": "48fa7ece-52b1-446b-9855-413ee4714185"
+    },
+    {
+     "code": "cn2",
+     "name": "Conspiracy: Take the Crown",
+     "id": "ad1b8847-1905-4080-9e26-80691ea7c1ef"
+    },
+    {
+     "code": "tcn2",
+     "name": "Conspiracy: Take the Crown Tokens",
+     "id": "05253e32-2e5b-41e3-8be4-c55cd31fe5fd"
+    }
+   ]
+  },
+  {
+   "id": "6c7a715c-ded9-449e-89b0-c665773e9c3c",
+   "name": "Khans of Tarkir",
+   "sets": [
+    {
+     "code": "ktk",
+     "name": "Khans of Tarkir",
+     "id": "6c7a715c-ded9-449e-89b0-c665773e9c3c"
+    },
+    {
+     "code": "pktk",
+     "name": "Khans of Tarkir Promos",
+     "id": "95318a25-1983-40ae-b315-140160078e3c"
+    },
+    {
+     "code": "tktk",
+     "name": "Khans of Tarkir Tokens",
+     "id": "703ad254-4167-46a7-be4f-a0b86247a42b"
+    },
+    {
+     "code": "ugin",
+     "name": "Ugin's Fate",
+     "id": "fc7ea025-628e-45f4-9e0b-73681b1f68b7"
+    },
+    {
+     "code": "frf",
+     "name": "Fate Reforged",
+     "id": "7bb5cb2b-081a-4c8c-b7e1-494046e6baa1"
+    },
+    {
+     "code": "cp2",
+     "name": "Fate Reforged Clash Pack",
+     "id": "a1bcdc11-74b2-4c86-880f-ae193857ae54"
+    },
+    {
+     "code": "pfrf",
+     "name": "Fate Reforged Promos",
+     "id": "aa9f80e3-8d60-46b7-b91e-eb1736fde866"
+    },
+    {
+     "code": "tfrf",
+     "name": "Fate Reforged Tokens",
+     "id": "bd0fb627-519a-4597-8977-74aa69ab31f5"
+    },
+    {
+     "code": "dtk",
+     "name": "Dragons of Tarkir",
+     "id": "7e72625f-f320-4552-a719-d11e2f1853bd"
+    },
+    {
+     "code": "pdtk",
+     "name": "Dragons of Tarkir Promos",
+     "id": "7f424509-214f-4d0e-91ab-18a99e83afef"
+    },
+    {
+     "code": "tdtk",
+     "name": "Dragons of Tarkir Tokens",
+     "id": "e9bd9e1e-754a-4d8f-a1d1-b9b6f18474c5"
+    },
+    {
+     "code": "ptkdf",
+     "name": "Tarkir Dragonfury",
+     "id": "6f68a621-24b7-4371-a25c-9fff3ed68b8f"
+    }
+   ]
+  },
+  {
+   "id": "9a2e709a-04ee-4d4d-b41e-0642822855b3",
+   "name": "Battle for Zendikar",
+   "sets": [
+    {
+     "code": "pss1",
+     "name": "BFZ Standard Series",
+     "id": "9a2e709a-04ee-4d4d-b41e-0642822855b3"
+    },
+    {
+     "code": "bfz",
+     "name": "Battle for Zendikar",
+     "id": "91719374-7ac5-4afa-ada8-5da964dcf1d4"
+    },
+    {
+     "code": "pbfz",
+     "name": "Battle for Zendikar Promos",
+     "id": "1b5e95bd-4947-4991-8d7d-b770d6b2aaff"
+    },
+    {
+     "code": "tbfz",
+     "name": "Battle for Zendikar Tokens",
+     "id": "b0b5bce3-fe9f-49ca-848d-dc6e2d39c810"
+    },
+    {
+     "code": "exp",
+     "name": "Zendikar Expeditions",
+     "id": "f6ccda04-e8ef-4260-8453-9408d788bacf"
+    },
+    {
+     "code": "ogw",
+     "name": "Oath of the Gatewatch",
+     "id": "cd51d245-8f95-45b0-ab5f-e2b3a3eb5dfe"
+    },
+    {
+     "code": "pogw",
+     "name": "Oath of the Gatewatch Promos",
+     "id": "7de0b874-7cb5-495b-9b2c-137a92d3d493"
+    },
+    {
+     "code": "togw",
+     "name": "Oath of the Gatewatch Tokens",
+     "id": "0898d3dd-a7dd-4d65-bddc-3a0e32a1dfd0"
+    }
+   ]
+  },
+  {
+   "id": "5e914d7e-c1e9-446c-a33d-d093c02b2743",
+   "name": "Shadows over Innistrad",
+   "sets": [
+    {
+     "code": "soi",
+     "name": "Shadows over Innistrad",
+     "id": "5e914d7e-c1e9-446c-a33d-d093c02b2743"
+    },
+    {
+     "code": "psoi",
+     "name": "Shadows over Innistrad Promos",
+     "id": "e1068688-13ff-4a3f-8c66-439162505e7a"
+    },
+    {
+     "code": "tsoi",
+     "name": "Shadows over Innistrad Tokens",
+     "id": "114885aa-26f2-45a5-822f-376ae5374d63"
+    },
+    {
+     "code": "emn",
+     "name": "Eldritch Moon",
+     "id": "5f0e4093-334f-4439-bbb5-a0affafd0ffc"
+    },
+    {
+     "code": "pemn",
+     "name": "Eldritch Moon Promos",
+     "id": "a173a21c-7d0f-4bdd-97df-72ce0b661d62"
+    },
+    {
+     "code": "temn",
+     "name": "Eldritch Moon Tokens",
+     "id": "eaa440dd-b2b5-4228-b7da-9071818497a2"
+    }
+   ]
+  },
+  {
+   "id": "d667e468-be8f-411f-a030-473d148deb74",
+   "name": "Kaladesh",
+   "sets": [
+    {
+     "code": "kld",
+     "name": "Kaladesh",
+     "id": "d667e468-be8f-411f-a030-473d148deb74"
+    },
+    {
+     "code": "mps",
+     "name": "Kaladesh Inventions",
+     "id": "910ea2a2-9f6a-4665-98f6-165ea7928952"
+    },
+    {
+     "code": "pkld",
+     "name": "Kaladesh Promos",
+     "id": "a3531980-f20d-4857-9de0-1b6826ef68e9"
+    },
+    {
+     "code": "tkld",
+     "name": "Kaladesh Tokens",
+     "id": "8980a939-9003-46ee-bd9a-a6bdefd18e26"
+    },
+    {
+     "code": "aer",
+     "name": "Aether Revolt",
+     "id": "a4a0db50-8826-4e73-833c-3fd934375f96"
+    },
+    {
+     "code": "paer",
+     "name": "Aether Revolt Promos",
+     "id": "2acdb824-7cac-4858-a77e-ac868eed5270"
+    },
+    {
+     "code": "taer",
+     "name": "Aether Revolt Tokens",
+     "id": "540e9f76-9408-49bb-910f-ab9c5baea23f"
+    }
+   ]
+  },
+  {
+   "id": "02d1c536-68bc-4208-9b65-7741ef1f9da8",
+   "name": "Amonkhet",
+   "sets": [
+    {
+     "code": "akh",
+     "name": "Amonkhet",
+     "id": "02d1c536-68bc-4208-9b65-7741ef1f9da8"
+    },
+    {
+     "code": "mp2",
+     "name": "Amonkhet Invocations",
+     "id": "c26402e7-838e-48db-a4b2-7abfc305998a"
+    },
+    {
+     "code": "pakh",
+     "name": "Amonkhet Promos",
+     "id": "c1847ece-b71e-4125-973a-465dfb35e496"
+    },
+    {
+     "code": "takh",
+     "name": "Amonkhet Tokens",
+     "id": "739edf06-0069-4a07-8995-18ff67083e8e"
+    },
+    {
+     "code": "hou",
+     "name": "Hour of Devastation",
+     "id": "65ff168b-bb94-47a5-a8f9-4ec6c213e768"
+    },
+    {
+     "code": "phou",
+     "name": "Hour of Devastation Promos",
+     "id": "220548b3-7b6a-43e0-a423-8eefe7feb1a0"
+    },
+    {
+     "code": "thou",
+     "name": "Hour of Devastation Tokens",
+     "id": "cb890bc8-ec73-449e-9be0-46891f39eea1"
+    }
+   ]
+  },
+  {
+   "id": "e9dbe497-c76a-4037-82c1-7ef338d6c54c",
+   "name": "Heroes of the Realm",
+   "sets": [
+    {
+     "code": "phtr",
+     "name": "2016 Heroes of the Realm",
+     "id": "e9dbe497-c76a-4037-82c1-7ef338d6c54c"
+    },
+    {
+     "code": "ph17",
+     "name": "2017 Heroes of the Realm",
+     "id": "6213f371-2428-42aa-a0a9-52c4947039ed"
+    },
+    {
+     "code": "ph18",
+     "name": "2018 Heroes of the Realm",
+     "id": "38346fd1-60eb-4f27-850d-81c9967e8c3e"
+    },
+    {
+     "code": "ph19",
+     "name": "2019 Heroes of the Realm",
+     "id": "dea849fc-18c3-4327-8c1e-72583d6f08e8"
+    },
+    {
+     "code": "ph20",
+     "name": "2020 Heroes of the Realm",
+     "id": "3bb49836-a6be-4249-a461-8a34a4cf48a2"
+    },
+    {
+     "code": "ph21",
+     "name": "2021 Heroes of the Realm",
+     "id": "38549f4f-6e79-46d9-b2f9-52ab0245ee06"
+    },
+    {
+     "code": "ph22",
+     "name": "2022 Heroes of the Realm",
+     "id": "db138fa6-33da-4062-9e48-712cdb893528"
+    },
+    {
+     "code": "ph23",
+     "name": "2023 Heroes of the Realm",
+     "id": "ecbf5a1a-ccdd-4279-856c-928977171f05"
+    }
+   ]
+  },
+  {
+   "id": "fe0dad85-54bc-4151-9200-d68da84dd0f2",
+   "name": "Ixalan",
+   "sets": [
+    {
+     "code": "xln",
+     "name": "Ixalan",
+     "id": "fe0dad85-54bc-4151-9200-d68da84dd0f2"
+    },
+    {
+     "code": "pxln",
+     "name": "Ixalan Promos",
+     "id": "e2876a7e-3444-49cc-a299-aae5094f3566"
+    },
+    {
+     "code": "txln",
+     "name": "Ixalan Tokens",
+     "id": "52f094c5-f3ed-42fc-b6a4-4004c0a48f50"
+    },
+    {
+     "code": "pss2",
+     "name": "XLN Standard Showdown",
+     "id": "6e61f42a-48ff-4cde-8cc7-06dfec6ac11f"
+    },
+    {
+     "code": "pxtc",
+     "name": "XLN Treasure Chest",
+     "id": "2b5230c7-25a8-4521-9f6a-7e3cefb07213"
+    },
+    {
+     "code": "rix",
+     "name": "Rivals of Ixalan",
+     "id": "2f7e40fc-772d-4a85-bfdd-01653c41d0fa"
+    },
+    {
+     "code": "prix",
+     "name": "Rivals of Ixalan Promos",
+     "id": "e7140c68-d478-4ca3-9185-9a64d5e104df"
+    },
+    {
+     "code": "trix",
+     "name": "Rivals of Ixalan Tokens",
+     "id": "a49703ee-b842-44f1-aff3-20a7c75253f6"
+    }
+   ]
+  },
+  {
+   "id": "597c6d4a-8212-4903-a6af-12c4ae9e13f0",
+   "name": "Guilds of Ravnica",
+   "sets": [
+    {
+     "code": "grn",
+     "name": "Guilds of Ravnica",
+     "id": "597c6d4a-8212-4903-a6af-12c4ae9e13f0"
+    },
+    {
+     "code": "pgrn",
+     "name": "Guilds of Ravnica Promos",
+     "id": "ea8a86b2-f171-4942-b52c-6c4e67d1acca"
+    },
+    {
+     "code": "tgrn",
+     "name": "Guilds of Ravnica Tokens",
+     "id": "967bba11-2f81-452c-98c4-56bd7c051242"
+    },
+    {
+     "code": "prwk",
+     "name": "GRN Ravnica Weekend",
+     "id": "3a6a9844-812a-4576-ab71-0e7bc9b16f3b"
+    },
+    {
+     "code": "rna",
+     "name": "Ravnica Allegiance",
+     "id": "97a7fd84-8d89-45a3-b48b-c951f6a3f9f1"
+    },
+    {
+     "code": "prna",
+     "name": "Ravnica Allegiance Promos",
+     "id": "503230ec-81e3-4f92-b847-ff435b1652e0"
+    },
+    {
+     "code": "trna",
+     "name": "Ravnica Allegiance Tokens",
+     "id": "7766a0e4-ff37-4ceb-b68c-6f9336c64ba0"
+    },
+    {
+     "code": "prw2",
+     "name": "RNA Ravnica Weekend",
+     "id": "ee3a8eb6-0583-492b-8be5-265795d38038"
+    },
+    {
+     "code": "war",
+     "name": "War of the Spark",
+     "id": "ee044f0b-e101-4ead-8d0e-aa510aad4277"
+    },
+    {
+     "code": "twar",
+     "name": "War of the Spark Tokens",
+     "id": "347699d9-cef8-457f-b08d-691abe09fc9c"
+    }
+   ]
+  },
+  {
+   "id": "d7efccd6-55bc-4fb8-9138-e72577510a99",
+   "name": "Modern Horizons Block",
+   "sets": [
+    {
+     "code": "mh1",
+     "name": "Modern Horizons",
+     "id": "d7efccd6-55bc-4fb8-9138-e72577510a99"
+    },
+    {
+     "code": "mh2",
+     "name": "Modern Horizons 2",
+     "id": "c1c7eb8c-f205-40ab-a609-767cb296544e"
+    },
+    {
+     "code": "mh3",
+     "name": "Modern Horizons 3",
+     "id": "3ed80bb6-77e8-4aa7-8262-95377a38aba1"
+    }
+   ]
+  },
+  {
+   "id": "44b8eb8f-fa23-401a-98b5-1fbb9871128e",
+   "name": "Innistrad: Double Feature",
+   "sets": [
+    {
+     "code": "mid",
+     "name": "Innistrad: Midnight Hunt",
+     "id": "44b8eb8f-fa23-401a-98b5-1fbb9871128e"
+    },
+    {
+     "code": "pmid",
+     "name": "Innistrad: Midnight Hunt Promos",
+     "id": "e7f1d597-3f0b-4892-a857-ac6f8f6f1058"
+    },
+    {
+     "code": "smid",
+     "name": "Innistrad: Midnight Hunt Substitute Cards",
+     "id": "b2c4b255-2603-478b-b343-3f3bd433896d"
+    },
+    {
+     "code": "tmid",
+     "name": "Innistrad: Midnight Hunt Tokens",
+     "id": "cb7c7eac-c13c-465e-b276-85517f1472d8"
+    },
+    {
+     "code": "amid",
+     "name": "Midnight Hunt Art Series",
+     "id": "fe07d074-f59a-4765-bbbf-80b9bca25130"
+    },
+    {
+     "code": "avow",
+     "name": "Crimson Vow Art Series",
+     "id": "595121bf-ef1d-4ee8-a8ce-591ca2a74ef1"
+    },
+    {
+     "code": "ovoc",
+     "name": "Crimson Vow Commander Display Commanders",
+     "id": "e2b34562-32c8-4221-9fb8-d634b7ad4f86"
+    },
+    {
+     "code": "tvoc",
+     "name": "Crimson Vow Commander Tokens",
+     "id": "1316053f-0acb-48cf-b140-b8cf29437662"
+    },
+    {
+     "code": "vow",
+     "name": "Innistrad: Crimson Vow",
+     "id": "8144b676-569f-4716-8005-bc8f0778f3fa"
+    },
+    {
+     "code": "tvow",
+     "name": "Innistrad: Crimson Vow Tokens",
+     "id": "381f2eb8-544e-409c-a8c5-7171cd78edea"
+    }
+   ]
+  },
+  {
+   "id": "8a673262-8745-452d-820a-03d5c4a4f135",
+   "name": "Alchemy 2022",
+   "sets": [
+    {
+     "code": "ymid",
+     "name": "Alchemy: Innistrad",
+     "id": "8a673262-8745-452d-820a-03d5c4a4f135"
+    },
+    {
+     "code": "yneo",
+     "name": "Alchemy: Kamigawa",
+     "id": "e804713e-fee5-49ee-8a34-5889ffd6094a"
+    },
+    {
+     "code": "ysnc",
+     "name": "Alchemy: New Capenna",
+     "id": "64e1763b-7bcc-45a1-b1b2-69277b754caf"
+    },
+    {
+     "code": "hbg",
+     "name": "Alchemy Horizons: Baldur's Gate",
+     "id": "35528ede-7870-4598-a2ee-7f3d6464a74b"
+    }
+   ]
+  },
+  {
+   "id": "63e08e74-9029-40c3-887a-56211c15ab21",
+   "name": "Alchemy 2023",
+   "sets": [
+    {
+     "code": "ydmu",
+     "name": "Alchemy: Dominaria",
+     "id": "63e08e74-9029-40c3-887a-56211c15ab21"
+    },
+    {
+     "code": "ybro",
+     "name": "Alchemy: The Brothers' War",
+     "id": "5e5f43cc-2312-426e-8ba3-8cda4c2dbba2"
+    },
+    {
+     "code": "yone",
+     "name": "Alchemy: Phyrexia",
+     "id": "d34ef41f-624e-4bf2-9cec-7a7325e474c5"
+    }
+   ]
+  },
+  {
+   "id": "217f004e-8669-45c9-a0ba-1baf81eefab0",
+   "name": "Alchemy 2024",
+   "sets": [
+    {
+     "code": "ywoe",
+     "name": "Alchemy: Wilds of Eldraine",
+     "id": "217f004e-8669-45c9-a0ba-1baf81eefab0"
+    },
+    {
+     "code": "ylci",
+     "name": "Alchemy: Ixalan",
+     "id": "6e26aecd-60e0-4947-b1b2-47ca9416970a"
+    },
+    {
+     "code": "ymkm",
+     "name": "Alchemy: Murders at Karlov Manor",
+     "id": "3879667a-f0b8-4bc2-8662-7c861e22b4e9"
+    },
+    {
+     "code": "yotj",
+     "name": "Alchemy: Outlaws of Thunder Junction",
+     "id": "53ef6d2e-0719-4002-bb5d-5dd41b7ba96c"
+    }
+   ]
+  },
+  {
+   "id": "8b51294d-fc54-410c-83b2-0168837ede87",
+   "name": "Outlaws of Thunder Junction",
+   "sets": [
+    {
+     "code": "otp",
+     "name": "Breaking News",
+     "id": "8b51294d-fc54-410c-83b2-0168837ede87"
+    },
+    {
+     "code": "otj",
+     "name": "Outlaws of Thunder Junction",
+     "id": "55a85ebe-644e-4bef-8be8-5290408be3d1"
+    },
+    {
+     "code": "big",
+     "name": "The Big Score",
+     "id": "14332d2c-ba93-4498-bf3f-9d601f88f783"
+    }
+   ]
+  },
+  {
+   "id": "9425de98-cc10-4295-80e5-42a3bcb75453",
+   "name": "Alchemy 2025",
+   "sets": [
+    {
+     "code": "yblb",
+     "name": "Alchemy: Bloomburrow",
+     "id": "9425de98-cc10-4295-80e5-42a3bcb75453"
+    }
+   ]
+  }
+ ]
+}

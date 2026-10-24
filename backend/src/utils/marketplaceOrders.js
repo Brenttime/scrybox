@@ -913,7 +913,9 @@ async function resolveTcgPageLines(rawLines, deps = {}) {
   for (const pid of ids) {
     if (byPid.has(pid)) continue;
     try {
-      const resp = await scryGet(`/cards/tcgplayer/${pid}`);
+      // tcgplayer_id lookups need live price data the sidecar does not carry,
+      // so pin this one upstream even when LOCAL_SCRYFALL_ENABLED is on.
+      const resp = await scryGet(`/cards/tcgplayer/${pid}`, { upstream: true });
       if (resp && resp.data && resp.data.id) byPid.set(pid, String(resp.data.id));
     } catch { /* 404: not a card Scryfall knows; stays unresolved */ }
   }
