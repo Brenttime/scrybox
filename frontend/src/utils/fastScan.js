@@ -359,7 +359,10 @@ export function guessFromChoices(choices, sets = []) {
   // sheet / promo, then newest, then the lowest collector number.
   const num = (c) => { const n = Number.parseInt(c.number ?? c.collector_number, 10); return Number.isFinite(n) ? n : 1e9; };
   const rel = (c) => String(c.released_at || '');
-  const rank = (a, b) => (sheetish(a) - sheetish(b)) || (rel(b) < rel(a) ? -1 : rel(b) > rel(a) ? 1 : 0) || (num(a) - num(b)) || (String(a.id) < String(b.id) ? -1 : 1);
+  // Normalized card rows carry no release date or treatment flags; promo
+  // sets ('p' + parent code, or a promo set name) rank after regular ones.
+  const promo = (c) => (/^p[a-z0-9]{3}$/.test(String(c.set_id || '').toLowerCase()) || /promo/i.test(c.set_name || '') ? 1 : 0);
+  const rank = (a, b) => (sheetish(a) - sheetish(b)) || (promo(a) - promo(b)) || (rel(b) < rel(a) ? -1 : rel(b) > rel(a) ? 1 : 0) || (num(a) - num(b)) || (String(a.id) < String(b.id) ? -1 : 1);
   for (const s of order) {
     const inSet = list.filter(c => String(c.set_id || '').toLowerCase() === s);
     if (inSet.length) return { card: [...inSet].sort(rank)[0], guess: 'context' };
@@ -400,9 +403,22 @@ export function presenceDecision(committed, hit, epoch) {
 }
 // Change printing is offered on every row whose title has more than one
 // printing (alts unknown = a server answer: offered too), before and after
-// it is sent: a sent collection row re-points its entry ids, a sent list
-// row swaps the list card. Hidden only while the row is still hydrating.
+// it is sent to the collection (its entry ids are re-pointed). Lists hold
+// cards by name, so a row sent to a list has no printing to change; a row
+// still hydrating (~0.1-0.3 s) gets the button once its card arrives.
 export function canChangePrinting(row) {
-  return !!row && !row.pending && (row.alts == null || row.alts > 1)
-    && (!row.sent || row.entryIds?.length > 0 || (!!row.sentDest && row.sentDest !== 'collection'));
+  return !!row && !row.pending && (row.alts == null || row.alts > 1) && (!row.sent || row.entryIds?.length > 0);
+}
+
+// Pure: the collection entry ids each sent row got from bulk-add. Every
+// added entry names its request index, so of two rows for one card only the
+// one that landed is matched (review R1-S5). Map row key -> ids.
+export function sentEntryIds(rows, entries) {
+  const byIndex = new Map((entries || []).filter(e => Number.isInteger(e?.index)).map(e => [e.index, e]));
+  const out = new Map();
+  rows.forEach((row, i) => {
+    const e = byIndex.get(i);
+    if (e && String(e.card_id) === String(row.card.id)) out.set(row.key, (e.ids?.length ? e.ids : [e.id]).filter(Boolean));
+  });
+  return out;
 }

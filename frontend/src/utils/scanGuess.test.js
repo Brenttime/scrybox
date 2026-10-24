@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { loadIndex } from '../../../shared/clientScan/text.mjs';
 import { guessPrinting, guessCodes, guessNumbers } from '../../../shared/clientScan/guess.mjs';
 import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
-import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting } from './fastScan.js';
+import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting, sentEntryIds } from './fastScan.js';
 
 // Real printings (Scryfall, 2026-10) with the index's appended columns
 // [released yyyymmdd, flags: 1 variant, 2 promo/reprint product].
@@ -67,6 +67,7 @@ test('guess: only the last 3 adds are context; footer numbers keep the set-total
   assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { footer: ['110/180'], sets: ['soa'] })), 'mr-soa110');
   // A copyright year is never a number; denominators are never numbers.
   assert.deepEqual([...guessNumbers(['© 2003/2010', '050/249']).keys()], ['50']);
+  assert.deepEqual([...guessNumbers(['050/0249']).keys()], ['50'], 'a padded total is not a number');
 });
 
 test('guess: a same-set old-frame twin (mh2 135 / retro 408) is not a first-look guess', () => {
@@ -208,8 +209,28 @@ test('tray helpers: recent sets, server-choice guess, same-card correction, chan
   assert.equal(canChangePrinting({ alts: 2 }), true);
   assert.equal(canChangePrinting({ alts: 1 }), false);
   assert.equal(canChangePrinting({}), true, 'server answers: printing count unknown');
-  assert.equal(canChangePrinting({ alts: 3, sent: true }), false, 'sent, no entry ids, no destination');
-  assert.equal(canChangePrinting({ alts: 3, sent: true, sentDest: '12' }), true, 'a sent list row swaps the list card');
+  assert.equal(canChangePrinting({ alts: 3, sent: true }), false, 'sent without entry ids');
+  assert.equal(canChangePrinting({ alts: 3, sent: true, sentDest: '12' }), false, 'lists hold cards by name');
   assert.equal(canChangePrinting({ alts: 3, sent: true, entryIds: [5] }), true);
   assert.equal(canChangePrinting({ alts: 3, pending: true }), false);
+});
+
+test('tray: bulk-add entry ids go to the row whose request entry landed (review R1-S5)', () => {
+  const rows = [{ key: 'a', card: { id: 'mtg-x' } }, { key: 'b', card: { id: 'mtg-x' } }];
+  // The first copy failed; the second landed with three ids.
+  const m = sentEntryIds(rows, [{ card_id: 'mtg-x', id: 7, ids: [7, 8, 9], index: 1 }]);
+  assert.deepEqual([...m], [['b', [7, 8, 9]]]);
+  // The server-choice guess puts a promo set after the regular printing.
+  assert.equal(guessFromChoices([{ id: 'p', set_id: 'pm21', number: '1' }, { id: 'r', set_id: 'm21', number: '200' }], []).card.id, 'r');
+});
+
+test('pipeline: a verify read that misses the title verifies nothing (review R2-B2)', async () => {
+  const { r, calls } = reader((c) => (c === 1 ? 'twisted image' : 'zz'));
+  const opts = (frameId) => ({ requireStill: true, frameId, guess: { sets: ['som', 'som', 'som'] } });
+  assert.equal((await r.read(sharpFrame(), small, opts(1))).results[0].guess, 'context');
+  await r.read(sharpFrame(), small, opts(2));            // title miss
+  const n = calls();
+  const third = (await r.read(sharpFrame(), small, opts(3))).results[0];
+  assert.ok(calls() > n, 'the next frame reads again'); assert.ok(!third?.cached);
+  r.resetCache?.();
 });

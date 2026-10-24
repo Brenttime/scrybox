@@ -33,7 +33,8 @@ export function guessNumbers(raws) {
     if (!YEAR.test(n)) out.set(normalizeCollector(n), total || 0);
   }
   for (const raw of raws) {
-    for (const run of String(raw).match(/(?<!\d)0\d{3}(?!\d)/g) || []) {
+    // Not after a '/': a padded set total ('050/0249') is never a number.
+    for (const run of String(raw).match(/(?<![\d/])0\d{3}(?![\d/])/g) || []) {
       const n = normalizeCollector(run);
       if (!out.has(n)) out.set(n, 0);
     }

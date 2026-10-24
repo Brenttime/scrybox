@@ -563,7 +563,9 @@ async function bulkAddToCollection(user, entries, shared) {
   const failed = [];
   // Sequential on purpose: preserve input order and avoid overlapping cache
   // hydration/insertion work for duplicate cards in the same request.
-  for (const entry of entries) {
+  // `index` = the entry's position in the request, so a caller with several
+  // entries for one card (Scan Cards rows) can tell which of them landed.
+  for (const [index, entry] of entries.entries()) {
     const keyed = entry && typeof entry === 'object';
     const card_id = keyed ? entry.card_id : entry;
     const perCard = {};
@@ -580,10 +582,10 @@ async function bulkAddToCollection(user, entries, shared) {
 
     try {
       const result = await addCardToCollection(user, { ...shared, ...perCard, card_id });
-      added.push({ card_id, id: result.id, ids: result.ids });
+      added.push({ card_id, id: result.id, ids: result.ids, index });
     } catch (error) {
       if (!(error instanceof AddCardError)) console.error(error);
-      failed.push({ card_id, error: error instanceof AddCardError ? error.message : 'Failed to add card' });
+      failed.push({ card_id, error: error instanceof AddCardError ? error.message : 'Failed to add card', index });
     }
   }
   return { added, failed, quantity: Math.max(1, parseInt(shared && shared.quantity, 10) || 1) };

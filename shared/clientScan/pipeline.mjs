@@ -602,7 +602,9 @@ export function createReader(env) {
       // A guess: verify once with every stage unless this read already ran
       // them (a verify pass, or a guess made after the full cascade).
       guessed = result.guess ? { sig, coarse: coarseSig, result, verified: verifying || !result.guess_first } : null;
-    } else if (verifying) guessed = { ...guessed, verified: true };
+    // A verify read counts once it reached the footer cascade (title read);
+    // a title miss or an edge abstain ran no stage and verifies nothing.
+    } else if (verifying && result.title) guessed = { ...guessed, verified: true };
     else if (result.title && (result.footer_ocr?.length || result.deferred || result.held?.length)) {
       // Validated old-frame numbers are stored per frame, aligned with the
       // frames window, so they expire with their own frame (review R3-S1)
@@ -1010,7 +1012,7 @@ export function createReader(env) {
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, resetCache() { tracked = null; } };
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, resetCache() { tracked = null; guessed = null; } };
 }
 
 export { normName };

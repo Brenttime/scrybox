@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting, sentEntryIds } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -39,8 +39,10 @@ const EDGE_HINT = {
 // yields the main thread (tray, overlay) between passes.
 const AUTO_FRAME_MIN_MS = 8;
 const HYDRATE_RETRY_MS = [1000, 3000, 10000, 30000];
-// Deadline for each Change-printing request on a sent row.
+// Deadline for each Change-printing request on a sent row, and the pause
+// before a failed automatic correction is tried again.
 const REPOINT_TIMEOUT_MS = 8000;
+const FIX_RETRY_MS = 3000;
 const AUTO_FRAME_MAX_EXTRA_MS = 40;
 const FAST_DEVICE = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 8);
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
@@ -331,6 +333,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // A failure never drops the proven card (review R1-B4): the row stays in
   // the tray, unsendable, marked failed, and is retried with backoff (and on
   // tap) until it hydrates or the user dismisses it.
+  const wantHitRef = useRef(new Map());   // row key -> the hit a corrected pending row must hydrate
   const hydrateRow = useCallback((row, attempt = 0) => {
     // One lifecycle per row (review R2-S3): a manual retry replaces any
     // scheduled one, and a row already hydrating is not started twice.
@@ -346,7 +349,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     // The row may be re-pointed (a guess corrected) while this request runs:
     // the answer belongs to THIS printing only, and the row's new printing
     // gets its own hydration (review R1-B3).
-    const moved = () => { const now = resultsRef.current.find(x => x.key === row.key); return now?.pending && now.hit && now.hit.scryfallId !== h.scryfallId ? now : null; };
+    // wantHitRef is written synchronously by a correction, so this holds
+    // even before React has committed the corrected row (review R2-B3).
+    const moved = () => { const want = wantHitRef.current.get(row.key); return want && want.scryfallId !== h.scryfallId ? { ...row, hit: want } : null; };
     hydrateResults([{ number: h.number ?? 1, ok: true, scryfallId: h.scryfallId, title: h.title, via: h.via }], ctl.signal)
       .then((res) => {
         const card = res?.[0]?.card;
@@ -355,6 +360,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         life.delete(row.key);
         const next = moved();
         if (next) { hydrateRow(next); return; }
+        wantHitRef.current.delete(row.key);
         setResults(prev => prev.map(x => (x.key === row.key && (!x.hit || x.hit.scryfallId === h.scryfallId) ? { ...x, card, pending: false, hydrateFailed: false, hit: undefined } : x)));
         scanTelemetry.begin({ mode: 'hydrate', sw: 0, sh: 0 }).end({ outcome: 'hydrated', row: row.key, pres: row.pres, attempt, hydrate_ms: Math.round(performance.now() - th), usable_enqueue_ms: row.t0 != null ? Math.round(performance.now() - row.t0) : undefined });
       })
@@ -375,35 +381,30 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       });
   }, []);
 
-  // Re-point a SENT row at another printing of the same card. Collection:
+  // Re-point a SENT collection row at another printing of the same card:
   // the collection's own Change printing (PUT /collection/:id {card_id}),
-  // one entry at a time; a failure part-way reverts the entries already
-  // moved, so the collection never ends up split between two printings.
-  // List: add the new printing, then remove the old one. Every request has
-  // a deadline (review R1-B6).
+  // one entry at a time with a deadline each. A failure part-way reverts
+  // the entries already moved; if a revert fails too, the error says the
+  // copies are split so the user is told to check them (review R2-B6).
+  // Lists hold cards by name, not printing, so a sent list row has no
+  // printing to change (review R2-NB1).
   const repointSent = useCallback(async (row, card) => {
-    const call = (url, method, body) => {
+    const put = (id, cardId) => {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), REPOINT_TIMEOUT_MS);
-      return fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal })
+      return fetch(`/api/collection/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card_id: cardId }), signal: ctl.signal })
         .then(r => r.ok).catch(() => false).finally(() => clearTimeout(timer));
     };
     const old = row.card;
-    if (row.sentDest && row.sentDest !== 'collection') {
-      const base = `/api/lists/${encodeURIComponent(row.sentDest)}/cards`;
-      const qty = qtyOf(row);
-      if (!await call(`${base}/bulk`, 'POST', { cards: [{ card_id: card.id, quantity: qty }] })) throw new Error('change printing failed');
-      if (!await call(`${base}/bulk-remove`, 'POST', { cards: [{ card_id: old.id, quantity: qty }] })) {
-        await call(`${base}/bulk-remove`, 'POST', { cards: [{ card_id: card.id, quantity: qty }] });
-        throw new Error('change printing failed');
-      }
-      return;
-    }
     const moved = [];
     for (const id of row.entryIds || []) {
-      if (await call(`/api/collection/${id}`, 'PUT', { card_id: card.id })) { moved.push(id); continue; }
-      for (const back of moved) await call(`/api/collection/${back}`, 'PUT', { card_id: old.id });
-      throw new Error('change printing failed');
+      if (await put(id, card.id)) { moved.push(id); continue; }
+      let split = false;
+      for (const back of moved) if (!await put(back, old.id)) split = true;
+      const err = new Error(split ? 'change printing split' : 'change printing failed');
+      err.split = split;
+      if (split) onAddSuccess?.();
+      throw err;
     }
     onAddSuccess?.();
   }, [onAddSuccess]);
@@ -414,22 +415,32 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // is never overridden (review R1-B4/B5/B6).
   const fixingRef = useRef(new Set());
   const sendingRef = useRef(false);
-  const pendingFixRef = useRef(new Map());   // row key -> hit, queued during a Send
-  const correctGuess = useCallback(async (rowKey, h) => {
+  const pendingFixRef = useRef(new Map());   // row key -> [presence record, hit], queued during a Send
+  const correctGuess = useCallback(async (rec, h) => {
+    const rowKey = rec.rowKey;
     const row = resultsRef.current.find(x => x.key === rowKey);
-    if (!row || row.userPicked || fixingRef.current.has(rowKey)) return;
-    if (sendingRef.current) { pendingFixRef.current.set(rowKey, h); return; }
-    if (row.card.id === h.card.id) { setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
+    // The commit is acknowledged as proven only when the correction lands;
+    // a failed one is retried by a later proof after a pause (review R2-NS1).
+    if (!row || row.userPicked) { rec.guess = false; return; }
+    if (fixingRef.current.has(rowKey) || (rec.retryAt && Date.now() < rec.retryAt)) return;
+    if (sendingRef.current) { pendingFixRef.current.set(rowKey, [rec, h]); return; }
+    if (row.card.id === h.card.id) { rec.guess = false; setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
     fixingRef.current.add(rowKey);
     try {
-      if (row.sent) await repointSent(row, h.card);
+      if (row.sent) {
+        if (!row.entryIds?.length) { rec.guess = false; return; }
+        await repointSent(row, h.card);
+      }
     } catch (e) {
       console.warn('[fastscan] guess correction failed:', e?.message);
-      if (aliveRef.current) showToast?.(t('fastscan.changeFailed'));
+      rec.retryAt = Date.now() + FIX_RETRY_MS;
+      if (aliveRef.current) showToast?.(t(e?.split ? 'fastscan.changeSplit' : 'fastscan.changeFailed'));
       return;
     } finally { fixingRef.current.delete(rowKey); }
+    rec.guess = false;
     if (!aliveRef.current) return;
     const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
+    if (next.pending) wantHitRef.current.set(rowKey, h); else wantHitRef.current.delete(rowKey);
     setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, ...next } : x)));
     if (next.pending) hydrateRow({ ...row, ...next });
   }, [hydrateRow, repointSent, showToast, t]);
@@ -609,12 +620,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const fresh = hits.filter((h) => {
         const dup = autoPass && !dedupeFresh(seenIdsRef.current, h.card.id, now);
         const d = autoPass && pres ? presenceDecision(committedRef.current, h, pres.epoch) : { action: 'add' };
-        if (d.action === 'fix') { fixes.push([d.rec.rowKey, h]); d.rec.guess = false; }
+        if (d.action === 'fix') fixes.push([d.rec, h]);
         if (d.action !== 'add') return false;
         return !dup;
       });
       notePresence(seenIdsRef.current, out, hits, now, new Set(fresh.map(h => h.card.id)));
-      for (const [key, h] of fixes) correctGuessRef.current(key, h);
+      for (const [rec, h] of fixes) correctGuessRef.current(rec, h);
       const guessed = fresh.find(h => h.guess);
       if (hits.length) firstSeenRef.current = null;
       const tEnd = performance.now();
@@ -773,16 +784,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const got = j.entries || [];
         let okRows;
         if (dest === 'collection') {
-          // bulk-add processes the entries in request order and answers one
-          // entry per ADDED card, skipping failures: match them in order, row
-          // by row, so a failed copy of a card never costs another row its
-          // entry ids (review R1-S5).
-          okRows = [];
-          let gi = 0;
-          for (const row of part) {
-            const e = got[gi];
-            if (e && String(e.card_id) === String(row.card.id)) { okRows.push(row); entryIds.set(row.key, (e.ids?.length ? e.ids : [e.id]).filter(Boolean)); gi++; }
-          }
+          // Each added entry names its request index (review R1-S5/R2): a
+          // failed copy of a card never lends another row its entry ids.
+          const sent = sentEntryIds(part, got);
+          okRows = part.filter(row => sent.has(row.key));
+          for (const [key, ids] of sent) entryIds.set(key, ids);
         } else {
           const failed = new Set((j.failed || []).map(f => (typeof f === 'object' ? f.card_id : f)));
           okRows = part.filter(row => !failed.has(row.card.id));
@@ -814,7 +820,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // Corrections that waited for this Send (review R1-B4); after the
       // tray state above has landed.
       const queued = [...pendingFixRef.current]; pendingFixRef.current.clear();
-      if (queued.length) setTimeout(() => { for (const [key, h] of queued) correctGuessRef.current(key, h); }, 0);
+      if (queued.length) setTimeout(() => { for (const [, [rec, h]] of queued) correctGuessRef.current(rec, h); }, 0);
     }
   };
 
@@ -847,7 +853,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (row.sent && card.id !== row.card.id) {
       if (card.name !== row.card.name) return;
       fixingRef.current.add(key);
-      try { await repointSent(row, card); } catch { showToast?.(t('fastscan.changeFailed')); return; } finally { fixingRef.current.delete(key); }
+      try { await repointSent(row, card); } catch (e) { showToast?.(t(e?.split ? 'fastscan.changeSplit' : 'fastscan.changeFailed')); return; } finally { fixingRef.current.delete(key); }
     }
     setResults(prev => prev.map((x) => {
       if (x.key !== key) return x;
@@ -880,8 +886,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         for (const part of chunks(u.rows)) {
           const r = await fetch(`/api/lists/${encodeURIComponent(u.dest)}/cards/bulk-remove`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            // The printing on the list now (it may have been changed since).
-            body: JSON.stringify({ cards: part.map(row => ({ card_id: (resultsRef.current.find(x => x.key === row.key) || row).card.id, quantity: qtyOf(row) })) }),
+            body: JSON.stringify({ cards: part.map(row => ({ card_id: row.card.id, quantity: qtyOf(row) })) }),
           });
           if (!r.ok) throw new Error('undo failed');
         }

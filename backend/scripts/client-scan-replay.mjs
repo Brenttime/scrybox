@@ -88,6 +88,8 @@ for (const f of files) {
   // Context advances on simulated ADDS only: a new title (the tray de-dupes
   // a card that stays in view), as FastScanner's recentSets sees it.
   if (r?.ok && r.set && r.title !== lastAdded) { recent.unshift(r.set); lastAdded = r.title; }
+  // A later proof of the same card corrects that add's set (the tray row).
+  else if (r?.ok && r.set && !r.guess && r.title === lastAdded) recent[0] = r.set;
   rows.push({
     frame: f, ms: Math.round(ms), recCalls: reader.stats.recCalls - before.recCalls,
     status: cand ? cand.status : 'no card', sharp: cand?.sharpness, stage: r?.footer_stage, err: r?.error, ok: !!r?.ok, id: r?.scryfallId || null,
