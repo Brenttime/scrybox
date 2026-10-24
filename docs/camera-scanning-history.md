@@ -359,7 +359,64 @@ Next: verify stamp registration against the footer text line, then re-run
 the sweep with offsets; ask Brent for a scan round with frame retention on
 SOS / List cards to calibrate from real frames.
 
+## Printing guess from scan context (scanguess build, 2026-10-24)
+Owner decision (Brent): when the title is proven but the footer cannot
+split its printings, guess the printing instead of waiting or asking. This
+supersedes the old "never guess the printing" rule for proven titles only.
+The title is never guessed.
+
+- **Measured problem.** Round of 2026-10-24 13:19-13:26Z (Windows, build
+  1.8.5+20261023T1950): 118 adds, `waited_ms` p50 581, p90 1895, max 9999,
+  80.5 % under 1 s. The largest cause of slow adds was repeated deep footer
+  retries on proven titles ("exact printing not resolved"), mostly soa
+  archive variants and sos/plst twins. The independent Astra analysis came
+  to the same top cause. The ~16.8k misses were mostly idle or unreadable
+  scenes, not printing loops.
+- **Guess (shared/clientScan/guess.mjs).** Footer numbers/set codes that
+  the resolver could not use still narrow the candidates. Then the set of
+  the last 3 added cards (most frequent, then most recent). Then the most
+  regular printing: no reprint sheet, no promo set, no variant treatment,
+  two finishes; then newest; then lowest number. Rows and telemetry carry
+  `guess: 'footer'|'context'|'fallback'`.
+- **When.** A first-look guess (before the deeper footer stages) only when
+  the pick is strictly the most regular printing of its set and the set has
+  no old-frame twin (mh2 135 / retro 408), not near the frame edge, not for
+  a title that prefixes a longer one (Flicker / Flickering Hound). The next
+  frame of the same card then runs the full cascade once, so a deeper
+  footer proof still corrects the row. Otherwise the guess comes after the
+  full cascade. Guesses are single-card only; multi-card frames keep proofs
+  and the tray choice row.
+- **Client index.** Printing rows gained two optional columns:
+  `[id, set, num, released_yyyymmdd, flags]` (cardscan
+  `tools/build_client_index.py`; flags 1 variant/promo treatment, 2 promo
+  or product set, 4 old frame, 8 single finish, from Scryfall
+  default-cards). Older indexes still work, with fewer first-look guesses.
+- **Tray.** Every row with more than one printing has a visible printing
+  chip, before and after Send. A sent collection row is re-pointed with
+  `PUT /collection/:id {card_id}` (reverted on partial failure). Lists hold
+  cards by name, so a list row has no printing to change after Send.
+  Guessed rows get a subtle amber outline and a "guessed" tag. A proof
+  after a guess corrects
+  the row in place; a card that stays in view is never added twice.
+  bulk-add now returns each entry's request `index`.
+- **Replay** (1,024-frame set, `--stream --auto --guess --every 2`): no
+  new wrong titles, no proven printing changed. Client answers 299 -> 466
+  frames (+136 guesses on "exact printing not resolved", +31 on "needs a
+  choice"). Mean read time on those ambiguous frames 1.81 s -> 1.16 s.
+- **Telemetry projection** (same adds, guess policy applied):
+  2026-10-24 round p90 1895 -> ~1075 ms, under 1 s 80.5 % -> ~89 %;
+  2026-10-23 round under 1 s 72 % -> ~83 %. Still above 1 s: sos title
+  misses (Charging Strifeknight 4.9 s, Expressive Firedancer 3.4 s), soa
+  cards whose footer the first look reads but cannot use, and verify passes
+  that overlap the next card.
+- **Reviews.** Astra review loop: 8 rounds (prefix titles, verify after a
+  first-look guess, hydration/send/correction ownership, duplicate adds,
+  bulk-add index, multi-card scope).
+
 ## Known open items
+- Measure the scanguess build on a real round (`guess` field in telemetry).
+- Title misses on sharp sos cards (Charging Strifeknight, Expressive
+  Firedancer): see the Astra latency report's title-rescue plan.
 - Measure the new build on the PC and a phone (target < 1 s).
 - Targeted OCR-confusion handling (Icy Reception). The frame still
   fails.
