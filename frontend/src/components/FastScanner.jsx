@@ -4,7 +4,7 @@ import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, updatePresence, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -147,10 +147,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // One id per camera session: the sidecar scopes its identity cache to it.
   const sessionRef = useRef(Math.random().toString(36).slice(2, 12));
   const seenIdsRef = useRef(new Map()); // card.id -> {at, place, broken} (auto de-dupe)
-  // Cards committed per presentation (epoch + title -> {rowKey, guess}),
-  // independent of the tray: a dismissed or edited row still counts, so a
-  // card that stays in view is never added twice (review R1-B5).
-  const committedRef = useRef(new Map());
+  // Cards committed and still lying where they were read (fastScan
+  // updatePresence): independent of the tray and of the presentation epoch,
+  // so a card that stays in view is never added twice (review R1-B5 .. R9).
+  const committedRef = useRef([]);
   const presRef = useRef(null);         // current presentation (one card in view), for telemetry
   const epochRef = useRef(0);           // last presentation epoch handed out this run (monotonic)
   const hydrateAbortRef = useRef(null); // background hydrations, aborted on unmount only
@@ -628,9 +628,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // same title): a footer-proven printing corrects that row in place; a
       // further guess is a repeat. Never a second copy of one card.
       const fixes = [];
+      if (autoPass) committedRef.current = updatePresence(committedRef.current, out, hits);
       const fresh = hits.filter((h) => {
         const dup = autoPass && !dedupeFresh(seenIdsRef.current, h.card.id, now);
-        const d = autoPass && pres ? presenceDecision(committedRef.current, h, pres.epoch, hitCentre(out, h)) : { action: 'add' };
+        const d = autoPass ? presenceDecision(committedRef.current, h, hitCentre(out, h)) : { action: 'add' };
         if (d.action === 'fix') fixes.push([d.rec, h]);
         if (d.action !== 'add') return false;
         return !dup;
@@ -662,10 +663,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
           alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
-        if (pres) {
+        if (autoPass) {
           for (const row of rows) {
             const tentative = !!(row.guess || row.needsChoice);
-            notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: tentative, wasGuess: tentative }, hitCentre(out, row.hit));
+            committedRef.current = notePresenceCommit(committedRef.current, row.card, { rowKey: row.key, guess: tentative, wasGuess: tentative }, hitCentre(out, row.hit));
           }
         }
         setResults(prev => [...rows, ...prev]);
@@ -736,7 +737,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); committedRef.current.clear(); failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; presRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); committedRef.current = []; failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; presRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };

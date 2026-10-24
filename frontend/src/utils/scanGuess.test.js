@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { loadIndex } from '../../../shared/clientScan/text.mjs';
 import { guessPrinting, guessCodes, guessNumbers } from '../../../shared/clientScan/guess.mjs';
 import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
-import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, hitCentre, canChangePrinting, sentEntryIds } from './fastScan.js';
+import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, updatePresence, hitCentre, canChangePrinting, sentEntryIds } from './fastScan.js';
 
 // Real printings (Scryfall, 2026-10) with the index's appended columns
 // [released yyyymmdd, flags: 1 variant, 2 promo/reprint product].
@@ -197,21 +197,19 @@ test('tray helpers: recent sets, server-choice guess, same-card correction, chan
   assert.deepEqual(guessFromChoices(cards, []), { card: cards[1], guess: 'fallback' });
   const h = guessChoiceHit({ card: { id: 'choose:x' }, choose: cards }, ['plst']);
   assert.equal(h.card.id, 'mtg-p'); assert.equal(h.ok, true); assert.equal(h.alts, 2); assert.equal(h.choose, undefined);
-  // Same-presentation bookkeeping, independent of the tray (review R1-B5).
-  const committed = new Map();
-  notePresenceCommit(committed, 7, { name: "Archaic's Agony" }, { rowKey: 'a', guess: true });
-  assert.equal(presenceDecision(committed, { card: { name: 'archaic s agony', id: 'x' } }, 7).action, 'fix', 'a proof after a guess corrects it');
-  assert.equal(presenceDecision(committed, { guess: 'context', card: { name: "Archaic's Agony", id: 'y' } }, 7).action, 'repeat');
-  assert.equal(presenceDecision(committed, { card: { name: "Archaic's Agony" } }, 8).action, 'add', 'another presentation is another copy');
-  notePresenceCommit(committed, 9, { name: 'Twisted Image' }, { rowKey: 'p', guess: false });
-  assert.equal(presenceDecision(committed, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'a guess after a proof is a repeat');
-  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'add', 'two proofs keep the old id de-dupe (reprint swap, second card)');
-  // A guess corrected to B: further B proofs in that presentation repeat,
-  // even after the id de-dupe window (review R4-B5).
-  notePresenceCommit(committed, 10, { name: 'Twisted Image' }, { rowKey: 'q', guess: false, wasGuess: true });
-  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-b' } }, 10).action, 'repeat');
-  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-c' } }, 10).action, 'repeat');
-  assert.equal(presenceDecision(committed, { card: { name: 'Bala Ged Recovery // Bala Ged Sanctuary' } }, 3).action, 'add');
+  // Card-place bookkeeping, independent of the tray (review R1-B5).
+  let recs = notePresenceCommit([], { name: "Archaic's Agony" }, { rowKey: 'a', guess: true, wasGuess: true });
+  assert.equal(presenceDecision(recs, { card: { name: 'archaic s agony', id: 'x' } }).action, 'fix', 'a proof after a guess corrects it');
+  assert.equal(presenceDecision(recs, { guess: 'context', card: { name: "Archaic's Agony", id: 'y' } }).action, 'repeat');
+  assert.equal(updatePresence(recs, { candidates: [] }).length, 0, 'a lift ends it');
+  recs = notePresenceCommit([], { name: 'Twisted Image' }, { rowKey: 'p', guess: false });
+  assert.equal(presenceDecision(recs, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }).action, 'repeat', 'a guess after a proof is a repeat');
+  assert.equal(presenceDecision(recs, { card: { name: 'Twisted Image', id: 'mtg-a25' } }).action, 'add', 'two proofs keep the old id de-dupe (reprint swap, second card)');
+  assert.equal(presenceDecision(recs, { card: { name: 'Bala Ged Recovery // Bala Ged Sanctuary' } }).action, 'add');
+  // A guess corrected to B: further B (or C) proofs at that place repeat.
+  recs = notePresenceCommit([], { name: 'Twisted Image' }, { rowKey: 'q', guess: false, wasGuess: true });
+  assert.equal(presenceDecision(recs, { card: { name: 'Twisted Image', id: 'mtg-b' } }).action, 'repeat');
+  assert.equal(presenceDecision(recs, { card: { name: 'Twisted Image', id: 'mtg-c' } }).action, 'repeat');
   // The server-choice guess uses the same ranking: newest regular printing.
   const tw = [{ id: 'mtg-o', set_id: 'ody', number: '129', released_at: '2001-10-01' }, { id: 'mtg-l', set_id: 'plst', number: 'ODY-129', set_name: 'The List', released_at: '2020-09-01' }, { id: 'mtg-m', set_id: 'm12', number: '92', released_at: '2011-07-15' }];
   assert.equal(guessFromChoices(tw, []).card.id, 'mtg-m');
@@ -253,18 +251,24 @@ test('pipeline: resetCache keeps a pending verify, drops a verified guess (revie
   assert.equal((await r.read(sharpFrame(), small, opts(2))).results[0].scryfallId, 'ti-a25', 'the verify still ran');
 });
 
-test('tray: presence records are per card place; choices count as tentative (review R7/R8)', () => {
-  const out = { frame: { width: 1000, height: 0 }, candidates: [{ number: 1, box: [0, 0, 100, 100] }, { number: 2, box: [600, 0, 100, 100] }] };
-  const left = hitCentre(out, { number: 1 }), right = hitCentre(out, { number: 2 });
+test('tray: presence records are per card place and survive the first candidate changing (review R7-R9)', () => {
+  const frame = { width: 1000, height: 0 };
+  const L = { number: 1, box: [0, 0, 100, 100] }, R = { number: 2, box: [600, 0, 100, 100] };
+  const two = { frame, candidates: [L, R] }, rightOnly = { frame, candidates: [{ ...R, number: 1 }] };
+  const left = hitCentre(two, { number: 1 }), right = hitCentre(two, { number: 2 });
   assert.ok(left && right && right.cx > left.cx);
-  const committed = new Map();
-  notePresenceCommit(committed, 1, { name: 'Shock' }, { rowKey: 'l', guess: true, wasGuess: true }, left);
-  // The same title proven at another place is another card.
-  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'b' } }, 1, right).action, 'add');
-  // At the guessed card's place it corrects it; a choice there repeats.
-  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'b' } }, 1, left).action, 'fix');
-  assert.equal(presenceDecision(committed, { choose: [{}, {}], card: { name: 'Shock', id: 'k' } }, 1, left).action, 'repeat');
-  // A choice row at the right is tentative too: a proof there resolves it.
-  notePresenceCommit(committed, 1, { name: 'Shock' }, { rowKey: 'r', guess: true, wasGuess: true }, right);
-  assert.equal(presenceDecision(committed, { card: { name: 'Shock', id: 'c' } }, 1, right).rec.rowKey, 'r');
+  let recs = notePresenceCommit([], { name: 'Shock' }, { rowKey: 'l', guess: true, wasGuess: true }, left);
+  assert.equal(presenceDecision(recs, { card: { name: 'Shock', id: 'b' } }, right).action, 'add', 'another place is another card');
+  assert.equal(presenceDecision(recs, { card: { name: 'Shock', id: 'b' } }, left).action, 'fix');
+  assert.equal(presenceDecision(recs, { choose: [{}, {}], card: { name: 'Shock', id: 'k' } }, left).action, 'repeat');
+  recs = notePresenceCommit(recs, { name: 'Shock' }, { rowKey: 'r', guess: true, wasGuess: true }, right);
+  assert.equal(presenceDecision(recs, { card: { name: 'Shock', id: 'c' } }, right).rec.rowKey, 'r');
+  // The left companion leaves: the right card's record stays (its place is
+  // still occupied), the left one ends.
+  recs = updatePresence(recs, rightOnly);
+  assert.deepEqual(recs.map(r => r.rowKey), ['r']);
+  assert.equal(presenceDecision(recs, { guess: 'context', card: { name: 'Shock', id: 'a' } }, hitCentre(rightOnly, { number: 1 })).action, 'repeat');
+  // Another title read at that place ends the record.
+  recs = updatePresence(recs, rightOnly, [{ number: 1, card: { name: 'Opt' } }]);
+  assert.equal(recs.length, 0);
 });
