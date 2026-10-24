@@ -442,7 +442,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     } finally { fixingRef.current.delete(rowKey); }
     rec.guess = false; rec.cardId = h.card.id;
     if (!aliveRef.current) return;
-    const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
+    const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, hydrateFailed: false, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
     if (next.pending) wantHitRef.current.set(rowKey, h); else wantHitRef.current.delete(rowKey);
     setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, ...next } : x)));
     if (next.pending) hydrateRow({ ...row, ...next });

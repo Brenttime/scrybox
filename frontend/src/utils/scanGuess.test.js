@@ -201,7 +201,7 @@ test('tray helpers: recent sets, server-choice guess, same-card correction, chan
   assert.equal(presenceDecision(committed, { card: { name: "Archaic's Agony" } }, 8).action, 'add', 'another presentation is another copy');
   notePresenceCommit(committed, 9, { name: 'Twisted Image' }, { rowKey: 'p', guess: false });
   assert.equal(presenceDecision(committed, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'a guess after a proof is a repeat');
-  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'add', 'two proofs keep the old id de-dupe');
+  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'one card per presentation and title');
   // A guess corrected to B: further B proofs in that presentation repeat,
   // even after the id de-dupe window (review R4-B5).
   notePresenceCommit(committed, 10, { name: 'Twisted Image' }, { rowKey: 'q', guess: false, cardId: 'mtg-b' });
