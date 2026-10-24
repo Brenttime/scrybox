@@ -187,7 +187,7 @@ export function readOnDevice(source, sw, sh, opts = {}) {
   return serialized(() => readOnce(source, sw, sh, opts));
 }
 
-async function readOnce(source, sw, sh, { requireStill = false } = {}) {
+async function readOnce(source, sw, sh, { requireStill = false, guess = null } = {}) {
   const clock = frameClock(source);
   // Re-loads transparently if a crash or deadline tore the last worker down.
   const tq = performance.now();
@@ -223,7 +223,7 @@ async function readOnce(source, sw, sh, { requireStill = false } = {}) {
   if (!p.quad) return { ...p.out, span };          // no card: skip the full-frame readback
   const frame = pixels(fc, w, h);
   lap('readback_ms');
-  const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill, frameId }, [frame]);
+  const r = await call({ type: 'read', frame, w, h, quad: p.quad, requireStill, frameId, guess }, [frame]);
   lap('worker_read_ms');
   return r.error ? { error: r.error, span } : { ...r.out, span };
 }

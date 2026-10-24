@@ -1968,6 +1968,12 @@ select optgroup,
 .fs-card-edit { position: absolute; inset: 0; border: 0; padding: 0; background: transparent; cursor: pointer; }
 .fs-card-edit:focus-visible { outline: 2px solid #fbbf24; outline-offset: -2px; }
 .fs-card-art .fs-card-x, .fs-card-art .fs-card-price, .fs-card-art .fs-card-badge { z-index: 1; }
+.fs-card-printing { position: absolute; top: 5px; left: 5px; z-index: 1; display: inline-flex; align-items: center; gap: 3px; height: 22px; padding: 0 7px; border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: rgba(8,10,18,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: var(--text-strong, #f3f4f6); font: 600 10.5px/1 -apple-system, system-ui, sans-serif; cursor: pointer; }
+.fs-card-printing:focus-visible { outline: 2px solid #fbbf24; outline-offset: 1px; }
+/* A guessed printing: a subtle amber hint on the art and the chip. */
+.fs-card.is-guessed .fs-card-art { box-shadow: 0 0 0 1.5px rgba(251,191,36,.5), 0 6px 18px -8px rgba(0,0,0,.8); }
+.fs-card.is-guessed.is-added .fs-card-art { box-shadow: 0 0 0 2px #34d399, 0 0 0 4px rgba(251,191,36,.4), 0 6px 18px -8px rgba(0,0,0,.8); }
+.fs-card.is-guessed .fs-card-printing { color: #fde68a; border-color: rgba(251,191,36,.45); }
 .fs-undo { display: inline-flex; align-items: center; gap: 4px; font-size: .8rem; padding: 6px 10px; border-radius: 999px; }
 .fs-sheet-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,.55); display: flex; align-items: flex-end; justify-content: center; }
 .fs-sheet { width: min(720px, 100%); max-height: 78vh; overflow: auto; border-radius: 22px 22px 0 0; padding: 16px; }

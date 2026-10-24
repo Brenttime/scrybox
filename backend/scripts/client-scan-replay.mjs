@@ -7,6 +7,8 @@
 //
 //   node scripts/client-scan-replay.mjs <assets dir> <frames dir> [--limit N] [--threads 1] [--json out.json]
 //   --stream --auto: consecutive frames pool evidence as in Auto mode (requireStill, distinct frame ids)
+//   --guess: printing guess on, with the sets of the last 3 client answers as scan context
+//            (a guessed printing that differs from the server's counts as 'guessDiff', not WRONG)
 //
 // <assets dir> holds manifest.json + the files it names (cardscan
 // tools/build_client_index.py). Cornelius comes from CV_MODEL_DIR/data/models.
@@ -61,6 +63,7 @@ function serverAnswer(j) {
 const every = Number(opt('--every', 1));
 const files = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg')).sort().filter((f, i) => i % every === 0).slice(0, limit);
 const rows = [];
+const recent = [];   // --guess: sets of the last answers, newest first
 for (const f of files) {
   const jsonPath = path.join(framesDir, f.replace(/\.jpg$/, '.json'));
   const srv = fs.existsSync(jsonPath) ? serverAnswer(JSON.parse(fs.readFileSync(jsonPath, 'utf8'))) : null;
@@ -77,14 +80,15 @@ for (const f of files) {
   const t0 = performance.now();
   const out = await reader.read(
     { data: new Uint8ClampedArray(full.data.buffer, full.data.byteOffset, full.data.length), width: full.info.width, height: full.info.height },
-    small, { smallChannels: 3, ...(args.includes('--auto') ? { requireStill: true, frameId: rows.length + 1 } : {}) });
+    small, { smallChannels: 3, ...(args.includes('--auto') ? { requireStill: true, frameId: rows.length + 1 } : {}), ...(args.includes('--guess') ? { guess: { sets: recent.slice(0, 20) } } : {}) });
   const ms = performance.now() - t0;
   const r = out.results[0];
   const cand = out.candidates[0];
+  if (r?.ok && r.set) recent.unshift(r.set);
   rows.push({
     frame: f, ms: Math.round(ms), recCalls: reader.stats.recCalls - before.recCalls,
     status: cand ? cand.status : 'no card', sharp: cand?.sharpness, stage: r?.footer_stage, err: r?.error, ok: !!r?.ok, id: r?.scryfallId || null,
-    title: r?.title || null, footer: r?.footer_ocr,
+    title: r?.title || null, footer: r?.footer_ocr, guess: r?.guess,
     got: r?.ok ? `${r.title}[${r.set} ${r.num}] via ${r.via}` : (r ? `${r.error}${r.title ? ` (${r.title})` : ''}` : ''),
     server: srv, timings: out.timings,
   });
@@ -93,13 +97,17 @@ for (const f of files) {
 process.stdout.write('\n');
 
 // --- scoring ---------------------------------------------------------------
-let titleConflict = 0, wrong = 0, agree = 0, clientOnly = 0, serverOnly = 0, bothMiss = 0, multi = 0;
+let titleConflict = 0, guessDiff = 0, wrong = 0, agree = 0, clientOnly = 0, serverOnly = 0, bothMiss = 0, multi = 0;
 const wrongRows = [];
 for (const row of rows) {
   const s = row.server;
   if (s && s.cards > 1) multi++;
   if (row.ok && s && s.ids.length) {
-    if (s.ids.includes(row.id)) agree++; else { wrong++; wrongRows.push(row); }
+    const norm = (t) => String(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (s.ids.includes(row.id)) agree++;
+    // A guessed printing of the right title is the expected kind of change.
+    else if (row.guess && s.titles.some(t => norm(t) === norm(row.title))) { guessDiff++; wrongRows.push({ ...row, guessDiff: true }); }
+    else { wrong++; wrongRows.push(row); }
   } else if (row.ok) {
     clientOnly++;
     // No server printing to compare with: the title must still agree with
@@ -119,7 +127,7 @@ const summary = {
   frames: rows.length, multiCardFrames: multi,
   clientMatched: rows.filter(r => r.ok).length,
   serverMatched: rows.filter(r => r.server?.ids.length).length,
-  agree, wrong, titleConflict, clientOnly, serverOnly, bothMiss,
+  agree, wrong, titleConflict, guessDiff, guessed: rows.filter(r => r.guess).length, clientOnly, serverOnly, bothMiss,
   gated: Object.fromEntries(Object.entries(rows.reduce((a, r) => { a[r.status] = (a[r.status] || 0) + 1; return a; }, {}))),
   ms: {
     matched: { n: okMs.length, p50: pct(okMs, 0.5), p90: pct(okMs, 0.9), max: pct(okMs, 1) },
@@ -129,7 +137,7 @@ const summary = {
   recCallsPerMatch: okMs.length ? +(read.filter(r => r.ok).reduce((s, r) => s + r.recCalls, 0) / okMs.length).toFixed(2) : 0,
 };
 console.log(JSON.stringify(summary, null, 1));
-for (const r of wrongRows) console.log('WRONG', r.frame, r.got, 'server:', r.server.label);
+for (const r of wrongRows) console.log(r.guessDiff ? 'GUESS' : 'WRONG', r.frame, r.got, 'server:', r.server.label);
 for (const r of rows.filter(x => !x.ok && x.server?.ids.length).slice(0, 25)) console.log('miss', r.frame, r.status, r.got, 'server:', r.server.label);
 const jsonOut = opt('--json');
 if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify({ summary, rows }, null, 1));

@@ -1,10 +1,10 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Zap, ZapOff, ScanLine, Check, X, SwitchCamera, Camera, Sparkles, Trash2, Send, Undo2, Minus, Plus } from 'lucide-react';
+import { Zap, ZapOff, ScanLine, Check, X, SwitchCamera, Camera, Sparkles, Trash2, Send, Undo2, Minus, Plus, Layers } from 'lucide-react';
 import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
 import { priceText } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
-import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE } from '../utils/fastScan';
+import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, guessedRowFor, canChangePrinting } from '../utils/fastScan';
 import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
@@ -76,12 +76,19 @@ const rowPriceOf = (row) => { const p = usdPrice(row.card, printingOf(row)); ret
 // (replaced only when that row changes) and stable callbacks.
 const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPatch, onRetry }) {
   const price = rowPriceOf(row);
+  const change = canChangePrinting(row);
   return (
-<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}${row.needsChoice ? ' is-choice' : ''}`} aria-busy={row.pending || undefined}>
+<li className={`fs-card${row.sent ? ' is-added' : ''}${row.pending ? ' is-pending' : ''}${row.hydrateFailed ? ' is-failed' : ''}${row.needsChoice ? ' is-choice' : ''}${row.guess ? ' is-guessed' : ''}`} aria-busy={row.pending || undefined}>
         <div className="fs-card-art">
           {row.card.image_url ? <img src={row.card.image_url} alt="" loading="lazy" crossOrigin="anonymous" /> : null}
           {!row.sent && !row.pending && (
             <button type="button" className="fs-card-edit" onClick={() => onEdit(row)} aria-label={row.needsChoice ? t('fastscan.choosePrinting') : t('fastscan.changePrinting')} />
+          )}
+          {change && !row.needsChoice && (
+            <button type="button" className="fs-card-printing" onClick={() => onEdit(row)} aria-label={t('fastscan.changePrinting')}
+              title={row.guess ? t('fastscan.guessedHint') : t('fastscan.changePrinting')}>
+              <Layers size={11} />{t('fastscan.printingBtn')}
+            </button>
           )}
           {row.needsChoice && <span className="fs-card-choose" aria-hidden="true">{t('fastscan.choosePrinting')}</span>}
           {row.pending && row.hydrateFailed && (
@@ -92,7 +99,7 @@ const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPat
           {row.sent && <span className="fs-card-badge"><Check size={14} /></span>}
         </div>
         <div className="fs-card-name">{displayName(row.card)}</div>
-        <div className="fs-card-meta">{row.needsChoice ? choiceLabel(row.choose) : `${String(row.card.set_id || '').toUpperCase()} · #${row.card.number}`}</div>
+        <div className="fs-card-meta">{row.needsChoice ? choiceLabel(row.choose) : `${String(row.card.set_id || '').toUpperCase()} · #${row.card.number}${row.guess ? ` · ${t('fastscan.guessed')}` : ''}`}</div>
         {!row.sent && (
           <div className="fs-card-quick">
             <div className="fs-qty" role="group" aria-label={t('fastscan.quantity')}>
@@ -350,6 +357,28 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       });
   }, []);
 
+  // Re-point a sent collection row's entries at another printing: the
+  // collection's own Change printing (PUT /collection/:id {card_id}, same
+  // card name only; the server hydrates the new printing).
+  const repointSent = useCallback(async (row, card) => {
+    const oks = await Promise.all(row.entryIds.map(id => fetch(`/api/collection/${id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ card_id: card.id }),
+    }).then(r => r.ok).catch(() => false)));
+    if (oks.some(ok => !ok)) throw new Error('change printing failed');
+    onAddSuccess?.();
+  }, [onAddSuccess]);
+  // A guessed row whose card a later frame of the same presentation proved:
+  // the proof replaces the guess (before or after the row was sent).
+  const correctGuess = useCallback(async (row, h) => {
+    try { if (row.sent) await repointSent(row, h.card); } catch (e) { console.warn('[fastscan] guess correction failed:', e?.message); return; }
+    if (!aliveRef.current) return;
+    const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
+    setResults(prev => prev.map(x => (x.key === row.key ? { ...x, ...next } : x)));
+    if (next.pending) hydrateRow({ ...row, ...next });
+  }, [hydrateRow, repointSent]);
+  const correctGuessRef = useRef(correctGuess);
+  correctGuessRef.current = correctGuess;
+
   const scan = useCallback(async (source, { autoPass = false, gen = runRef.current } = {}) => {
     if (busyRef.current) return { busy: true };
     // Results commit only for the run that asked: an auto pass that outlives a
@@ -400,7 +429,8 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (onDeviceRef.current) {
         const tl = performance.now();
         localStart = tl;
-        local = await readOnDevice(source, sw, sh, { requireStill: autoPass });
+        // Printing guess context: the sets of the last added rows.
+        local = await readOnDevice(source, sw, sh, { requireStill: autoPass, guess: { sets: recentSets(resultsRef.current, 20) } });
         tel.mark('local_ms', performance.now() - tl);
         tel.local(local);
         if (local?.error) { console.warn('[fastscan] on-device read failed:', local.error); why = 'device-error'; }
@@ -477,7 +507,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       drawOverlay(out.frame, out.candidates, byNumber);
       // Proven printings, plus proven footers that several printings share
       // (the user picks those in the tray; never a guess).
-      const hits = [...out.results.filter(x => x.ok && x.card), ...choiceHits(out.results)];
+      // Footer twins nobody could split are guessed from the scan context
+      // (Brent, 2026-10-24): no blocking picker; the row is marked and its
+      // printing can be changed from the tray.
+      const ctxSets = recentSets(resultsRef.current, 20);
+      const hits = [...out.results.filter(x => x.ok && x.card), ...choiceHits(out.results).map(h => guessChoiceHit(h, ctxSets))];
       const eligible = out.candidates.filter(c => c.eligible).length;
       if (!out.candidates.length) firstSeenRef.current = null;
       else if (firstSeenRef.current == null) firstSeenRef.current = t0;
@@ -511,13 +545,25 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       // Auto: a card that stays on the table must not be re-added every pass,
       // nor after 4 s of failed reads while it never left (dedupeFresh).
       const now = Date.now();
-      const fresh = hits.filter(h => !autoPass || dedupeFresh(seenIdsRef.current, h.card.id, now));
+      // The same card still in view after a GUESSED add (same presentation,
+      // same title): a footer-proven printing corrects that row in place; a
+      // further guess is a repeat. Never a second copy of one card.
+      const fixes = [];
+      const fresh = hits.filter((h) => {
+        const dup = autoPass && !dedupeFresh(seenIdsRef.current, h.card.id, now);
+        const prior = autoPass && pres ? guessedRowFor(resultsRef.current, h, pres.epoch) : null;
+        if (prior) { if (prior.guess && !h.guess && prior.card.id !== h.card.id) fixes.push([prior, h]); return false; }
+        return !dup;
+      });
       notePresence(seenIdsRef.current, out, hits, now, new Set(fresh.map(h => h.card.id)));
+      for (const [row, h] of fixes) correctGuessRef.current(row, h);
+      const guessed = fresh.find(h => h.guess);
       if (hits.length) firstSeenRef.current = null;
       const tEnd = performance.now();
       tel.end({
         outcome: hits.length ? (fresh.length ? 'added' : 'repeat') : (out.candidates.length ? 'miss' : 'no-card'),
-        hits: hits.map(h => (h.choose ? `${h.card.name}[choose ${h.choose.map(c => `${c.set_id} ${c.number}`).join(' | ')}]` : `${h.card.name}[${h.card.set_id} ${h.card.number}]`)).slice(0, 8),
+        hits: hits.map(h => (h.choose ? `${h.card.name}[choose ${h.choose.map(c => `${c.set_id} ${c.number}`).join(' | ')}]` : `${h.card.name}[${h.card.set_id} ${h.card.number}]${h.guess ? '~guess' : ''}`)).slice(0, 8),
+        guess: guessed?.guess, guess_ctx: guessed ? ctxSets : undefined, guess_fixed: fixes.length || undefined,
         total_ms: ms, waited_ms: waited,
         // Presentation timeline: epoch, and ms from its first candidate to
         // its first confident title and to this pass's end (proof/commit).
@@ -534,6 +580,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         setFlash(f => f + 1);
         navigator.vibrate?.(18);
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
+          alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
@@ -644,7 +691,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     setSending(true);
     try {
       // Chunks go one at a time; a failed chunk stays in the tray for retry.
-      const sentRows = [], entries = [];
+      const sentRows = [], entries = [], entryIds = new Map();
       let chunkError = null;
       for (const part of chunks(rows)) {
         let r;
@@ -665,13 +712,20 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const j = await r.json().catch(() => ({}));
         if (!r.ok) { chunkError = new Error(j.error || 'send failed'); break; }
         const failed = new Set((j.failed || []).map(f => (typeof f === 'object' ? f.card_id : f)));
-        sentRows.push(...part.filter(row => !failed.has(row.card.id)));
-        entries.push(...(j.entries || []));
+        const okRows = part.filter(row => !failed.has(row.card.id));
+        sentRows.push(...okRows);
+        // bulk-add answers one entry per added card, in request order.
+        const got = j.entries || [];
+        if (dest === 'collection' && got.length === okRows.length) {
+          okRows.forEach((row, i) => { const e = got[i]; if (e && String(e.card_id) === String(row.card.id)) entryIds.set(row.key, (e.ids?.length ? e.ids : [e.id]).filter(Boolean)); });
+        }
+        entries.push(...got);
       }
       if (chunkError && !sentRows.length) throw chunkError;
       const keys = new Set(sentRows.map(row => row.key));
-      // Sent cards leave the tray; failures stay so they can be retried.
-      setResults(prev => prev.filter(x => !keys.has(x.key)));
+      // Sent cards stay in the tray, marked sent, so their printing can still
+      // be changed (collection entries); failures stay unsent for retry.
+      setResults(prev => prev.map(x => (keys.has(x.key) ? { ...x, sent: true, entryIds: entryIds.get(x.key) } : x)));
       const where = dest === 'collection' ? t('fastscan.destCollection') : (lists.find(l => String(l.id) === dest)?.name || t('fastscan.destList'));
       clearTimeout(undoTimer.current);
       if (sentRows.length) {
@@ -691,7 +745,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
   // (review R1-B6).
   const printsReqRef = useRef(0);
   const openPrintings = async (row) => {
-    if (row.sent) return;
+    if (row.sent && !row.entryIds?.length) return;
     const req = ++printsReqRef.current;
     setEditKey(row.key); setPrints(null);
     if (row.needsChoice && row.choose?.length) { setPrints(row.choose); return; }
@@ -706,12 +760,18 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (req === printsReqRef.current) setPrints(next);
   };
   const closePrintings = () => { printsReqRef.current++; setEditKey(null); setPrints(null); };
-  const choosePrinting = (card) => {
+  const choosePrinting = async (card) => {
+    const row = resultsRef.current.find(x => x.key === editKey);
+    if (row?.sent && card.id !== row.card.id) {
+      if (card.name !== row.card.name) return;
+      try { await repointSent(row, card); } catch { showToast?.(t('fastscan.changeFailed')); return; }
+    }
     setResults(prev => prev.map((x) => {
       if (x.key !== editKey) return x;
       // A choice row only accepts one of its own candidates.
       if (x.needsChoice) return x.choose?.some(c => c.id === card.id) ? { ...x, card, needsChoice: false, choose: undefined } : x;
-      return card.name === x.card.name ? { ...x, card } : x;
+      // The user's pick is no longer a guess.
+      return card.name === x.card.name ? { ...x, card, guess: undefined } : x;
     }));
     closePrintings();
   };
@@ -742,7 +802,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
           if (!r.ok) throw new Error('undo failed');
         }
       }
-      setResults(prev => [...u.rows.map(row => ({ ...row, sent: false })), ...prev]);
+      const back = new Set(u.rows.map(row => row.key));
+      setResults((prev) => {
+        const have = new Set(prev.map(x => x.key));
+        return [...u.rows.filter(row => !have.has(row.key)).map(row => ({ ...row, sent: false, entryIds: undefined })),
+          ...prev.map(x => (back.has(x.key) ? { ...x, sent: false, entryIds: undefined } : x))];
+      });
       showToast?.(t('fastscan.undone', { where: u.where }));
     } catch (e) {
       console.error(e); showToast?.(t('fastscan.undoFailed'));

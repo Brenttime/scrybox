@@ -22,6 +22,7 @@ import {
   footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
+import { guessPrinting, CONTEXT_MAX } from './guess.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -417,6 +418,9 @@ export function createReader(env) {
   // or an id is missing, so two DISTINCT decoded frames are always provable.
   let stampPres = null;
   let curFrameId = null;
+  // Printing guess (opts.guess = {sets: recent added sets}); absent = the
+  // old abstain/picker behaviour.
+  let curGuess = null;
 
   async function detect(small, channels, frameW, frameH) {
     const out = await env.cornelius.run({ image: corneliusTensor(env.ort, small, channels) });
@@ -433,8 +437,9 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known, frameId = null } = opts;
+    const { smallChannels = 4, requireStill = false, quad: known, frameId = null, guess = null } = opts;
     curFrameId = frameId;
+    curGuess = guess && typeof guess === 'object' ? { sets: Array.isArray(guess.sets) ? guess.sets.slice(0, CONTEXT_MAX) : [] } : null;
     if (stampPres?.confirm && (frameId == null || typeof frameId !== stampPres.confirm.src)) stampPres.confirm = null;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
@@ -669,7 +674,19 @@ export function createReader(env) {
     const done = (pi, via, footer, stage = -1) => {
       const p = ix.printings[pi];
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw };
+      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw, alts: (ix.byTitle[name] || []).length };
+    };
+    // Title proven, printing not split by the footer: guess it (guess.mjs)
+    // instead of a picker. Only with opts.guess; `first` = the cheap first
+    // look, where only a guess with a basis (footer hint, scan context, or a
+    // single regular original) is made and anything weaker keeps the cascade.
+    const guessed = (cands, via, footer, stage, first = false) => {
+      if (!curGuess || !cands?.length) return null;
+      const g = guessPrinting(ix, cands, { footer, sets: curGuess.sets });
+      if (!g || (first && !g.sure)) return null;
+      const r = done(g.pi, `${via} + guess`, footer, stage);
+      timings.guess = g.guess;
+      return { ...r, guess: g.guess, guess_of: cands.length };
     };
     // A proven PHYSICAL footer: one printing -> done. Several printings with
     // that footer (a reprint sheet such as The List / MB2 next to its
@@ -751,6 +768,8 @@ export function createReader(env) {
           title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw, stamp_obs: stampObs, absent_pick: orig[0],
           held: held.length ? held : undefined, rescued: rescued || undefined };
       }
+      const gp = guessed(group, via, footer, stage);
+      if (gp) return gp;
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
       return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage, stamp_obs: stampObs,
         choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
@@ -914,6 +933,16 @@ export function createReader(env) {
       // Refute Destiny, Marwyn). Stop here; this frame's footer reads are
       // pooled, and the next still frame of the same card continues with them
       // and runs every stage.
+      // First look with a guess allowed: the footer could not split the
+      // title's printings, so guess now instead of looping (Brent,
+      // 2026-10-24: < 1 s per card). Not over a strong List stamp (that
+      // card's own stamp exit above decides), and only a guess with a basis.
+      if (curGuess && si === 0 && !(sheetLike && listStamp()?.present)) {
+        const hold = veto();
+        const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
+        const gp = guessed(cands, 'title', pooled ? [...pooled.flat(), ...raws] : raws, si, true);
+        if (gp) return gp;
+      }
       if (auto && !pooled && si === 0) {
         // env.retroFirst (default on at >= 4 ORT threads, see the worker): a
         // title with an own-numbered (mb2) printing reads its copyright line on
@@ -933,6 +962,15 @@ export function createReader(env) {
         timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
         return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined, stamp_obs: stampObs };
       }
+    }
+    // Every stage ran and nothing split the printings: guess (fallback
+    // allowed), unless a validated copyright-line number contradicts it.
+    if (curGuess && !(sheetLike && listStamp()?.present)) {
+      const all = pooled ? [...pooled.flat(), ...raws] : raws;
+      const hold = veto();
+      const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
+      const gp = guessed(cands, 'title', all, -1);
+      if (gp) return gp;
     }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
     return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined, stamp_obs: stampObs };

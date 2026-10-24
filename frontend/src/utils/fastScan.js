@@ -328,3 +328,66 @@ export function choiceLabel(cards) {
   const names = [...new Set((cards || []).map(c => c.set_name || String(c.set_id || '').toUpperCase()).filter(Boolean))];
   return names.length ? `${names.join(' or ')}?` : '';
 }
+
+// Printing guess (Brent, 2026-10-24): a proven title whose printing the
+// footer could not split is not a blocking picker any more. Set codes of the
+// last RECENT_SETS added rows (newest first), the context for the guess.
+export const RECENT_SETS = 3;
+export function recentSets(rows, n = RECENT_SETS) {
+  const out = [];
+  for (const r of rows || []) {
+    if (!r || r.needsChoice || !r.card) continue;
+    const s = String(r.card.set_id || r.card.set || '').toLowerCase();
+    if (s) out.push(s);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+// Reprint-sheet and promo products lose to a regular printing in a fallback.
+const SHEETISH = /^(plst|mb2|ulst|cmb1|cmb2|mbc|sld)$/;
+const sheetish = (c) => SHEETISH.test(String(c?.set_id || '').toLowerCase()) || /the list|mystery booster|secret lair/i.test(c?.set_name || '');
+// Pure: pick one card from twin candidates the server could not split
+// ({card rows}). Context set first (most frequent, then most recent), else a
+// non-reprint-sheet printing, else the first. Returns {card, guess}.
+export function guessFromChoices(choices, sets = []) {
+  const list = (choices || []).filter(c => c && c.id);
+  if (!list.length) return null;
+  const byFreq = (list) => {
+    const freq = new Map();
+    list.forEach((s, i) => { const e = freq.get(s) || { n: 0, i }; e.n++; freq.set(s, e); });
+    return [...freq.entries()].sort((a, b) => b[1].n - a[1].n || a[1].i - b[1].i).map(([k]) => k);
+  };
+  // The last RECENT_SETS adds first, then the rest of the session.
+  const order = [...new Set([...byFreq(sets.slice(0, RECENT_SETS)), ...byFreq(sets.slice(RECENT_SETS))])];
+  for (const s of order) {
+    const hit = list.find(c => String(c.set_id || '').toLowerCase() === s);
+    if (hit) return { card: hit, guess: 'context' };
+  }
+  return { card: list.find(c => !sheetish(c)) || list[0], guess: 'fallback' };
+}
+// Pure: a choice hit (choiceHits) turned into a guessed hit; the full list
+// stays on the row (`alts`) for the Change printing sheet.
+export function guessChoiceHit(hit, sets) {
+  const g = guessFromChoices(hit.choose, sets);
+  if (!g) return hit;
+  return { ...hit, ok: true, card: g.card, guess: g.guess, alts: hit.choose.length, altCards: hit.choose, choose: undefined };
+}
+// Pure: the tray row of the SAME presentation with this title, when either
+// side is a guess: a later footer proof replaces a guessed row's printing,
+// and any other combination is only a repeat (a guess never adds a second
+// copy of a card still in view). Two proven printings keep the old rules.
+export function guessedRowFor(rows, hit, epoch) {
+  const row = sameCardRow(rows, hit, epoch);
+  return row && (row.guess || hit.guess) ? row : null;
+}
+function sameCardRow(rows, hit, epoch) {
+  if (epoch == null || !hit?.card) return null;
+  const nm = (c) => String(c?.name || '').toLowerCase().replace(/\u2019/g, "'").normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  return (rows || []).find(r => r.pres === epoch && nm(r.card) === nm(hit.card)) || null;
+}
+// Change printing is offered on every row whose title has more than one
+// printing (alts unknown = a server answer: offered too), before and after
+// it is sent; a sent row needs its collection entry ids to re-point.
+export function canChangePrinting(row) {
+  return !!row && !row.pending && (row.alts == null || row.alts > 1) && (!row.sent || row.entryIds?.length > 0);
+}
