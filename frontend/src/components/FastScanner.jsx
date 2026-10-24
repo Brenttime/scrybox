@@ -424,10 +424,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const row = resultsRef.current.find(x => x.key === rowKey);
     // The commit is acknowledged as proven only when the correction lands;
     // a failed one is retried by a later proof after a pause (review R2-NS1).
-    if (!row || row.userPicked) { rec.guess = false; if (row) rec.cardId = row.card.id; return; }
+    if (!row || row.userPicked) { rec.guess = false; return; }
     if (fixingRef.current.has(rowKey) || (rec.retryAt && Date.now() < rec.retryAt)) return;
     if (sendingRef.current) { pendingFixRef.current.set(rowKey, [rec, h]); return; }
-    if (row.card.id === h.card.id) { rec.guess = false; rec.cardId = h.card.id; setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
+    if (row.card.id === h.card.id) { rec.guess = false; setResults(prev => prev.map(x => (x.key === rowKey ? { ...x, guess: undefined } : x))); return; }
     fixingRef.current.add(rowKey);
     try {
       if (row.sent) {
@@ -440,7 +440,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (aliveRef.current) showToast?.(t(e?.split ? 'fastscan.changeSplit' : 'fastscan.changeFailed'));
       return;
     } finally { fixingRef.current.delete(rowKey); }
-    rec.guess = false; rec.cardId = h.card.id;
+    rec.guess = false;
     if (!aliveRef.current) return;
     const next = { card: h.card, hit: h, pending: !!h.pendingHydrate, hydrateFailed: false, guess: undefined, altCards: undefined, ...(h.alts != null ? { alts: h.alts } : {}) };
     if (next.pending) wantHitRef.current.set(rowKey, h); else wantHitRef.current.delete(rowKey);
@@ -654,7 +654,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         const rows = fresh.map(h => ({ key: `${h.card.id}-${now}-${Math.random().toString(36).slice(2, 7)}`, card: h.card, added: false, pending: !!h.pendingHydrate, hit: h, pres: pres?.epoch, t0,
           alts: h.alts, guess: h.guess, altCards: h.altCards,
           ...(h.choose ? { needsChoice: true, choose: h.choose } : {}) }));
-        if (pres) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, cardId: row.card.id });
+        if (pres) for (const row of rows) notePresenceCommit(committedRef.current, pres.epoch, row.card, { rowKey: row.key, guess: !!row.guess, wasGuess: !!row.guess });
         setResults(prev => [...rows, ...prev]);
         for (const row of rows) if (row.pending) hydrateRow(row);
       } else if (!autoPass) {

@@ -201,11 +201,12 @@ test('tray helpers: recent sets, server-choice guess, same-card correction, chan
   assert.equal(presenceDecision(committed, { card: { name: "Archaic's Agony" } }, 8).action, 'add', 'another presentation is another copy');
   notePresenceCommit(committed, 9, { name: 'Twisted Image' }, { rowKey: 'p', guess: false });
   assert.equal(presenceDecision(committed, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'a guess after a proof is a repeat');
-  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'one card per presentation and title');
+  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'add', 'two proofs keep the old id de-dupe (reprint swap, second card)');
   // A guess corrected to B: further B proofs in that presentation repeat,
   // even after the id de-dupe window (review R4-B5).
-  notePresenceCommit(committed, 10, { name: 'Twisted Image' }, { rowKey: 'q', guess: false, cardId: 'mtg-b' });
+  notePresenceCommit(committed, 10, { name: 'Twisted Image' }, { rowKey: 'q', guess: false, wasGuess: true });
   assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-b' } }, 10).action, 'repeat');
+  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-c' } }, 10).action, 'repeat');
   assert.equal(presenceDecision(committed, { card: { name: 'Bala Ged Recovery // Bala Ged Sanctuary' } }, 3).action, 'add');
   // The server-choice guess uses the same ranking: newest regular printing.
   const tw = [{ id: 'mtg-o', set_id: 'ody', number: '129', released_at: '2001-10-01' }, { id: 'mtg-l', set_id: 'plst', number: 'ODY-129', set_name: 'The List', released_at: '2020-09-01' }, { id: 'mtg-m', set_id: 'm12', number: '92', released_at: '2011-07-15' }];
