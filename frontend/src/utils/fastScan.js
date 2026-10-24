@@ -401,16 +401,28 @@ export function hitCentre(out, hit) {
 const samePlace = (a, b) => !a || !b || Math.hypot(a.cx - b.cx, a.cy - b.cy) <= SAME_PLACE;
 // Pure: the records still in view after a pass. A pass with no candidates
 // (the card was lifted) ends them all; a record with no candidate at its
-// place ends; an errored pass changes nothing. hits: this pass's read cards
-// (another title read at a record's place ends that record).
+// place ends; another title read at its place (a hit, or a title the pass
+// read without its printing) ends it; MOTION_BREAK moving / blurred passes
+// in a row at its place end it, as they break a presentation (a hand swapping
+// cards). An errored pass changes nothing (review R10). hits: accepted hits.
 export function updatePresence(records, out, hits = []) {
   if (!out || out.error) return records;
   const cands = out.candidates || [];
   if (!cands.length) return [];
-  const centres = cands.map(c => boxCentre(out, c)).filter(Boolean);
-  const reads = hits.map(h => ({ name: presenceName(h.card), centre: hitCentre(out, h) })).filter(r => r.centre && r.name);
-  return records.filter(r => (!r.centre || !centres.length || centres.some(c => samePlace(r.centre, c)))
-    && !reads.some(x => x.name !== r.name && r.centre && samePlace(r.centre, x.centre)));
+  const placed = cands.map(c => ({ centre: boxCentre(out, c), shaky: c.status === 'moving' || c.status === 'too blurry' })).filter(c => c.centre);
+  const reads = [...hits.map(h => ({ name: presenceName(h.card), centre: hitCentre(out, h) })),
+    ...(out.results || []).filter(x => x?.title).map(x => ({ name: presenceName({ name: x.title }), centre: hitCentre(out, x) }))]
+    .filter(r => r.centre && r.name);
+  const next = [];
+  for (const r of records) {
+    const here = r.centre ? placed.filter(c => samePlace(r.centre, c.centre)) : placed;
+    if (r.centre && placed.length && !here.length) continue;
+    if (r.centre && reads.some(x => x.name !== r.name && samePlace(r.centre, x.centre))) continue;
+    const motion = here.length && here.every(c => c.shaky) ? (r.motion || 0) + 1 : 0;
+    if (motion >= MOTION_BREAK) continue;
+    next.push(motion === (r.motion || 0) ? r : { ...r, motion });
+  }
+  return next;
 }
 export function notePresenceCommit(records, card, rec, centre = null) {
   if (!card) return records;

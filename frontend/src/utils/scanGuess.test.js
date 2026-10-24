@@ -268,7 +268,15 @@ test('tray: presence records are per card place and survive the first candidate 
   recs = updatePresence(recs, rightOnly);
   assert.deepEqual(recs.map(r => r.rowKey), ['r']);
   assert.equal(presenceDecision(recs, { guess: 'context', card: { name: 'Shock', id: 'a' } }, hitCentre(rightOnly, { number: 1 })).action, 'repeat');
-  // Another title read at that place ends the record.
-  recs = updatePresence(recs, rightOnly, [{ number: 1, card: { name: 'Opt' } }]);
-  assert.equal(recs.length, 0);
+  // Another title read at that place ends the record, hit or not.
+  assert.equal(updatePresence(recs, rightOnly, [{ number: 1, card: { name: 'Opt' } }]).length, 0);
+  assert.equal(updatePresence(recs, { ...rightOnly, results: [{ number: 1, ok: false, title: 'opt' }] }).length, 0);
+  assert.equal(updatePresence(recs, { ...rightOnly, results: [{ number: 1, ok: false, title: 'shock' }] }).length, 1);
+  // Sustained hand motion at its place ends it (a swap without a lift).
+  const shaky = { frame, candidates: [{ ...R, number: 1, status: 'too blurry' }] };
+  let m = recs;
+  for (let i = 0; i < 2; i++) m = updatePresence(m, shaky);
+  assert.equal(m.length, 1, 'a blur or two keeps it');
+  assert.equal(updatePresence(updatePresence(m, rightOnly), shaky).length, 1, 'a still pass resets the count');
+  assert.equal(updatePresence(m, shaky).length, 0);
 });
