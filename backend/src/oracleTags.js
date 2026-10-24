@@ -307,6 +307,9 @@ async function refreshOracleTags(opts = {}) {
   const lastChecked = Number(state && state.oracle_tags_checked_at) || 0;
   if (!force && now - lastChecked < DAY_MS) return { status: 'not-due' };
 
+  // Exempt from the LOCAL_SCRYFALL sidecar: bulk oracle-tag enrichment is a
+  // background offline job, not a hot path — upstream is the authoritative
+  // source and the sidecar does not serve /bulk-data.
   const metadataResponse = await http.get(`${BULK_ENDPOINT}/oracle_tags`);
   const metadata = bulkMetadata(metadataResponse.data, 'oracle_tags');
   const active = await database.get(
@@ -373,6 +376,8 @@ async function backfillOracleIds(opts = {}) {
   let bulkCount = 0;
   if (!bulkAlreadyCompleted) {
     const wanted = new Set(unresolved.map(row => row.id));
+    // Exempt from LOCAL_SCRYFALL for the same reason as the oracle_tags pull
+    // above: bulk metadata is background enrichment, always from upstream.
     const metadataResponse = await http.get(`${BULK_ENDPOINT}/default_cards`);
     const metadata = bulkMetadata(metadataResponse.data, 'default_cards');
     let buffered = [];

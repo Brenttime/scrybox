@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set · Scryfall Local</title>
+<meta name="description" content="Visual card gallery for a set from the local Scryfall clone.">
+<link rel="stylesheet" href="/sets.css">
+</head>
+<body>
+<a class="skip-links vh" href="#main-content">Skip to main content</a>
+
+<header class="header" data-component="header">
+  <div class="header-control-row">
+    <div class="header-logo"><a href="/" title="Home" aria-label="Home (card search)">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="rgba(253,253,253,0.85)" height="28" width="28"><path d="M15.465 2.063c.45.375.623 1.264.773 2.464.169 1.345.375 2.42.959 3.057.604.658 1.627.996 3.529 1.094 1 .052 1.936.359 1.936 1.076 0 .764-.985 1.041-1.995 1.129-1.789.156-2.853.552-3.484 1.204-.642.664-.825 1.684-.948 3.008-.14 1.519-.332 2.416-.904 2.969-.542.524-1.268.557-1.822.367-.565-.194-1.484-.869-2.397-2.504a4.324 4.324 0 0 0-.545-.768c-.743-.797-1.976-1.362-3.846-1.639-1.141-.17-2.652-.229-3.266-.656-.325-.227-.459-.524-.459-.856 0-.342.174-.649.443-.859.602-.468 2.07-.583 3.207-.543 1.75.063 2.958-.213 3.761-.755.907-.612 1.325-15.024 5.058-1.787Z"></path></svg>
+    </a></div>
+    <form class="header-search" action="/" accept-charset="UTF-8" method="get" role="search">
+      <label class="vh" for="header-search-field">Search for Magic cards</label>
+      <input id="header-search-field" class="header-search-field" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" autofocus="autofocus" name="q" placeholder="Search for Magic cards…" title="Search for Magic cards">
+      <button type="submit" class="vh" tabindex="-1" aria-hidden="true">Search</button>
+    </form>
+    <div class="header-links">
+      <a class="header-link" href="/sets.html" title="All sets">Sets</a>
+      <span class="header-link-divider"></span>
+      <a class="header-link" href="/" title="Card search">Cards</a>
+    </div>
+  </div>
+</header>
+
+<main class="main" id="main-content">
+  <!-- Header block (populated from /api/set/{code}) -->
+  <div class="set-header" data-component="set-header">
+    <div class="inner-flex">
+      <div class="set-header-title">
+        <img class="set-header-symbol" id="set-symbol" src="" alt="" hidden>
+        <span class="set-header-symbol-fallback" id="set-symbol-fallback" hidden></span>
+        <div class="set-header-title-words">
+          <h1 class="set-header-title-h1" id="set-h1">Loading…</h1>
+          <p class="set-header-title-subline" id="set-subline1"></p>
+          <p class="set-header-title-subline" id="set-subline2"></p>
+        </div>
+      </div>
+      <div class="set-header-controls" id="set-actions">
+        <a class="button-n inverted" href="/sets.html" title="Back to all sets">All Sets</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Card grid: q=s:CODE include:extras (set order), like Scryfall's
+       own set-page search_uri (include_extras + include_variations) -->
+  <div class="card-grid" data-component="card-grid">
+    <div class="card-grid-inner" id="card-grid">
+      <div class="grid-status">Loading cards…</div>
+    </div>
+  </div>
+</main>
+
+<footer class="footer" data-component="footer">
+  <div class="inner-flex">
+    <div class="footer-legal"><p>Not affiliated with Scryfall or Wizards of the Coast. Card images served from cards.scryfall.io / svgs.scryfall.io. Card data cached locally. MTG and Magic: The Gathering are trademarks of Wizards of the Coast LLC.</p></div>
+  </div>
+</footer>
+
+<script src="/set.js"></script>
+</body>
+</html>

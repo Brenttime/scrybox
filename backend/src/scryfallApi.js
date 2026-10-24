@@ -9,11 +9,49 @@ const { cacheNormalizedCards } = require('./utils/cardCache');
 const { sqlCardKey } = require('./utils/cardIdentity');
 const { oracleIdForCard, defaultSearchEligible } = require('./utils/oracleId');
 
+// ---- Local Scryfall sidecar (see local-scryfall/) -------------------------
+// LOCAL_SCRYFALL_ENABLED points the Scryfall HTTP layer at a self-hosted
+// clone of the API (same repo, compose service `scryfall-local`): search,
+// set enumeration and card/collection lookups answer from RAM, with no
+// rate-limit budget spent and no internet needed. Off unless set to "true",
+// in which case every constant below behaves exactly as it always has.
+const LOCAL_SCRYFALL = process.env.LOCAL_SCRYFALL_ENABLED === 'true';
+const LOCAL_SCRYFALL_URL = (process.env.LOCAL_SCRYFALL_URL || 'http://scryfall-local:8420').replace(/\/$/, '');
+
+// Rewrite an absolute api.scryfall.com URL onto the sidecar. Relative URLs
+// need no rewrite because the client's baseURL already points at it — but
+// Scryfall-returned absolute links (next_page etc.) and the hardcoded URLs
+// in cardSets.js MUST pass through here or the baseURL swap leaks upstream.
+function scryUrl(u) {
+  return LOCAL_SCRYFALL ? String(u).replace(/^https:\/\/api\.scryfall\.com/, LOCAL_SCRYFALL_URL) : u;
+}
+
+// True when a request, after scryUrl rewriting AND baseURL resolution, lands
+// on something that is NOT api.scryfall.com. Only the sidecar can be that
+// target, and it has no rate limits — that is the entire point of running it —
+// so limiter gaps and 429 cooldowns are skipped for it. Must be evaluated on
+// the EFFECTIVE url (what scryRequest hands axios): an absolute
+// api.scryfall.com URL that scryUrl rewrites to the sidecar must not be
+// paced, while anything still facing upstream keeps the limiter.
+function isLocalScryfallTarget(effectiveUrl, config) {
+  if (!LOCAL_SCRYFALL || (config && config.upstream)) return false;
+  try {
+    const host = new URL(String(effectiveUrl), config?.baseURL || client.defaults.baseURL).hostname;
+    return host !== 'api.scryfall.com';
+  } catch {
+    return false; // unparseable → treat as upstream and let the limiter guard it
+  }
+}
+
 // Scryfall needs no API key but asks callers to identify themselves and accept
 // JSON. See https://scryfall.com/docs/api. IDs from Scryfall are UUIDs / set-num
 // slugs; we prefix them with "mtg-" so the game is derivable from the id.
+// baseURL flips to the sidecar when LOCAL_SCRYFALL so every RELATIVE call
+// (/cards/search, /sets, …) follows the swap too; the local server serves the
+// same paths. The sidecar accepts any User-Agent; Scrybox/1.0 is kept so
+// upstream traffic (limiter-gated) stays identifiable.
 const client = axios.create({
-  baseURL: 'https://api.scryfall.com',
+  baseURL: LOCAL_SCRYFALL ? LOCAL_SCRYFALL_URL : 'https://api.scryfall.com',
   timeout: 6000,
   headers: { 'User-Agent': 'Scrybox/1.0', 'Accept': 'application/json' }
 });
@@ -96,17 +134,34 @@ function noteRateLimit(error) {
   return true;
 }
 
+// Turn a caller's (url, config) into what actually hits axios. Default path:
+// absolute upstream URLs go through scryUrl (sidecar swap). `config.upstream`
+// is the explicit escape hatch for endpoints the sidecar cannot answer (e.g.
+// /cards/tcgplayer price lookups) — they stay pinned to the real API and
+// therefore keep the limiter.
+function scryRequest(url, config) {
+  if (config && config.upstream) {
+    return [String(url), { ...config, baseURL: 'https://api.scryfall.com' }];
+  }
+  return [scryUrl(url), config];
+}
+
 function scryGet(url, config) {
   const run = scryfallQueue.then(async () => {
-    // Re-check after waiting: a 429 may have armed the cooldown while queued.
-    for (let w = waitFor(url); w.ms > 0; w = waitFor(url)) {
-      await new Promise(r => setTimeout(r, w.ms));
+    const [u, cfg] = scryRequest(url, config);
+    // Local sidecar traffic skips the queue's pacing entirely: the gaps and
+    // the 429 cooldown exist only because Scryfall demands them.
+    if (!isLocalScryfallTarget(u, cfg)) {
+      // Re-check after waiting: a 429 may have armed the cooldown while queued.
+      for (let w = waitFor(url); w.ms > 0; w = waitFor(url)) {
+        await new Promise(r => setTimeout(r, w.ms));
+      }
+      const { key } = endpointGap(url);
+      lastScryfallAt = Date.now();
+      lastByEndpoint.set(key, lastScryfallAt);
     }
-    const { key } = endpointGap(url);
-    lastScryfallAt = Date.now();
-    lastByEndpoint.set(key, lastScryfallAt);
     try {
-      return await client.get(url, config);
+      return await client.get(u, cfg);
     } catch (error) {
       noteRateLimit(error);
       throw error;
@@ -124,14 +179,18 @@ const COLLECTION_BATCH = 75;
 // bulk lookups can never race ahead of (or pile on top of) search traffic.
 function scryPost(url, body, config) {
   const run = scryfallQueue.then(async () => {
-    for (let w = waitFor(url); w.ms > 0; w = waitFor(url)) {
-      await new Promise(r => setTimeout(r, w.ms));
+    const [u, cfg] = scryRequest(url, config);
+    // Local target ⇒ no pacing (see scryGet).
+    if (!isLocalScryfallTarget(u, cfg)) {
+      for (let w = waitFor(url); w.ms > 0; w = waitFor(url)) {
+        await new Promise(r => setTimeout(r, w.ms));
+      }
+      const { key } = endpointGap(url);
+      lastScryfallAt = Date.now();
+      lastByEndpoint.set(key, lastScryfallAt);
     }
-    const { key } = endpointGap(url);
-    lastScryfallAt = Date.now();
-    lastByEndpoint.set(key, lastScryfallAt);
     try {
-      return await client.post(url, body, config);
+      return await client.post(u, body, cfg);
     } catch (error) {
       noteRateLimit(error);
       throw error;
@@ -1347,4 +1406,4 @@ async function resolveCollectionQuery({
 // adapter. `collectionQueryCache` is the in-process half of the durable
 // catalog-query cache — exposed so tests can age an entry to drive the
 // stale-while-revalidate paths (production code never reads it directly).
-module.exports = { getOracleText, scryPostRetried, searchCards, normalizeCard, cacheCards, getCardsBySet, fetchAndCacheSets, updateCollectionPrices, getCardById, getPrintingInLang, bulkFetchByIdentifier, scryGetRetried, client, fetchWindow, resolveCollectionQuery, collectionQueryCache };
+module.exports = { getOracleText, scryPostRetried, searchCards, normalizeCard, cacheCards, getCardsBySet, fetchAndCacheSets, updateCollectionPrices, getCardById, getPrintingInLang, bulkFetchByIdentifier, scryGetRetried, scryUrl, LOCAL_SCRYFALL, LOCAL_SCRYFALL_URL, client, fetchWindow, resolveCollectionQuery, collectionQueryCache };

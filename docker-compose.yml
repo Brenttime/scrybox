@@ -21,8 +21,40 @@ services:
       # - DEFAULT_ADMIN_PASSWORD=       # Create the admin account with this password instead of creating the owner account on first visit
       # - ALLOW_REGISTRATION=           # "true" = open self-registration. Unset = invite-only
       # - TRUST_PROXY=                  # "1" behind a TLS-terminating reverse proxy so rate limiting sees the real client IP
+      # - LOCAL_SCRYFALL_ENABLED=       # "true" = route hot-path Scryfall calls (card search, set lists, card/collection lookups) to the scryfall-local sidecar below: no rate-limit budget, works offline. Unset = upstream api.scryfall.com (zero behavior change)
+      # - LOCAL_SCRYFALL_URL=           # Sidecar base URL. Default http://scryfall-local:8420 (the compose service). Point at any local-scryfall instance
+      # - LOCAL_WEB_PORTAL_ENABLED=     # "true" = serve the sidecar's card portal UI at /scryfall-portal/* (proxied; needs LOCAL_SCRYFALL_ENABLED too for the API to match). Unset = route not mounted
     volumes:
       - bindarr-data:/app/database
 
+  # Local Scryfall search engine — see local-scryfall/README.md. Boots without
+  # any scrybox involvement; scrybox only talks to it when
+  # LOCAL_SCRYFALL_ENABLED=true. NO published ports on purpose: this serves
+  # the same public card data as Scryfall, so it belongs on the compose
+  # network only. To debug from the host, temporarily add:
+  #   ports: ["127.0.0.1:8420:8420"]
+  scryfall-local:
+    build:
+      context: ./local-scryfall
+      dockerfile: Dockerfile
+    container_name: scryfall-local
+    restart: unless-stopped
+    environment:
+      - SCRYFALL_DATA_DIR=/data
+    volumes:
+      # Named volume holds the ~86 MB bulk files (default-cards, oracle-tags)
+      # pulled on first boot by fetch-data.sh. For a pre-seeded directory
+      # instead, swap for: - ./local-scryfall/data:/data
+      - scryfall-data:/data
+    healthcheck:
+      # curl is already in the runtime image (fetch-data.sh needs it); the
+      # slim base has no wget.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8420/api/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s   # cold index load is ~10 s; first boot also downloads
+
 volumes:
   bindarr-data:
+  scryfall-data:

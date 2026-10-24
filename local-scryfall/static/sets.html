@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>All Sets · Scryfall Local</title>
+<meta name="description" content="All Magic: The Gathering sets, with card counts and release dates — Scryfall Local clone.">
+<link rel="stylesheet" href="sets.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238f6ad8'/%3E%3Cstop offset='1' stop-color='%233b1260'/%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='30' fill='url(%23g)'/%3E%3Cpath d='M36 12 22 36h9l-3 16 16-24h-9z' fill='%23FFD041'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<div class="skip-links">
+  <ul>
+    <li><a href="#main">Skip to main content</a></li>
+    <li><a href="#footer">Skip to footer</a></li>
+  </ul>
+</div>
+
+<!-- ============ HEADER (mirrors index.html chrome; page is standalone) ============ -->
+<div id="header" class="header">
+  <div class="header-control-row">
+
+    <a class="header-logo" href="/" title="Back to homepage" aria-label="Scryfall Local home">
+      <span class="vh">Scryfall Local</span>
+      <svg width="28" height="28" viewBox="0 0 64 64" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="orb-g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#8f6ad8"/><stop offset="1" stop-color="#3b1260"/>
+        </linearGradient></defs>
+        <circle cx="32" cy="32" r="30" fill="url(#orb-g)" stroke="rgba(255,255,255,0.35)" stroke-width="2"/>
+        <path d="M36 12 22 36h9l-3 16 16-24h-9z" fill="#FFD041"/>
+      </svg>
+    </a>
+
+    <form class="header-search" role="search" action="/" method="get" autocomplete="off">
+      <label class="vh" for="header-search-field">Search for Magic cards</label>
+      <input type="text" id="header-search-field" class="header-search-field"
+             name="q" placeholder="Search for Magic cards…" spellcheck="false" autocapitalize="none" autocorrect="off" maxlength="1024">
+      <button type="submit" class="vh">Find Cards</button>
+    </form>
+
+    <div class="header-links">
+      <div class="header-link-divider"></div>
+      <a class="header-link" href="/">Advanced</a>
+      <a class="header-link active" href="/sets.html" aria-current="page">Sets</a>
+      <a class="header-link" href="/?q=t%3Acreature">Creatures</a>
+      <a class="header-link" href="/?q=r%3Amythic">Mythics</a>
+      <div class="header-link-divider"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ============ MAIN ============ -->
+<div id="main" class="main" role="main">
+
+  <!-- Filter bar (mirrors scryfall.com/sets .search-controls) -->
+  <div class="search-controls">
+    <div class="search-controls-inner">
+      <div class="search-controls-display-options">
+        <label for="lang"><span id="sets-count">…</span> sets in</label>
+        <select name="lang" id="lang" title="Show sets for a specific language" class="select-n">
+          <option value="">All languages</option>
+          <option value="en">English (English)</option>
+          <option value="es">Spanish (Español)</option>
+          <option value="fr">French (Français)</option>
+          <option value="de">German (Deutsch)</option>
+          <option value="it">Italian (Italiano)</option>
+          <option value="pt">Portuguese (Português)</option>
+          <option value="ja">Japanese (日本語)</option>
+          <option value="ko">Korean (한국어)</option>
+          <option value="ru">Russian (русский язык)</option>
+          <option value="zhs">Simplified Chinese (简体中文)</option>
+          <option value="zht">Traditional Chinese (繁體中文)</option>
+        </select>
+        <label for="order">sorted by</label>
+        <select name="order" id="order" title="Change how sets are sorted" class="select-n">
+          <option value="date">Release Date</option>
+          <option value="set">Name</option>
+          <option value="block">Block/Group</option>
+          <option value="cards">No. of Cards</option>
+        </select>
+        <label for="type">of type</label>
+        <select name="type" id="type" title="Change which sets are shown" class="select-n">
+          <option value="">Any</option>
+        </select>
+      </div>
+      <div class="search-controls-display-options">
+        <label for="q-text">named</label>
+        <input type="text" id="q-text" class="select-n set-query" placeholder="e.g. commander" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+  </div>
+
+  <!-- The set list (mirrors scryfall's table.checklist) -->
+  <div class="checklist-wrapper">
+    <table class="checklist">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th class="em6">Cards</th>
+          <th class="em9">Date</th>
+          <th class="w35">Languages</th>
+        </tr>
+      </thead>
+      <tbody id="sets-body">
+        <tr><td colspan="4" class="sets-status">Loading sets…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+
+<!-- ============ FOOTER ============ -->
+<footer id="footer" class="footer">
+  <div class="inner-flex">
+    <div class="footer-column">
+      <h6>Cards</h6>
+      <ul>
+        <li><a class="footer-link" href="/?q=">Search</a></li>
+        <li><a class="footer-link" href="/sets.html">All Sets</a></li>
+        <li><a class="footer-link" href="/?q=r%3Amythic">Mythics</a></li>
+        <li><a class="footer-link" href="/?q=is%3Aplaneswalker">Planeswalkers</a></li>
+      </ul>
+    </div>
+    <div class="footer-column">
+      <h6>This Site</h6>
+      <ul>
+        <li><a class="footer-link" href="/?q=">Home</a></li>
+        <li><a class="footer-link" href="/api/sets">Sets API</a></li>
+        <li><a class="footer-link" href="/api/suggest?q=lightn">Suggest API</a></li>
+      </ul>
+    </div>
+    <div class="footer-column">
+      <h6>Developers</h6>
+      <ul>
+        <li><a class="footer-link" href="/api/cards/search?q=t%3Ainstant&amp;order=cmc&amp;dir=desc&amp;limit=20">Search endpoint</a></li>
+        <li><a class="footer-link" href="/api/health">Health check</a></li>
+      </ul>
+    </div>
+    <div class="footer-column">
+      <h6>More</h6>
+      <ul>
+        <li><a class="footer-link" href="https://scryfall.com/docs/syntax" rel="noopener" target="_blank">Scryfall Syntax Docs ↗</a></li>
+        <li><a class="footer-link" href="https://scryfall.com/sets" rel="noopener" target="_blank">Scryfall.com Sets ↗</a></li>
+      </ul>
+    </div>
+    <div class="footer-legal">
+      <p>Scryfall Local is an unofficial, self-hosted search interface. It is not affiliated with or endorsed by Scryfall or Wizards of the Coast.</p>
+      <p>card data &amp; images © <a href="https://scryfall.com/" rel="noopener" target="_blank">Scryfall</a>. Portions of this site are unofficial Fan Content permitted under the <a href="https://wpn.wizards.com/en/document/magic-gathering-fan-content-policy" rel="noopener" target="_blank">Wizards Fan Content Policy</a>.</p>
+      <p>Magic: The Gathering and card images are trademarks of Wizards of the Coast LLC.</p>
+    </div>
+  </div>
+</footer>
+
+<script src="sets.js"></script>
+</body>
+</html>

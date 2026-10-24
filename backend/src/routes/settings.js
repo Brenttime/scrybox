@@ -91,6 +91,11 @@ async function getEffectiveSettings() {
     setup_complete,
     moxfield_decklist_interval_min,
     moxfield_content_interval_min,
+    // Read-only env-driven flags (same "effective settings" pattern as
+    // public_base_url, which falls back to its env var): the frontend uses
+    // these to surface the sidecar/portal only when they are actually on.
+    scryfall_local: process.env.LOCAL_SCRYFALL_ENABLED === 'true',
+    scryfall_portal_enabled: process.env.LOCAL_WEB_PORTAL_ENABLED === 'true',
   };
 }
 
