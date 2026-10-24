@@ -383,7 +383,8 @@ The title is never guessed.
   no old-frame twin (mh2 135 / retro 408), not near the frame edge, not for
   a title that prefixes a longer one (Flicker / Flickering Hound). The next
   frame of the same card then runs the full cascade once, so a deeper
-  footer proof still corrects the row. Otherwise the guess comes after the
+  footer proof still corrects the row (that pass costs about what the old
+  deferred read did, and can overlap the next card). Otherwise the guess comes after the
   full cascade. Guesses are single-card only; multi-card frames keep proofs
   and the tray choice row.
 - **Client index.** Printing rows gained two optional columns:
@@ -409,9 +410,10 @@ The title is never guessed.
   misses (Charging Strifeknight 4.9 s, Expressive Firedancer 3.4 s), soa
   cards whose footer the first look reads but cannot use, and verify passes
   that overlap the next card.
-- **Reviews.** Astra review loop: 8 rounds (prefix titles, verify after a
-  first-look guess, hydration/send/correction ownership, duplicate adds,
-  bulk-add index, multi-card scope).
+- **Reviews.** Astra review loop: 13 rounds to SHIP (prefix titles, verify
+  after a first-look guess, hydration/send/correction ownership, duplicate
+  adds, bulk-add index, multi-card scope, per-place card records that end on
+  lift, move, sustained motion or another title, double-faced names).
 
 ## Known open items
 - Measure the scanguess build on a real round (`guess` field in telemetry).
