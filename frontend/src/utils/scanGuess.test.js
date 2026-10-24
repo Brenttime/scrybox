@@ -277,6 +277,9 @@ test('tray: presence records are per card place and survive the first candidate 
   assert.equal(updatePresence(dfc, { ...rightOnly, results: [{ number: 1, title: 'insectile aberration' }] }).length, 1);
   assert.equal(presenceDecision(dfc, { title: 'insectile aberration', card: { name: 'Delver of Secrets', id: 'b' } }).action, 'fix');
   assert.equal(presenceDecision(notePresenceCommit([], { name: 'Bala Ged Recovery // Bala Ged Sanctuary' }, { rowKey: 'x', guess: true }), { card: { name: 'Bala Ged Sanctuary', id: 'z' } }).action, 'fix');
+  // A server answer titled with the combined name is the same card.
+  const split = notePresenceCommit([], { name: 'Bala Ged Recovery // Bala Ged Sanctuary' }, { rowKey: 's', guess: true, wasGuess: true }, null, 'bala ged recovery');
+  assert.equal(updatePresence(split, { ...rightOnly, results: [{ number: 1, title: 'Bala Ged Recovery // Bala Ged Sanctuary' }] }).length, 1);
   // Sustained hand motion at its place ends it (a swap without a lift).
   const shaky = { frame, candidates: [{ ...R, number: 1, status: 'too blurry' }] };
   let m = recs;

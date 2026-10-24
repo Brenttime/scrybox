@@ -389,10 +389,10 @@ const normPresence = (n) => String(n || '').toLowerCase().replace(/\u2019/g, "'"
 // the title the scanner read (a double-faced card read on its back face is
 // hydrated under its front name: review R11).
 const presenceNames = (card, title) => [...new Set([
-  ...String(card?.name || '').split(' // '),
+  card?.name,
   ...((card?.card_faces || card?.faces || []).map(f => f?.name)),
   title,
-].map(normPresence).filter(Boolean))];
+].flatMap(n => String(n || '').split(/\s*\/\/\s*/)).map(normPresence).filter(Boolean))];
 const sameName = (a, b) => a.some(n => b.includes(n));
 export const PRESENCE_KEEP = 50;
 const boxCentre = (out, c) => {
@@ -420,7 +420,8 @@ export function updatePresence(records, out, hits = []) {
   if (!cands.length) return [];
   const placed = cands.map(c => ({ centre: boxCentre(out, c), shaky: c.status === 'moving' || c.status === 'too blurry' })).filter(c => c.centre);
   const reads = [...hits.map(h => ({ names: presenceNames(h.card, h.title), centre: hitCentre(out, h) })),
-    ...(out.results || []).filter(x => x?.title).map(x => ({ names: presenceNames(null, x.title), centre: hitCentre(out, x) }))]
+    // Titles read WITHOUT an accepted card (a resolved result is its hit).
+    ...(out.results || []).filter(x => x?.title && !(x.ok && x.card)).map(x => ({ names: presenceNames(null, x.title), centre: hitCentre(out, x) }))]
     .filter(r => r.centre && r.names.length);
   const next = [];
   for (const r of records) {
