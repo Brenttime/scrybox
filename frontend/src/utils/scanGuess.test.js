@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { loadIndex } from '../../../shared/clientScan/text.mjs';
 import { guessPrinting, guessCodes, guessNumbers } from '../../../shared/clientScan/guess.mjs';
 import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
-import { recentSets, guessFromChoices, guessChoiceHit, guessedRowFor, canChangePrinting } from './fastScan.js';
+import { recentSets, guessFromChoices, guessChoiceHit, presenceDecision, notePresenceCommit, canChangePrinting } from './fastScan.js';
 
 // Real printings (Scryfall, 2026-10) with the index's appended columns
 // [released yyyymmdd, flags: 1 variant, 2 promo/reprint product].
@@ -54,16 +54,19 @@ test('guess: footer evidence beats context (a clean set code, a padded number)',
   assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { footer: ['C 0110'], sets: ['soa'] })), 'mr-soa110');
   // Rules text is not a set code, a year is not a number.
   assert.deepEqual([...guessCodes(x, ['more than', 'SOS·EN', 'soa'])].sort(), ['soa', 'sos']);
-  assert.deepEqual([...guessNumbers(['© 2026 Wizards', 'U 0058'])], ['58']);
+  assert.deepEqual([...guessNumbers(['© 2026 Wizards', 'U 0058']).keys()], ['58']);
 });
 
-test('guess: older adds of the session break ties the last 3 cannot; the last 3 come first', () => {
+test('guess: only the last 3 adds are context; footer numbers keep the set-total check', () => {
   const x = ix();
-  // Last 3 were sos (no Monstrous Rage there), earlier in the session: soa.
-  const g = guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['sos', 'sos', 'sos', 'soa', 'woe'] });
-  assert.equal(id(x, g), 'mr-soa45'); assert.equal(g.guess, 'context');
-  // A set in the last 3 beats a more frequent older one.
-  assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['woe', 'sos', 'sos', 'soa', 'soa', 'soa'] })), 'mr-woe');
+  // An older soa add does not count once the last 3 are other sets.
+  const g = guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['sos', 'sos', 'sos', 'soa'] });
+  assert.equal(g.guess, 'fallback'); assert.equal(id(x, g), 'mr-woe');
+  // '110/999': no set runs to 999, so the number is not evidence.
+  assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { footer: ['110/999'], sets: ['soa'] })), 'mr-soa45');
+  assert.equal(id(x, guessPrinting(x, x.byTitle['monstrous rage'], { footer: ['110/180'], sets: ['soa'] })), 'mr-soa110');
+  // A copyright year is never a number; denominators are never numbers.
+  assert.deepEqual([...guessNumbers(['© 2003/2010', '050/249']).keys()], ['50']);
 });
 
 test('guess: a same-set old-frame twin (mh2 135 / retro 408) is not a first-look guess', () => {
@@ -137,6 +140,25 @@ test('pipeline: a weak fallback on the first look still defers, then the full ca
   assert.equal(r2.ok, true, JSON.stringify(r2)); assert.equal(r2.guess, 'fallback'); assert.equal(r2.scryfallId, 'ti-a25');
 });
 
+test('pipeline: after a first-look guess the next frame runs every stage once, so a deeper footer proof still wins (review R1-B2)', async () => {
+  // Calls: frame 1 title + first batch (guess SOM 50); frame 2 title, first
+  // batch, tall (proves A25 75); frame 3 is carried (no OCR).
+  const { r, calls } = reader((c) => (c === 1 || c === 3 ? 'twisted image' : c === 5 ? 'a25 075/249' : 'zz'));
+  const opts = (frameId) => ({ requireStill: true, frameId, guess: { sets: ['som', 'som', 'som'] } });
+  const r1 = (await r.read(sharpFrame(), small, opts(1))).results[0];
+  assert.equal(r1.scryfallId, 'ti-som'); assert.equal(r1.guess, 'context');
+  const r2 = (await r.read(sharpFrame(), small, opts(2))).results[0];
+  assert.equal(r2.scryfallId, 'ti-a25', JSON.stringify(r2)); assert.equal(r2.guess, undefined);
+  const { r: q, calls: qc } = reader((c) => (c === 1 || c === 3 ? 'twisted image' : 'zz'));
+  await q.read(sharpFrame(), small, opts(1));
+  const v = (await q.read(sharpFrame(), small, opts(2))).results[0];
+  assert.equal(v.guess, 'context', 'nothing deeper: the guess stands');
+  const before = qc();
+  const c3 = (await q.read(sharpFrame(), small, opts(3))).results[0];
+  assert.equal(c3.cached, true); assert.equal(qc(), before, 'verified once, then carried without OCR');
+  assert.ok(calls() >= 5);
+});
+
 test('pipeline: a footer-proven printing is never overridden by context', async () => {
   const { r } = reader((c) => (c === 1 ? 'twisted image' : 'a25 075/249'));
   const res = (await r.read(sharpFrame(), small, { guess: { sets: ['som', 'som', 'som'] } })).results[0];
@@ -168,17 +190,26 @@ test('tray helpers: recent sets, server-choice guess, same-card correction, chan
   assert.deepEqual(guessFromChoices(cards, []), { card: cards[1], guess: 'fallback' });
   const h = guessChoiceHit({ card: { id: 'choose:x' }, choose: cards }, ['plst']);
   assert.equal(h.card.id, 'mtg-p'); assert.equal(h.ok, true); assert.equal(h.alts, 2); assert.equal(h.choose, undefined);
-  const tray = [{ key: 'a', guess: 'context', pres: 7, card: { name: "Archaic's Agony" } }];
-  assert.equal(guessedRowFor(tray, { card: { name: 'archaic s agony' } }, 7)?.key, 'a');
-  assert.equal(guessedRowFor(tray, { card: { name: 'archaic s agony' } }, 8), null, 'another presentation is another copy');
-  // A proven row, then a guess of the same card in view: a repeat, not a second copy.
-  const proven = [{ key: 'p', pres: 9, card: { name: 'Twisted Image', id: 'mtg-som' } }];
-  assert.equal(guessedRowFor(proven, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9)?.key, 'p');
-  assert.equal(guessedRowFor(proven, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9), null, 'two proofs keep the old rules');
+  // Same-presentation bookkeeping, independent of the tray (review R1-B5).
+  const committed = new Map();
+  notePresenceCommit(committed, 7, { name: "Archaic's Agony" }, { rowKey: 'a', guess: true });
+  assert.equal(presenceDecision(committed, { card: { name: 'archaic s agony', id: 'x' } }, 7).action, 'fix', 'a proof after a guess corrects it');
+  assert.equal(presenceDecision(committed, { guess: 'context', card: { name: "Archaic's Agony", id: 'y' } }, 7).action, 'repeat');
+  assert.equal(presenceDecision(committed, { card: { name: "Archaic's Agony" } }, 8).action, 'add', 'another presentation is another copy');
+  notePresenceCommit(committed, 9, { name: 'Twisted Image' }, { rowKey: 'p', guess: false });
+  assert.equal(presenceDecision(committed, { guess: 'fallback', card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'repeat', 'a guess after a proof is a repeat');
+  assert.equal(presenceDecision(committed, { card: { name: 'Twisted Image', id: 'mtg-a25' } }, 9).action, 'add', 'two proofs keep the old id de-dupe');
+  assert.equal(presenceDecision(committed, { card: { name: 'Bala Ged Recovery // Bala Ged Sanctuary' } }, 3).action, 'add');
+  // The server-choice guess uses the same ranking: newest regular printing.
+  const tw = [{ id: 'mtg-o', set_id: 'ody', number: '129', released_at: '2001-10-01' }, { id: 'mtg-l', set_id: 'plst', number: 'ODY-129', set_name: 'The List', released_at: '2020-09-01' }, { id: 'mtg-m', set_id: 'm12', number: '92', released_at: '2011-07-15' }];
+  assert.equal(guessFromChoices(tw, []).card.id, 'mtg-m');
+  assert.equal(guessFromChoices([...tw].reverse(), []).card.id, 'mtg-m', 'order-independent');
+  assert.equal(guessFromChoices(tw, ['woe', 'woe', 'woe', 'ody']).guess, 'fallback', 'only the last 3 adds are context');
   assert.equal(canChangePrinting({ alts: 2 }), true);
   assert.equal(canChangePrinting({ alts: 1 }), false);
   assert.equal(canChangePrinting({}), true, 'server answers: printing count unknown');
-  assert.equal(canChangePrinting({ alts: 3, sent: true }), false, 'sent without entry ids (a list)');
+  assert.equal(canChangePrinting({ alts: 3, sent: true }), false, 'sent, no entry ids, no destination');
+  assert.equal(canChangePrinting({ alts: 3, sent: true, sentDest: '12' }), true, 'a sent list row swaps the list card');
   assert.equal(canChangePrinting({ alts: 3, sent: true, entryIds: [5] }), true);
   assert.equal(canChangePrinting({ alts: 3, pending: true }), false);
 });

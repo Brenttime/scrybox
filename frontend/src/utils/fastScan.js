@@ -347,23 +347,24 @@ export function recentSets(rows, n = RECENT_SETS) {
 const SHEETISH = /^(plst|mb2|ulst|cmb1|cmb2|mbc|sld)$/;
 const sheetish = (c) => SHEETISH.test(String(c?.set_id || '').toLowerCase()) || /the list|mystery booster|secret lair/i.test(c?.set_name || '');
 // Pure: pick one card from twin candidates the server could not split
-// ({card rows}). Context set first (most frequent, then most recent), else a
-// non-reprint-sheet printing, else the first. Returns {card, guess}.
+// ({card rows}). A set of the last RECENT_SETS adds first (most frequent,
+// then most recent), else the regular printing. Returns {card, guess}.
 export function guessFromChoices(choices, sets = []) {
   const list = (choices || []).filter(c => c && c.id);
   if (!list.length) return null;
-  const byFreq = (list) => {
-    const freq = new Map();
-    list.forEach((s, i) => { const e = freq.get(s) || { n: 0, i }; e.n++; freq.set(s, e); });
-    return [...freq.entries()].sort((a, b) => b[1].n - a[1].n || a[1].i - b[1].i).map(([k]) => k);
-  };
-  // The last RECENT_SETS adds first, then the rest of the session.
-  const order = [...new Set([...byFreq(sets.slice(0, RECENT_SETS)), ...byFreq(sets.slice(RECENT_SETS))])];
+  const seen = new Map();
+  sets.slice(0, RECENT_SETS).forEach((s, i) => { const e = seen.get(s) || { n: 0, i }; e.n++; seen.set(s, e); });
+  const order = [...seen.entries()].sort((a, b) => b[1].n - a[1].n || a[1].i - b[1].i).map(([k]) => k);
+  // Same contract as shared/clientScan/guess.mjs: regular before reprint
+  // sheet / promo, then newest, then the lowest collector number.
+  const num = (c) => { const n = Number.parseInt(c.number ?? c.collector_number, 10); return Number.isFinite(n) ? n : 1e9; };
+  const rel = (c) => String(c.released_at || '');
+  const rank = (a, b) => (sheetish(a) - sheetish(b)) || (rel(b) < rel(a) ? -1 : rel(b) > rel(a) ? 1 : 0) || (num(a) - num(b)) || (String(a.id) < String(b.id) ? -1 : 1);
   for (const s of order) {
-    const hit = list.find(c => String(c.set_id || '').toLowerCase() === s);
-    if (hit) return { card: hit, guess: 'context' };
+    const inSet = list.filter(c => String(c.set_id || '').toLowerCase() === s);
+    if (inSet.length) return { card: [...inSet].sort(rank)[0], guess: 'context' };
   }
-  return { card: list.find(c => !sheetish(c)) || list[0], guess: 'fallback' };
+  return { card: [...list].sort(rank)[0], guess: 'fallback' };
 }
 // Pure: a choice hit (choiceHits) turned into a guessed hit; the full list
 // stays on the row (`alts`) for the Change printing sheet.
@@ -372,22 +373,36 @@ export function guessChoiceHit(hit, sets) {
   if (!g) return hit;
   return { ...hit, ok: true, card: g.card, guess: g.guess, alts: hit.choose.length, altCards: hit.choose, choose: undefined };
 }
-// Pure: the tray row of the SAME presentation with this title, when either
-// side is a guess: a later footer proof replaces a guessed row's printing,
-// and any other combination is only a repeat (a guess never adds a second
-// copy of a card still in view). Two proven printings keep the old rules.
-export function guessedRowFor(rows, hit, epoch) {
-  const row = sameCardRow(rows, hit, epoch);
-  return row && (row.guess || hit.guess) ? row : null;
+// Same-presentation bookkeeping for guessed printings (review R1-B5). The
+// record is written when a row is committed and lives outside the tray, so
+// dismissing or editing the row never re-opens the door to a second copy.
+const presenceName = (card) => String(card?.name || '').split(' // ')[0].toLowerCase().replace(/\u2019/g, "'")
+  .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+export function presenceKey(epoch, card) { return `${epoch}|${presenceName(card)}`; }
+export const PRESENCE_KEEP = 200;
+export function notePresenceCommit(committed, epoch, card, rec) {
+  if (epoch == null || !card) return;
+  committed.set(presenceKey(epoch, card), rec);
+  while (committed.size > PRESENCE_KEEP) committed.delete(committed.keys().next().value);
 }
-function sameCardRow(rows, hit, epoch) {
-  if (epoch == null || !hit?.card) return null;
-  const nm = (c) => String(c?.name || '').toLowerCase().replace(/\u2019/g, "'").normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
-  return (rows || []).find(r => r.pres === epoch && nm(r.card) === nm(hit.card)) || null;
+// Pure: what a hit means for the card already committed in this
+// presentation with the same title. A footer-proven hit after a GUESSED
+// commit corrects (or confirms) that row: 'fix'. Any other pairing with a
+// guess on either side is a 'repeat': a guess never adds a second copy of a
+// card still in view. Two proofs keep the old rules: 'add' (id de-dupe).
+export function presenceDecision(committed, hit, epoch) {
+  if (epoch == null || !hit?.card) return { action: 'add' };
+  const rec = committed.get(presenceKey(epoch, hit.card));
+  if (!rec) return { action: 'add' };
+  if (rec.guess && !hit.guess) return { action: 'fix', rec };
+  if (rec.guess || hit.guess) return { action: 'repeat', rec };
+  return { action: 'add' };
 }
 // Change printing is offered on every row whose title has more than one
 // printing (alts unknown = a server answer: offered too), before and after
-// it is sent; a sent row needs its collection entry ids to re-point.
+// it is sent: a sent collection row re-points its entry ids, a sent list
+// row swaps the list card. Hidden only while the row is still hydrating.
 export function canChangePrinting(row) {
-  return !!row && !row.pending && (row.alts == null || row.alts > 1) && (!row.sent || row.entryIds?.length > 0);
+  return !!row && !row.pending && (row.alts == null || row.alts > 1)
+    && (!row.sent || row.entryIds?.length > 0 || (!!row.sentDest && row.sentDest !== 'collection'));
 }

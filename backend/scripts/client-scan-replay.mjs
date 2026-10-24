@@ -63,7 +63,8 @@ function serverAnswer(j) {
 const every = Number(opt('--every', 1));
 const files = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg')).sort().filter((f, i) => i % every === 0).slice(0, limit);
 const rows = [];
-const recent = [];   // --guess: sets of the last answers, newest first
+const recent = [];   // --guess: sets of the last adds, newest first
+let lastAdded = null;
 for (const f of files) {
   const jsonPath = path.join(framesDir, f.replace(/\.jpg$/, '.json'));
   const srv = fs.existsSync(jsonPath) ? serverAnswer(JSON.parse(fs.readFileSync(jsonPath, 'utf8'))) : null;
@@ -80,11 +81,13 @@ for (const f of files) {
   const t0 = performance.now();
   const out = await reader.read(
     { data: new Uint8ClampedArray(full.data.buffer, full.data.byteOffset, full.data.length), width: full.info.width, height: full.info.height },
-    small, { smallChannels: 3, ...(args.includes('--auto') ? { requireStill: true, frameId: rows.length + 1 } : {}), ...(args.includes('--guess') ? { guess: { sets: recent.slice(0, 20) } } : {}) });
+    small, { smallChannels: 3, ...(args.includes('--auto') ? { requireStill: true, frameId: rows.length + 1 } : {}), ...(args.includes('--guess') ? { guess: { sets: recent.slice(0, 3) } } : {}) });
   const ms = performance.now() - t0;
   const r = out.results[0];
   const cand = out.candidates[0];
-  if (r?.ok && r.set) recent.unshift(r.set);
+  // Context advances on simulated ADDS only: a new title (the tray de-dupes
+  // a card that stays in view), as FastScanner's recentSets sees it.
+  if (r?.ok && r.set && r.title !== lastAdded) { recent.unshift(r.set); lastAdded = r.title; }
   rows.push({
     frame: f, ms: Math.round(ms), recCalls: reader.stats.recCalls - before.recCalls,
     status: cand ? cand.status : 'no card', sharp: cand?.sharpness, stage: r?.footer_stage, err: r?.error, ok: !!r?.ok, id: r?.scryfallId || null,
