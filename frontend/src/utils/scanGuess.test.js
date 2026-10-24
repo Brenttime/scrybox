@@ -18,7 +18,7 @@ const ix = () => loadIndex({
     ['ap-plst', 'plst', 'SOS-108', 20261109, 2], ['ap-sos', 'sos', '108', 20260424, 0],
     ['wa-sos', 'sos', '168', 20260424, 0], ['wa-sos-sc', 'sos', '297', 20260424, 1], ['wa-psos', 'psos', '168p', 20260424, 2],
     ['mr-pw25', 'pw25', '9', 20250801, 2], ['mr-soa45', 'soa', '45', 20260424, 1], ['mr-mar', 'mar', '72', 20260626, 1],
-    ['mr-soa110', 'soa', '110', 20260424, 1], ['mr-soa175', 'soa', '175', 20260424, 1], ['mr-woe', 'woe', '142', 20230908, 0],
+    ['mr-soa110', 'soa', '110', 20260424, 9], ['mr-soa175', 'soa', '175', 20260424, 9], ['mr-woe', 'woe', '142', 20230908, 0],
     ['dt-ody', 'ody', '129', 20011001, 0], ['dt-plst', 'plst', 'ODY-129', 20200901, 2],
     ['ti-som', 'som', '50', 20101001, 0], ['ti-plst', 'plst', 'SOM-50', 20200901, 2], ['ti-a25', 'a25', '75', 20180316, 0],
     ['f-ody', 'ody', '350'], ['f-som', 'som', '249'], ['f-sos', 'sos', '300'], ['f-soa', 'soa', '180'],
@@ -78,7 +78,11 @@ test('guess: a same-set old-frame twin (mh2 135 / retro 408) is not a first-look
   assert.equal(id(x, g), 'mc-135'); assert.equal(g.sure, false);
   // A same-set variant with the same frame era does not block (sos 168 / 297).
   assert.equal(guessPrinting(x, x.byTitle['wildgrowth archaic'], { sets: ['sos'] }).sure, true);
-  // Variant-only sets (soa) are never a first-look guess.
+  // A variant-only set: its two-finish main slot (soa 45) over the single-
+  // finish collector slots (110, 175) is a first-look guess ...
+  assert.equal(guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['soa'] }).sure, true);
+  // ... but not when two printings of the set are equally regular.
+  x.printings[x.byTitle['monstrous rage'].find(o => x.printings[o][0] === 'mr-soa110')][4] = 1;
   assert.equal(guessPrinting(x, x.byTitle['monstrous rage'], { sets: ['soa'] }).sure, false);
 });
 

@@ -12,7 +12,8 @@
 //      variant treatment), newest first.
 // Within the chosen set: regular before variant, then the lowest number.
 // Index rows are [id, set, num, released yyyymmdd?, flags?] (flags: 1 =
-// variant treatment, 2 = promo / reprint product, 4 = old card frame);
+// variant treatment, 2 = promo / reprint product, 4 = old card frame,
+// 8 = single finish);
 // older indexes without the extra columns still guess, only without the
 // newest-first tie-break and with fewer first-look guesses.
 import { normalizeCollector, strongNumbers } from './text.mjs';
@@ -65,12 +66,13 @@ const flagsOf = (ix, o) => Number(ix.printings[o][4]) || 0;
 const relOf = (ix, o) => Number(ix.printings[o][3]) || 0;
 const numOf = (ix, o) => { const n = Number.parseInt(ix.phys[o]?.num ?? ix.printings[o][2], 10); return Number.isFinite(n) ? n : 1e9; };
 
-// Regular printing first: no reprint sheet, no promo, no variant treatment,
-// then newest, then the lowest collector number.
+// How far from the set's main printing (lower = more regular): reprint
+// sheet, promo / product set, variant treatment, single finish.
+const tierOf = (ix, o) => (isSheet(ix, o) ? 8 : 0) + (flagsOf(ix, o) & 2 ? 4 : 0) + (flagsOf(ix, o) & 1 ? 2 : 0) + (flagsOf(ix, o) & 8 ? 1 : 0);
+
+// Regular printing first (tierOf), then newest, then the lowest number.
 function rank(ix, pool) {
-  return [...pool].sort((a, b) => (isSheet(ix, a) - isSheet(ix, b))
-    || ((flagsOf(ix, a) & 2) - (flagsOf(ix, b) & 2))
-    || ((flagsOf(ix, a) & 1) - (flagsOf(ix, b) & 1))
+  return [...pool].sort((a, b) => (tierOf(ix, a) - tierOf(ix, b))
     || (relOf(ix, b) - relOf(ix, a))
     || (numOf(ix, a) - numOf(ix, b))
     || (a - b));
@@ -102,20 +104,22 @@ export function guessPrinting(ix, cands, { footer = [], sets = [] } = {}) {
   }
   const ranked = rank(ix, pool);
   // `sure` (a guess safe to make on the first look, before the deeper footer
-  // stages): the pick is a regular printing (no sheet, promo or variant
-  // flag) and the only one of its set with its treatment, and no printing of
-  // that set uses another frame era. The deeper stages are what split two
-  // regular printings of one set (fra 213 / 298) and a modern card from its
-  // old-frame twin (mh2 135 / retro mh2 408, number on the copyright line):
-  // 2026-10-24 replay, a first-look guess there lost 17 retro-frame proofs.
-  // Those keep the cascade and guess only after it.
+  // stages): the pick is no sheet or promo printing, it is strictly the most
+  // regular printing of its set (tierOf: soa 37, the two-finish main slot,
+  // over the single-finish 102 / 167; fra 213 over showcase 298), and no
+  // printing of that set uses another frame era (mh2 135 / retro 408: the
+  // number is on the copyright line, only the deeper stages read it; the
+  // 2026-10-24 replay lost 17 such proofs to a first-look guess). A fallback
+  // pick must also be the single most regular candidate overall. The next
+  // frame still runs the full cascade once (pipeline verify), so a deeper
+  // footer proof corrects a wrong first-look guess.
   const pick = ranked[0];
   const all = [...new Set(cands)].filter(o => ix.printings[o]);
-  const regular = (o) => !isSheet(ix, o) && !(flagsOf(ix, o) & 3);
+  const t = tierOf(ix, pick);
   const sameSet = all.filter(o => ix.printings[o][1] === ix.printings[pick][1]);
-  const sure = regular(pick)
-    && sameSet.filter(o => (flagsOf(ix, o) & 3) === (flagsOf(ix, pick) & 3) && !isSheet(ix, o)).length === 1
+  const sure = t < 4
+    && sameSet.every(o => o === pick || tierOf(ix, o) > t)
     && sameSet.every(o => (flagsOf(ix, o) & 4) === (flagsOf(ix, pick) & 4))
-    && (basis !== 'fallback' || all.filter(regular).length === 1);
+    && (basis !== 'fallback' || all.every(o => o === pick || tierOf(ix, o) > t));
   return { pi: pick, guess: basis, sure };
 }
