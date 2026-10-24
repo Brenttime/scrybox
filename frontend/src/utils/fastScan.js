@@ -328,3 +328,153 @@ export function choiceLabel(cards) {
   const names = [...new Set((cards || []).map(c => c.set_name || String(c.set_id || '').toUpperCase()).filter(Boolean))];
   return names.length ? `${names.join(' or ')}?` : '';
 }
+
+// Printing guess (Brent, 2026-10-24): a proven title whose printing the
+// footer could not split is not a blocking picker any more. Set codes of the
+// last RECENT_SETS added rows (newest first), the context for the guess.
+export const RECENT_SETS = 3;
+export function recentSets(rows, n = RECENT_SETS) {
+  const out = [];
+  for (const r of rows || []) {
+    if (!r || r.needsChoice || !r.card) continue;
+    const s = String(r.card.set_id || r.card.set || '').toLowerCase();
+    if (s) out.push(s);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+// Reprint-sheet and promo products lose to a regular printing in a fallback.
+const SHEETISH = /^(plst|mb2|ulst|cmb1|cmb2|mbc|sld)$/;
+const sheetish = (c) => SHEETISH.test(String(c?.set_id || '').toLowerCase()) || /the list|mystery booster|secret lair/i.test(c?.set_name || '');
+// Pure: pick one card from twin candidates the server could not split
+// ({card rows}). A set of the last RECENT_SETS adds first (most frequent,
+// then most recent), else the regular printing. Returns {card, guess}.
+export function guessFromChoices(choices, sets = []) {
+  const list = (choices || []).filter(c => c && c.id);
+  if (!list.length) return null;
+  const seen = new Map();
+  sets.slice(0, RECENT_SETS).forEach((s, i) => { const e = seen.get(s) || { n: 0, i }; e.n++; seen.set(s, e); });
+  const order = [...seen.entries()].sort((a, b) => b[1].n - a[1].n || a[1].i - b[1].i).map(([k]) => k);
+  // Same contract as shared/clientScan/guess.mjs: regular before reprint
+  // sheet / promo, then newest, then the lowest collector number.
+  const num = (c) => { const n = Number.parseInt(c.number ?? c.collector_number, 10); return Number.isFinite(n) ? n : 1e9; };
+  const rel = (c) => String(c.released_at || '');
+  // Normalized card rows carry no release date or treatment flags; promo
+  // sets ('p' + parent code, or a promo set name) rank after regular ones.
+  const promo = (c) => (/^p[a-z0-9]{3}$/.test(String(c.set_id || '').toLowerCase()) || /promo/i.test(c.set_name || '') ? 1 : 0);
+  const rank = (a, b) => (sheetish(a) - sheetish(b)) || (promo(a) - promo(b)) || (rel(b) < rel(a) ? -1 : rel(b) > rel(a) ? 1 : 0) || (num(a) - num(b)) || (String(a.id) < String(b.id) ? -1 : 1);
+  for (const s of order) {
+    const inSet = list.filter(c => String(c.set_id || '').toLowerCase() === s);
+    if (inSet.length) return { card: [...inSet].sort(rank)[0], guess: 'context' };
+  }
+  return { card: [...list].sort(rank)[0], guess: 'fallback' };
+}
+// Pure: a choice hit (choiceHits) turned into a guessed hit; the full list
+// stays on the row (`alts`) for the Change printing sheet.
+export function guessChoiceHit(hit, sets) {
+  const g = guessFromChoices(hit.choose, sets);
+  if (!g) return hit;
+  return { ...hit, ok: true, card: g.card, guess: g.guess, alts: hit.choose.length, altCards: hit.choose, choose: undefined };
+}
+// Card-place bookkeeping for guessed printings (review R1-B5 .. R9). One
+// record per committed card: its title and where it lies. It lives outside
+// the tray (dismissing or editing a row never re-opens the door to a second
+// copy) and outside the presentation epoch (which follows the first
+// candidate only): it stays while a candidate is seen at its place and ends
+// when that place is empty (a no-card pass, or the card moved away) or holds
+// another title.
+const normPresence = (n) => String(n || '').toLowerCase().replace(/\u2019/g, "'")
+  .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+// Every name a card answers to: each face of its name, its faces' names and
+// the title the scanner read (a double-faced card read on its back face is
+// hydrated under its front name: review R11).
+const presenceNames = (card, title) => [...new Set([
+  card?.name,
+  ...((card?.card_faces || card?.faces || []).map(f => f?.name)),
+  title,
+].flatMap(n => String(n || '').split(/\s*\/\/\s*/)).map(normPresence).filter(Boolean))];
+const sameName = (a, b) => a.some(n => b.includes(n));
+export const PRESENCE_KEEP = 50;
+const boxCentre = (out, c) => {
+  if (!c?.box) return null;
+  const diag = Math.hypot(out.frame?.width || 1, out.frame?.height || 1);
+  return { cx: (c.box[0] + c.box[2] / 2) / diag, cy: (c.box[1] + c.box[3] / 2) / diag };
+};
+// Pure: the centre of the candidate a hit was read from (fraction of the
+// frame diagonal, like nextPresentation), or null when unknown.
+export function hitCentre(out, hit) {
+  const cands = out?.candidates || [];
+  const c = cands.find(x => x.number != null && x.number === hit?.number) || (cands.length === 1 ? cands[0] : null);
+  return boxCentre(out, c);
+}
+const samePlace = (a, b) => !a || !b || Math.hypot(a.cx - b.cx, a.cy - b.cy) <= SAME_PLACE;
+// Pure: the records still in view after a pass. A pass with no candidates
+// (the card was lifted) ends them all; a record with no candidate at its
+// place ends; another title read at its place (a hit, or a title the pass
+// read without its printing) ends it; MOTION_BREAK moving / blurred passes
+// in a row at its place end it, as they break a presentation (a hand swapping
+// cards). An errored pass changes nothing (review R10). hits: accepted hits.
+export function updatePresence(records, out, hits = []) {
+  if (!out || out.error) return records;
+  const cands = out.candidates || [];
+  if (!cands.length) return [];
+  const placed = cands.map(c => ({ centre: boxCentre(out, c), shaky: c.status === 'moving' || c.status === 'too blurry' })).filter(c => c.centre);
+  const reads = [...hits.map(h => ({ names: presenceNames(h.card, h.title), centre: hitCentre(out, h) })),
+    // Titles read WITHOUT an accepted card (a resolved result is its hit).
+    ...(out.results || []).filter(x => x?.title && !(x.ok && x.card)).map(x => ({ names: presenceNames(null, x.title), centre: hitCentre(out, x) }))]
+    .filter(r => r.centre && r.names.length);
+  const next = [];
+  for (const r of records) {
+    const here = r.centre ? placed.filter(c => samePlace(r.centre, c.centre)) : placed;
+    if (r.centre && placed.length && !here.length) continue;
+    if (r.centre && reads.some(x => !sameName(x.names, r.names) && samePlace(r.centre, x.centre))) continue;
+    const motion = here.length && here.every(c => c.shaky) ? (r.motion || 0) + 1 : 0;
+    if (motion >= MOTION_BREAK) continue;
+    next.push(motion === (r.motion || 0) ? r : { ...r, motion });
+  }
+  return next;
+}
+export function notePresenceCommit(records, card, rec, centre = null, title = null) {
+  if (!card) return records;
+  const next = [...records, { ...rec, names: presenceNames(card, title), centre }];
+  return next.slice(-PRESENCE_KEEP);
+}
+// Pure: what a hit means for a card already committed at the same place
+// with the same title. A footer-proven hit after a GUESSED (or still
+// choosing) commit corrects that row: 'fix'. A commit that started as a
+// guess or choice is one physical card: whatever happened to its row since
+// (corrected, picked, dismissed, sent) it is not added again, and a guess or
+// choice never adds beside it: 'repeat'. Two proofs keep the old rules:
+// 'add' with the id de-dupe (a proven reprint swap, review R6). Another
+// place is another card: 'add'.
+export function presenceDecision(records, hit, centre = null) {
+  if (!hit?.card) return { action: 'add' };
+  const names = presenceNames(hit.card, hit.title);
+  const rec = records.find(r => sameName(r.names, names) && samePlace(r.centre, centre));
+  if (!rec) return { action: 'add' };
+  const tentative = !!(hit.guess || hit.choose);
+  if (rec.guess && !tentative) return { action: 'fix', rec };
+  if (rec.wasGuess || tentative) return { action: 'repeat', rec };
+  return { action: 'add' };
+}
+// Change printing is offered on every row whose title has more than one
+// printing (alts unknown = a server answer: offered too), before and after
+// it is sent to the collection (its entry ids are re-pointed). Lists hold
+// cards by name, so a row sent to a list has no printing to change; a row
+// still hydrating (~0.1-0.3 s) gets the button once its card arrives.
+export function canChangePrinting(row) {
+  return !!row && !row.pending && (row.alts == null || row.alts > 1) && (!row.sent || row.entryIds?.length > 0);
+}
+
+// Pure: the collection entry ids each sent row got from bulk-add. Every
+// added entry names its request index, so of two rows for one card only the
+// one that landed is matched (review R1-S5). Map row key -> ids.
+export function sentEntryIds(rows, entries) {
+  const byIndex = new Map((entries || []).filter(e => Number.isInteger(e?.index)).map(e => [e.index, e]));
+  const out = new Map();
+  rows.forEach((row, i) => {
+    const e = byIndex.get(i);
+    if (e && String(e.card_id) === String(row.card.id)) out.set(row.key, (e.ids?.length ? e.ids : [e.id]).filter(Boolean));
+  });
+  return out;
+}

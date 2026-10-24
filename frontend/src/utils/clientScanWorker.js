@@ -129,13 +129,13 @@ self.onmessage = async (e) => {
   }
   // Phase 2: the full read, reusing the corners phase 1 found for this frame.
   if (type === 'read') {
-    const { frame, w, h, quad, requireStill, frameId = null } = e.data;
+    const { frame, w, h, quad, requireStill, frameId = null, guess = null } = e.data;
     try {
       if (!readerPromise) throw new Error('reader not loaded');
       const { reader } = await readerPromise;
       const out = await reader.read(
         { data: new Uint8ClampedArray(frame), width: w, height: h },
-        null, { requireStill, quad, frameId });
+        null, { requireStill, quad, frameId, guess });
       self.postMessage({ id, out, frame }, [frame]);
     } catch (err) {
       self.postMessage({ id, error: err?.message || String(err), frame }, [frame]);

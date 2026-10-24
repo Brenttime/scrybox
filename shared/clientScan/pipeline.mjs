@@ -22,6 +22,7 @@ import {
   footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
+import { guessPrinting, CONTEXT_PRIMARY } from './guess.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -400,6 +401,12 @@ export function createReader(env) {
   // card has stayed in view since it was proven. Any frame without a card
   // drops it, and the next card is re-proven from its own title + footer.
   let tracked = null;   // {sig, result}
+  // A printing GUESSED on a first look (before the deeper footer stages) is
+  // added at once; the next frame of the same card in continuous view runs
+  // the full cascade ONCE (verify) so a deeper footer proof still wins, and
+  // after that the guess is carried like a tracked identity (no re-reads).
+  // Dropped wherever tracking is. {sig, coarse, result, verified}
+  let guessed = null;
   // Cross-frame footer evidence. A still card is read on consecutive frames;
   // each frame's footer OCR is noisy in different places, so an unresolved
   // card's footer reads are kept and pooled with the next frame's IF it is the
@@ -417,6 +424,9 @@ export function createReader(env) {
   // or an id is missing, so two DISTINCT decoded frames are always provable.
   let stampPres = null;
   let curFrameId = null;
+  // Printing guess (opts.guess = {sets: recent added sets}); absent = the
+  // old abstain/picker behaviour.
+  let curGuess = null;
 
   async function detect(small, channels, frameW, frameH) {
     const out = await env.cornelius.run({ image: corneliusTensor(env.ort, small, channels) });
@@ -433,8 +443,9 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known, frameId = null } = opts;
+    const { smallChannels = 4, requireStill = false, quad: known, frameId = null, guess = null } = opts;
     curFrameId = frameId;
+    curGuess = guess && typeof guess === 'object' ? { sets: Array.isArray(guess.sets) ? guess.sets.slice(0, CONTEXT_PRIMARY) : [] } : null;
     if (stampPres?.confirm && (frameId == null || typeof frameId !== stampPres.confirm.src)) stampPres.confirm = null;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
@@ -442,7 +453,7 @@ export function createReader(env) {
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -527,7 +538,7 @@ export function createReader(env) {
     // one uninterrupted presentation.
     // 'settling' is a still card waiting out its window: nothing about it
     // suggests a swap, so tracking and pooled evidence survive it.
-    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; evidence = null; stampPres = null; }
+    if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; guessed = null; evidence = null; stampPres = null; }
     if (!cand.eligible) return base;
 
     // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
@@ -544,6 +555,12 @@ export function createReader(env) {
     // it is matched on the signature of the gated quad, as it was stored.
     const coarseSig = artSignature(rgba, w, h, m);
     if (tracked && cosine(tracked.coarse, coarseSig) < 0.97) tracked = null;
+    if (guessed && cosine(guessed.coarse, coarseSig) < 0.97) guessed = null;
+    if (guessed?.verified) {
+      base.results.push({ ...guessed.result, number: 1, cached: true });
+      timings.total_ms = Math.round(now() - t0);
+      return base;
+    }
     if (tracked) {
       base.results.push({ ...tracked.result, number: 1, cached: true });
       timings.total_ms = Math.round(now() - t0);
@@ -567,7 +584,9 @@ export function createReader(env) {
     const prior = evidence && cosine(evidence.sig, sig) >= EVIDENCE_SIM ? evidence : null;
     const recBefore = env.stats.recCalls;
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred, nearEdge, readQuad, requireStill && frameId != null);
+    const verifying = !!guessed && !nearEdge;
+    if (verifying) timings.guess_verify = 1;
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -577,8 +596,15 @@ export function createReader(env) {
     // Only a title-proven answer is carried: a card swapped for a same-art
     // reprint between two frames at the same spot is invisible to tracking,
     // so a printing that needed its footer is re-read every time.
-    if (nearEdge) { evidence = null; tracked = null; stampPres = null; }
-    else if (result.ok) { evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null; }
+    if (nearEdge) { evidence = null; tracked = null; guessed = null; stampPres = null; }
+    else if (result.ok) {
+      evidence = null; tracked = TITLE_PROVEN.has(result.via) ? { sig, coarse: coarseSig, result } : null;
+      // A guess: verify once with every stage unless this read already ran
+      // them (a verify pass, or a guess made after the full cascade).
+      guessed = result.guess ? { sig, coarse: coarseSig, result, verified: verifying || !result.guess_first } : null;
+    // A verify read counts once it reached the footer cascade (title read);
+    // a title miss or an edge abstain ran no stage and verifies nothing.
+    } else if (verifying && result.title) guessed = { ...guessed, verified: true };
     else if (result.title && (result.footer_ocr?.length || result.deferred || result.held?.length)) {
       // Validated old-frame numbers are stored per frame, aligned with the
       // frames window, so they expire with their own frame (review R3-S1)
@@ -594,7 +620,7 @@ export function createReader(env) {
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto, verify = false) {
     const tA = now();
     // Near the frame edge, a strip that reaches off-frame would be read from
     // clamped, repeated edge pixels. The stage is re-projected with the
@@ -669,12 +695,25 @@ export function createReader(env) {
     const done = (pi, via, footer, stage = -1) => {
       const p = ix.printings[pi];
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
-      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw };
+      return { number: 1, ok: true, scryfallId: p[0], set: p[1], num: p[2], title: name, title_score: score, via, footer_stage: stage, footer_ocr: footer, title_raw: titleRaw, alts: (ix.byTitle[name] || []).length };
+    };
+    // Title proven, printing not split by the footer: guess it (guess.mjs)
+    // instead of a picker. Only with opts.guess; `first` = the cheap first
+    // look, where only a guess with a basis (footer hint, scan context, or a
+    // single regular original) is made and anything weaker keeps the cascade.
+    const guessed = (cands, via, footer, stage, first = false) => {
+      if (!curGuess || !cands?.length) return null;
+      const g = guessPrinting(ix, cands, { footer, sets: curGuess.sets });
+      if (!g || (first && !g.sure)) return null;
+      const r = done(g.pi, `${via} + guess`, footer, stage);
+      timings.guess = g.guess;
+      return { ...r, guess: g.guess, guess_of: cands.length, guess_first: first || undefined };
     };
     // A proven PHYSICAL footer: one printing -> done. Several printings with
     // that footer (a reprint sheet such as The List / MB2 next to its
     // original) -> the footer cannot decide, and no later footer stage can
-    // either. The cascade stops and the user picks; never a guess.
+    // either. The cascade stops; with opts.guess the printing is guessed from
+    // the scan context (guess.mjs), else the user picks.
     // The List / MB2 stamp (stamp.mjs), read at most once per frame and only
     // for a title with a reprint-sheet printing. A PRESENT stamp is evidence
     // on one frame. A stamp that is not seen may be covered, glared or outside
@@ -751,6 +790,8 @@ export function createReader(env) {
           title: name, title_score: score, footer_ocr: footer, title_raw: titleRaw, stamp_obs: stampObs, absent_pick: orig[0],
           held: held.length ? held : undefined, rescued: rescued || undefined };
       }
+      const gp = guessed(group, via, footer, stage);
+      if (gp) return gp;
       timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
       return { number: 1, ok: false, retry: false, error: 'printing needs a choice', via, footer_stage: stage, stamp_obs: stampObs,
         choices: group.map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }),
@@ -834,7 +875,8 @@ export function createReader(env) {
     const ownNumbered = (ix.byTitle[name] || []).some(o => STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
     // Reprint-sheet titles with a short printing list: hand the caller the
     // full list so it can offer a one-tap picker instead of stalling (the
-    // title is proven; only the printing is not). Never auto-picked.
+    // title is proven; only the printing is not). Without opts.guess this is
+    // never auto-picked.
     const titleChoices = sheetLike && (ix.byTitle[name] || []).length <= 10
       ? ix.byTitle[name].map(g => { const p = ix.printings[g]; return { scryfallId: p[0], set: p[1], num: p[2] }; }) : undefined;
     for (const [si, stage] of (env.footerStages || FOOTER_STAGES).entries()) {
@@ -914,6 +956,21 @@ export function createReader(env) {
       // Refute Destiny, Marwyn). Stop here; this frame's footer reads are
       // pooled, and the next still frame of the same card continues with them
       // and runs every stage.
+      // First look with a guess allowed: the footer could not split the
+      // title's printings, so guess now instead of looping (Brent,
+      // 2026-10-24: < 1 s per card). Not over a strong List stamp (that
+      // card's own stamp exit above decides), and only a guess with a basis.
+      // The title must clear the bar a unique-printing title clears: a title
+      // that starts a longer one ('flicker' / 'flickering hound') is never
+      // proven by its OCR alone, so it gets no title-only guess either.
+      // Not near the frame edge: that read is never cached or verified, so
+      // a first-look guess there would never meet the deeper stages (R7).
+      if (curGuess && si === 0 && !verify && !nearEdge && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
+        const hold = veto();
+        const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
+        const gp = guessed(cands, 'title', pooled ? [...pooled.flat(), ...raws] : raws, si, true);
+        if (gp) return gp;
+      }
       if (auto && !pooled && si === 0) {
         // env.retroFirst (default on at >= 4 ORT threads, see the worker): a
         // title with an own-numbered (mb2) printing reads its copyright line on
@@ -934,6 +991,15 @@ export function createReader(env) {
         return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', deferred: true, sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, held: held.length ? held : undefined, stamp_obs: stampObs };
       }
     }
+    // Every stage ran and nothing split the printings: guess (fallback
+    // allowed), unless a validated copyright-line number contradicts it.
+    if (curGuess && !ix.prefixOfLonger?.has(name) && !(sheetLike && listStamp()?.present)) {
+      const all = pooled ? [...pooled.flat(), ...raws] : raws;
+      const hold = veto();
+      const cands = (ix.byTitle[name] || []).filter(o => !hold.length || hold.includes(ph[o].num));
+      const gp = guessed(cands, 'title', all, -1);
+      if (gp) return gp;
+    }
     timings.footer_ms = Math.round(now() - tA) - timings.title_ms;
     return { number: 1, ok: false, retry: true, error: 'exact printing not resolved', sheet_like: sheetLike || undefined, title_choices: titleChoices, title: name, title_score: score, footer_ocr: raws, title_raw: titleRaw, rescued: rescued || undefined, held: held.length ? held : undefined, stamp_obs: stampObs };
   }
@@ -942,13 +1008,15 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }
     return quad;
   }
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; evidence = null; stampPres = null; }, resetCache() { tracked = null; } };
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, // A pending verify survives (it IS a real read); a verified guess is a
+    // cached answer and goes, like tracked.
+    resetCache() { tracked = null; if (guessed?.verified) guessed = null; } };
 }
 
 export { normName };
