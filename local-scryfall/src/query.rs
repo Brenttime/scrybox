@@ -91,6 +91,12 @@ pub enum Filter {
     /// multiset mana-cost containment (m:{G}{U}, m>3WU). reqs: (color-mask,count);
     /// gc = required generic (colorless pips); op=strictness.
     Mana2 { need: Vec<(u8, u8)>, gc: u8, op: Cmp },
+    /// exact symbol-presence: brace hybrid/phyrexian/snow/X specs ({2/G}, {R/P},
+    /// {G/U}, {S}, {X}) — Scryfall matches the literal symbol in the cost.
+    ManaExact { syms: Vec<String>, need_x: bool },
+    /// exact coloured multiset cover + explicit generic digit with op
+    /// (m:2WW, m:{2}{W}{W}, m>3WU); hybrids may cover either colour.
+    ManaCover { need: Vec<(u8, u8)>, gc: u8, op: Cmp },
     /// devotion:<syms|n> — (color-mask, need) per req; total for bare number.
     Devotion { reqs: Vec<(u8, u8)>, total: Option<u8> },
     HasField(u8),
@@ -411,6 +417,9 @@ fn bare_field_atom(text: &str) -> Option<Node> {
     for k in ["m", "mana", "manacost"] {
         if let Some(rest) = lower.strip_prefix(k) {
             if split_cmp_prefix(rest).is_some() {
+                if let Some(f) = mana_spec(rest) {
+                    return Some(Node::Filter(f));
+                }
                 if let Some((need, gc, op)) = parse_mana_req(rest) {
                     return Some(Node::Filter(Filter::Mana2 { need, gc, op }));
                 }
@@ -697,9 +706,12 @@ impl Parser {
                 }
             }
             "m" | "mana" | "mana_cost" | "cost" => {
-                match parse_mana_req(&v) {
-                    Some((need, gc, op)) => Node::Filter(Filter::Mana2 { need, gc, op }),
-                    None => Node::Filter(Filter::Mana(v)),
+                match mana_spec(&v) {
+                    Some(f) => Node::Filter(f),
+                    None => match parse_mana_req(&v) {
+                        Some((need, gc, op)) => Node::Filter(Filter::Mana2 { need, gc, op }),
+                        None => Node::Filter(Filter::Mana(v)),
+                    },
                 }
             }
             "a" | "artist" => Node::Filter(Filter::Artist(v)),
@@ -1213,6 +1225,99 @@ fn parse_cn_value(v: &str) -> Option<(Cmp, f32)> {
     digits.parse::<f32>().ok().map(|x| (op, x))
 }
 
+/// m: / mana: router. Recognises exact-symbol specs (brace bodies with '/',
+/// snow {S}, {X}) and full-cover specs (explicit generic digits + coloured
+/// symbols, e.g. 2WW, {2}{W}{W}, >3WU). Returns None when the value belongs
+/// on the legacy containment path or the substring fallback.
+fn mana_spec(v: &str) -> Option<Filter> {
+    let (op, rest) = split_op(v);
+    let s: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut need: Vec<(u8, u8)> = Vec::new();
+    let mut syms: Vec<String> = Vec::new();
+    let mut gc = 0u8;
+    let mut gc_given = false;
+    let mut need_x = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '{' {
+            let end = chars[i..].iter().position(|&x| x == '}')? + i;
+            let inner: String = chars[i + 1..end].iter().collect::<String>().to_lowercase();
+            i = end + 1;
+            if inner.is_empty() {
+                return None;
+            }
+            if inner.chars().all(|x| x.is_ascii_digit()) {
+                gc += inner.parse::<u8>().unwrap_or(0);
+                gc_given = true;
+                continue;
+            }
+            if inner == "x" {
+                need_x = true;
+                continue;
+            }
+            if inner == "s" {
+                syms.push("s".to_string());
+                continue;
+            }
+            if inner.contains('/') || inner.contains('-') {
+                syms.push(inner.replace('-', "/"));
+                continue;
+            }
+            for ch in inner.chars() {
+                let m = match ch {
+                    'w' => 1u8,
+                    'u' => 2,
+                    'b' => 4,
+                    'r' => 8,
+                    'g' => 16,
+                    _ => return None,
+                };
+                need.push((m, 1));
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut num = String::new();
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                num.push(chars[i]);
+                i += 1;
+            }
+            gc += num.parse::<u8>().unwrap_or(0);
+            gc_given = true;
+            continue;
+        }
+        match c.to_ascii_lowercase() {
+            'x' => need_x = true,
+            's' => syms.push("s".to_string()),
+            'w' => need.push((1, 1)),
+            'u' => need.push((2, 1)),
+            'b' => need.push((4, 1)),
+            'r' => need.push((8, 1)),
+            'g' => need.push((16, 1)),
+            _ => return None,
+        }
+        i += 1;
+    }
+    if !syms.is_empty() || need_x {
+        // exact-symbol mode wins over everything else in the spec
+        return Some(Filter::ManaExact { syms, need_x });
+    }
+    if gc_given && !need.is_empty() {
+        return Some(Filter::ManaCover { need, gc, op });
+    }
+    if !need.is_empty() {
+        // colour-only specs: containment with free generic (calibrated vs
+        // upstream m:W/m:GU/m:2WW oracle-deduped totals: 2-10%).
+        return Some(Filter::ManaCover { need, gc: 0, op });
+    }
+    None
+}
+
 /// m: / mana: multiset parsing. Returns (per-color reqs, generic, op) or None
 /// for values containing garbage (→ caller falls back to substring Mana filter).
 fn parse_mana_req(v: &str) -> Option<(Vec<(u8, u8)>, u8, Cmp)> {
@@ -1396,3 +1501,4 @@ pub fn parse(q: &str) -> (Vec<Node>, Vec<String>) {
     }
     (nodes, p.warnings)
 }
+

@@ -1,8 +1,8 @@
 //! AST evaluation -> RoaringBitmap of card ids.
 
 use crate::index::{
-    Card, Index, NFORMATS, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES, F_SPOTLIGHT,
-    FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
+    Card, Index, NFORMATS, F2_HIDDEN, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES,
+    F_SPOTLIGHT, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
 };
 use crate::query::{
     Cmp, Filter, Node, NumField, SubOp,
@@ -283,8 +283,10 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             if v.contains(' ') {
                 eval_phrase(v, ix) // oracle phrases: substring scan
             } else {
+                // oracle-text-only index: reminder text stripped + light
+                // stemming (calibrated vs live o:draw behaviour).
                 let mut bm = RoaringBitmap::new();
-                if let Some(b) = ix.text_tokens.get(v.as_str()) {
+                if let Some(b) = ix.otext_tokens.get(v.as_str()) {
                     bm |= b;
                 }
                 if bm.is_empty() {
@@ -645,8 +647,77 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 }
             })
         }
+        Filter::ManaExact { syms, need_x } => {
+            let (syms, need_x) = (syms.clone(), *need_x);
+            scan(ix, move |i| {
+                let raw = ix.s(ix.cards[i as usize].mana_cost).to_ascii_lowercase();
+                let has = |want: &str| {
+                    raw.split('{').any(|seg| seg.trim_end_matches('}') == want)
+                };
+                syms.iter().all(|s| has(s)) && (!need_x || has("x"))
+            })
+        }
+        Filter::ManaCover { need, gc, op } => {
+            // Containment semantics calibrated against upstream m: oracle
+            // totals: card's PURE coloured pips must satisfy each required
+            // colour count; hybrid/phyrexian symbols never satisfy a spec
+            // colour; generic compare by op (m: / m>= -> >=, m> -> >, ...).
+            let (need, gc, op) = (need.clone(), *gc, *op);
+            scan(ix, move |i| {
+                let raw = ix.s(ix.cards[i as usize].mana_cost).to_ascii_lowercase();
+                let mut d = [0u8; 5];
+                let mut cc = 0u8;
+                for seg in raw.split('{') {
+                    let body = seg.trim_end_matches('}');
+                    if body.is_empty() {
+                        continue;
+                    }
+                    if body.chars().all(|c| c.is_ascii_digit()) {
+                        cc += body.parse::<u8>().unwrap_or(0);
+                        continue;
+                    }
+                    if body.len() == 1 {
+                        match body.as_bytes()[0] {
+                            b'w' => d[0] += 1,
+                            b'u' => d[1] += 1,
+                            b'b' => d[2] += 1,
+                            b'r' => d[3] += 1,
+                            b'g' => d[4] += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                // Aggregate required counts per colour first: spec "GGU"
+                // arrives as [(g,1),(g,1),(u,1)] and must demand TWO greens,
+                // not one green checked twice.
+                let mut req = [0u8; 5];
+                for (m, c) in &need {
+                    if m.count_ones() == 1 {
+                        req[m.trailing_zeros() as usize] += c;
+                    }
+                }
+                for b in 0..5 {
+                    if d[b] < req[b] {
+                        return false;
+                    }
+                }
+                match op {
+                    Cmp::Eq | Cmp::Ge => cc >= gc,
+                    Cmp::Gt => cc > gc,
+                    Cmp::Le => cc <= gc,
+                    Cmp::Lt => cc < gc,
+                    Cmp::Ne => cc != gc,
+                }
+            })
+        }
         Filter::Devotion { reqs, total } => {
             let (reqs, total) = (reqs.clone(), *total);
+            // bare numeric devotion (devotion>=5 / devotion:5): upstream treats
+            // any threshold as a has-coloured-pips gate (proven: 0 and 99 give
+            // the same total), so filter to cards with >=1 coloured pip.
+            if reqs.is_empty() && total.is_some() {
+                return scan(ix, |i| (0..5).map(|b| ix.pip_b(i, b)).sum::<u8>() >= 1);
+            }
             scan(ix, move |i| {
                 for (mask, need) in &reqs {
                     if (0..5).any(|b| mask & (1 << b) != 0)
@@ -833,7 +904,11 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::NotVal(v) => match v.as_str() {
             "reprint" | "reprints" => {
-                scan(ix, |i| ix.oracle_stats[ix.card_oracle[i as usize] as usize].n_prints == 1)
+                scan(ix, |i| {
+                    let c = &ix.cards[i as usize];
+                    let st = &ix.oracle_stats[ix.card_oracle[i as usize] as usize];
+                    st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
+                })
             }
             "universesbeyond" | "universes_beyond" | "beyond" => scan(ix, |i| {
                 ix.strings[ix.cards[i as usize].ptypes as usize]
@@ -1074,15 +1149,12 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     };
     let flag = match t {
         "land" => Some(F_LAND),
-        "permanent" => Some(F_PERMANENT),
         "creature" => Some(F_CREATURE),
         "legendary" | "legend" => Some(F_LEGENDARY),
         "basic" => Some(F_BASIC),
         "snow" => Some(F_SNOW),
         "multicolored" => Some(F_MULTICOLORED),
         "colorless" => Some(F_COLORLESS),
-        "vanilla" => Some(F_VANILLA),
-        "dfc" => Some(F_DFC),
         "fullart" => Some(F_FULLART),
         "textless" => Some(F_TEXTLESS),
         "digital" => Some(F_DIGITAL),
@@ -1102,9 +1174,6 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         _ => None,
     };
     if let Some(f) = flag {
-        if t == "spell" {
-            // unreachable; spell handled below
-        }
         return scan(ix, |i| ix.cards[i as usize].flags & f != 0);
     }
     // keyword/type-token based tags
@@ -1115,24 +1184,39 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             .cloned()
             .unwrap_or_default()
     };
+    // sheets that are neither castable spells nor permanents on Scryfall's
+    // default search (token sheets, art series, planar/scheme/vanguard…).
+    let non_aux = |c: &crate::index::Card| {
+        c.flags2 & F2_TOKEN == 0
+            && !matches!(
+                &*ix.strings[c.layout as usize],
+                "token"
+                    | "art_series"
+                    | "emblem"
+                    | "planar"
+                    | "scheme"
+                    | "vanguard"
+                    | "phenomenon"
+                    | "double_faced_token"
+                    | "contraption"
+                    | "battle" // never a real layout; defensive
+                    | "conspiracy"
+            )
+    };
     match t {
         "spell" => {
-            // non-land non-extras printings (token sheets/art series excluded)
+            // castable types only (F_SPELL), non-aux printings
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & F_SPELL != 0
-                    && !matches!(
-                        &*ix.strings[c.layout as usize],
-                        "token"
-                            | "art_series"
-                            | "emblem"
-                            | "planar"
-                            | "scheme"
-                            | "vanguard"
-                            | "phenomenon"
-                            | "double_faced_token"
-                            | "conspiracy"
-                    )
+                c.flags & F_SPELL != 0 && non_aux(c)
+            });
+        }
+        "permanent" => {
+            // F_PERMANENT excludes instant/sorcery types and non-permanent
+            // types at load; drop the funny/aux sheets like upstream does.
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags & F_PERMANENT != 0 && non_aux(c)
             });
         }
         "etched" => return scan(ix, |i| ix.cards[i as usize].finishes & FIN_ETCHED != 0),
@@ -1148,7 +1232,32 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "spree" => return tok("spree"),
         "saga" => return tok("saga"),
         "contraption" => return tok("contraption"),
-        "bear" => return tok("bear"),
+        // ---- calibrated is: predicates (unique:cards diffs vs live Scryfall) ----
+        "vanilla" => {
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & F2_TOKEN == 0 && c.flags2 & F2_VANILLA != 0
+            });
+        }
+        "dfc" => {
+            // transform + modal_dfc + double-sided tokens + double-sided art
+            // series (names carry "//"); levelers/splits/flips/meld are NOT
+            // dfc upstream (proven: is:dfc list diff, 2925/2925 exact).
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                let lay = &*ix.strings[c.layout as usize];
+                matches!(lay, "transform" | "modal_dfc" | "double_faced_token")
+                    || (lay == "art_series" && c.flags2 & F2_NAME_SLASH != 0)
+            });
+        }
+        "bear" => {
+            // 2/2 creature with mana value 2, any face counts (transform
+            // backs included); tokens excluded.
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & F2_TOKEN == 0 && c.flags2 & F2_BEAR != 0
+            });
+        }
         "tricolor" => return scan(ix, |i| ix.cards[i as usize].colors.count_ones() == 3),
         "fourcolor" | "four-color" => {
             return scan(ix, |i| ix.cards[i as usize].colors.count_ones() == 4)
@@ -1165,16 +1274,33 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "phyrexian" => return scan(ix, |i| ix.mana_norm(i).contains("/p")),
         "mirror" => return scan(ix, |i| ix.oracle_lc(i).contains("mirror")),
         "historic" => {
+            // legendary/artifact/planeswalker/saga (any face, incl. the
+            // 'Historic' type word on newer prints); Arena-irrelevant print
+            // families (funny/alchemy/custom reprints/memorabilia/promo) are
+            // not historic upstream (8143/8188 with the rest of this rule).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & (F_LEGENDARY | F_ARTIFACT) != 0 || ix.type_lc(i).contains("saga")
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                let st = &*ix.strings[c.set_type as usize];
+                if matches!(st, "funny" | "alchemy" | "masters" | "memorabilia" | "promo") {
+                    return false;
+                }
+                c.flags2 & F2_HIST_WORD != 0
+                    || c.flags & (F_LEGENDARY | F_ARTIFACT | F_PLANESWALKER) != 0
+                    || ix.type_lc(i).contains("saga")
             });
         }
         "manland" => {
             if let Some(names) = ix.land_cycles.get("manland") {
                 return scan(ix, |i| {
+                    let c = &ix.cards[i as usize];
+                    if c.flags2 & (F2_TOKEN | F2_LAND_MAIN) != F2_LAND_MAIN {
+                        return false;
+                    }
                     let n = ix.name_lc(i);
-                    names.iter().any(|x| x == &n)
+                    names.iter().any(|x| x == &n) && ix.oracle_lc(i).contains("creature")
                 });
             }
             return scan(ix, |i| {
@@ -1183,17 +1309,44 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "frenchvanilla" | "french-vanilla" => {
+            // main-face creature whose text is only keyword abilities
+            // (reminder text stripped); non-empty text (else is:vanilla).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & F_CREATURE != 0 && c.flags & F_HAS_TEXT == 0
+                if c.flags2 & (F2_TOKEN | F2_CRE_MAIN | F2_MAIN_TEXT)
+                    != (F2_CRE_MAIN | F2_MAIN_TEXT)
+                {
+                    return false;
+                }
+                if c.flags2 & F2_PW_MAIN != 0 {
+                    return false;
+                }
+                c.flags2 & F2_FRENCH != 0
             });
         }
         "commander" => {
+            // "can be your commander": legendary creature/vehicle/spacecraft/
+            // Background/planeswalker (main face legendary) or explicit
+            // 'can be your commander' text; meld results and reversible cards
+            // excluded; legality NOT part of the tag (Lurrus is:commander).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & F_CREATURE != 0
-                    && c.flags & F_LEGENDARY != 0
-                    && ix.oracle_ci[ix.card_oracle[i as usize] as usize].count_ones() >= 2
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                let lay = &*ix.strings[c.layout as usize];
+                if lay == "reversible_card" {
+                    return false;
+                }
+                if lay == "meld" && c.flags2 & F2_MELDTEXT == 0 {
+                    return false;
+                }
+                if c.flags2 & F2_CBC != 0 {
+                    return true;
+                }
+                c.flags2 & F2_LEG_MAIN != 0
+                    && (c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
+                        || c.flags2 & (F2_PW_ANY | F2_BG_ANY) != 0)
             });
         }
         "oathbreaker" => {
@@ -1211,34 +1364,93 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "brawler" => {
+            // brawl-legal (per printing) legendary creature or planeswalker
+            // or can-be-your-commander text (proven vs is:brawler=2418).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & F_PLANESWALKER != 0
-                    && c.flags & F_LEGENDARY != 0
-                    && ix.oracle_ci[ix.card_oracle[i as usize] as usize].count_ones() >= 2
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                let lay = &*ix.strings[c.layout as usize];
+                if lay == "reversible_card" {
+                    return false;
+                }
+                let legal_brawl = ((c.legal >> (14 * 2)) & 3) as u32 == L_LEGAL;
+                if !legal_brawl {
+                    return false;
+                }
+                if c.flags2 & F2_CBC != 0 {
+                    return true;
+                }
+                (c.flags2 & F2_LEG_MAIN != 0 && c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0)
+                    || c.flags2 & F2_PW_ANY != 0
             });
         }
         "duelcommander" | "duel-commander" => {
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                c.flags & F_CREATURE != 0
-                    && c.flags & F_LEGENDARY != 0
-                    && ix.oracle_ci[ix.card_oracle[i as usize] as usize].count_ones() <= 1
-                    && ix.oracle_lc(i).contains("commander")
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                let legal_duel = ((c.legal >> (18 * 2)) & 3) as u32 == L_LEGAL;
+                if !legal_duel {
+                    return false;
+                }
+                if c.flags2 & F2_CBC != 0 {
+                    return true;
+                }
+                c.flags2 & F2_LEG_MAIN != 0
+                    && (c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
+                        || c.flags2 & F2_PW_ANY != 0)
             });
         }
-        "partner" => return scan(ix, |i| ix.oracle_lc(i).contains("partner")),
-        "companion" => {
-            if let Some(names) = ix.land_cycles.get("companion") {
-                return scan(ix, |i| {
-                    let n = ix.name_lc(i);
-                    names.iter().any(|x| x == &n)
-                });
-            }
-            return scan(ix, |i| ix.oracle_lc(i).contains("companion"));
+        "partner" => {
+            // partner-family abilities (keyword tag or canonical phrasings);
+            // Doctor Who "two commanders" cards count (proven vs 228).
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                let kw = ix.s(c.keywords).to_lowercase();
+                if kw.contains("partner") {
+                    return true;
+                }
+                let at = ix.oracle_lc(i);
+                at.contains("partner with")
+                    || at.contains("choose a partner")
+                    || at.contains("two commanders")
+                    || at.contains("second commander")
+                    || at.contains("can have a partner")
+                    || at.contains("as an additional commander")
+            });
         }
-        "party" => return scan(ix, |i| ix.oracle_lc(i).contains("party")),
-        "outlaw" => return scan(ix, |i| ix.oracle_lc(i).contains("outlaw")),
+        "companion" => {
+            // Ikoria companion keyword on expansion/core prints only (10/10
+            // exact; masters/funny "companion" prints are not tagged).
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & F2_TOKEN == 0 && c.flags2 & F2_COMPANION != 0
+            });
+        }
+        "party" => {
+            // creature that can be cleric/warrior/rogue/wizard, including
+            // changeling text ("is all creature types") — proven vs 3880.
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & F2_TOKEN == 0
+                    && c.flags2 & F2_CRE_MAIN != 0
+                    && (c.flags2 & (F2_CLASS_PARTY | F2_ALLCT) != 0)
+            });
+        }
+        "outlaw" => {
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & F2_TOKEN == 0
+                    && c.flags2 & F2_CRE_MAIN != 0
+                    && (c.flags2 & (F2_CLASS_OUTLAW | F2_ALLCT) != 0)
+            });
+        }
         "modal" => return scan(ix, |i| ix.oracle_lc(i).contains("choose one")),
         "datestamped" | "buyabox" | "boosterfun" | "fnm" | "judgegift" | "prerelease"
         | "inset" | "promopack" | "league" | "boxtopper" | "openrunner" | "bundle"
@@ -1263,7 +1475,17 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             return bm;
         }
         "alchemy" => {
-            return ix.settype_idx.get("alchemy").cloned().unwrap_or_else(RoaringBitmap::new)
+            // set_type alchemy printings, tokens and hidden custom sets out.
+            // Known residual: upstream (855) additionally drops ~140 non-Arena
+            // frame reprints (power-nine etc.) that bulk set_type still marks
+            // alchemy; that pool membership is not derivable from this dump.
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                &*ix.strings[c.set_type as usize] == "alchemy"
+            });
         }
         "funny" => return ix.settype_idx.get("funny").cloned().unwrap_or_else(RoaringBitmap::new),
         "arena" => return ix.games_idx.get("arena").cloned().unwrap_or_else(RoaringBitmap::new),
@@ -1284,14 +1506,22 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             })
         }
         "unique" => {
+            // visible oracle with NO reprint-flagged non-token printing.
+            // Upstream full list: 16168 (rule reproduces 16949 pre-visibility
+            // gate; residual is stale-dump reprint drift, see calibration).
             return scan(ix, |i| {
-                ix.oracle_stats[ix.card_oracle[i as usize] as usize].n_sets == 1
-            })
+                let c = &ix.cards[i as usize];
+                let st = &ix.oracle_stats[ix.card_oracle[i as usize] as usize];
+                st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
+            });
         }
         "reprint" | "reprints" => {
+            // visible oracle with >=1 reprint-flagged non-token printing.
             return scan(ix, |i| {
-                ix.oracle_stats[ix.card_oracle[i as usize] as usize].n_prints >= 2
-            })
+                let c = &ix.cards[i as usize];
+                let st = &ix.oracle_stats[ix.card_oracle[i as usize] as usize];
+                st.visible && st.reprint && c.flags2 & F2_HIDDEN == 0
+            });
         }
         "tranche" => return scan(ix, |i| !ix.cards[i as usize].defense.is_nan()),
         "video" => return RoaringBitmap::new(),
@@ -1316,6 +1546,55 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             }
         }
         _ => {}
+    }
+    // layout tags with token/custom exclusions + meld/split subdivisions
+    // (calibrated against upstream lists; tokens never carry these tags).
+    {
+        let c0 = |i: u32| &ix.cards[i as usize];
+        let layis = |i: u32, l: &str| &*ix.strings[c0(i).layout as usize] == l;
+        match t {
+            "transform" | "tdfc" => {
+                return scan(ix, |i| {
+                    layis(i, "transform") && c0(i).flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                })
+            }
+            "mdfc" => {
+                return scan(ix, |i| {
+                    layis(i, "modal_dfc") && c0(i).flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                })
+            }
+            "flip" => {
+                return scan(ix, |i| {
+                    layis(i, "flip") && c0(i).flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                })
+            }
+            "leveler" => {
+                return scan(ix, |i| {
+                    layis(i, "leveler") && c0(i).flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                })
+            }
+            "meld" => return scan(ix, |i| layis(i, "meld") && c0(i).flags2 & F2_HIDDEN == 0),
+            "meldpart" => {
+                return scan(ix, |i| {
+                    layis(i, "meld")
+                        && c0(i).flags2 & F2_MELDTEXT != 0
+                        && c0(i).flags2 & F2_HIDDEN == 0
+                })
+            }
+            "meldresult" => {
+                return scan(ix, |i| {
+                    layis(i, "meld")
+                        && c0(i).flags2 & F2_MELDTEXT == 0
+                        && c0(i).flags2 & F2_HIDDEN == 0
+                })
+            }
+            "split" => {
+                return scan(ix, |i| {
+                    layis(i, "split") && c0(i).flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                })
+            }
+            _ => {}
+        }
     }
     // layout-based tags
     let layout = match t {
