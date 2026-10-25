@@ -79,6 +79,109 @@ pub const F_HAS_FACES: u32 = 1 << 29;
 pub const F_PREVIEW: u32 = 1 << 30;
 pub const F_HAS_TEXT: u32 = 1 << 31;
 
+// Second flag word (u64) — printings' derived predicates, calibrated against
+// live Scryfall semantics (unique:cards diffs, Oct 2026). All computed once at
+// load time from the raw JSON so eval stays a bitmap/scan over packed bits.
+pub const F2_TOKEN: u64 = 1 << 0; // token-like printing (token set/layout or 'Token' in type)
+pub const F2_CRE_MAIN: u64 = 1 << 1; // main face type contains 'creature'
+pub const F2_VEH_MAIN: u64 = 1 << 2; // main face type contains vehicle/spacecraft
+pub const F2_LEG_MAIN: u64 = 1 << 3; // main face type contains 'legendary'
+pub const F2_PW_MAIN: u64 = 1 << 4;
+pub const F2_LAND_MAIN: u64 = 1 << 5;
+pub const F2_PW_ANY: u64 = 1 << 6; // any face type contains 'planeswalker'
+pub const F2_BG_ANY: u64 = 1 << 7; // any face type contains 'background'
+pub const F2_HIST_WORD: u64 = 1 << 8; // any face type contains 'historic'
+pub const F2_CLASS_PARTY: u64 = 1 << 9; // cleric/warrior/rogue/wizard on any face
+pub const F2_CLASS_OUTLAW: u64 = 1 << 10; // assassin/pirate/rogue/warlock/bard/mercenary/trader
+pub const F2_ALLCT: u64 = 1 << 11; // text says 'all/every creature type(s)' (changeling)
+pub const F2_MELDTEXT: u64 = 1 << 12; // text contains 'meld'
+pub const F2_CBC: u64 = 1 << 13; // text contains 'can be your commander'
+pub const F2_BEAR: u64 = 1 << 14; // some face (or top level) is a 2/2 with mana value 2
+pub const F2_VANILLA: u64 = 1 << 15; // main face creature, not PW, main face has no text
+pub const F2_MAIN_TEXT: u64 = 1 << 16; // main face text non-empty
+pub const F2_NAME_SLASH: u64 = 1 << 17; // name contains "//"
+pub const F2_HIDDEN: u64 = 1 << 18; // printing's set is not in Scryfall's default search
+pub const F2_COMPANION: u64 = 1 << 19; // 'Companion' keyword on an expansion/core printing
+pub const F2_ANGEL: u64 = 1 << 20; // 'angel' on any face type (game:/t: combos)
+pub const F2_FRENCH: u64 = 1 << 21; // main text is keyword-abilities-only
+
+/// True when oracle text (reminder parens already absent or removed) consists
+/// only of keyword abilities — the is:frenchvanilla test (calibrated against
+/// upstream's 1094-card list: sentence openers are keywords, ward/cube/prowess
+/// triggers, "This creature has/gains <keyword>", protection, cycling).
+pub fn keyword_only_text(s: &str) -> bool {
+    let s = strip_paren_text(s);
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    for seg in s.split(|c| c == '.' || c == '\n' || c == '•') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let low = seg.to_lowercase();
+        let low = low.trim_start_matches(|c: char| c.is_whitespace());
+        // activation costs "{W}: " prefix a keyword ability (Trample etc.)
+        let low = low.trim_start_matches(|c: char| c == '{' || c == '}' || c == ' ' || (c.is_ascii_digit()));
+        let low = low.trim_start_matches(':').trim();
+        // "{1}{W}: " style needs a second pass after symbols
+        let low = low.trim_start_matches(|c: char| c == '{' || c == '}' || c == ' ' || (c.is_ascii_alphabetic() && "wubrg".contains(c)));
+        let low = low.trim_start_matches(':').trim();
+        let ok = [
+            "flying", "first strike", "double strike", "deathtouch", "haste", "hexproof",
+            "indestructible", "lifelink", "menace", "reach", "trample", "vigilance",
+            "shadow", "fear", "intimidate", "banding", "flash", "defender", "ward",
+            "protection", "this creature has", "this creature gains", "this card has",
+            "this card gains", "this permanent has", "this permanent gains",
+            "cycling", "landwalk", "horsemanship", "buyback", "kicker", "split second",
+            "trample, ", "cumulant upkeep", "cubes", "prowess", "endure", "extort",
+            "as this creature enters", "when this creature enters",
+        ]
+        .iter()
+        .any(|k| low.starts_with(k));
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sets whose prints are absent from Scryfall's default-search universe.
+/// Proven by full is:unique/is:reprint list coverage (our oracles from these
+/// sets appear in neither upstream list) plus 404 name probes; the s:<code>
+/// totals upstream returns for unknown codes are fuzzy fallbacks, not proof
+/// of visibility. mb2/fra/dsk/hbg residuals are stale-dump drift, not hiding.
+pub fn is_hidden_set_code(code: &str) -> bool {
+    matches!(code, "unk" | "hho" | "ph18" | "ph19" | "ph21" | "ph22" | "ph23")
+}
+
+/// Layouts that never make an oracle 'visible' for is:unique/is:reprint
+/// (extras & memorabilia surfaces; proven against upstream's full lists).
+pub fn is_aux_layout(layout: &str) -> bool {
+    matches!(
+        layout,
+        "art_series"
+            | "front_card"
+            | "album"
+            | "vanguard"
+            | "planar"
+            | "scheme"
+            | "emblem"
+            | "token"
+            | "double_faced_token"
+    )
+}
+
+/// set_types that never make an oracle 'visible' for is:unique/is:reprint.
+pub fn is_aux_set_type(st: &str) -> bool {
+    matches!(
+        st,
+        "memorabilia" | "promo" | "box" | "vanguard" | "archenemy" | "token" | "album"
+    )
+}
+
+
 // price indices for Card::prices
 pub const P_USD: usize = 0;
 pub const P_USD_FOIL: usize = 1;
@@ -159,6 +262,10 @@ pub struct Card {
     pub set_name: u32,
     pub set_type: u32,
     pub collector_number: u32,
+    /// collector_number with trailing variant stars stripped; printings are
+    /// counted per (set, cn_key) so foil/star twins share one print (proven
+    /// against Scryfall: Embermage Goblin prints=1 despite cn "200" + "200★").
+    pub cn_key: u32,
     pub type_line: u32,
     pub mana_cost: u32,
     pub oracle_text: u32,
@@ -182,6 +289,10 @@ pub struct Card {
     pub set_type_code: u8,
     pub legal: u64, // 2 bits per FORMATS entry (23 formats -> needs u64)
     pub flags: u32,
+    /// derived predicates (F2_*), computed at load time (see index constants).
+    pub flags2: u64,
+    /// bulk `reprint` flag for this printing.
+    pub reprint: bool,
     pub cn_val: u32, // numeric prefix of collector number
     pub released: u32, // YYYYMMDD, 0 = unknown
     /// prices: usd, usd_foil, tix, eur, eur_foil — NAN = absent.
@@ -222,6 +333,15 @@ pub struct OracleStats {
     pub n_artists: u16,
     pub n_illus: u16,
     pub games: u8,
+    /// any non-token printing carries the bulk `reprint` flag (is:reprint).
+    pub reprint: bool,
+    /// every printing of this oracle is token-like (is:unique/is:reprint skip
+    /// these; t:creature etc still include tokens, matching upstream).
+    pub tok_oracle: bool,
+    /// has at least one non-auxiliary (non memorabilia/promo/box/extras-layout/
+    /// hidden) printing — upstream only offers is:unique/is:reprint for such
+    /// oracles (proven: full 16168/17469 list coverage).
+    pub visible: bool,
 }
 
 /// Aggregated per-set row for /api/sets (built once at startup, cached).
@@ -283,6 +403,11 @@ pub struct Index {
     pub name_tokens: HashMap<String, RoaringBitmap>,
     pub type_tokens: HashMap<String, RoaringBitmap>,
     pub text_tokens: HashMap<String, RoaringBitmap>,
+    /// oracle-text-only token index with reminder text stripped and light
+    /// stemming (draws/drawn→draw etc); also folds compound keywords
+    /// (landcycling→cycling). o:/oracle: filters use this, NOT text_tokens
+    /// (which mixes in type-line words and caused o:draw over-matching).
+    pub otext_tokens: HashMap<String, RoaringBitmap>,
     pub keyword_tokens: HashMap<String, RoaringBitmap>,
     /// (name_lc offset, card idx) sorted by lowercased name — prefix search + suggest.
     pub prefix: Vec<(u32, u32)>,
@@ -908,6 +1033,7 @@ struct RawC {
     set_name: String,
     set_type: String,
     collector_number: String,
+    cn_key: String,
     type_line: String,
     type_tokens: Vec<String>,
     mana_cost: String,
@@ -944,6 +1070,28 @@ struct RawC {
     finishes: u8,
     produced: u8,
     ffx: u32,
+    flags2: u64,
+    reprint: bool,
+}
+
+/// Remove balanced-parenthesis runs (reminder text) from oracle text before
+/// indexing, matching Scryfall's oracle-word index behaviour (proven with
+/// o:draw: cards whose only 'draw' sits in a (…) reminder are excluded).
+pub fn strip_paren_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0u32;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {
+                if depth == 0 {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn parse_line(line: &str) -> Option<RawC> {
@@ -1123,13 +1271,22 @@ fn parse_line(line: &str) -> Option<RawC> {
     let land = has("land");
     if land {
         flags |= F_LAND;
-    } else {
+    }
+    // Scryfall semantics: is:permanent = can enter the battlefield =
+    // artifact/creature/enchantment/land/planeswalker/battle (any subtype
+    // combo: Artifact Land, Creature Land, Host, Kingdom…); instants and
+    // sorceries are never permanents. is:spell = castable = same set minus
+    // lands, plus instant/sorcery. Conspiracy/Contraption/Vanguard/etc.
+    // types are neither.
+    let perm = has("artifact") || has("creature") || has("enchantment")
+        || has("land") || has("planeswalker") || has("battle");
+    let castable = has("artifact") || has("creature") || has("enchantment")
+        || has("instant") || has("sorcery") || has("planeswalker") || has("battle");
+    if perm && !has("instant") && !has("sorcery") {
+        flags |= F_PERMANENT;
+    }
+    if castable {
         flags |= F_SPELL;
-        if has("creature") || has("instant") || has("sorcery") || has("artifact")
-            || has("enchantment") || has("planeswalker") || has("battle")
-        {
-            flags |= F_PERMANENT;
-        }
     }
     if has("creature") {
         flags |= F_CREATURE;
@@ -1233,7 +1390,7 @@ fn parse_line(line: &str) -> Option<RawC> {
     if v.get("card_faces").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
         flags |= F_HAS_FACES;
     }
-    if v.get("preview").filter(|x| !x.is_null()).is_some() {
+    if v.get("preview").and_then(|x| x.as_bool()).unwrap_or(false) {
         flags |= F_PREVIEW;
     }
     let layout = str_of(&v, "layout").to_string();
@@ -1275,6 +1432,156 @@ fn parse_line(line: &str) -> Option<RawC> {
         })
         .unwrap_or_default();
 
+    // ---- flags2: derived predicates calibrated against live Scryfall ----
+    let faces_arr: Vec<serde_json::Value> = v
+        .get("card_faces")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let fstr = |f: &serde_json::Value, k: &str| -> String {
+        f.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    let fnum = |f: &serde_json::Value, k: &str| -> Option<f64> {
+        match f.get(k) {
+            Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_f64(),
+            _ => None,
+        }
+    };
+    let main_tl: String = type_line.split("//").next().unwrap_or("").to_string();
+    let mut main_words: Vec<String> = Vec::new();
+    for_each_token(&main_tl.to_lowercase(), 2, &mut |t| main_words.push(t.to_string()));
+    let has_main = |tok: &str| main_words.iter().any(|t| t == tok);
+    let mut any_words: Vec<String> = Vec::new();
+    if faces_arr.is_empty() {
+        any_words = type_tokens.clone();
+    } else {
+        for f in &faces_arr {
+            for_each_token(&fstr(f, "type_line").to_lowercase(), 2, &mut |t| {
+                any_words.push(t.to_string())
+            });
+        }
+    }
+    let has_any = |tok: &str| any_words.iter().any(|t| t == tok);
+    let main_text: String = if !faces_arr.is_empty() {
+        faces_arr.first().map(|f| fstr(f, "oracle_text")).unwrap_or_default()
+    } else {
+        oracle_text.clone()
+    };
+    let joined_text = oracle_text.to_lowercase();
+    let pt_num = |o: &serde_json::Value, k: &str| -> Option<f64> {
+        match o.get(k) {
+            Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_f64(),
+            _ => None,
+        }
+    };
+    let mut flags2 = 0u64;
+    if str_of(&v, "set_type") == "token"
+        || matches!(layout.as_str(), "token" | "double_faced_token")
+        || type_tokens.iter().any(|t| t == "token")
+    {
+        flags2 |= F2_TOKEN;
+    }
+    if has_main("creature") {
+        flags2 |= F2_CRE_MAIN;
+    }
+    if has_main("vehicle") || has_main("spacecraft") {
+        flags2 |= F2_VEH_MAIN;
+    }
+    if has_main("legendary") {
+        flags2 |= F2_LEG_MAIN;
+    }
+    if has_main("planeswalker") {
+        flags2 |= F2_PW_MAIN;
+    }
+    if has_main("land") {
+        flags2 |= F2_LAND_MAIN;
+    }
+    if has_any("planeswalker") {
+        flags2 |= F2_PW_ANY;
+    }
+    if has_any("background") {
+        flags2 |= F2_BG_ANY;
+    }
+    if has_any("historic") {
+        flags2 |= F2_HIST_WORD;
+    }
+    if ["cleric", "warrior", "rogue", "wizard"]
+        .iter()
+        .any(|c| has_any(c))
+    {
+        flags2 |= F2_CLASS_PARTY;
+    }
+    if ["assassin", "pirate", "rogue", "warlock", "bard", "mercenary", "trader"]
+        .iter()
+        .any(|c| has_any(c))
+    {
+        flags2 |= F2_CLASS_OUTLAW;
+    }
+    if joined_text.contains("all creature type") || joined_text.contains("every creature type") {
+        flags2 |= F2_ALLCT;
+    }
+    if joined_text.contains("meld") {
+        flags2 |= F2_MELDTEXT;
+    }
+    if joined_text.contains("can be your commander") {
+        flags2 |= F2_CBC;
+    }
+    let mut pts: Vec<(Option<f64>, Option<f64>, Option<f64>)> = vec![(
+        pt_num(&v, "power"),
+        pt_num(&v, "toughness"),
+        pt_num(&v, "cmc"),
+    )];
+    for f in &faces_arr {
+        pts.push((fnum(f, "power"), fnum(f, "toughness"), fnum(f, "cmc")));
+    }
+    if pts.iter().any(|(p, t, m)| {
+        p == &Some(2.0) && t == &Some(2.0) && m == &Some(2.0)
+    }) && (flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
+        || any_words.iter().any(|t| t == "creature"))
+    {
+        flags2 |= F2_BEAR;
+    }
+    if !main_text.trim().is_empty() {
+        flags2 |= F2_MAIN_TEXT;
+    }
+    if has_main("creature") && !has_main("planeswalker") && main_text.trim().is_empty() {
+        flags2 |= F2_VANILLA;
+    }
+    if str_of(&v, "name").contains("//") {
+        flags2 |= F2_NAME_SLASH;
+    }
+    if is_hidden_set_code(str_of(&v, "set")) {
+        flags2 |= F2_HIDDEN;
+    }
+    if (str_of(&v, "set_type") == "expansion" || str_of(&v, "set_type") == "core")
+        && keywords_joined
+            .split_whitespace()
+            .any(|k| k.eq_ignore_ascii_case("companion"))
+    {
+        flags2 |= F2_COMPANION;
+    }
+    if has_any("angel") {
+        flags2 |= F2_ANGEL;
+    }
+    if (flags2 & (F2_CRE_MAIN | F2_MAIN_TEXT | F2_PW_MAIN)) == (F2_CRE_MAIN | F2_MAIN_TEXT)
+        && keyword_only_text(&main_text)
+    {
+        flags2 |= F2_FRENCH;
+    }
+    // duplicate the F_PREVIEW semantic fix: 'preview' present-but-false is not
+    // a preview card (bulk data carries preview:false on many prints).
+    let reprint = v.get("reprint").and_then(|x| x.as_bool()).unwrap_or(false);
+    let cn_key = {
+        let cn = str_of(&v, "collector_number");
+        cn.trim()
+            .trim_end_matches(|c: char| {
+                c == '\u{2605}' || c == '\u{2606}' || c == '\u{2730}' || c.is_whitespace()
+            })
+            .to_string()
+    };
+
     Some(RawC {
         id: str_of(&v, "id").to_string(),
         oracle_id: str_of(&v, "oracle_id").to_string(),
@@ -1283,6 +1590,7 @@ fn parse_line(line: &str) -> Option<RawC> {
         set_name: str_of(&v, "set_name").to_string(),
         set_type: str_of(&v, "set_type").to_string(),
         collector_number: str_of(&v, "collector_number").to_string(),
+        cn_key,
         type_line,
         type_tokens,
         mana_cost: str_of(&v, "mana_cost").to_string(),
@@ -1313,6 +1621,8 @@ fn parse_line(line: &str) -> Option<RawC> {
             .unwrap_or(f32::NAN),
         legal,
         flags,
+        flags2,
+        reprint,
         cn_val: parse_cn(str_of(&v, "collector_number")),
         released: parse_released(str_of(&v, "released_at")),
         prices,
@@ -1446,6 +1756,7 @@ impl Index {
             name_tokens: HashMap::new(),
             type_tokens: HashMap::new(),
             text_tokens: HashMap::new(),
+            otext_tokens: HashMap::new(),
             keyword_tokens: HashMap::new(),
             prefix: Vec::with_capacity(raws.len()),
             color_bits: Default::default(),
@@ -1545,6 +1856,7 @@ impl Index {
                 set_name: s(&r.set_name),
                 set_type: s(&r.set_type),
                 collector_number: s(&r.collector_number),
+                cn_key: s(&r.cn_key),
                 type_line: s(&r.type_line),
                 mana_cost: s(&r.mana_cost),
                 oracle_text: s(&r.oracle_text),
@@ -1565,6 +1877,8 @@ impl Index {
                 set_type_code: set_type_code(&r.set_type),
                 legal: r.legal,
                 flags: r.flags,
+                flags2: r.flags2,
+                reprint: r.reprint,
                 cn_val: r.cn_val,
                 released: r.released,
                 prices: r.prices,
@@ -1797,15 +2111,41 @@ impl Index {
                 vec![Default::default(); n_or];
             let mut illus_seen: Vec<std::collections::HashSet<u32>> =
                 vec![Default::default(); n_or];
+            // print counting is per (set, cn_key): foil "200★" twins merge with
+            // their "200" sibling (proven against live Scryfall prints=).
+            let mut print_seen: Vec<std::collections::HashSet<(u32, u32)>> =
+                vec![Default::default(); n_or];
+            let mut pprint_seen: Vec<std::collections::HashSet<(u32, u32)>> =
+                vec![Default::default(); n_or];
+            let mut tok_cnt: Vec<u32> = vec![0; n_or];
+            let mut vis: Vec<bool> = vec![false; n_or];
             for (i, c) in ix.cards.iter().enumerate() {
                 let r = ix.card_oracle[i] as usize;
                 let i32 = i as u32;
                 ix.oracle_prints[r].insert(i32);
                 let st = &mut ix.oracle_stats[r];
-                st.n_prints = st.n_prints.saturating_add(1);
+                if !vis[r]
+                    && c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                    && !is_aux_layout(&ix.strings[c.layout as usize])
+                    && !is_aux_set_type(&ix.strings[c.set_type as usize])
+                {
+                    vis[r] = true;
+                }
+                if print_seen[r].insert((c.set, c.cn_key)) {
+                    st.n_prints = st.n_prints.saturating_add(1);
+                }
+                if c.flags2 & F2_TOKEN == 0 {
+                    if c.reprint {
+                        st.reprint = true;
+                    }
+                } else {
+                    tok_cnt[r] += 1;
+                }
                 st.games |= c.games;
                 if c.games & G_PAPER != 0 {
-                    st.n_paper = st.n_paper.saturating_add(1);
+                    if pprint_seen[r].insert((c.set, c.cn_key)) {
+                        st.n_paper = st.n_paper.saturating_add(1);
+                    }
                     pset_seen[r].insert(c.set);
                 }
                 set_seen[r].insert(c.set);
@@ -1847,6 +2187,8 @@ impl Index {
                 st.n_paper_sets = pset_seen[r].len() as u16;
                 st.n_artists = artist_seen[r].len() as u16;
                 st.n_illus = illus_seen[r].len() as u16;
+                st.tok_oracle = tok_cnt[r] as u64 == ix.oracle_prints[r].len();
+                st.visible = vis[r];
             }
 
             // new: flags — earliest print wins each (artist, illustration,
@@ -1928,6 +2270,43 @@ impl Index {
             })
             .reduce(HashMap::new, merge);
         ix.text_tokens = mk(|r| format!("{} {}", r.type_line, r.oracle_text));
+        ix.otext_tokens = raws
+            .par_iter()
+            .enumerate()
+            .fold(HashMap::<String, RoaringBitmap>::new, |mut m, (i, r)| {
+                let stripped = strip_paren_text(&r.oracle_text);
+                let lc = stripped.to_lowercase();
+                let bit = i as u32;
+                for_each_token(&lc, 1, &mut |t| {
+                    m.entry(t.to_string()).or_default().insert(bit);
+                    if t.len() > 4 {
+                        // light stemming: draws/drawn/drawing/… → draw
+                        if let Some(b) = t.strip_suffix("es") {
+                            m.entry(b.to_string()).or_default().insert(bit);
+                            m.entry(format!("{b}e")).or_default().insert(bit);
+                        } else if let Some(b) = t.strip_suffix('s') {
+                            m.entry(b.to_string()).or_default().insert(bit);
+                        }
+                        if let Some(b) = t.strip_suffix("ing") {
+                            m.entry(b.to_string()).or_default().insert(bit);
+                            m.entry(format!("{b}e")).or_default().insert(bit);
+                        }
+                        if let Some(b) = t.strip_suffix("ed") {
+                            m.entry(b.to_string()).or_default().insert(bit);
+                            m.entry(format!("{b}e")).or_default().insert(bit);
+                        }
+                        if let Some(b) = t.strip_suffix("wn") {
+                            m.entry(b.to_string()).or_default().insert(bit);
+                        }
+                    }
+                    // compound keyword: landcycling/vaultcycling ⇒ cycling
+                    if t.len() > 7 && t.ends_with("cycling") {
+                        m.entry("cycling".to_string()).or_default().insert(bit);
+                    }
+                });
+                m
+            })
+            .reduce(HashMap::new, merge);
         ix.type_tokens = mk(|r| r.type_line.clone());
         ix.keyword_tokens = mk(|r| r.keywords_joined.clone());
 
