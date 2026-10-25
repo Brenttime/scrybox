@@ -140,16 +140,31 @@ pub async fn search(
 
     let ix = &st.ix;
     let (nodes, mut warnings) = parse(&q);
-    let bm = eval(&nodes, ix, &mut warnings);
+    let mut bm = eval(&nodes, ix, &mut warnings);
     // Scryfall default search dedups to one printing per oracle in BOTH
     // total_cards and data (unique:cards). unique:prints disables dedup;
     // unique:art dedups per (oracle, illustration). otag:/id: queries were
     // already oracle-deduplicated via their gated bitmaps — same rule now
     // applies uniformly.
+    //
+    // THE DEFAULT-SEARCH POOL GATE (wave3, evidence-derived): upstream hides
+    // oracles whose only printings live in hidden set_types/layouts/set-codes
+    // (token sheets, memorabilia, promo boxes, minigames, art series, …).
+    // Proven by the t:creature full-set diff: ours 20214 vs upstream 18859;
+    // 1312 of 1368 extras are pool-invisible (759 token-only oracles, rest
+    // hidden-set printings); masking with the calibrated id-pool bitmap
+    // predicts 18899 (+0.22%). Skip the gate for include:extras/all, explicit
+    // extras targeting (t:scheme, is:token, …) and set-targeted queries —
+    // upstream auto-shows those — and for otag: queries (their bitmap is
+    // gated by the otag calibration already guarding the guardrails).
     let mut unique: Option<u8> = None;
     collect_unique(&nodes, &mut unique);
     let art_mode = unique == Some(2);
     let dedup = unique != Some(1);
+    if dedup && !art_mode && !crate::eval::uses_otag(&nodes) && !crate::eval::wants_extras(&nodes)
+    {
+        bm &= &ix.id_vis_bits;
+    }
 
     let total: u64 = if dedup {
         let mut seen: std::collections::HashSet<u64> =

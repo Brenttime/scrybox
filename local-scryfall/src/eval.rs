@@ -73,6 +73,71 @@ fn node_has_id(n: &Node) -> bool {
     }
 }
 
+/// True when the query explicitly targets "extras" content (tokens, art
+/// sheets, planar/scheme/vanguard sheets, promo-type printings) or broadens
+/// visibility with include:extras/all. Upstream auto-shows such content even
+/// though the default unique-card pool hides it (live-probed: t:scheme/t:plane
+/// return the sheets, is:token returns tokens, plain text search does NOT).
+/// api.rs skips the default-search pool gate for these queries.
+pub fn wants_extras(nodes: &[Node]) -> bool {
+    nodes.iter().any(node_wants_extras)
+}
+
+fn node_wants_extras(n: &Node) -> bool {
+    match n {
+        Node::And(v) | Node::Or(v) => v.iter().any(node_wants_extras),
+        Node::Not(b) => node_wants_extras(b),
+        Node::Filter(f) => filter_wants_extras(f),
+        _ => false,
+    }
+}
+
+const EXTRAS_TYPE_WORDS: &[&str] = &[
+    "token", "tokens", "scheme", "schemes", "vanguard", "vanguards", "phenomenon",
+    "phenomena", "plane", "planes", "planar", "emblem", "emblems", "contraption",
+    "contraptions", "conspiracy", "conspiracies", "attraction", "attractions", "art",
+    "art series", "art_series", "artseries", "sticker", "stickers",
+];
+const EXTRAS_IS_WORDS: &[&str] = &[
+    "token", "tokens", "double_faced_token", "doublefacedtoken", "dfctoken", "dfc",
+    "doublefaced", "double-faced", "modal", "modal_dfc", "funny", "emblem",
+    "emblems", "scheme", "schemes", "plane", "planes", "planar", "phenomenon",
+    "phenomena", "vanguard", "vanguards", "contraption", "contraptions", "artseries",
+    "art_series", "planeswalkerdeck", "boxtopper", "boxtoppers", "globalillustrator",
+    "globalillustrators", "starter", "starters", "datestamped", "buyabox", "boosterfun",
+    "fnm", "judgegift", "judge_gift", "prerelease", "inset", "promopack", "league",
+    "openrunner", "bundle", "emergency", "stamped", "textlesspromo", "serialized",
+    "invitational",
+];
+const EXTRAS_LAYOUTS: &[&str] = &[
+    "token", "double_faced_token", "emblem", "planar", "scheme", "vanguard",
+    "phenomenon", "contraption", "art_series", "front_card",
+];
+
+fn filter_wants_extras(f: &Filter) -> bool {
+    match f {
+        Filter::IncludeVal(v) => v == "extras" || v == "all",
+        // explicit set/collection targeting shows the printings searched
+        // (live-probed: promo/expansion-hidden sets still return results).
+        Filter::Set(_) | Filter::InVal(_) | Filter::SetType(_) => true,
+        // printing-attribute targeting (artist, collector number, release
+        // date, grouping, name/name-regex): upstream searches the printings
+        // themselves and surfaces hidden-set work (probed: a:"proce" 134,
+        // g:fin 779, t:creature cn>=400, name:/\bizzet\b/ 21 all match the
+        // UNGATED totals; gating them regresses green rows).
+        Filter::Artist(_) | Filter::Group(_) | Filter::Name(_) | Filter::NameExact(_)
+        | Filter::Released(..) | Filter::CrossCmp { .. } => true,
+        Filter::Cmp { field, .. } | Filter::CmpRange { field, .. } => {
+            matches!(field, crate::query::NumField::Cn | crate::query::NumField::Date)
+        }
+        Filter::Layout(v) => EXTRAS_LAYOUTS.contains(&v.as_str()),
+        Filter::Regex { field, .. } => *field == 2 || *field == 0, // t~/re/, name~/re/
+        Filter::Type(v) => v.split_whitespace().any(|w| EXTRAS_TYPE_WORDS.contains(&w)),
+        Filter::Is(v) => EXTRAS_IS_WORDS.contains(&v.as_str()),
+        _ => false,
+    }
+}
+
 fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     match node {
         Node::All => ix.universe.clone(),
@@ -438,6 +503,12 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             } else if let Some(r) = norm.strip_prefix(">=") {
                 norm = r.to_string();
                 1
+            } else if let Some(r) = norm.strip_prefix('<') {
+                norm = r.to_string();
+                3
+            } else if let Some(r) = norm.strip_prefix('>') {
+                norm = r.to_string();
+                4
             } else if let Some(r) = norm.strip_prefix("==").or(norm.strip_prefix('=')) {
                 norm = r.to_string();
                 2
@@ -501,12 +572,29 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             }
             match op {
                 0 => ix.id_bitmap(m),
-                1 => {
-                    // id>=xyz: colour identity is a SUPERSET of the letters
+                1 | 4 => {
+                    // id>=xyz: colour identity is a SUPERSET of the letters;
+                    // id>xyz: PROPER superset (live-probed: id>bg t:instant
+                    // 17 vs id>=bg 47 — the 30 exactly-bg instants drop out).
+                    let strict = op == 4;
                     let mut hits: Vec<u32> = Vec::with_capacity(4096);
                     for (i, &row) in ix.card_oracle.iter().enumerate() {
                         let r = row as usize;
-                        if ix.oracle_id_vis[r] && (ix.oracle_ci[r] & m) == m {
+                        let ci = ix.oracle_ci[r];
+                        if ix.oracle_id_vis[r] && (ci & m) == m && (!strict || ci != m) {
+                            hits.push(i as u32);
+                        }
+                    }
+                    RoaringBitmap::from_iter(hits)
+                }
+                3 => {
+                    // id<xyz: PROPER subset (live-probed: id<esper t:instant
+                    // 2363 vs id<=esper 2372 — the 9 exactly-esper drop out).
+                    let mut hits: Vec<u32> = Vec::with_capacity(4096);
+                    for (i, &row) in ix.card_oracle.iter().enumerate() {
+                        let r = row as usize;
+                        let ci = ix.oracle_ci[r];
+                        if ix.oracle_id_vis[r] && (ci & !m) == 0 && ci != m {
                             hits.push(i as u32);
                         }
                     }
@@ -528,6 +616,19 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             ));
             RoaringBitmap::new()
         }
+        // art:/atag:/arttag: are Tagger *illustration* tags (art:squirrel =
+        // art that contains a squirrel). Not artist aliases (probed upstream:
+        // art:squirrel==arttag:squirrel==199, artist:"Larry Elmore"==14,
+        // arttag:"Larry Elmore"==0). The illustration-tag dump is not bundled.
+        Filter::ArtTag(v) => {
+            w.push(format!(
+                "illustration tags (art:/atag:/arttag:{v}) require the live Tagger API — not supported offline; to search by illustrator use artist: — 0 results"
+            ));
+            RoaringBitmap::new()
+        }
+        // include:extras/all — neutral term; api.rs skips the default-search
+        // pool gate when it sees this.
+        Filter::IncludeVal(_) => ix.universe.clone(),
         Filter::Layout(v) => ix
             .layout_idx
             .get(v.as_str())
@@ -1137,7 +1238,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     use crate::index::*;
     let t = match tag {
         "doublefaced" | "double-faced" => "dfc",
-        "full-art" => "fullart",
+        "full-art" | "full" => "fullart",
         "artseries" => "art_series",
         "playtest" => "emergency",
         "cmdr" => "commander",
@@ -1145,6 +1246,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "flyer" => "flying",
         "chase" => "planechase",
         "canopy" => "canopyland",
+        "highres" => "hires",
         other => other,
     };
     let flag = match t {
@@ -1171,6 +1273,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "spotlight" => Some(F_SPOTLIGHT),
         "booster" => Some(F_BOOSTER_FLAG),
         "preview" | "scryfallpreview" => Some(F_PREVIEW),
+        "hires" => Some(F_HIRES),
         _ => None,
     };
     if let Some(f) = flag {
@@ -1220,6 +1323,29 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "etched" => return scan(ix, |i| ix.cards[i as usize].finishes & FIN_ETCHED != 0),
+        // finishes (docs: "Each card is available in non-foil, in foil, or in
+        // both"; is:foil is:nonfoil = prints available in both).
+        "foil" => return scan(ix, |i| ix.cards[i as usize].finishes & FIN_FOIL != 0),
+        "nonfoil" => return scan(ix, |i| ix.cards[i as usize].finishes & FIN_NONFOIL != 0),
+        // is:glossy: upstream's glossy-finish (non-foil shiny) classifier has
+        // no representation in the bulk dump (finishes ∈ foil/nonfoil/etched
+        // only) — keeps the LOUD unknown-is warning below rather than a
+        // silent/wrong match. (upstream is:glossy = 7 cards)
+        // frame treatments (index.rs parse_line: atypical fit note). is:default
+        // = has at least one non-atypical printing (print-level predicate;
+        // upstream: is:default is:atypical == 0 per-print, both can hold at
+        // oracle level).
+        "atypical" => return scan(ix, |i| ix.cards[i as usize].atypical),
+        "default" => return scan(ix, |i| !ix.cards[i as usize].atypical),
+        "masterpiece" => return scan(ix, |i| ix.cards[i as usize].masterpiece),
+        // Universes Beyond prints (bulk promo_types carries 'universesbeyond').
+        "universesbeyond" | "universes_beyond" => {
+            return scan(ix, |i| {
+                ix.strings[ix.cards[i as usize].ptypes as usize]
+                    .split(',')
+                    .any(|x| x == "universesbeyond")
+            });
+        }
         "flying" => return tok("flying"),
         "crew" => return tok("crew"),
         "mutant" => return tok("mutant"),
@@ -1326,12 +1452,21 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         "commander" => {
             // "can be your commander": legendary creature/vehicle/spacecraft/
-            // Background/planeswalker (main face legendary) or explicit
-            // 'can be your commander' text; meld results and reversible cards
-            // excluded; legality NOT part of the tag (Lurrus is:commander).
+            // Background (main face legendary) or explicit 'can be your
+            // commander' text; meld results and reversible cards excluded;
+            // legality NOT part of the tag (Lurrus is:commander).
+            // PLANESWALKERS are only commanders with the explicit CBC text —
+            // live-probed: t:planeswalker is:commander = 45 upstream; famous
+            // walkers (Jace Beleren, Nicol Bolas, Basri) are 404/0 there.
+            // Digital-only (paper-less, e.g. hbg-style Alchemy) printings are
+            // not commander-able — live-probed: is:commander is:alchemy = 128
+            // upstream vs 225 ours pre-fix; Lukamina, Scorpion Form hidden.
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
                 if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return false;
+                }
+                if c.flags & F_DIGITAL != 0 && c.games & G_PAPER == 0 {
                     return false;
                 }
                 let lay = &*ix.strings[c.layout as usize];
@@ -1346,7 +1481,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 }
                 c.flags2 & F2_LEG_MAIN != 0
                     && (c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
-                        || c.flags2 & (F2_PW_ANY | F2_BG_ANY) != 0)
+                        || c.flags2 & F2_BG_ANY != 0)
             });
         }
         "oathbreaker" => {
@@ -1452,15 +1587,17 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "modal" => return scan(ix, |i| ix.oracle_lc(i).contains("choose one")),
-        "datestamped" | "buyabox" | "boosterfun" | "fnm" | "judgegift" | "prerelease"
-        | "inset" | "promopack" | "league" | "boxtopper" | "openrunner" | "bundle"
-        | "planeswalkerdeck" | "emergency" | "stamped" | "textlesspromo" => {
+        "datestamped" | "buyabox" | "boosterfun" | "fnm" | "judgegift" | "judge_gift"
+        | "prerelease" | "inset" | "promopack" | "league" | "boxtopper" | "openrunner"
+        | "bundle" | "planeswalkerdeck" | "emergency" | "stamped" | "textlesspromo" => {
             let q = t.trim_end_matches('s').to_string();
             let q2 = t.to_string();
+            let q3 = t.replace('_', "");
             return ix
                 .ptype_idx
                 .get(q.as_str())
                 .or_else(|| ix.ptype_idx.get(q2.as_str()))
+                .or_else(|| ix.ptype_idx.get(q3.as_str()))
                 .cloned()
                 .unwrap_or_else(|| {
                     w.push(format!("unknown is:{tag} (ignored)"));

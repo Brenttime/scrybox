@@ -293,6 +293,11 @@ pub struct Card {
     pub flags2: u64,
     /// bulk `reprint` flag for this printing.
     pub reprint: bool,
+    /// print-level variant frame treatment (is:atypical / is:default; see
+    /// parse_line note).
+    pub atypical: bool,
+    /// masterpiece-series printing (set_type/ffx/promo-type 'masterpiece').
+    pub masterpiece: bool,
     pub cn_val: u32, // numeric prefix of collector number
     pub released: u32, // YYYYMMDD, 0 = unknown
     /// prices: usd, usd_foil, tix, eur, eur_foil — NAN = absent.
@@ -1072,6 +1077,8 @@ struct RawC {
     ffx: u32,
     flags2: u64,
     reprint: bool,
+    atypical: bool,
+    masterpiece: bool,
 }
 
 /// Remove balanced-parenthesis runs (reminder text) from oracle text before
@@ -1582,6 +1589,45 @@ fn parse_line(line: &str) -> Option<RawC> {
             .to_string()
     };
 
+    // is:atypical / is:masterpiece print-level predicates (fit vs live
+    // upstream unique:cards counts: atypical=10562, default=33488,
+    // masterpiece=877, etched∩atypical=1018 — see scratch fit_is.py):
+    // a print is "atypical" if it carries a variant frame treatment.
+    let mut atypical = false;
+    let mut masterpiece = false;
+    {
+        if let Some(a) = v.get("frame_effects").and_then(|x| x.as_array()) {
+            for x in a {
+                match x.as_str().unwrap_or("") {
+                    "inverted" | "extendedart" | "showcase" | "serialized" | "invitational"
+                    | "prizemasterpiece" | "colorshifted" => atypical = true,
+                    "masterpiece" => {
+                        atypical = true;
+                        masterpiece = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        match str_of(&v, "frame") {
+            "showcase" | "textless" | "inverted" | "extendedart" => atypical = true,
+            _ => {}
+        }
+        if v.get("textless").and_then(|x| x.as_bool()).unwrap_or(false) {
+            atypical = true;
+        }
+        if str_of(&v, "set_type") == "masterpiece" {
+            masterpiece = true;
+        }
+        if let Some(a) = v.get("promo_types").and_then(|x| x.as_array()) {
+            for x in a {
+                if x.as_str().unwrap_or("") == "masterpiece" {
+                    masterpiece = true;
+                }
+            }
+        }
+    }
+
     Some(RawC {
         id: str_of(&v, "id").to_string(),
         oracle_id: str_of(&v, "oracle_id").to_string(),
@@ -1623,6 +1669,8 @@ fn parse_line(line: &str) -> Option<RawC> {
         flags,
         flags2,
         reprint,
+        atypical,
+        masterpiece,
         cn_val: parse_cn(str_of(&v, "collector_number")),
         released: parse_released(str_of(&v, "released_at")),
         prices,
@@ -1879,6 +1927,8 @@ impl Index {
                 flags: r.flags,
                 flags2: r.flags2,
                 reprint: r.reprint,
+                atypical: r.atypical,
+                masterpiece: r.masterpiece,
                 cn_val: r.cn_val,
                 released: r.released,
                 prices: r.prices,
