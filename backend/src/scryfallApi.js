@@ -1229,9 +1229,8 @@ function startRevalidation(q, lang, langCode, key, limit, byPrinting = false) {
    .finally(() => inflightCollectionNames.delete(key));
 }
 
-// Resolve a CATALOG-ONLY Scryfall query ("otag:sneak", "availability:modern",
-// any operator the stored rows cannot answer) and intersect the result with
-// the user's collection. Returns the user's OWNED rows for the matching game
+// Resolve a Scryfall-syntax query and intersect the result with the user's
+// collection. Returns the user's OWNED rows for the matching game
 // cards — same projection as the /api/collection endpoint, so they render in
 // the collection screen's tiles unchanged.
 //
@@ -1241,11 +1240,33 @@ function startRevalidation(q, lang, langCode, key, limit, byPrinting = false) {
 // through the same rate-limited queue and language scoping as every other raw
 // search; only the answer's shape differs.
 //
+// Two engines answer, and WHICH one answers is part of the contract:
+//   · Upstream mode (LOCAL_SCRYFALL false): queries made only of operators the
+//     stored rows can answer (mode 'local') are served by rawQuerySql against
+//     card_cache — a rate-limit optimization, not a truth claim. Scryfall
+//     costs 2 req/s; paging a 7,000-card color:u walk per keystroke cannot
+//     afford to be honest. Everything else walks the catalog.
+//   · Sidecar mode (LOCAL_SCRYFALL true): the ENGINE IS THE SOLE SYNTAX
+//     AUTHORITY. Every syntax query — local-mode operators included — goes to
+//     the sidecar verbatim (the same walk as catalog queries) and only the
+//     owned-row intersect touches card_cache SQL. The card_cache compiler
+//     stays as the fallback a sidecar outage earns, labelled 'local-fallback'
+//     so the divergence is never silent. The second implementation of
+//     Scryfall syntax (TYPE_WORDS gaps, set:fra returning nothing) cannot
+//     disagree with the engine when it never answers.
+//
 // `limit` caps how far one walk may page (20,000 game cards ≈ 115 Scryfall
 // pages — above the broadest tag in practice; a walk that still hits it
-// returns a flagged-incomplete answer, not a silently truncated one).
+// returns a flagged-incomplete answer, not a silently truncated one). Against
+// the sidecar a page costs milliseconds, not the half-second upstream waits,
+// so the cap there is latency insurance for pathological queries, not a
+// rate-limit mercy.
 //
-// Returns { cards, total, complete, upstreamTotal, cacheStatus }:
+// Returns { cards, total, complete, upstreamTotal, cacheStatus, source }:
+//   source        which engine answered: 'local' (card_cache SQL),
+//                 'scryfall'/'sidecar' (the catalog walk), or 'local-fallback'
+//                 (sidecar-mode syntax query the engine could not reach;
+//                 answered by the card_cache compiler instead)
 //   cards         the user's owned rows for the matched game cards
 //   total         how many owned rows matched (the X-Total-Count)
 //   complete      false when the upstream walk hit its page cap — the names
@@ -1278,7 +1299,7 @@ async function resolveCollectionQuery({
   includeTotal = true, expectedSnapshot = null,
 } = {}) {
   const cleanRaw = String(q || '').trim();
-  if (!cleanRaw || !userId) return { cards: [], total: includeTotal ? 0 : null, complete: true, upstreamTotal: null, cacheStatus: 'none', snapshot: null };
+  if (!cleanRaw || !userId) return { cards: [], total: includeTotal ? 0 : null, complete: true, upstreamTotal: null, cacheStatus: 'none', source: 'local', snapshot: null };
 
   // A catalog-classified query made only of data-backed operators plus otag:
   // becomes a single SQLite SELECT as soon as a complete local tag generation
@@ -1286,34 +1307,46 @@ async function resolveCollectionQuery({
   // existing Scryfall/SWR path below.
   const { analyze, toScryfall, stripDirectives, QuerySyntaxError } = require('../../shared/scryfallQuery.js');
   const oracleTags = require('./oracleTags');
-  let parsed;
+  let parsed = null;
   try {
     parsed = analyze(cleanRaw);
   } catch (error) {
-    if (error instanceof QuerySyntaxError) throw new Error('INVALID_QUERY');
-    throw error;
+    if (error instanceof QuerySyntaxError) {
+      // Scrybox's parser is not the owner of Scryfall grammar — Scryfall is.
+      // Upstream mode keeps pre-rejecting (a parse error costs no request).
+      // Sidecar mode DOWNGRADES the throw: a query this parser cannot classify
+      // is still sent to the engine verbatim, and the engine's own 400 (mapped
+      // to INVALID_QUERY at the walk below) is the only verdict it gets. A
+      // parser gap — an `is:` word not in TYPE_WORDS, a comparator form the
+      // sidecar accepts — must never shadow the authority's answer.
+      if (!LOCAL_SCRYFALL) throw new Error('INVALID_QUERY');
+    } else {
+      throw error;
+    }
   }
   // Every term is data-backed: the owned rows ARE the answer — no API, no tag
-  // index, no eligibility gate (the user asked about cards they own).
-  if (parsed.mode === 'local') {
-    return db.withDedicatedReadTransaction(async (readDb) => {
-      const snapshot = await readCatalogSnapshot(readDb, 'rows', 0, expectedSnapshot);
-      const rawSql = require('./utils/rawQuerySql');
-      const compiled = rawSql.compileCollectionQuery({
-        ast: parsed.ast, userId, limit: rowLimit, offset: rowOffset, eligibleOnly: false,
-      });
-      const rows = await readDb.all(compiled.sql, compiled.params);
-      const count = includeTotal ? await readDb.get(compiled.countSql, compiled.countParams) : null;
-      return {
-        cards: rows.map(row => ({ ...parseCardRow(row), price_trend: resolveCardPrice(row) })),
-        total: includeTotal ? (Number(count && count.n) || 0) : null,
-        complete: true,
-        upstreamTotal: null,
-        cacheStatus: 'local',
-        snapshot,
-      };
+  // index, no eligibility gate (the user asked about cards they own). In
+  // sidecar mode this is the FALLBACK, not the fast path: it answers only
+  // when the engine walk below fails on transport/timeout (see catch).
+  const answerLocally = () => db.withDedicatedReadTransaction(async (readDb) => {
+    const snapshot = await readCatalogSnapshot(readDb, 'rows', 0, expectedSnapshot);
+    const rawSql = require('./utils/rawQuerySql');
+    const compiled = rawSql.compileCollectionQuery({
+      ast: parsed.ast, userId, limit: rowLimit, offset: rowOffset, eligibleOnly: false,
     });
-  }
+    const rows = await readDb.all(compiled.sql, compiled.params);
+    const count = includeTotal ? await readDb.get(compiled.countSql, compiled.countParams) : null;
+    return {
+      cards: rows.map(row => ({ ...parseCardRow(row), price_trend: resolveCardPrice(row) })),
+      total: includeTotal ? (Number(count && count.n) || 0) : null,
+      complete: true,
+      upstreamTotal: null,
+      cacheStatus: 'local',
+      source: 'local',
+      snapshot,
+    };
+  });
+  if (parsed && parsed.mode === 'local' && !LOCAL_SCRYFALL) return answerLocally();
   if (oracleTags.supportsLocalCollectionQuery(parsed)) {
     const local = await db.withDedicatedReadTransaction(async (readDb) => {
       if (!await oracleTags.isReady(readDb, userId)) return null;
@@ -1343,6 +1376,7 @@ async function resolveCollectionQuery({
         complete: true,
         upstreamTotal: null,
         cacheStatus: 'local',
+        source: 'local',
         snapshot,
       };
     });
@@ -1351,11 +1385,16 @@ async function resolveCollectionQuery({
   // Printing-level terms (set, artist, art tag, price, frame, ...) must be
   // intersected by exact printing: owning a Bolt from M10 does not make it match
   // a:"christopher rush". Game-card terms (oracle text, formats, otag) keep the
-  // cheaper by-name walk.
-  const byPrinting = !!parsed.printing;
-  const filterAst = stripDirectives(parsed.ast);
+  // cheaper by-name walk. A query the parser REJECTED (sidecar mode only —
+  // parsed === null) has no classification to lean on, so it takes the
+  // name-level intersect, the same conservative default searchCards' live
+  // path uses; the engine still decided which names belong in the answer.
+  const byPrinting = !!parsed && !!parsed.printing;
+  const filterAst = parsed ? stripDirectives(parsed.ast) : null;
   // Directives (unique:, order:) are stripped: the walk picks its own shape.
-  const upstream = toScryfall(filterAst);
+  // No AST (parser-rejected) or a directives-only tree → send the user's
+  // string verbatim; the engine is the authority on what it means.
+  const upstream = filterAst ? toScryfall(filterAst) : cleanRaw;
   const rawWithLanguageScope = languages.resolve(lang).scryfall === 'en'
     ? upstream
     : `(${upstream})`;
@@ -1373,13 +1412,26 @@ async function resolveCollectionQuery({
         complete: true,
         upstreamTotal: 0,
         cacheStatus: 'resolved',
+        source: LIVE_SOURCE,
         snapshot: await readCatalogSnapshot(readDb, 'remote', 'empty', expectedSnapshot),
       }));
     }
     if (err.response && (err.response.status === 400 || err.response.status === 422)) {
+      // The engine's OWN verdict on this query — including one Scrybox's
+      // parser would have rejected before the request ever left. Validity is
+      // the engine's call; a 400 never falls through to the SQL compiler.
       throw new Error('INVALID_QUERY');
     }
     if (err.response && err.response.status === 429) throw new Error('RATE_LIMIT_EXCEEDED');
+    // Transport failure / timeout on a syntax query the parser understood:
+    // the pre-delegation card_cache compiler still answers, LOUDLY — meta
+    // says 'local-fallback' (surfaced as X-Catalog-Cache) so an engine
+    // outage is visible, not silently answered by the divergent SQL path.
+    if (LOCAL_SCRYFALL && parsed && parsed.mode === 'local') {
+      console.error('sidecar collection walk failed; answering from local SQL:', err.message);
+      const local = await answerLocally();
+      return { ...local, cacheStatus: 'local-fallback', source: 'local-fallback' };
+    }
     console.error('Scryfall collection query failed:', err.message);
     throw new Error('UPSTREAM_UNAVAILABLE');
   }
@@ -1393,6 +1445,7 @@ async function resolveCollectionQuery({
       complete: entry.complete,
       upstreamTotal: entry.total,
       cacheStatus: status,
+      source: LIVE_SOURCE,
       snapshot: await readCatalogSnapshot(readDb, 'remote', membershipVersion, expectedSnapshot),
     }));
   }
@@ -1428,6 +1481,7 @@ async function resolveCollectionQuery({
       complete: entry.complete,
       upstreamTotal: entry.total,
       cacheStatus: status,
+      source: LIVE_SOURCE,
       snapshot,
     };
   });

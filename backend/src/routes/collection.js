@@ -106,16 +106,28 @@ async function searchCards(req, res) {
       } catch (e) {
         // A genuine syntax error is a fixable query, not a down API.
         if (e instanceof QuerySyntaxError) {
-          return res.status(400).json({ error: 'INVALID_QUERY' });
+          // Sidecar mode: Scryfall is the authority on its own grammar, so a
+          // query THIS parser chokes on is still handed to the engine —
+          // resolveCollectionQuery re-analyzes, skips pre-validation, and lets
+          // the engine's own 400 decide validity. Upstream mode is unchanged:
+          // a parse failure costs no request and answers 400 here.
+          if (!scryfallApi.LOCAL_SCRYFALL) {
+            return res.status(400).json({ error: 'INVALID_QUERY' });
+          }
+          mode = 'catalog';
+        } else {
+          throw e;
         }
-        throw e;
       }
-      // Local-mode queries are answered from the owned rows in SQLite (no API);
-      // catalog-mode ones resolve on Scryfall / the Oracle Tags index. Either way
-      // the response is the user's own collection rows.
+      // Local-mode queries are answered from the owned rows in SQLite (no API)
+      // and catalog-mode ones resolve on Scryfall / the Oracle Tags index —
+      // EXCEPT in sidecar mode, where mode 'local' takes the same verbatim
+      // engine walk as catalog mode (the sidecar is the sole syntax authority;
+      // card_cache SQL is only the outage fallback). Either way the response
+      // is the user's own collection rows.
       if (mode === 'catalog' || mode === 'local') {
         const includeTotal = query.count !== '0';
-        const { cards, total, complete, upstreamTotal, cacheStatus, snapshot } = await scryfallApi.resolveCollectionQuery({
+        const { cards, total, complete, upstreamTotal, cacheStatus, snapshot, source } = await scryfallApi.resolveCollectionQuery({
           q, userId: req.user.id, lang,
           // Preserve the historical API contract: callers that omit page and
           // limit receive the complete owned result. Only explicit pagination
@@ -133,10 +145,22 @@ async function searchCards(req, res) {
         if (upstreamTotal != null) res.set('X-Catalog-Upstream-Total', String(upstreamTotal));
         // 'fresh' = served from the durable cache (no upstream this request);
         // 'stale' = cache served + background refresh in flight; 'resolved' =
-        // this request paid for the walk.
+        // this request paid for the walk; 'local' = card_cache SQL answered
+        // it; 'local-fallback' = the sidecar was unreachable mid-walk and the
+        // card_cache compiler answered in its place (visible, never silent).
         res.set('X-Catalog-Cache', cacheStatus || 'unknown');
         if (snapshot) res.set('X-Catalog-Snapshot', snapshot);
-        res.set('Access-Control-Expose-Headers', 'X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot');
+        let exposed = 'X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot';
+        // Which engine answered. Only the two values that can only EXIST in
+        // sidecar mode get the header — upstream mode answers with 'local'/'
+        // scryfall' exactly as before delegation and its response stays
+        // byte-identical. Sidecar clients read 'sidecar' vs 'local-fallback'
+        // to tell the authority from the outage fallback.
+        if (source === 'sidecar' || source === 'local-fallback') {
+          res.set('X-Source', source);
+          exposed += ', X-Source';
+        }
+        res.set('Access-Control-Expose-Headers', exposed);
         return res.json(cards);
       }
     }
