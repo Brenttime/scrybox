@@ -18,6 +18,12 @@ const { oracleIdForCard, defaultSearchEligible } = require('./utils/oracleId');
 const LOCAL_SCRYFALL = process.env.LOCAL_SCRYFALL_ENABLED === 'true';
 const LOCAL_SCRYFALL_URL = (process.env.LOCAL_SCRYFALL_URL || 'http://scryfall-local:8420').replace(/\/$/, '');
 
+// What X-Source reports when the LIVE path answered. The frontend only ever
+// compares this against 'cache' (green "Local" badge) and renders anything
+// else as the blue "Live" badge, so the sidecar value must never be 'cache' —
+// a sidecar answer IS a card-API call, just a free one served from RAM.
+const LIVE_SOURCE = LOCAL_SCRYFALL ? 'sidecar' : 'scryfall';
+
 // Rewrite an absolute api.scryfall.com URL onto the sidecar. Relative URLs
 // need no rewrite because the client's baseURL already points at it — but
 // Scryfall-returned absolute links (next_page etc.) and the hardcoded URLs
@@ -551,13 +557,16 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
   // Scryfall-syntax searches ("is:land color:g rarity:rare") are
   // authoritative: they replace the name/number/set fields entirely.
   //
-  // They are answered from the local card_cache when they can be — the moment
-  // every operator is data-backed (is:, color:, set:, rarity:, ...), the rows
-  // this install already holds ARE the answer, and a database query is instant
-  // and never touches the 2/sec rate limit. That is the common case: someone
-  // typing "set:lea color:g rarity:rare" has a fully cached set they are adding
-  // from. Only queries that reach past the cache (otag:, availability:, artist:,
-  // t:, ... — catalog operators) fall through to the live API.
+  // Upstream mode answers them from the local card_cache when they can be —
+  // the moment every operator is data-backed (is:, color:, set:, rarity:, ...),
+  // a database query is instant and never touches the 2/sec rate limit. That
+  // is the common case: someone typing "set:lea color:g rarity:rare" has a
+  // fully cached set they are adding from. Only queries that reach past the
+  // cache (otag:, availability:, artist:, t:, ... — catalog operators) fall
+  // through to the live API. (Being answerable from the cache is NOT the same
+  // as the cache holding every match — see the LOCAL gate below, which is
+  // what a never-cached set exposed.) With the sidecar up, the live path is
+  // cheap, exact, and always the first ask.
   //
   // Collection scope answers "what do I own" with plain field filters, so a raw
   // query has no meaning there and yields nothing rather than a LIKE on the
@@ -569,10 +578,17 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
     try {
       parsed = analyze(cleanRaw);
     } catch (err) {
-      // A genuine syntax error (unbalanced paren, unknown keyword, bad color) is a
-      // fixable query, not a down API. Name it exactly like the upstream 400.
-      if (err instanceof QuerySyntaxError) throw new Error('INVALID_QUERY');
-      throw err;
+      // A genuine syntax error (unbalanced paren, bad color) is a fixable
+      // query, not a down API. Name it exactly like the upstream 400 — but
+      // only when nothing better than our own parser is answering. Scryfall
+      // is the authority on its own grammar; when the sidecar is answering
+      // anyway, hand it the query verbatim and let ITS 400 name the typo.
+      // Upstream mode keeps the historical behavior byte-for-byte: a query
+      // this parser rejects is one the cache could never answer either, so
+      // the parser's verdict is the whole verdict.
+      if (err instanceof QuerySyntaxError && LOCAL_SCRYFALL) parsed = null;
+      else if (err instanceof QuerySyntaxError) throw new Error('INVALID_QUERY');
+      else throw err;
     }
     const langName = languages.toName(lang);
     // Answer from the local card_cache. Used first for `database` scope when every
@@ -603,22 +619,34 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
     // `internet` scope (Add Cards) is authoritative: the local cache holds only
     // the printings this install has seen, so t:elf c:g answered locally would
     // silently drop most elves. Internet scope always asks Scryfall.
-    if (parsed.mode === 'local' && scope !== 'internet') {
+    //
+    // And never under the sidecar. card_cache is a PARTIAL snapshot — it holds
+    // only printings this install ever fetched — so "every operator is
+    // data-backed" was never evidence that "the rows we hold are the whole
+    // answer": a set nobody cached (set:fra) answered 0 while the truth was
+    // 285. Cache-first existed to dodge upstream's 2/sec /cards/search limit;
+    // the sidecar has no limit and answers from RAM in ms, so LOCAL mode asks
+    // it for every raw query and keeps answerLocally() only as the fallback
+    // for when it is down. `parsed` is null exactly when the parser rejected
+    // a query the sidecar must still get to judge.
+    if (!LOCAL_SCRYFALL && parsed && parsed.mode === 'local' && scope !== 'internet') {
       const cachedLang = await db.get(
         `SELECT COUNT(*) AS n FROM card_cache WHERE language = ?`, [langName]
       );
       if (cachedLang && cachedLang.n > 0) return answerLocally();
     }
     // Upstream gets the query re-serialized from the AST: Scrybox extensions
-    // (is:land -> t:land) become real Scryfall syntax; everything else is verbatim.
-    const upstream = toScryfall(parsed.ast);
+    // (is:land -> t:land) become real Scryfall syntax; everything else is
+    // verbatim. A query the parser rejected (parsed === null, LOCAL only) is
+    // handed verbatim — we have no right to rewrite what we could not read.
+    const upstream = parsed ? toScryfall(parsed.ast) : cleanRaw;
     try {
       const rawWithLanguageScope = languages.resolve(lang).scryfall === 'en'
         ? upstream
         : `(${upstream})`;
       const { cards: hit, total } = await fetchWindow(rawWithLanguageScope, lang, offset, limit);
       if (total != null) meta.total = total;
-      meta.source = 'scryfall';
+      meta.source = LIVE_SOURCE;
       const cards = hit.map(c => normalizeCard(c, lang));
       if (cards.length) await cacheCards(cards);
       return cards;
@@ -628,8 +656,11 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
       if (err.response && (err.response.status === 404 || err.response.status === 422)) return [];
       if (err.response && err.response.status === 400) throw new Error('INVALID_QUERY');
       console.error('Scryfall raw query failed:', err.message);
-      // Upstream down: a data-backed query can still be answered from the cache.
-      if (parsed.mode === 'local') return answerLocally();
+      // Upstream down: a data-backed query can still be answered from the
+      // cache. (In LOCAL mode this is the designed fallback — sidecar down,
+      // stale cache beats an error page. A query the parser rejected cannot
+      // be evaluated locally at all, so `parsed` is checked before its mode.)
+      if (parsed && parsed.mode === 'local') return answerLocally();
       if (err.response && err.response.status === 429) throw new Error('RATE_LIMIT_EXCEEDED');
       throw new Error('UPSTREAM_UNAVAILABLE');
     }
@@ -653,7 +684,7 @@ async function runSearch(meta, nameQuery = '', numberQuery = '', setQuery = '', 
       // 250) so heavily reprinted cards do not silently lose later printings.
       const { cards: raw, total } = await fetchWindow(q, lang, offset, limit);
       if (total != null) meta.total = total;
-      meta.source = 'scryfall';
+      meta.source = LIVE_SOURCE;
       if (raw.length) {
         const cards = raw.map(c => normalizeCard(c, lang));
         await cacheCards(cards);
