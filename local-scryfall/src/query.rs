@@ -1003,6 +1003,14 @@ impl Parser {
                     if en.contains(v.as_str()) {
                         return Node::Filter(Filter::Keyword(v));
                     }
+                    // NOTE parity w5: word-prefix matching against multi-word
+                    // enum phrases (keyword:Tempting→"Tempting offer") was
+                    // tried and REVERTED: the bulk keywords[] blob contains
+                    // ~600 acorn/junk phrases ("death gigas", "job select")
+                    // beyond upstream's real enum, so prefix hits poison the
+                    // OR (keyword family 21→38 DRIFT). Left as drop-with-
+                    // warning exactly as before; multi-word rows stay on the
+                    // trailing bare-word path which lands on theirs totals.
                     // unknown value: upstream drops the keyword term (the
                     // all-terms-ignored rule turns the empty case into 400).
                     // Quoted multi-word values ("level up") that miss the

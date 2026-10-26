@@ -913,58 +913,86 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             })
         }
         Filter::ManaSyms(parts) => {
-            // m:{…} literal-symbol model (see query::Mp / mana_brace_spec).
-            // Multi-part specs must match ADJACENT printed symbols: upstream
-            // m:{W}{U} = "{W}{U}" contiguous, not {W}…gap…{U} (golden fit:
-            // m:{W}{U} ours-gap=682 vs upstream 644; m:{X}{R} 564 vs 155).
+            // parity w5 §6 (borrow report L73–79): containment counts the
+            // UNION of mana_cost and every card_faces[].mana_cost per print;
+            // spec parts must each appear (no adjacency requirement —
+            // golden m:{2}{W} sim 3,731 vs 3,697 needed union+independent,
+            // adjacency starved to 3,308), generic parts compare as the
+            // card's MAX generic pip, and hybrid/phyrexian/gold segments
+            // contribute nothing to plain colour needs (they match only
+            // when spelled explicitly — sim overshoot 686 proved this).
             let parts = parts.clone();
             scan(ix, move |i| {
                 let raw = ix.cost_all(i).to_ascii_lowercase();
-                for face in raw.split("///") {
-                    // exact brace-delimited segments in printed order
-                    let chars: Vec<char> = face.chars().collect();
-                    let mut segs: Vec<String> = Vec::with_capacity(chars.len() / 3 + 1);
-                    let mut k = 0usize;
-                    while k < chars.len() {
-                        if chars[k] == '{' {
-                            match chars[k + 1..].iter().position(|&x| x == '}') {
-                                Some(e) => {
-                                    segs.push(chars[k + 1..k + 1 + e].iter().collect());
-                                    k += e + 2;
-                                }
-                                None => break,
+                let chars: Vec<char> = raw.chars().collect();
+                let mut segs: Vec<String> = Vec::new();
+                let mut k = 0usize;
+                while k < chars.len() {
+                    if chars[k] == '{' {
+                        match chars[k + 1..].iter().position(|&x| x == '}') {
+                            Some(e) => {
+                                segs.push(chars[k + 1..k + 1 + e].iter().collect());
+                                k += e + 2;
                             }
-                        } else {
-                            k += 1;
+                            None => break,
                         }
-                    }
-                    if segs.is_empty() {
-                        continue;
-                    }
-                    let m = |seg: &str, p: &Mp| match p {
-                        Mp::Lit(s) => seg == s,
-                        Mp::Pip(m) => {
-                            let b = m.trailing_zeros() as usize;
-                            let ch = "wubrg".as_bytes()[b] as char;
-                            seg.len() == 1 && seg.chars().next() == Some(ch)
-                        }
-                        Mp::GenericMin(n) => {
-                            seg.chars().all(|c| c.is_ascii_digit())
-                                && seg.parse::<u32>().unwrap_or(0) >= *n
-                        }
-                        Mp::AnyCost => true,
-                    };
-                    let ok = if parts.len() == 1 {
-                        segs.iter().any(|s| m(s, &parts[0]))
                     } else {
-                        segs.windows(parts.len())
-                            .any(|w| w.iter().zip(parts.iter()).all(|(s, p)| m(s, p)))
-                    };
-                    if ok {
-                        return true;
+                        k += 1;
                     }
                 }
-                false
+                if segs.is_empty() {
+                    return parts.is_empty();
+                }
+                let mut pips = [0u8; 5];
+                let mut maxg = 0u32;
+                for s in &segs {
+                    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                        maxg = maxg.max(s.parse::<u32>().unwrap_or(0));
+                    } else if s.len() == 1 {
+                        if let Some(b) = "wubrg".find(s.as_str()) {
+                            pips[b] += 1;
+                        }
+                    }
+                }
+                let mut need = [0u8; 5];
+                for p in &parts {
+                    match p {
+                        Mp::Lit(s) => {
+                            if s.len() == 1 {
+                                if let Some(b) = "wubrg".find(s.as_str()) {
+                                    need[b] += 1;
+                                } else if !segs.iter().any(|x| x == s) {
+                                    return false;
+                                }
+                            } else if !segs.iter().any(|x| x == s) {
+                                return false;
+                            }
+                        }
+                        Mp::Pip(m) => {
+                            if m.count_ones() == 1 {
+                                need[m.trailing_zeros() as usize] += 1;
+                            } else {
+                                for b in 0..5 {
+                                    if m & (1 << b) != 0 && pips[b] < 1 {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        Mp::GenericMin(n) => {
+                            if maxg < *n {
+                                return false;
+                            }
+                        }
+                        Mp::AnyCost => {}
+                    }
+                }
+                for b in 0..5 {
+                    if need[b] > pips[b] {
+                        return false;
+                    }
+                }
+                true
             })
         }
         Filter::Fatal400(msg) => {
