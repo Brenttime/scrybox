@@ -428,6 +428,15 @@ fn bare_field_atom(text: &str) -> Option<Node> {
     ] {
         if let Some(rest) = lower.strip_prefix(k) {
             if let Some((_, r)) = split_cmp_prefix(rest) {
+                // parity w5 §1: ALL bare collector-number operator atoms take
+                // the CnCmp quantifier path (∃-over-printings with suffixed
+                // prints NULL, gated pool via api dedup) — the plain f32
+                // cmp_filter here was ungated (cn>=1: 38,322 vs 33,826
+                // golden); suffixed atoms (cn>=12a) previously fell through
+                // to a 0-hit text search.
+                if f == NumField::Cn && r.starts_with(|c: char| c.is_ascii_digit()) {
+                    return Some(cn_atom(rest));
+                }
                 if !r.is_empty() && r.parse::<f32>().is_ok() {
                     return Some(cmp_filter(f, rest));
                 }

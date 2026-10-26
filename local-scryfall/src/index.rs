@@ -323,6 +323,51 @@ pub struct Card {
     pub ffx: u32,      // frame_effects bitset over FFX_LIST
     pub new_flags: u8, // NEW_* bits (first-in-oracle occurrences), filled post-parse
     pub defense: f32,  // battle defense (NAN = absent)
+    /// parity w5 (borrow-plan §6): per-face numeric attributes packed 8 bits
+    /// per face (max 8 faces): 0 = absent, 1..=254 = value+1, 255 = '*'.
+    /// pow:/tou:/loyalty:/defense: comparisons satisfy on ANY face value.
+    pub face_pow: u64,
+    pub face_tou: u64,
+    pub face_loy: u64,
+    pub face_def: u64,
+}
+
+/// Pack card_faces numeric attributes into the 4×(8-bit×8) words stored on
+/// Card (see face_pow). 0 = absent, 1..=254 = value+1, 255 = '*' wildcard.
+pub fn pack_face_nums(faces: &[serde_json::Value]) -> (u64, u64, u64, u64) {
+    let code = |f: &serde_json::Value, k: &str| -> u64 {
+        match f.get(k) {
+            Some(serde_json::Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    return 0;
+                }
+                if t == "*" || t == "?" {
+                    return 255;
+                }
+                match t.parse::<f64>() {
+                    Ok(x) if x >= 0.0 => ((x as u32).min(253) + 1) as u64,
+                    _ => 0,
+                }
+            }
+            Some(serde_json::Value::Number(n)) => match n.as_f64() {
+                Some(x) if x >= 0.0 => ((x as u32).min(253) + 1) as u64,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    };
+    let mut pow = 0u64;
+    let mut tou = 0u64;
+    let mut loy = 0u64;
+    let mut def = 0u64;
+    for (k, f) in faces.iter().take(8).enumerate() {
+        pow |= code(f, "power") << (8 * k);
+        tou |= code(f, "toughness") << (8 * k);
+        loy |= code(f, "loyalty") << (8 * k);
+        def |= code(f, "defense") << (8 * k);
+    }
+    (pow, tou, loy, def)
 }
 
 pub struct Orders {
@@ -1131,6 +1176,10 @@ struct RawC {
     reprint: bool,
     atypical: bool,
     masterpiece: bool,
+    face_pow: u64,
+    face_tou: u64,
+    face_loy: u64,
+    face_def: u64,
 }
 
 /// Remove balanced-parenthesis runs (reminder text) from oracle text before
@@ -1546,6 +1595,8 @@ fn parse_line(line: &str) -> Option<RawC> {
         .and_then(|x| x.as_array())
         .cloned()
         .unwrap_or_default();
+    // per-face power/toughness/loyalty/defense packs (see Card::face_pow)
+    let fnums = pack_face_nums(&faces_arr);
     let fstr = |f: &serde_json::Value, k: &str| -> String {
         f.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
@@ -1794,6 +1845,10 @@ fn parse_line(line: &str) -> Option<RawC> {
         reprint,
         atypical,
         masterpiece,
+        face_pow: fnums.0,
+        face_tou: fnums.1,
+        face_loy: fnums.2,
+        face_def: fnums.3,
         cn_val: parse_cn(str_of(&v, "collector_number")),
         released: parse_released(str_of(&v, "released_at")),
         prices,
@@ -2058,6 +2113,10 @@ impl Index {
                 reprint: r.reprint,
                 atypical: r.atypical,
                 masterpiece: r.masterpiece,
+                face_pow: r.face_pow,
+                face_tou: r.face_tou,
+                face_loy: r.face_loy,
+                face_def: r.face_def,
                 cn_val: r.cn_val,
                 released: r.released,
                 prices: r.prices,
@@ -2293,10 +2352,11 @@ impl Index {
                 vec![Default::default(); n_or];
             let mut illus_seen: Vec<std::collections::HashSet<u32>> =
                 vec![Default::default(); n_or];
-            // print counting is per (set, cn_key): foil "200★" twins merge with
-            // their "200" sibling (proven against live Scryfall prints=).
-            let mut print_seen: Vec<std::collections::HashSet<(u32, u32)>> =
-                vec![Default::default(); n_or];
+            // parity w5 (borrow-plan §8): prints:N counts ALL bulk rows per
+            // oracle (Scryfall's prints_search_uri size incl. foil twins and
+            // promo/variant prints — gated/(set,cn) dedup over-counted
+            // prints=1 by ~260 oracles: 13,579 vs 13,395 golden). Paper
+            // prints keep the (set, cn_key) twin-merge below.
             let mut pprint_seen: Vec<std::collections::HashSet<(u32, u32)>> =
                 vec![Default::default(); n_or];
             let mut tok_cnt: Vec<u32> = vec![0; n_or];
@@ -2313,9 +2373,7 @@ impl Index {
                 {
                     vis[r] = true;
                 }
-                if print_seen[r].insert((c.set, c.cn_key)) {
-                    st.n_prints = st.n_prints.saturating_add(1);
-                }
+                st.n_prints = st.n_prints.saturating_add(1);
                 if c.flags2 & F2_TOKEN == 0 {
                     if c.reprint {
                         st.reprint = true;

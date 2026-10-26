@@ -1,13 +1,14 @@
 //! AST evaluation -> RoaringBitmap of card ids.
 
 use crate::index::{
-    Card, Index, NFORMATS, F2_HIDDEN, F2_TOKEN, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES,
-    F_SPOTLIGHT, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
+    Card, Index, NFORMATS, F2_HIDDEN, F2_TOKEN, F_BOOSTER_FLAG, F_FULLART, F_HAS_IND, F_HAS_TEXT,
+    F_HAS_WM, F_HIRES, F_PROMO, F_SPOTLIGHT, F_TEXTLESS, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL, STAR,
 };
 use crate::query::{
     Cmp, Filter, Mp, Node, NumField, SubOp,
-    HAS_ALCHEMY, HAS_BOOSTER, HAS_ETCHED, HAS_FLAVOR, HAS_FOIL, HAS_HIRES, HAS_INDICATOR,
-    HAS_NONFOIL, HAS_SPOTLIGHT, HAS_TEXT, HAS_VIDEO, HAS_WATERMARK,
+    HAS_ALCHEMY, HAS_ARTIST, HAS_ARTSERIES, HAS_BOOSTER, HAS_ETCHED, HAS_EXTART, HAS_FLAVOR,
+    HAS_FOIL, HAS_FULLART, HAS_HIRES, HAS_INDICATOR, HAS_NONFOIL, HAS_PROMO, HAS_REPRINT,
+    HAS_SPOTLIGHT, HAS_TEXT, HAS_TEXTLESS, HAS_UNIQUE, HAS_VIDEO, HAS_WATERMARK,
 };
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -297,31 +298,32 @@ fn prefix_union(_ix: &Index, map: &std::collections::HashMap<String, RoaringBitm
 fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     match f {
         Filter::CnCmp { op, num, full } => {
-            // Per-print collector-number compare over GATED printings (aux
-            // token/asset/stock prints excluded — golden cn>=1 33826 vs our
-            // ungated 38322, delta = aux). Alphanumeric suffixes: '=' is
-            // exact-string (cn=12a 290); inequalities order the full lower
-            // string lexicographically within the numeric tie class
-            // (golden cn<12a 3082 < cn<=12a 3296, both vs cn=12a 290).
+            // Parity w5 §1 (borrow-plan): per-printing collector-number
+            // compare with (numeric_prefix, alpha_suffix) PAIR ordering —
+            // "12b" > "12" > "9". Quantifier model validated on the bulk
+            // dump against cached upstream answers: pure-numeric query
+            // values use ∃-over-printings (suffixed prints are NULL for
+            // range ops; alpha-only bonus prints satisfy >=/>), while an
+            // alpha-suffixed query value ("12a") uses ∀-over-printings —
+            // golden cn>12a 24987 EXACT, cn>=12a 24989 vs 25064 (−0.3%).
+            // '=' keeps exact-string semantics (cn=12a). Pool visibility is
+            // enforced uniformly by the api layer's id_vis_bits gate.
             let op = *op;
             let num = *num;
             let full = full.clone();
-            scan(ix, |i| {
-                let c = &ix.cards[i as usize];
-                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0
-                    || crate::index::is_aux_layout(&ix.strings[c.layout as usize])
-                    || crate::index::is_aux_set_type(&ix.strings[c.set_type as usize])
-                {
-                    return false;
-                }
+            let print_ok = |c: &Card| -> bool {
                 let raw: &str = &ix.strings[c.collector_number as usize];
                 let flat = raw.trim_end_matches('★').trim_end_matches('*').to_lowercase();
+                let digits: String = flat.chars().take_while(|x| x.is_ascii_digit()).collect();
                 match (&full, op) {
                     (Some(f), Cmp::Eq) => flat == *f,
                     (Some(f), Cmp::Ne) => flat != *f,
-                    (None, Cmp::Eq) => flat == num.to_string(),
-                    (None, Cmp::Ne) => flat != num.to_string(),
+                    (None, Cmp::Eq) => !digits.is_empty() && c.cn_val == num,
+                    (None, Cmp::Ne) => digits.is_empty() || c.cn_val != num,
                     (Some(f), _) => {
+                        if digits.is_empty() {
+                            return false; // alpha-only print never passes
+                        }
                         let qs = f.trim_end_matches('★').trim_end_matches('*');
                         match op {
                             Cmp::Lt => c.cn_val < num || (c.cn_val == num && flat.as_str() < qs),
@@ -331,12 +333,44 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                             _ => unreachable!(),
                         }
                     }
-                    (None, Cmp::Lt) => c.cn_val < num,
-                    (None, Cmp::Le) => c.cn_val <= num,
-                    (None, Cmp::Gt) => c.cn_val > num,
-                    (None, Cmp::Ge) => c.cn_val >= num,
+                    (None, _) => {
+                        if digits.is_empty() {
+                            // pure-alpha bonus printing: sorts high, matches
+                            // lower-bound comparisons only.
+                            return matches!(op, Cmp::Ge | Cmp::Gt);
+                        }
+                        if flat.len() > digits.len() {
+                            return false; // suffixed prints are NULL for ranges
+                        }
+                        match op {
+                            Cmp::Lt => c.cn_val < num,
+                            Cmp::Le => c.cn_val <= num,
+                            Cmp::Gt => c.cn_val > num,
+                            Cmp::Ge => c.cn_val >= num,
+                            _ => unreachable!(),
+                        }
+                    }
                 }
-            })
+            };
+            if full.is_some() && matches!(op, Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge) {
+                // ∀-over-printings: oracle matches only when EVERY printing
+                // satisfies the pair comparison.
+                let mut bm = RoaringBitmap::new();
+                for pr in ix.oracle_prints.iter() {
+                    let mut all = true;
+                    for i in pr.iter() {
+                        if !print_ok(&ix.cards[i as usize]) {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if all && !pr.is_empty() {
+                        bm |= pr;
+                    }
+                }
+                return bm;
+            }
+            scan(ix, move |i| print_ok(&ix.cards[i as usize]))
         }
         Filter::Colors { mask, op, identity } => {
             let (bits, subsets, exacts) = if *identity {
@@ -464,23 +498,56 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::Cmp { field, op, val } => {
             let v = *val;
-            if v.is_nan() && *field != NumField::Pt {
+            if v.is_nan() {
+                if matches!(
+                    *field,
+                    NumField::Pt
+                        | NumField::Power
+                        | NumField::Toughness
+                        | NumField::Loyalty
+                        | NumField::Defense
+                ) {
+                    // non-numeric p/t/loyalty/defense value (pow=3+, tou=2+…):
+                    // upstream 404s — mirror with an empty result instead of
+                    // leaking the pool through the ignored-filter universe.
+                    return RoaringBitmap::new();
+                }
                 w.push("ignored numeric filter with non-numeric value".into());
                 return ix.universe.clone();
             }
             let o = *op;
-            if *field == NumField::Pt {
-                // p/t "either" semantics: pow:X matches power OR toughness
-                return scan(ix, |i| {
+            // parity w5 §6: pow/tou/loyalty/defense comparisons satisfy on the
+            // top-level value OR any card_faces[] value (packed), '*'
+            // satisfies every inequality; pt: keeps "either" semantics.
+            match *field {
+                NumField::Pt => scan(ix, move |i| {
                     let c = &ix.cards[i as usize];
-                    cmp_f(c.power, o, v) || cmp_f(c.toughness, o, v)
-                });
+                    num_any(c.power, c.face_pow, o, v) || num_any(c.toughness, c.face_tou, o, v)
+                }),
+                NumField::Power => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.power, c.face_pow, o, v)
+                }),
+                NumField::Toughness => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.toughness, c.face_tou, o, v)
+                }),
+                NumField::Loyalty => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.loyalty, c.face_loy, o, v)
+                }),
+                NumField::Defense => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.defense, c.face_def, o, v)
+                }),
+                _ => {
+                    let f = *field;
+                    scan(ix, move |i| {
+                        let x = num_field(ix, i as usize, f);
+                        !x.is_nan() && cmp_f(x, o, v)
+                    })
+                }
             }
-            let f = *field;
-            scan(ix, |i| {
-                let x = num_field(ix, i as usize, f);
-                !x.is_nan() && cmp_f(x, o, v)
-            })
         }
         Filter::CmpRange { field, lo, hi } => {
             let (lo, hi) = (*lo, *hi);
@@ -1050,24 +1117,31 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     HAS_TEXT => c.flags & F_HAS_TEXT != 0,
                     HAS_FLAVOR => !ix.strings[c.flavor as usize].is_empty(),
                     HAS_ALCHEMY => &*ix.strings[c.set_type as usize] == "alchemy",
+                    // parity w5 §4 (borrow-plan): these arms previously fell
+                    // through to a catch-all binding (the HAS_* constants
+                    // were never imported — the arms compiled as wildcard
+                    // patterns, making every one of them return the reprint
+                    // bitmap: the flat 17,602 for has:artist/textless/…).
+                    // Rules now follow the validated print-attribute spec.
                     HAS_REPRINT => c.reprint,
                     HAS_UNIQUE => {
+                        // has:unique == is:unique: visible oracle never
+                        // flagged reprint (mirrors the is:unique arm).
                         let r = ix.card_oracle[i as usize] as usize;
-                        ix.oracle_stats[r].n_illus == 1
+                        let st = &ix.oracle_stats[r];
+                        st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
                     }
                     HAS_ARTIST => !ix.strings[c.artist as usize].is_empty(),
-                    HAS_PROMO => !ix.strings[c.ptypes as usize].is_empty(),
-                    HAS_ARTSERIES => &*ix.strings[c.layout as usize] == "art_series",
-                    HAS_TEXTLESS => {
-                        c.ffx
-                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "textless").unwrap())
-                            != 0
+                    HAS_PROMO => c.flags & F_PROMO != 0,
+                    HAS_ARTSERIES => {
+                        // oracle-level: upstream counts the base card whose
+                        // (hidden) art_series printing exists — see
+                        // OracleStats::has_artseries (golden 2,352).
+                        let r = ix.card_oracle[i as usize] as usize;
+                        ix.oracle_stats[r].has_artseries && c.flags2 & F2_HIDDEN == 0
                     }
-                    HAS_FULLART => {
-                        c.ffx
-                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "fullart").unwrap())
-                            != 0
-                    }
+                    HAS_TEXTLESS => c.flags & F_TEXTLESS != 0,
+                    HAS_FULLART => c.flags & F_FULLART != 0,
                     HAS_EXTART => {
                         c.ffx
                             & (1u32 << crate::index::FFX_LIST
@@ -1355,7 +1429,19 @@ fn num_field(ix: &Index, i: usize, f: NumField) -> f32 {
         }
         NumField::PriceUsdFoil => c.prices[1],
         NumField::PriceTix => c.prices[2],
-        NumField::PriceEur => c.prices[3],
+        NumField::PriceEur => {
+            // parity w5 §7 (borrow-plan): cardmarket unified listings — a
+            // print with no non-foil eur price is priced by its eur_foil,
+            // mirroring the usd fallback above (golden eur>=5 4,689; our
+            // own-value-only count was 3,478). tix has no *_foil field in
+            // the bulk dump, so PriceTix keeps own-value semantics.
+            let e = c.prices[3];
+            if e.is_nan() {
+                c.prices[4]
+            } else {
+                e
+            }
+        }
         NumField::PriceEurFoil => c.prices[4],
         NumField::Edhrec => {
             if c.edhrec == u32::MAX {
@@ -1454,6 +1540,46 @@ fn mana_pips(cost: &str) -> (u8, [u8; 5]) {
         gc += num.parse::<u8>().unwrap_or(0);
     }
     (gc, pip)
+}
+
+/// parity w5 (borrow-plan §6): does any packed face value satisfy the
+/// comparison? Codes: 0 absent, 1..=254 value+1, 255 = '*'. The wildcard
+/// satisfies every INEQUALITY (golden pow<=3 14,450 vs 14,431 etc.) but never
+/// plain equality — pow=3 must not swallow the ~200 '*' creatures.
+fn face_pack_any(pack: u64, op: Cmp, v: f32) -> bool {
+    let mut p = pack;
+    for _ in 0..8 {
+        let code = (p & 0xFF) as u8;
+        p >>= 8;
+        if code == 0 {
+            continue;
+        }
+        if code == 255 {
+            // '*' sorts above every number: it satisfies upper bounds
+            // (pow<=3 golden 14450 vs 14431) but NEVER lower bounds —
+            // battery-confirmed: pow>1 14,833 vs 14,515 when star matched.
+            if matches!(op, Cmp::Lt | Cmp::Le) {
+                return true;
+            }
+            continue;
+        }
+        if cmp_f((code - 1) as f32, op, v) {
+            return true;
+        }
+    }
+    false
+}
+fn num_any(top: f32, pack: u64, op: Cmp, v: f32) -> bool {
+    if !top.is_nan() {
+        if top == STAR {
+            if matches!(op, Cmp::Lt | Cmp::Le) {
+                return true;
+            }
+        } else if cmp_f(top, op, v) {
+            return true;
+        }
+    }
+    face_pack_any(pack, op, v)
 }
 
 fn cmp_f(x: f32, op: Cmp, v: f32) -> bool {
