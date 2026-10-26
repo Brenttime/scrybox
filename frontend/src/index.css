@@ -1873,7 +1873,8 @@ select optgroup,
 /* List header actions on phones: one even row, icon over a short label
    (iOS action-row style) instead of wrapping into three ragged rows. */
 @media (max-width: 720px) {
-  .list-editor-header-actions {
+  .list-editor-header-actions,
+  .dk-head-actions {
     width: 100%;
     align-items: stretch !important;
     display: grid !important;
@@ -1881,7 +1882,8 @@ select optgroup,
     grid-auto-columns: minmax(0, 1fr);
     gap: 0.4rem !important;
   }
-  .list-editor-header-actions > .btn {
+  .list-editor-header-actions > .btn,
+  .dk-head-actions > .btn {
     flex-direction: column;
     justify-content: center;
     gap: 0.25rem !important;
@@ -1892,11 +1894,12 @@ select optgroup,
     font-size: 0.68rem;
     line-height: 1.1;
     text-align: center;
-    white-space: normal;
+    white-space: normal !important;
     border-radius: var(--radius-sm) !important;
   }
-  .list-editor-header-actions > * { min-width: 0; }
-  .list-editor-header-actions > .btn-icon-only { padding: 0.45rem 0.2rem !important; }
+  .list-editor-header-actions > *, .dk-head-actions > * { min-width: 0; }
+  .list-editor-header-actions > .btn-icon-only,
+  .dk-head-actions > .btn-icon-only { padding: 0.45rem 0.2rem !important; }
 }
 
 /* Deck editor commander banner: off unless a theme opts in (see theme-manabox.css). */

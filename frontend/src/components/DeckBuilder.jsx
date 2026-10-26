@@ -1470,25 +1470,27 @@ function DeckBuilder({ showToast, onNavigate }) {
                   <LogOut size={14} /> {t('deck.checkoutAction')}
                 </button>
               )}
+              {/* Everyday actions in view (one even row on a phone); the menu
+                  keeps the draw simulator and Delete. */}
+              {isBuilding && (
+                <button className="btn btn-secondary" onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
+                  <LogOut size={14} /> {t('deck.checkoutShort')}
+                </button>
+              )}
+              {canRegister && (
+                <button className="btn btn-secondary" onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
+                  <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerShort')}
+                </button>
+              )}
+              <button className="btn btn-secondary" onClick={() => setShowExportModal(true)} title={t('deck.exportDeckList')}>
+                <Download size={14} /> {t('deck.exportShort')}
+              </button>
+              <button className="btn btn-secondary" onClick={() => setShowImportModal(true)} title={t('deck.importDeckList')}>
+                <Upload size={14} /> {t('deck.importShort')}
+              </button>
               <OverflowMenu label={t('deck.moreActions')}>
                 <button role="menuitem" style={moreItem} onClick={startSimulator}>
                   <Play size={14} /> {t('deck.drawHand')}
-                </button>
-                {isBuilding && (
-                  <button role="menuitem" style={moreItem} onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
-                    <LogOut size={14} /> {t('deck.checkoutAction')}
-                  </button>
-                )}
-                {canRegister && (
-                  <button role="menuitem" style={moreItem} onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
-                    <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
-                  </button>
-                )}
-                <button role="menuitem" style={moreItem} onClick={() => setShowExportModal(true)}>
-                  <Download size={14} /> {t('deck.exportDeckList')}
-                </button>
-                <button role="menuitem" style={moreItem} onClick={() => setShowImportModal(true)}>
-                  <Upload size={14} /> {t('deck.importDeckList')}
                 </button>
                 <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.35rem' }} />
                 <button
