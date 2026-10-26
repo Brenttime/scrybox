@@ -804,6 +804,12 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             w.push(format!("\u{1}{msg}"));
             RoaringBitmap::new()
         }
+        Filter::Ignored(msg) => {
+            // unreachable: parse() prunes these (upstream drop-semantics).
+            // Defensive fallback: neutral element for AND conjunctions.
+            w.push(format!("invalid expression \"{msg}\" was ignored"));
+            ix.universe.clone()
+        }
         Filter::Mana2 { need, gc, op } => {
             let (need, gc, op) = (need.clone(), *gc, *op);
             scan(ix, move |i| {
@@ -1521,17 +1527,41 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "mirror" => return scan(ix, |i| ix.oracle_lc(i).contains("mirror")),
         "historic" => {
             // legendary/artifact/planeswalker/saga (any face, incl. the
-            // 'Historic' type word on newer prints); Arena-irrelevant print
-            // families (funny/alchemy/custom reprints/memorabilia/promo) are
-            // not historic upstream (8143/8188 with the rest of this rule).
+            // 'Historic' type word on newer prints). Oracle-set diff vs live
+            // Scryfall (2026-10-26, ours_cw/ishist fetches): upstream's 8190
+            // CONTAINS every funny/acorn legendary-artifact (Un-sets, Under-
+            // down, BG3/acorn promos) — our previous exclusion of "funny" |
+            // "promo" removed 460 rows it should not (extras=0 => strict
+            // subset). "alchemy" | "masters" | "memorabilia" printings are
+            // genuinely absent from upstream's set (no such sets in the
+            // missing diff) so those exclusions stay.
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                if c.flags2 & F2_HIDDEN != 0 {
                     return false;
                 }
                 let st = &*ix.strings[c.set_type as usize];
-                if matches!(st, "funny" | "alchemy" | "masters" | "memorabilia" | "promo") {
+                if matches!(st, "memorabilia") {
+                    // sets_catalog probe (2026-10-26): upstream's 8190 has
+                    // ZERO memorabilia cards but DOES include every
+                    // alchemy (172) and masters (cmm/2xm/me*/tsr…) printing,
+                    // so only memorabilia is excluded.
                     return false;
+                }
+                // (hbg 'Agent of…' extras: stale dump rows — upstream now
+                // 404s those exact cards; an all_parts/combo_piece engine
+                // rule over-fired on 21k legit cards, so this is DATA, not
+                // engine, drift.)
+                // artifact-family tokens (Contraptions/Attractions printed
+                // on token sheets) count as historic upstream — other token
+                // cards stay excluded. The artifact must be on the MAIN
+                // face, else DFC token sides (q07 Goblin // Artifact-Blood)
+                // leak in as extras.
+                if c.flags2 & F2_TOKEN != 0 {
+                    let main = ix.type_lc(i).split("//").next().unwrap_or("").to_string();
+                    if !main.contains("artifact") {
+                        return false;
+                    }
                 }
                 c.flags2 & F2_HIST_WORD != 0
                     || c.flags & (F_LEGENDARY | F_ARTIFACT | F_PLANESWALKER) != 0

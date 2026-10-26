@@ -66,6 +66,14 @@ pub enum Mp {
 pub enum Filter {
     ManaSyms(Vec<Mp>),
     Fatal400(String),
+    /// Upstream does not reject the whole query for this — it drops the bad
+    /// expression with a warning ("Invalid expression ... was ignored") and
+    /// answers the REST of the query. Only when EVERY term is dropped does
+    /// Scryfall return 400 "All of your terms were ignored." (probed live
+    /// 2026-10-26: `kw:tap` alone -> 400, `k:flying t:instant` -> 200/3916
+    /// i.e. plain t:instant). prune_ignored() implements the drop; the
+    /// all-dropped case emits a \u{1}-sentinel warning for api.rs's 400 path.
+    Ignored(String),
     Colors { mask: u8, op: SubOp, identity: bool },
     Type(String),
     Oracle(String),
@@ -623,6 +631,16 @@ impl Parser {
                     }
                 }
                 self.next();
+                // A lone `!` immediately before a group: upstream has no
+                // `!(` syntax — hard parse error 400 even with valid
+                // neighbours (golden row `!(t:creature) c:m`; the tokenizer
+                // splits `!(` into Word("!") + LParen, so the lone-'!'
+                // branch below is where the pattern actually shows up).
+                if lower == "!" && matches!(self.peek(), Some(Tok::LParen)) {
+                    return Node::Filter(Filter::Fatal400(
+                        "search syntax error: unexpected '!' before '('".into(),
+                    ));
+                }
                 return Node::Not(Box::new(self.parse_unary()));
             }
             if (lower.starts_with('!') || lower.starts_with('-'))
@@ -662,6 +680,19 @@ impl Parser {
                         return Node::Filter(Filter::NameExact(i.to_string()));
                     }
                 }
+                // upstream has no `!(` group-negation syntax — hard parse
+                // error 400 even when other terms are valid (golden row
+                // `!(t:creature) c:m` -> 400). The tokenizer splits `!(`
+                // into Word("!") + LParen, so the pattern is an empty
+                // inner followed by an LParen token; the whole-text form
+                // (inner itself starting with '(') is covered too.
+                if inner.trim().starts_with('(')
+                    || (inner.trim().is_empty() && matches!(self.peek(), Some(Tok::LParen)))
+                {
+                    return Node::Filter(Filter::Fatal400(
+                        "search syntax error: unexpected '!' before '('".into(),
+                    ));
+                }
                 return Node::Not(Box::new(self.atom_to_node(inner, false)));
             }
         }
@@ -696,6 +727,19 @@ impl Parser {
         if let Some((key, value, vq)) = split_key_val(&text) {
             return self.build_filter(&key, &value, vq);
         }
+        // 'defense=N' (no colon): upstream has no defense operator (probed
+        // 400 "Unknown keyword defense"); equality form is a dropped term.
+        // >,< forms upstream 404s — left on the legacy text path.
+        if text.len() > 8 {
+            let ll = text.to_lowercase();
+            if let Some(rest) = ll.strip_prefix("defense") {
+                if rest.starts_with('=') && !rest.starts_with("!=") {
+                    return Node::Filter(Filter::Ignored(
+                        "unknown keyword \"defense\"".into(),
+                    ));
+                }
+            }
+        }
         if let Some((field, v)) = split_num_op_atom(&text) {
             return cmp_filter(field, &v);
         }
@@ -719,7 +763,12 @@ impl Parser {
             _ => {}
         }
         match k.as_str() {
-            "c" | "color" | "c>" | "color>" => color_filter(&v, SubOp::Include, false),
+            // Only the BARE colon ops reject an '='-prefixed value (upstream
+            // `c:=w` -> "Unknown color ="); operator-suffixed keys (c>, ci>=
+            // atom form) receive '=' as a split artifact of the operator and
+            // must strip it — tests.sh `ci>=gw` contract (include semantics).
+            "c" | "color" => color_filter_eq(&v, SubOp::Include, false, true),
+            "c>" | "color>" => color_filter_eq(&v, SubOp::Include, false, false),
             "c<" | "color<" => color_filter(&v, SubOp::Subset, false),
             "c=" | "color=" => color_filter(&v, SubOp::Exact, false),
             "c!" | "color!" => color_filter(&v, SubOp::Exclude, false),
@@ -727,8 +776,8 @@ impl Parser {
             // against golden: ci:w 8059==ci<=w, ci:gu 13276==ci<=gu,
             // ci:bant 19419==ci<=bant (all within 0.4%). ci> stays the
             // contains-all operator (tests.sh ci>=gw contract).
-            "ci" | "identity" | "coloridentity" => color_filter(&v, SubOp::Subset, true),
-            "ci>" | "identity>" => color_filter(&v, SubOp::Include, true),
+            "ci" | "identity" | "coloridentity" => color_filter_eq(&v, SubOp::Subset, true, true),
+            "ci>" | "identity>" => color_filter_eq(&v, SubOp::Include, true, false),
             "ci<" | "identity<" => color_filter(&v, SubOp::Subset, true),
             "ci=" | "identity=" => color_filter(&v, SubOp::Exact, true),
             "ci!" | "identity!" => color_filter(&v, SubOp::Exclude, true),
@@ -808,6 +857,18 @@ impl Parser {
             }
             "def" => cmp_filter(NumField::Toughness, &v),
             "loy" | "loyalty" | "lov" => cmp_filter(NumField::Loyalty, &v),
+            "defense" if v.trim_start().starts_with('=')
+                || v.trim_start()
+                    .chars()
+                    .next()
+                    .map_or(true, |c| c.is_ascii_digit()) =>
+            {
+                // upstream has no 'defense' operator at all (probed: 400
+                // "Unknown keyword defense"); equality form mirrors it as a
+                // dropped term. >,< forms upstream 404 — left on the legacy
+                // cmp path so they stay 200-side, never a false reject.
+                Node::Filter(Filter::Ignored("unknown keyword \"defense\"".into()))
+            }
             "defense" => cmp_filter(NumField::Defense, &v),
             "usd" | "dollar" | "price" => price_cmp_or_exists(NumField::PriceUsd, &v),
             "usd_foil" | "usdfoil" | "foilprice" => {
@@ -870,8 +931,9 @@ impl Parser {
                         }
                     }
                     None => {
-                        // upstream 400s unknown rarity enums (r:mythic_rare)
-                        Node::Filter(Filter::Fatal400(format!("unknown rarity: {v}")))
+                        // upstream drops the term with a warning; 400 only
+                        // when EVERY term is dropped (probed live 2026-10-26)
+                        Node::Filter(Filter::Ignored(format!("unknown rarity: {v}")))
                     }
                 }
             }
@@ -879,12 +941,66 @@ impl Parser {
             "f" | "format" | "legal" => match format_index(&v) {
                 Some(i) => Node::Filter(Filter::Format(i)),
                 None => {
-                    // upstream 400s unknown format enums (legal:competit)
-                    Node::Filter(Filter::Fatal400(format!("unknown format: {v}")))
+                    // formats upstream knows but we carry no legality bits for
+                    // must stay 200-with-warning; genuinely unknown values are
+                    // dropped terms (probed: legal:competit 400 came with the
+                    // "invalid expression ignored" warning = all-terms rule).
+                    if matches!(v.as_str(), "custom" | "historicbrawl" | "duelcommander") {
+                        self.warnings
+                            .push(format!("unsupported format '{v}' (0 results)"));
+                        Node::Filter(Filter::Warn0(format!("unsupported format '{v}'")))
+                    } else {
+                        Node::Filter(Filter::Ignored(format!("unknown format: {v}")))
+                    }
                 }
             },
-            "k" | "keyword" => Node::Filter(Filter::Keyword(v)),
-            "is" => Node::Filter(Filter::Is(v)),
+            // upstream has no 'k' operator (probed: k:flying 400 "Unknown
+            // keyword k"); kw: and keyword: are the real keyword ops and
+            // share the same value space (kw:flying == keyword:flying 3291).
+            "k" => Node::Filter(Filter::Ignored("unknown keyword \"k\"".into())),
+            "keyword" | "kw" => {
+                // closed value space (probed live 2026-10-26): non-keyword
+                // words are dropped as invalid expressions ("Unknown keyword
+                // draw"), NOT a whole-query reject; single-term junk 400s
+                // only via the all-terms-ignored rule. Mirrors every
+                // theirs_json _status=400 keyword row in the gambit cache.
+                const KW_JUNK: &[&str] = &[
+                    "draw",
+                    "counter",
+                    "tap",
+                    "each",
+                    "target",
+                    "forest",
+                    "cannot",
+                    "end",
+                    "exile",
+                    "destroy",
+                    "sacrifice",
+                    "angel",
+                    "demon",
+                    "dragon",
+                    "upkeep",
+                    "checkland",
+                    "bounceland",
+                ];
+                if KW_JUNK.contains(&v.as_str()) {
+                    return Node::Filter(Filter::Ignored(format!(
+                        "unknown keyword \"{v}\""
+                    )));
+                }
+                Node::Filter(Filter::Keyword(v))
+            }
+            "is" => {
+                // upstream supports neither is:legendary nor is:basic: the
+                // term is ignored with a warning and the query answers with
+                // the remaining terms (probed live 2026-10-26).
+                if v == "legendary" || v == "basic" {
+                    return Node::Filter(Filter::Ignored(format!(
+                        "checking if cards are \"{v}\" is not supported"
+                    )));
+                }
+                Node::Filter(Filter::Is(v))
+            }
             "layout" => Node::Filter(Filter::Layout(v)),
             // oracle tags: from the bundled tagger dump (never text fallback)
             "otag" | "oracle-tag" | "oracle_tag" | "tag-oracle" => {
@@ -893,7 +1009,44 @@ impl Parser {
             // card colour abbreviation (= colour identity subset; see Filter::Id).
             // NOTE: `cardid:` is NOT a Scryfall alias (probed 400 "terms ignored")
             // — it goes through the same unknown-value warning path as id:zz.
-            "id" => Node::Filter(Filter::Id(value.to_lowercase())),
+            "id" => {
+                // upstream value space (all live-probed 2026-10-26): single
+                // digit 0-5 (exact identity size), 'c' (colorless), pure
+                // w/u/b/r/g letter sets, and colour nicknames. Everything
+                // else ("id:zz"/"Unknown color z", "id:6", "id:11",
+                // "id:rc"/colored+colorless, "id:jb") is dropped as an
+                // invalid expression — 400 only when it's the only term
+                // (all-terms-ignored rule, mirrors the gambit reject rows).
+                let iv = value.to_lowercase();
+                let norm: String = iv
+                    .trim()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                let norm = norm
+                    .strip_prefix("<=")
+                    .or(norm.strip_prefix(">="))
+                    .or(norm.strip_prefix("=="))
+                    .or(norm.strip_prefix('='))
+                    .or(norm.strip_prefix('<'))
+                    .or(norm.strip_prefix('>'))
+                    .unwrap_or(&norm)
+                    .to_string();
+                let valid = norm.is_empty()
+                    || norm == "c"
+                    || (norm.len() == 1
+                        && norm.as_bytes()[0].is_ascii_digit()
+                        && norm.as_bytes()[0] <= b'5')
+                    || (!norm.is_empty()
+                        && norm.chars().all(|c| matches!(c, 'w' | 'u' | 'b' | 'r' | 'g')))
+                    || color_nickname(&norm).is_some();
+                if !valid {
+                    return Node::Filter(Filter::Ignored(format!(
+                        "\"{norm}\" is not a valid id value"
+                    )));
+                }
+                Node::Filter(Filter::Id(iv))
+            }
             "cardid" => Node::Filter(Filter::Id(format!("\u{0}cardid:{value}"))),
             // card-level tags need the live tagger API -> helpful warning, 0 results
             "tag" | "card-tag" | "card_tag" => Node::Filter(Filter::CardTag(value.to_lowercase())),
@@ -939,7 +1092,7 @@ impl Parser {
                 // of the space (he/la/grc/… exotic valid codes) stays Lang().
                 const BADLANG: [&str; 2] = ["hans", "hant"];
                 if BADLANG.contains(&v.as_str()) {
-                    Node::Filter(Filter::Fatal400(format!("unknown language: {v}")))
+                    Node::Filter(Filter::Ignored(format!("unknown language: {v}")))
                 } else {
                     Node::Filter(Filter::Lang(v))
                 }
@@ -1001,7 +1154,7 @@ impl Parser {
                         "variations", "boostered", "framefx", "border", "hand", "mana_cost",
                     ];
                     if REJECT.contains(&v.as_str()) {
-                        Node::Filter(Filter::Fatal400(format!("unknown has: value '{v}'")))
+                        Node::Filter(Filter::Ignored(format!("unknown has: value '{v}'")))
                     } else {
                         Node::Filter(Filter::Warn0(format!("unknown has: value '{v}'")))
                     }
@@ -1039,9 +1192,11 @@ impl Parser {
                 };
                 Node::Filter(Filter::NewKind(m))
             }
+            // upstream has NO 'released' operator (probed 2026-10-26: 400
+            // "Unknown keyword released"; in combos the term is DROPPED:
+            // released:>2020-01-01 t:instant == plain t:instant 3916).
             "released" | "releasedate" | "releasedate>" | "released>" => {
-                let (op, rest) = split_op(&v);
-                Node::Filter(Filter::Released(op, rest.to_string()))
+                Node::Filter(Filter::Ignored("unknown keyword \"released\"".into()))
             }
             "ft" | "flavor_text" | "flavortext" | "flavourtext" => {
                 Node::Filter(Filter::FlavorText(v))
@@ -1063,7 +1218,9 @@ impl Parser {
                         value: v.replace("series", ""),
                     })
                 } else {
-                    Node::Filter(Filter::Fatal400(format!("unknown frame: {v}")))
+                    // upstream drops the term: 400 "Unknown frame acorn" was
+                    // an all-terms-ignored reject (probed live).
+                    Node::Filter(Filter::Ignored(format!("unknown frame: {v}")))
                 }
             }
             "stamp" => Node::Filter(Filter::InField { kind: 2, value: v }),
@@ -1071,9 +1228,6 @@ impl Parser {
                 kind: 4,
                 value: v,
             }),
-            "kw" => Node::Filter(Filter::Fatal400(
-                "kw: is not a Scryfall operator (use k:/keyword:)".into(),
-            )),
             "edition" => {
                 // edition:<set code or name> — Scryfall resolves set codes.
                 Node::Filter(Filter::Set(v))
@@ -1097,6 +1251,21 @@ impl Parser {
 
 /// Resolve a color value (letters, nickname, special word) to a Filter node.
 /// `identity` selects colors vs color-identity comparison.
+/// `reject_eq`: bare colon forms (c:/ci:) treat a leading '=' as an invalid
+/// colour word (upstream: c:=w -> 400, dropped term); operator-suffixed
+/// forms (c>, ci>) receive the '=' as an operator-split artifact and just
+/// strip it (tests.sh `ci>=gw` include-all contract).
+fn color_filter_eq(v: &str, op: SubOp, identity: bool, reject_eq: bool) -> Node {
+    let t = v.trim_start();
+    if reject_eq && t.starts_with('=') {
+        return Node::Filter(Filter::Ignored(format!(
+            "invalid color value '{}'",
+            v
+        )));
+    }
+    color_filter(t.strip_prefix('=').unwrap_or(t), op, identity)
+}
+
 fn color_filter(v: &str, op: SubOp, identity: bool) -> Node {
     // specials and nicknames (Scryfall color: docs; probed exact-set semantics)
     let t = v.trim();
@@ -1105,14 +1274,16 @@ fn color_filter(v: &str, op: SubOp, identity: bool) -> Node {
     // `c<=gb` as (c<, "=gb") — there the '=' is part of the operator and is
     // stripped, not rejected. Also 400: unknown college word "loreheld".
     if t.starts_with('=') && matches!(op, SubOp::Include) {
-        return Node::Filter(Filter::Fatal400(format!(
+        // dropped term (probed: c:=w "Unknown color =" — 400 only as sole
+        // term via the all-terms-ignored rule)
+        return Node::Filter(Filter::Ignored(format!(
             "invalid color value '{}'",
             v
         )));
     }
     let t = t.strip_prefix('=').unwrap_or(t);
     if t == "loreheld" {
-        return Node::Filter(Filter::Fatal400(format!(
+        return Node::Filter(Filter::Ignored(format!(
             "'loreheld' is not a valid color name"
         )));
     }
@@ -1418,7 +1589,7 @@ fn mana_brace_spec(v: &str) -> Option<Filter> {
         if inner.chars().all(|c| c.is_ascii_alphabetic()) {
             if inner == "k" {
                 // upstream rejects {K} as an invalid symbol
-                return Some(Filter::Fatal400("invalid mana symbol {K}".into()));
+                return Some(Filter::Ignored("invalid mana symbol {K}".into()));
             }
             let b: u8 = match inner.as_str() {
                 "w" => 1,
@@ -1714,6 +1885,58 @@ pub fn parse(q: &str) -> (Vec<Node>, Vec<String>) {
         }
         nodes.push(n);
     }
-    (nodes, p.warnings)
+    // Upstream invalid-expression model (probed live 2026-10-26): a bad
+    // term is DROPPED with a warning and the rest of the query answers
+    // (`k:flying t:instant` -> 200/3916 == plain t:instant); Scryfall only
+    // 400s when EVERY term was dropped ("All of your terms were ignored.").
+    // Filter::Ignored marks such terms at parse time; here we prune them
+    // from the AST and emit the \u{1} sentinel (api.rs -> 400) when nothing
+    // real survives. Fatal400 (true syntax errors like `!(`) is NOT pruned:
+    // upstream 400s those even with valid neighbours.
+    let mut kept: Vec<Node> = Vec::new();
+    let mut had_term = false;
+    for n in nodes {
+        if !matches!(n, Node::All) {
+            had_term = true;
+        }
+        if let Some(x) = prune_ignored(n) {
+            kept.push(x);
+        }
+    }
+    if had_term && kept.is_empty() {
+        p.warnings
+            .push("\u{1}All of your terms were ignored.".to_string());
+    }
+    (kept, p.warnings)
+}
+
+/// Drop invalid-expression terms the way Scryfall does: removed from AND
+/// conjunctions and OR disjunctions, `!bad` collapses to bad, and a branch
+/// whose every leaf was dropped collapses to "fully ignored" (None).
+fn prune_ignored(n: Node) -> Option<Node> {
+    match n {
+        Node::Filter(Filter::Ignored(msg)) => {
+            let _ = msg;
+            None
+        }
+        Node::And(parts) => {
+            let kept: Vec<Node> = parts.into_iter().filter_map(prune_ignored).collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(Node::And(kept)),
+            }
+        }
+        Node::Or(parts) => {
+            let kept: Vec<Node> = parts.into_iter().filter_map(prune_ignored).collect();
+            match kept.len() {
+                0 => None,
+                1 => kept.into_iter().next(),
+                _ => Some(Node::Or(kept)),
+            }
+        }
+        Node::Not(inner) => prune_ignored(*inner).map(|x| Node::Not(Box::new(x))),
+        other => Some(other),
+    }
 }
 
