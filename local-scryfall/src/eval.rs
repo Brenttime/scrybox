@@ -178,6 +178,17 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
 /// Free-text single word: Scryfall's bare-word search matches NAMES only
 /// (probed: "power" == name~power; oracle/type matches are key: filters).
 fn eval_text(word: &str, ix: &Index) -> RoaringBitmap {
+    // token maps key on for_each_token output, which drops apostrophes
+    // ("doctor's" -> key "doctor"); the raw query token still carries them,
+    // so fold apostrophes before any map lookup (upstream text search
+    // matches Doctor's-companion cards for the bare words).
+    let stripped: String;
+    let word = if word.contains('\'') {
+        stripped = word.replace('\'', "");
+        stripped.as_str()
+    } else {
+        word
+    };
     let mut bm = RoaringBitmap::new();
     if word.len() >= 2 {
         if let Some(b) = ix.name_tokens.get(word) {
@@ -480,6 +491,36 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 bm = scan(ix, |i| ix.s(ix.cards[i as usize].keywords).contains(&q));
             }
             if bm.is_empty() {
+                // Hyphen/apostrophe keyword enums (Jump-start, Doctor's
+                // companion, Hero's Reward, Power-up, Web-slinging,
+                // Council's dilemma) are valid upstream (live-probed
+                // 200/13, 200/25, 200/37, ...) but the raw value never
+                // matches the word-keyed token maps — the tokenizer keeps
+                // the hyphen/apostrophe while the maps split on them. Last
+                // resort: normalized-phrase scan over oracle text, type
+                // line and the keywords blob ('' and '-' fold to spaces so
+                // "Doctor's companion" matches the reminder text).
+                let norm_kw = |s: &str| -> String {
+                    s.to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                        .collect::<String>()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let target = norm_kw(&v);
+                if !target.is_empty() && target.contains(' ') {
+                    bm = scan(ix, |i| {
+                        let c = &ix.cards[i as usize];
+                        norm_kw(&ix.s(c.oracle_text)).contains(&target)
+                            || norm_kw(&ix.s(c.type_line)).contains(&target)
+                            || norm_kw(&ix.s(c.keywords)).contains(&target)
+                    });
+                    if !bm.is_empty() {
+                        return bm;
+                    }
+                }
                 if !v.contains(' ') {
                     // single unknown word: before rejecting, allow the
                     // reminder-text fallback — apostrophe/hyphen keywords
