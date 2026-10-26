@@ -141,6 +141,21 @@ pub async fn search(
     let ix = &st.ix;
     let (nodes, mut warnings) = parse(&q);
     let mut bm = eval(&nodes, ix, &mut warnings);
+    // Wave-4 reject parity: filters/parse arms that mirror upstream's hard
+    // 400s (unknown k: enums, id: junk letters, frame:/lang:/r:/has: bad
+    // values, m:{K}, `!(`, c:=) push a \u{1}-sentinel warning; turn that into
+    // the same 400 Scryfall returns.
+    if let Some(pos) = warnings.iter().position(|x| x.starts_with('\u{1}')) {
+        let msg = warnings.remove(pos).trim_start_matches('\u{1}').to_string();
+        warnings.retain(|x| !x.starts_with('\u{1}'));
+        return json_response(
+            format!(
+                "{{\"object\":\"error\",\"code\":\"invalid_search_syntax\",\"details\":{},\"status_code\":400}}",
+                json_str(&msg)
+            ),
+            StatusCode::BAD_REQUEST,
+        );
+    }
     // Scryfall default search dedups to one printing per oracle in BOTH
     // total_cards and data (unique:cards). unique:prints disables dedup;
     // unique:art dedups per (oracle, illustration). otag:/id: queries were

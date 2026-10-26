@@ -5,7 +5,7 @@ use crate::index::{
     F_SPOTLIGHT, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
 };
 use crate::query::{
-    Cmp, Filter, Node, NumField, SubOp,
+    Cmp, Filter, Mp, Node, NumField, SubOp,
     HAS_ALCHEMY, HAS_BOOSTER, HAS_ETCHED, HAS_FLAVOR, HAS_FOIL, HAS_HIRES, HAS_INDICATOR,
     HAS_NONFOIL, HAS_SPOTLIGHT, HAS_TEXT, HAS_VIDEO, HAS_WATERMARK,
 };
@@ -178,6 +178,17 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
 /// Free-text single word: Scryfall's bare-word search matches NAMES only
 /// (probed: "power" == name~power; oracle/type matches are key: filters).
 fn eval_text(word: &str, ix: &Index) -> RoaringBitmap {
+    // token maps key on for_each_token output, which drops apostrophes
+    // ("doctor's" -> key "doctor"); the raw query token still carries them,
+    // so fold apostrophes before any map lookup (upstream text search
+    // matches Doctor's-companion cards for the bare words).
+    let stripped: String;
+    let word = if word.contains('\'') {
+        stripped = word.replace('\'', "");
+        stripped.as_str()
+    } else {
+        word
+    };
     let mut bm = RoaringBitmap::new();
     if word.len() >= 2 {
         if let Some(b) = ix.name_tokens.get(word) {
@@ -346,18 +357,35 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::Oracle(v) => {
             if v.contains(' ') {
-                eval_phrase(v, ix) // oracle phrases: substring scan
+                // phrases: contiguous substring on reminder-stripped oracle
+                // text (whitespace-normalised). Golden: o:"forest walk" = 0
+                // (cards print "forestwalk" as ONE word) — exact phrase, not
+                // an AND of words.
+                let q: String = v.split_whitespace().collect::<Vec<_>>().join(" ");
+                scan(ix, |i| {
+                    let t: String = ix.otext_lc(i).split_whitespace().collect::<Vec<_>>().join(" ");
+                    t.contains(q.as_str())
+                })
             } else {
-                // oracle-text-only index: reminder text stripped + light
-                // stemming (calibrated vs live o:draw behaviour).
+                // Upstream o: matches the word as a SUBSTRING of oracle words
+                // (tap -> taps/tapped/untap; angel -> archangel), on text with
+                // (…) reminder stripped. Golden: oracle:tap ours(tokens)=1029
+                // vs upstream 3770; substring scan lands ~3.7k.
                 let mut bm = RoaringBitmap::new();
-                if let Some(b) = ix.otext_tokens.get(v.as_str()) {
-                    bm |= b;
+                if v.len() >= 2 {
+                    if let Some(b) = ix.otext_tokens.get(v.as_str()) {
+                        bm |= b;
+                    }
                 }
-                if bm.is_empty() {
-                    let q = v.clone();
-                    bm = scan(ix, |i| ix.oracle_lc(i).contains(&q));
-                }
+                let q = v.clone();
+                let mut hits: Vec<u32> = ix
+                    .otext_lc
+                    .par_iter()
+                    .enumerate()
+                    .filter(|(_, &off)| ix.s(off).contains(q.as_str()))
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                bm.extend(hits.drain(..));
                 bm
             }
         }
@@ -463,6 +491,50 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 bm = scan(ix, |i| ix.s(ix.cards[i as usize].keywords).contains(&q));
             }
             if bm.is_empty() {
+                // Hyphen/apostrophe keyword enums (Jump-start, Doctor's
+                // companion, Hero's Reward, Power-up, Web-slinging,
+                // Council's dilemma) are valid upstream (live-probed
+                // 200/13, 200/25, 200/37, ...) but the raw value never
+                // matches the word-keyed token maps — the tokenizer keeps
+                // the hyphen/apostrophe while the maps split on them. Last
+                // resort: normalized-phrase scan over oracle text, type
+                // line and the keywords blob ('' and '-' fold to spaces so
+                // "Doctor's companion" matches the reminder text).
+                let norm_kw = |s: &str| -> String {
+                    s.to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                        .collect::<String>()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let target = norm_kw(&v);
+                if !target.is_empty() && target.contains(' ') {
+                    bm = scan(ix, |i| {
+                        let c = &ix.cards[i as usize];
+                        norm_kw(&ix.s(c.oracle_text)).contains(&target)
+                            || norm_kw(&ix.s(c.type_line)).contains(&target)
+                            || norm_kw(&ix.s(c.keywords)).contains(&target)
+                    });
+                    if !bm.is_empty() {
+                        return bm;
+                    }
+                }
+                if !v.contains(' ') {
+                    // single unknown word: before rejecting, allow the
+                    // reminder-text fallback — apostrophe/hyphen keywords
+                    // (Doctor's companion, Jump-start) arrive word-broken
+                    // from the tokenizer but ARE valid upstream enums.
+                    let in_text = ix.text_tokens.contains_key(v.as_str())
+                        || ix.type_tokens.contains_key(v.as_str());
+                    if !in_text {
+                        // upstream 400s unknown single-word keyword enums
+                        // (k:destroy / keyword:angel) — mirror
+                        w.push(format!("\u{1}\"{v}\" is not a valid keyword"));
+                        return bm;
+                    }
+                }
                 // bulk `keywords` coverage is sparse; fall back to keyword
                 // words appearing in oracle text / type line (reminder text)
                 if let Some(b) = ix.text_tokens.get(v.as_str()) {
@@ -549,7 +621,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     m = nm;
                 } else {
                     w.push(format!(
-                        "unknown id \"{v}\" — id: values are colour abbreviations: 'c' (colorless) or letters from w/u/b/r/g; card colour identity must be a subset of the letters given; all terms ignored, 0 results"
+                        "\u{1}invalid id \"{v}\" — id: values are colour abbreviations: 'c' (colorless) or letters from w/u/b/r/g"
                     ));
                     return RoaringBitmap::new();
                 }
@@ -713,6 +785,72 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 }
             })
         }
+        Filter::ManaSyms(parts) => {
+            // m:{…} literal-symbol model (see query::Mp / mana_brace_spec).
+            // Multi-part specs must match ADJACENT printed symbols: upstream
+            // m:{W}{U} = "{W}{U}" contiguous, not {W}…gap…{U} (golden fit:
+            // m:{W}{U} ours-gap=682 vs upstream 644; m:{X}{R} 564 vs 155).
+            let parts = parts.clone();
+            scan(ix, move |i| {
+                let raw = ix.cost_all(i).to_ascii_lowercase();
+                for face in raw.split("///") {
+                    // exact brace-delimited segments in printed order
+                    let chars: Vec<char> = face.chars().collect();
+                    let mut segs: Vec<String> = Vec::with_capacity(chars.len() / 3 + 1);
+                    let mut k = 0usize;
+                    while k < chars.len() {
+                        if chars[k] == '{' {
+                            match chars[k + 1..].iter().position(|&x| x == '}') {
+                                Some(e) => {
+                                    segs.push(chars[k + 1..k + 1 + e].iter().collect());
+                                    k += e + 2;
+                                }
+                                None => break,
+                            }
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    if segs.is_empty() {
+                        continue;
+                    }
+                    let m = |seg: &str, p: &Mp| match p {
+                        Mp::Lit(s) => seg == s,
+                        Mp::Pip(m) => {
+                            let b = m.trailing_zeros() as usize;
+                            let ch = "wubrg".as_bytes()[b] as char;
+                            seg.len() == 1 && seg.chars().next() == Some(ch)
+                        }
+                        Mp::GenericMin(n) => {
+                            seg.chars().all(|c| c.is_ascii_digit())
+                                && seg.parse::<u32>().unwrap_or(0) >= *n
+                        }
+                        Mp::AnyCost => true,
+                    };
+                    let ok = if parts.len() == 1 {
+                        segs.iter().any(|s| m(s, &parts[0]))
+                    } else {
+                        segs.windows(parts.len())
+                            .any(|w| w.iter().zip(parts.iter()).all(|(s, p)| m(s, p)))
+                    };
+                    if ok {
+                        return true;
+                    }
+                }
+                false
+            })
+        }
+        Filter::Fatal400(msg) => {
+            // sentinel-prefixed warning: api.rs turns this into a 400
+            w.push(format!("\u{1}{msg}"));
+            RoaringBitmap::new()
+        }
+        Filter::Ignored(msg) => {
+            // unreachable: parse() prunes these (upstream drop-semantics).
+            // Defensive fallback: neutral element for AND conjunctions.
+            w.push(format!("invalid expression \"{msg}\" was ignored"));
+            ix.universe.clone()
+        }
         Filter::Mana2 { need, gc, op } => {
             let (need, gc, op) = (need.clone(), *gc, *op);
             scan(ix, move |i| {
@@ -852,6 +990,32 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     HAS_TEXT => c.flags & F_HAS_TEXT != 0,
                     HAS_FLAVOR => !ix.strings[c.flavor as usize].is_empty(),
                     HAS_ALCHEMY => &*ix.strings[c.set_type as usize] == "alchemy",
+                    HAS_REPRINT => c.reprint,
+                    HAS_UNIQUE => {
+                        let r = ix.card_oracle[i as usize] as usize;
+                        ix.oracle_stats[r].n_illus == 1
+                    }
+                    HAS_ARTIST => !ix.strings[c.artist as usize].is_empty(),
+                    HAS_PROMO => !ix.strings[c.ptypes as usize].is_empty(),
+                    HAS_ARTSERIES => &*ix.strings[c.layout as usize] == "art_series",
+                    HAS_TEXTLESS => {
+                        c.ffx
+                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "textless").unwrap())
+                            != 0
+                    }
+                    HAS_FULLART => {
+                        c.ffx
+                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "fullart").unwrap())
+                            != 0
+                    }
+                    HAS_EXTART => {
+                        c.ffx
+                            & (1u32 << crate::index::FFX_LIST
+                                .iter()
+                                .position(|x| *x == "extendedart")
+                                .unwrap())
+                            != 0
+                    }
                     _ => false,
                 }
             })
@@ -1367,13 +1531,16 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         "dfc" => {
             // transform + modal_dfc + double-sided tokens + double-sided art
-            // series (names carry "//"); levelers/splits/flips/meld are NOT
-            // dfc upstream (proven: is:dfc list diff, 2925/2925 exact).
+            // series (names carry "//") + battles (double-faced: creature
+            // front / battle back). levelers/splits/flips/meld are NOT
+            // dfc upstream (proven: is:dfc list diff).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
                 let lay = &*ix.strings[c.layout as usize];
-                matches!(lay, "transform" | "modal_dfc" | "double_faced_token")
-                    || (lay == "art_series" && c.flags2 & F2_NAME_SLASH != 0)
+                matches!(
+                    lay,
+                    "transform" | "modal_dfc" | "double_faced_token" | "battle" | "prepare"
+                ) || (lay == "art_series" && c.flags2 & F2_NAME_SLASH != 0)
             });
         }
         "bear" => {
@@ -1401,17 +1568,41 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "mirror" => return scan(ix, |i| ix.oracle_lc(i).contains("mirror")),
         "historic" => {
             // legendary/artifact/planeswalker/saga (any face, incl. the
-            // 'Historic' type word on newer prints); Arena-irrelevant print
-            // families (funny/alchemy/custom reprints/memorabilia/promo) are
-            // not historic upstream (8143/8188 with the rest of this rule).
+            // 'Historic' type word on newer prints). Oracle-set diff vs live
+            // Scryfall (2026-10-26, ours_cw/ishist fetches): upstream's 8190
+            // CONTAINS every funny/acorn legendary-artifact (Un-sets, Under-
+            // down, BG3/acorn promos) — our previous exclusion of "funny" |
+            // "promo" removed 460 rows it should not (extras=0 => strict
+            // subset). "alchemy" | "masters" | "memorabilia" printings are
+            // genuinely absent from upstream's set (no such sets in the
+            // missing diff) so those exclusions stay.
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                if c.flags2 & F2_HIDDEN != 0 {
                     return false;
                 }
                 let st = &*ix.strings[c.set_type as usize];
-                if matches!(st, "funny" | "alchemy" | "masters" | "memorabilia" | "promo") {
+                if matches!(st, "memorabilia") {
+                    // sets_catalog probe (2026-10-26): upstream's 8190 has
+                    // ZERO memorabilia cards but DOES include every
+                    // alchemy (172) and masters (cmm/2xm/me*/tsr…) printing,
+                    // so only memorabilia is excluded.
                     return false;
+                }
+                // (hbg 'Agent of…' extras: stale dump rows — upstream now
+                // 404s those exact cards; an all_parts/combo_piece engine
+                // rule over-fired on 21k legit cards, so this is DATA, not
+                // engine, drift.)
+                // artifact-family tokens (Contraptions/Attractions printed
+                // on token sheets) count as historic upstream — other token
+                // cards stay excluded. The artifact must be on the MAIN
+                // face, else DFC token sides (q07 Goblin // Artifact-Blood)
+                // leak in as extras.
+                if c.flags2 & F2_TOKEN != 0 {
+                    let main = ix.type_lc(i).split("//").next().unwrap_or("").to_string();
+                    if !main.contains("artifact") {
+                        return false;
+                    }
                 }
                 c.flags2 & F2_HIST_WORD != 0
                     || c.flags & (F_LEGENDARY | F_ARTIFACT | F_PLANESWALKER) != 0

@@ -129,6 +129,15 @@ print("OK" if ok else "BAD total=%s warn=%s"%(d.get("total"),d.get("warnings")[:
   report "$label" "${out%% *}" "q=$q  ${out#* }"
 }
 
+# check_400 <label> <q>: HTTP 400 (mirrors upstream invalid_search_syntax
+# rejects for closed-enum values: id: junk letters, bad k:/frame:/r: values)
+check_400() {
+  local label="$1" q="$2" st out
+  st=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/search" --get --data-urlencode "q=$q" --data-urlencode limit=1)
+  if [ "$st" = 400 ]; then out=OK; else out="BAD http=$st"; fi
+  report "$label" "${out%% *}" "q=$q  ${out#* }"
+}
+
 # check_eq <label> <q1> <q2>: same total for both queries
 check_eq() {
   local label="$1" q1="$2" q2="$3" out
@@ -150,14 +159,45 @@ check_eq    "id:0 == id:c (colorless)" "id:0"               "id:c"
 check_eq    "id:rb == id:br"            "id:rb"             "id:br"
 check_eq    "id:w id:u == id:c"         "id:w id:u"         "id:c"
 check_eq    "id:RB == id:rb (case)"     "id:RB"             "id:rb"
-# values Scryfall ignores (400 'all terms ignored') => warning + 0, never a crash
-check_warn0 "id:zz ignored"             "id:zz"
-check_warn0 "id:jb ignored"             "id:jb"
-check_warn0 "id:rc mixed-c ignored"     "id:rc"
-check_warn0 "id:6 digit-range"          "id:6"
-check_warn0 "id:11 multi-digit"         "id:11"
+# values Scryfall 400s outright (all-terms-ignored; live-probed 2026-10-26:
+# "Unknown color c/z/j", "Unknown color 6/1" etc.) => 400, never a 500
+check_400    "id:zz rejected"            "id:zz"
+check_400    "id:jb rejected"            "id:jb"
+check_400    "id:rc mixed-c rejected"    "id:rc"
+check_400    "id:6 out-of-range rejected" "id:6"
+check_400    "id:11 multi-digit rejected" "id:11"
 check_warn0 "cardid: not an operator"   "cardid:rb"
 check_took "id:rb fast"                 "id:rb"              10
+
+# == wave-4 closer: reject-table parity vs live Scryfall (2026-10-26 probes) ==
+# Upstream model: a bad enum value drops the TERM with a warning; the API
+# only 400s when EVERY term is gone ("All of your terms were ignored").
+# Mirror exactly the theirs_json _status=400 values — never a whole family.
+check_400 "kw junk value draw"          "kw:draw"
+check_400 "kw junk value tap"           "kw:tap"
+check_400 "keyword junk value destroy"  'keyword:"destroy"'
+check_400 "keyword junk both ignored"   "keyword:checkland or keyword:bounceland"
+check_400 "id double-prefix junk"       "id:id<=esper"
+check_400 "r: mythic_rare junk"         "r:mythic_rare"
+check_400 "f: competit junk"            "f:competit"
+check_400 "legal: competit junk"        "legal:competit"
+check_400 "frame: acorn junk"           "frame:acorn"
+check_400 "has: variations junk"        "has:variations"
+check_400 "lang: hans junk"             "lang:hans"
+check_400 "m:{K} invalid symbol"        "m:{K}"
+check_400 "c:= colon form junk"         "c:=w"
+check_400 "c: loreheld junk"            "c:loreheld"
+check_400 "ci: loreheld junk"           "ci:loreheld"
+check_400 "defense= unknown operator"   "defense=3"
+check_400 "!( group negation"           "!(t:creature) c:m"
+check_400 "is:legendary+released all-ignored" "is:legendary released:>2020-01-01"
+check_400 "is:basic+released all-ignored" "-is:basic released:>2020-01-01"
+# drop-term semantics: bad term must vanish, NOT AND-with-empty (upstream
+# releases no 'released'/'is:legendary' op: combos answer as the good term)
+check_eq "released: dropped"    "released:>2020-01-01 t:instant"    "t:instant"
+check_eq "is:legendary dropped" "is:legendary border:black released:>2020-01-01" "border:black"
+check_eq "k: dropped in combo"  "k:flying t:instant"                "t:instant"
+check_eq "kw: == keyword:"      "kw:flying"                         "keyword:flying"
 
 echo
 echo "passed=$PASS failed=$FAIL"
