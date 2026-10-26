@@ -77,6 +77,14 @@ pub enum Filter {
     Id(String),
     /// tag:<value> — card-level tag; needs the live tagger API (offline: warning)
     CardTag(String),
+    /// art:/atag:/arttag:<value> — Tagger illustration tags; dump not bundled
+    /// offline (loud warning + 0 results, never text fallback — probed upstream
+    /// to NOT be an artist: alias).
+    ArtTag(String),
+    /// include:<value> — Scryfall's visibility broadener. Neutral term for the
+    /// evaluator; the api layer reads its presence to skip the default-search
+    /// unique-card pool gate (include:extras / include:all).
+    IncludeVal(String),
     /// unknown key -> treat value as free phrase
     Text(String),
 
@@ -277,6 +285,7 @@ fn split_num_op_atom(text: &str) -> Option<(NumField, String)> {
     let lower = text.to_lowercase();
     let keys: &[(&str, NumField)] = &[
         ("convertedmana", NumField::Cmc),
+        ("manavalue", NumField::Cmc),
         ("converted", NumField::Cmc),
         ("toughness", NumField::Toughness),
         ("loyalty", NumField::Loyalty),
@@ -346,7 +355,7 @@ fn bare_field_atom(text: &str) -> Option<Node> {
                 let b = match r {
                     "tou" | "toughness" | "t" => NumField::Toughness,
                     "pow" | "power" | "p" => NumField::Power,
-                    "cmc" | "mv" | "convertedmana" => NumField::Cmc,
+                    "cmc" | "mv" | "convertedmana" | "manavalue" => NumField::Cmc,
                     "loy" | "loyalty" => NumField::Loyalty,
                     _ => continue,
                 };
@@ -715,9 +724,16 @@ impl Parser {
                 }
             }
             "a" | "artist" => Node::Filter(Filter::Artist(v)),
+            // art:/atag:/arttag: — Tagger illustration tags ("art that contains
+            // a squirrel"); live-probed NOT to be artist aliases (art:squirrel
+            // == arttag:squirrel == 199, artist:"Larry Elmore" != art:...).
+            // The illustration-tag dump is not bundled offline -> loud warning,
+            // never a text fallback (same honest path as tag:).
+            "art" | "atag" | "arttag" => Node::Filter(Filter::ArtTag(v)),
             "artists" | "illustrators" => cmp_filter(NumField::Artists, &v),
             "illustrations" => cmp_filter(NumField::Illustrations, &v),
-            "cmc" | "mv" | "convertedmana" | "converted" | "convertedmana>" | "cmc>" => {
+            "cmc" | "mv" | "convertedmana" | "converted" | "convertedmana>" | "cmc>"
+            | "manavalue" | "manavalues" => {
                 match v.as_str() {
                     "even" => Node::Filter(Filter::Parity(true)),
                     "odd" => Node::Filter(Filter::Parity(false)),
@@ -856,7 +872,7 @@ impl Parser {
                     self.warnings
                         .push(format!("unknown include: value '{value}' (ignored)"));
                 }
-                Node::All
+                Node::Filter(Filter::IncludeVal(v))
             }
             // ---- parity keys (Oct 2026) ----
             "unique" | "uniqueness" => match v.as_str() {
@@ -1035,13 +1051,18 @@ fn color_filter(v: &str, op: SubOp, identity: bool) -> Node {
 /// Named color groups from the Scryfall color: docs (guilds, shards, wedges,
 /// 4-color, chaos/order). Returns None for anything not a known name.
 pub(crate) fn color_nickname(v: &str) -> Option<u8> {
-    const NAMES: [(&str, u8); 32] = [
+    const NAMES: [(&str, u8); 36] = [
         ("azorius", 1 | 2), ("dimir", 2 | 4), ("rakdos", 4 | 8), ("gruul", 8 | 16),
         ("selesnya", 1 | 16), ("orzhov", 1 | 4), ("izzet", 2 | 8), ("golgari", 4 | 16),
         ("boros", 1 | 8), ("simic", 2 | 16),
-        ("bant", 1 | 2 | 16), ("jeskai", 2 | 8 | 16), ("mardu", 4 | 8 | 16),
+        ("bant", 1 | 2 | 16), ("jeskai", 1 | 2 | 8), ("mardu", 4 | 8 | 16),
         ("abzan", 1 | 4 | 16), ("sultai", 2 | 4 | 16),
-        ("protean", 1 | 2 | 8), ("edge", 1 | 4 | 8), ("temur", 2 | 4 | 8),
+        // wedges (Esper/Tron set): esper WUB, jund BRG, grixis UBR, naya RGW,
+        // temur URG. (jeskai/temur masks were wrong pre-wave3; fixed + live-
+        // verified vs upstream: id<=esper t:instant 2372, id<=wub t:instant.)
+        ("esper", 1 | 2 | 4), ("jund", 4 | 8 | 16), ("grixis", 2 | 4 | 8),
+        ("naya", 1 | 8 | 16),
+        ("protean", 1 | 2 | 8), ("edge", 1 | 4 | 8), ("temur", 2 | 8 | 16),
         ("quartet", 1 | 2 | 4), ("trinity", 1 | 4 | 8),
         ("chaos", 2 | 4 | 8), ("order", 1 | 4 | 16),
         ("white", 1), ("blue", 2), ("black", 4), ("red", 8), ("green", 16),
@@ -1182,7 +1203,7 @@ fn cross_cmp_atom(v: &str, self_field: NumField) -> Option<Node> {
     let b = match rest.trim() {
         "tou" | "toughness" | "t" => NumField::Toughness,
         "pow" | "power" | "p" => NumField::Power,
-        "cmc" | "mv" | "convertedmana" => NumField::Cmc,
+        "cmc" | "mv" | "convertedmana" | "manavalue" => NumField::Cmc,
         "loy" | "loyalty" => NumField::Loyalty,
         _ => return None,
     };
