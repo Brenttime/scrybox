@@ -7,7 +7,6 @@ import { scrollToTop } from './utils/scrollRoot';
 import { pushBackGuard } from './utils/useBackGuard';
 import { getRememberedTab, rememberView, clearRememberedView, forgetOpenSubviews } from './utils/viewMemory';
 import { useT } from './utils/i18n';
-import { readTcgImportHash, TCG_IMPORT_KEY, hasPendingTcgImport } from './utils/tcgBookmarklet';
 
 // View components are code-split so heavy deps (recharts in the chart views)
 // load on demand instead of in the initial bundle.
@@ -131,15 +130,6 @@ function App() {
   // we know we are logged in and not on a share route — see the effect below
   // that reconciles this with token/user/share state.
   const [activeTab, setActiveTab] = useState(() => {
-    // TCGplayer bookmarklet handoff: stash the order (it may need to survive a
-    // login first), scrub it from the URL, and boot straight into Add Cards.
-    const handoff = readTcgImportHash(window.location.hash);
-    if (handoff) {
-      try { sessionStorage.setItem(TCG_IMPORT_KEY, JSON.stringify(handoff)); } catch { /* storage blocked */ }
-      window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-      rememberView('add-cards');
-      return 'add-cards';
-    }
     return getRememberedTab();
   });
   // First-run scanning setup. Asked once per session, only for an admin, and only
@@ -241,7 +231,7 @@ function App() {
               localStorage.setItem('bindarr_token', oidcToken);
               localStorage.setItem('bindarr_user', JSON.stringify(data.user));
               showToast(t('toast.welcomeBack', { name: data.user.username }));
-              setActiveTab(hasPendingTcgImport() ? 'add-cards' : 'dashboard');
+              setActiveTab('dashboard');
             }
           })
           .catch(err => {
@@ -325,9 +315,7 @@ function App() {
     // logout only *tries* to clear the key (private mode can refuse
     // removeItem), so a stale entry must not drag a fresh login into the last
     // session's tab.
-    // A TCGplayer bookmark handoff that arrived logged-out was stashed; go
-    // straight to it instead of Dashboard.
-    const next = hasPendingTcgImport() ? 'add-cards' : 'dashboard';
+    const next = 'dashboard';
     setActiveTab(next);
     rememberView(next);
   };

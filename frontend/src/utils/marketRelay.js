@@ -2,7 +2,7 @@
 // not a credential channel.
 //
 // Two facts decide the design:
-//   - Scrybox cannot inject anything into a manapool.com / tcgplayer.com page.
+//   - Scrybox cannot inject anything into a manapool.com page.
 //     A popup has no cross-origin scripting access, period.
 //   - localStorage is partitioned per SITE FOR TOP FRAME. A manapool.com popup
 //     opened by Scrybox does NOT share a readable store with the Scrybox tab
@@ -14,7 +14,6 @@
 // credential is DISPLAYED to the signed-in user:
 //   manapool  -> the profile's Account tab, which shows the API access token
 //                (Creator Studio cannot display it; the profile tab can).
-//   tcgplayer -> the account page, where dev-tools cookie capture is explained.
 // The user copies the value and pastes it into the field beside the button.
 // Nothing is captured, transmitted, or polled; there is never a credential in
 // Scrybox's memory. The tab is verified open in the same tick as the call --
@@ -23,7 +22,6 @@
 
 const CONNECT_TARGETS = {
   manapool: 'https://manapool.com/profile?tab=account',
-  tcgplayer: 'https://www.tcgplayer.com/account',
 };
 
 const FEATURES = 'popup,width=980,height=760';

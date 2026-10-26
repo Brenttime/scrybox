@@ -1,4 +1,4 @@
-// Marketplace order import (ManaPool / TCGplayer) — no network, no real database.
+// Marketplace order import (ManaPool) — no network, no real database.
 //
 // What this pins down is the part that a live call cannot show repeatably: the
 // shape-guessing readers, the credential normalisers, the endline-vs-extras rule,
@@ -18,9 +18,9 @@ const path = require('path');
 process.env.DB_PATH = path.join(os.tmpdir(), `scrybox-mktorders-${process.pid}.db`);
 
 const {
-  normalizeCookies, cookieCount, maskSecret, maskEmail, customerIdHints,
+  maskSecret, maskEmail,
   mapCondition, unitPriceCents, isFoilish, orderLines, parseOrderPayload,
-  fetchManapoolOrder, fetchTcgOrder, previewOrder, addOrderToCollection,
+  fetchManapoolOrder, previewOrder, addOrderToCollection,
 } = require('../src/utils/marketplaceOrders');
 
 const UUID_A = 'c385447a-f56d-4b65-a090-bae48b0313c0';
@@ -53,20 +53,13 @@ assert.strictEqual(isFoilish({ finish: 'nonfoil' }), false, 'a nonfoil finish is
 assert.strictEqual(isFoilish({ name: 'Sol Ring Foil' }), true);
 assert.strictEqual(isFoilish({ name: 'Sol Ring' }), false);
 
-// --- cookie jar ------------------------------------------------------------
-assert.strictEqual(normalizeCookies('Cookie: a=1; b=2'), 'a=1; b=2', 'the header label is stripped, not sent as a cookie');
-assert.strictEqual(normalizeCookies([{ name: 'sid', value: '9' }, { name: 'bad' }]), 'sid=9', 'a cookie with no value is dropped');
-assert.strictEqual(normalizeCookies('garbage with no pairs'), null, 'a string with no `=` is not a jar');
-assert.strictEqual(normalizeCookies(''), null);
-assert.strictEqual(cookieCount('a=1; b=2; c=3'), 3);
+// --- credential masking ---------------------------------------------------
 assert.ok(maskSecret('short').indexOf('short') === -1, 'a short secret is never echoed');
 assert.ok(maskSecret('aaaaaaaa-bbbb-cccc-dddd').startsWith('aaa'));
 assert.ok(maskSecret('aaaaaaaa-bbbb-cccc-dddd').endsWith('(23 chars)'));
 const masked = maskEmail('bturner@gmail.com');
 assert.ok(masked.includes('@gmail.com'), 'the domain stays visible so the user can recognise the account');
 assert.ok(!masked.includes('bturner'), 'the local part is masked');
-assert.deepStrictEqual(customerIdHints('tcg_customer_id=42; sid=abc'), ['42']);
-assert.deepStrictEqual(customerIdHints('sid=abc'), []);
 
 // --- captured live responses (verbatim from a real buyer account, PII trimmed) -
 // The MANAPOOL network paths assert against these, never against a hand-written
@@ -123,7 +116,7 @@ const MP_DETAIL = {
   assert.strictEqual(parsed.lines.__cardCopies, 5, 'the held-out path tallies the same cards');
 }
 
-// --- the TCGplayer gateway list shape --------------------------------------
+// --- a gateway-style list shape (generic parser) ---------------------------
 const TCG_LIST = {
   data: [{
     number: '9991', name: 'Order', status: 'shipped',
@@ -246,41 +239,6 @@ async function fetchers() {
     fetchManapoolOrder({ email: 'a@b.com', token: 't', orderNumber: 'a/../x', httpGet: () => ({ status: 200, body: {} }) }),
     (e) => e.status === 400,
     'a path-traversal order number is refused',
-  );
-  await assert.rejects(
-    fetchTcgOrder({ cookies: '', orderNumber: '1', httpGet: () => ({ status: 200, body: {} }) }),
-    (e) => e.status === 400,
-    'no cookies saved yet is a config error',
-  );
-
-  // TCGplayer discovers the customer id from the jar and carries the cookie.
-  const seen = [];
-  const tcg = await fetchTcgOrder({
-    cookies: 'tcg_customer_id=42; sid=abc', orderNumber: '9991',
-    httpGet: (url, headers) => {
-      seen.push({ url, headers });
-      return { status: 200, body: TCG_LIST };
-    },
-  });
-  assert.ok(seen[0].url.includes('customers/42/orders'), `expected the discovered customer id, got ${seen[0].url}`);
-  assert.strictEqual(seen[0].headers.Cookie, 'tcg_customer_id=42; sid=abc');
-  assert.ok(seen[0].url.includes('per_page='), 'the list endpoint is paged');
-  assert.strictEqual(tcg.body.data[0].number, '9991');
-
-  // Expired cookies: say so, and never echo the jar back into the message.
-  await assert.rejects(
-    fetchTcgOrder({ cookies: 'sid=abc', orderNumber: '1', httpGet: () => ({ status: 401, body: {} }) }),
-    (e) => e.status === 401 && !/sid=abc/.test(e.message) && !/TCG_/.test(e.message),
-  );
-  // A gateway that answers 200 with something unrecognisable is reported with
-  // the observed keys, not as a passing empty import.
-  const odd = await fetchTcgOrder({ cookies: 'sid=abc', orderNumber: '1', httpGet: () => ({ status: 200, body: { nope: true } }) });
-  assert.strictEqual(odd.unrecognised, true);
-  assert.ok(odd.keys.includes('nope'));
-  // Every path exhausted with none of them an order list is a failure, not a 0-card success.
-  await assert.rejects(
-    fetchTcgOrder({ cookies: 'sid=abc', orderNumber: '1', httpGet: () => ({ status: 500, body: 'oops' }) }),
-    (e) => e.status === 502,
   );
   console.log('fetchers ok');
 }
@@ -483,31 +441,10 @@ async function writes() {
 
 
 // --- recent-order summaries -------------------------------------------------
-const { fetchTcgRecentOrders, recentOrderSummaries, manapoolRecentOrderSummaries, RECENT_LIMIT } =
+const { manapoolRecentOrderSummaries, RECENT_LIMIT } =
   require('../src/utils/marketplaceOrders');
 
 assert.strictEqual(RECENT_LIMIT, 3, 'the picker promises three');
-
-// summaries keep only header fields, newest first, capped, no PII riding along.
-{
-  const list = [
-    { orderNumber: 'A1', created: '2026-09-01T10:00:00Z', status: 'SHIPPED', totalCents: 1250,
-      customer: { email: 'me@x.com', address: '1 Main' },
-      items: [{ product: { single: { name: 'Tarmogoyf', set: 'FUT', number: '147' } }, quantity: 2, unitPriceCents: 500 }] },
-    { orderNumber: 'B2', created: '2026-09-10T10:00:00Z', status: 'NEW', totalCents: 999,
-      items: [{ product: { single: { name: 'Lion' + 's Eye', kind: 'sealed' } }, quantity: 1 }] },
-    { orderNumber: 'C3', created: '2026-08-01T10:00:00Z', status: 'SHIPPED', totalCents: 10,
-      items: [{ card: { name: 'Forest' }, quantity: 4 }] },
-    { orderNumber: 'D4', created: '2026-07-01T10:00:00Z', items: [] },
-  ];
-  const rows = recentOrderSummaries(list);
-  assert.strictEqual(rows.length, 3, 'capped at RECENT_LIMIT');
-  assert.deepStrictEqual(rows.map((r) => r.number), ['B2', 'A1', 'C3'], 'newest first');
-  assert.strictEqual(rows[1].cardCount, 2, 'copies counted');
-  assert.strictEqual(rows[0].cardCount, 0, 'a sealed-only order has no card copies');
-  const blob = JSON.stringify(rows);
-  assert.ok(!blob.includes('me@x.com') && !blob.includes('Main'), 'no PII rides along');
-}
 
 async function recentPicker() {
   // The picker's data path, against the captured list AND the captured details.

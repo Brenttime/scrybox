@@ -17,11 +17,8 @@ async function main() {
   assert.strictEqual(calls[0], CONNECT_TARGETS.manapool);
   assert.deepStrictEqual(await mp, { opened: true });
 
-  calls.length = 0;
-  const tcg = startMarketRelay('tcgplayer', () => { calls.push('tcg'); return { location: {} }; });
-  assert.strictEqual(calls[0], 'tcg');
-  assert.strictEqual(CONNECT_TARGETS.tcgplayer, 'https://www.tcgplayer.com/account');
-  await tcg;
+  // TCGplayer order import was removed; its Connect target went with it.
+  await assert.rejects(startMarketRelay('tcgplayer', allowed), /UNKNOWN_SOURCE/);
 
   // A popup object without a usable location (blocked/cross-origin edge) is a
   // failure, not a silent success.

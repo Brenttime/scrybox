@@ -5,13 +5,12 @@ import CardSearch from './CardSearch';
 import SecretLairPanel from './SecretLairPanel';
 import OrderImportPanel from './OrderImportPanel';
 import { useT } from '../utils/i18n';
-import { hasPendingTcgImport } from '../utils/tcgBookmarklet';
 
 // The "Add Cards" tab. It holds four independent ways to put cards in the
 // collection, so it opens on a choice between them rather than assuming the
 // camera: scan a physical card, search the catalogue and add what you find,
-// bring in a whole Secret Lair drop, or pull every card from a ManaPool /
-// TCGplayer order you have already placed.
+// bring in a whole Secret Lair drop, or pull every card from a ManaPool
+// order you have already placed.
 //
 // The search mode speaks full Scryfall syntax (`is:land`, `color:g`,
 // `set:m21`, `rarity:rare`, `otag:...`, quoted phrases, `-negation`,
@@ -26,7 +25,7 @@ import { hasPendingTcgImport } from '../utils/tcgBookmarklet';
 // throw away, and neither view has state worth keeping alive across the other.
 export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
   const { t } = useT();
-  const [mode, setMode] = useState(() => (hasPendingTcgImport() ? 'orderimport' : 'fastscan'));
+  const [mode, setMode] = useState('fastscan');
 
   // Demo build has no backend: neither the camera scanner nor the Secret Lair
   // importer can work, so show a notice instead of two controls that would fail.

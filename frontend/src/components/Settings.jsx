@@ -519,10 +519,9 @@ function Settings({ user, onUpdateUser, showToast, target }) {
         </SettingsSection>
 
         {/* Marketplace Accounts: credentials for importing cards from a ManaPool
-            or TCGplayer order you already placed (the Add Cards -> From order tab).
+            order you already placed (the Add Cards -> From order tab).
             Per-user, unlike the instance settings above: a member imports against
-            their own marketplace account, and a TCGplayer cookie jar is a
-            session-grade secret that must never be echoed back to another user. */}
+            their own marketplace account. */}
         <SettingsSection id="marketplace-panel" icon={<ShoppingCart size={20} style={{ color: 'var(--accent-yellow)' }} />} title={t('marketplace.title')} open={!!openSections['marketplace-panel']} onToggle={() => toggleSection('marketplace-panel')}>
           <MarketplaceAccountsPanel showToast={showToast} />
         </SettingsSection>
