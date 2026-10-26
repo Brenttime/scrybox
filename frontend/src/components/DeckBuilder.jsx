@@ -1471,15 +1471,10 @@ function DeckBuilder({ showToast, onNavigate }) {
                 </button>
               )}
               {/* Everyday actions in view (one even row on a phone); the menu
-                  keeps the draw simulator and Delete. */}
+                  keeps Draw hand, Register in Collection and Delete. */}
               {isBuilding && (
                 <button className="btn btn-secondary" onClick={() => handleCheckout(activeDeck)} disabled={busy} title={t('deck.checkoutHint')}>
                   <LogOut size={14} /> {t('deck.checkoutShort')}
-                </button>
-              )}
-              {canRegister && (
-                <button className="btn btn-secondary" onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
-                  <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerShort')}
                 </button>
               )}
               <button className="btn btn-secondary" onClick={() => setShowExportModal(true)} title={t('deck.exportDeckList')}>
@@ -1492,6 +1487,11 @@ function DeckBuilder({ showToast, onNavigate }) {
                 <button role="menuitem" style={moreItem} onClick={startSimulator}>
                   <Play size={14} /> {t('deck.drawHand')}
                 </button>
+                {canRegister && (
+                  <button role="menuitem" style={moreItem} onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
+                    <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
+                  </button>
+                )}
                 <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.35rem' }} />
                 <button
                   role="menuitem"
