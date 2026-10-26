@@ -26,11 +26,20 @@ import { deckSidebarStats, findCommander, cardColorLetters, isLandCard } from '.
 
 const EMPTY_DECK_CARDS = [];
 
+// Last deck list this session, per user. The tab unmounts on every switch, so
+// without it each visit (and every back-out of a deck) showed a spinner while
+// /api/decks reloaded. Render it at once, then revalidate in the background.
+let deckListMemo = null; // { userId, decks }
+const memoUserId = () => {
+  try { return JSON.parse(localStorage.getItem('bindarr_user') || 'null')?.id ?? null; } catch { return null; }
+};
+const memoDecks = () => (deckListMemo && deckListMemo.userId === memoUserId() ? deckListMemo.decks : null);
+
 function DeckBuilder({ showToast, onNavigate }) {
   const { t } = useT();
-  const [decks, setDecks] = useState([]);
+  const [decks, setDecks] = useState(() => memoDecks() || []);
   const [activeDeck, setActiveDeck] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => memoDecks() == null);
   const [viewMode, setViewMode] = useState('list'); // 'list' or 'detail'
   // Mobile-only editor tabs (CSS hides the inactive panes at <=768px).
   const [editorTab, setEditorTab] = useState('cards'); // 'cards' | 'add' | 'stats'
@@ -211,10 +220,11 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   const fetchDecks = async () => {
     try {
-      setLoading(true);
+      if (memoDecks() == null) setLoading(true);
       const response = await fetch('/api/decks');
       if (response.ok) {
         const data = await response.json();
+        deckListMemo = { userId: memoUserId(), decks: data };
         setDecks(data);
         return data;
       }
