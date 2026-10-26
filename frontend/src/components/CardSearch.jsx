@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Search, Plus, Minus, X, ShieldAlert, Check, Undo2, Braces, Zap } from 'lucide-react';
+import { Search, Plus, Minus, X, ShieldAlert, Check, Undo2, Braces, Zap, SlidersHorizontal } from 'lucide-react';
 import { usdPrice } from '../utils/resolveCardPrice';
 import { CONDITIONS, LANGUAGES } from '../utils/cardOptions';
 import { displayName } from '../utils/languages';
@@ -9,6 +9,12 @@ import LoadMore from './LoadMore';
 import { useT } from '../utils/i18n';
 import { adjustOwnedQuantityByName } from '../utils/cardIdentity';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
+import ColorPicker from './ColorPicker';
+import MultiSelectDropdown from './MultiSelectDropdown';
+import Field from './FilterField';
+import { CARD_TYPES, MANA_VALUES } from '../utils/mtgFilters';
+import { LANGUAGES as LANGUAGE_TABLE } from '../utils/languages';
+import { EMPTY_SEARCH_FILTERS, SEARCH_RARITIES, SEARCH_FINISHES, COMMON_SUBTYPES, compileSearchFilters, countSearchFilters, withFilters } from '../utils/searchFilters';
 import { parseDirectAdd, directAddQuery, pickPrinting, sortByRelease } from '../utils/directAdd';
 
 // Add Cards > Search, grid-first (Brent's "C grid" design):
@@ -59,6 +65,12 @@ function CardSearch({ onAddSuccess, showToast }) {
   const [undo, setUndo] = useState(null); // { ids, card, qty }
   const [busyId, setBusyId] = useState(null);
   const [knownSets, setKnownSets] = useState(() => new Set());
+  const [setOptions, setSetOptions] = useState([]);
+  const [filters, setFilters] = useState(EMPTY_SEARCH_FILTERS);
+  const [showFilters, setShowFilters] = useState(false);
+  const filterClause = useMemo(() => compileSearchFilters(filters), [filters]);
+  const activeFilterCount = countSearchFilters(filters);
+  const setF = (key) => (v) => setFilters(f => ({ ...f, [key]: v }));
   const [sheet, setSheet] = useState(null);
   const [zoom, setZoom] = useState(null);
   const inputRef = useRef(null);
@@ -72,6 +84,13 @@ function CardSearch({ onAddSuccess, showToast }) {
       .then(rows => {
         if (cancelled) return;
         setKnownSets(new Set(rows.map(s => String(s.id || '').replace(/^mtg-/, '').toLowerCase()).filter(Boolean)));
+        setSetOptions([...rows]
+          .sort((a, b) => String(b.release_date || '').localeCompare(String(a.release_date || '')))
+          .map(s => {
+            const code = String(s.set_code || s.id || '').replace(/^mtg-/, '').toLowerCase();
+            return { value: code, label: `${s.name} (${code.toUpperCase()})` };
+          })
+          .filter(o => o.value));
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -110,20 +129,20 @@ function CardSearch({ onAddSuccess, showToast }) {
     return { data, total: Number.isFinite(reported) ? reported : null, limit };
   }, [t]);
 
-  const runSearch = useCallback(async (raw) => {
+  const runSearch = useCallback(async (raw, clause = '') => {
     const value = String(raw || '').trim();
-    if (!value) return;
+    if (!value && !clause) return;
     const reqId = ++reqRef.current;
     setSuggestOpen(false);
     setLoading(true);
     setSearchError(null);
     setChip(c => (c === 'added' ? 'all' : c));
     try {
-      let prints = !looksLikeSyntax(value);
-      let q = prints ? namesQuery(value) : value;
+      let prints = !!value && !looksLikeSyntax(value);
+      let q = withFilters(prints ? namesQuery(value) : value, clause);
       let r = await fetchPage(q, prints, 1);
       // Not an exact card name: fall back to a plain name search.
-      if (prints && r.data.length === 0) { prints = false; q = value; r = await fetchPage(q, false, 1); }
+      if (prints && r.data.length === 0) { prints = false; q = withFilters(value, clause); r = await fetchPage(q, false, 1); }
       if (reqId !== reqRef.current) return;
       setQuery({ q, prints });
       setCards(prints ? sortByRelease(r.data) : r.data);
@@ -133,13 +152,28 @@ function CardSearch({ onAddSuccess, showToast }) {
     } catch (err) {
       if (reqId !== reqRef.current) return;
       setCards([]);
-      setQuery({ q: value, prints: false });
+      setQuery({ q: withFilters(value, clause), prints: false });
       setSearchError(err.code || null);
       if (err.code !== 'invalid-query') showToast(err.message || t('search.errApi'));
     } finally {
       if (reqId === reqRef.current) setLoading(false);
     }
   }, [fetchPage, showToast, t]);
+
+  // Changing a filter re-runs the search (filters alone are a valid query).
+  const textRef = useRef('');
+  textRef.current = text;
+  const firstClause = useRef(true);
+  useEffect(() => {
+    if (firstClause.current) { firstClause.current = false; return; }
+    const typed = textRef.current.trim();
+    if (!typed && !filterClause) {
+      reqRef.current += 1;
+      setQuery(null); setCards([]); setTotal(null); setHasMore(false); setLoading(false);
+      return;
+    }
+    runSearch(typed, filterClause);
+  }, [filterClause, runSearch]);
 
   const loadMore = async () => {
     if (!query || loadingMore) return;
@@ -227,8 +261,8 @@ function CardSearch({ onAddSuccess, showToast }) {
   // Enter: a direct-add form adds; anything else searches.
   const submit = async (e) => {
     e?.preventDefault();
-    if (!trimmed) return;
-    if (!direct) { runSearch(trimmed); return; }
+    if (!trimmed && !filterClause) return;
+    if (!direct) { runSearch(trimmed, filterClause); return; }
     setLoading(true);
     try {
       const params = new URLSearchParams({ q: directAddQuery(direct), scope: 'internet', lang: 'en', page: '1', limit: '250' });
@@ -271,14 +305,14 @@ function CardSearch({ onAddSuccess, showToast }) {
     setText(name);
     setSuggestions([]);
     setSuggestOpen(false);
-    runSearch(name);
+    runSearch(name, filterClause);
   };
 
   const applySyntaxChip = (q) => {
-    const base = query && !query.prints ? text.trim() || query.q : text.trim();
+    const base = text.trim();
     const next = base && !looksLikeSyntax(base) ? q : `${base ? `${base} ` : ''}${q}`;
     setText(next);
-    runSearch(next);
+    runSearch(next, filterClause);
   };
 
   const shown = useMemo(() => {
@@ -362,12 +396,77 @@ function CardSearch({ onAddSuccess, showToast }) {
             {c.label}{c.key === 'added' && Object.keys(added).length > 0 ? ` ${Object.values(added).reduce((a, b) => a + b, 0)}` : ''}
           </button>
         ))}
+        <button type="button" className={`deck-chip deck-chip-btn ${showFilters || activeFilterCount ? 'on' : ''}`} onClick={() => setShowFilters(s => !s)} aria-expanded={showFilters}>
+          <SlidersHorizontal size={13} />
+          {t('collection.filters')}
+          {activeFilterCount > 0 && <span className="deck-chip-count">{activeFilterCount}</span>}
+        </button>
         {SYNTAX_CHIPS.map(c => (
           <button key={c.key} type="button" className="deck-chip deck-chip-btn addsearch-syntax-chip" onClick={() => applySyntaxChip(c.q)} title={c.q}>
             {t(`addsearch.chip.${c.key}`)}
           </button>
         ))}
       </div>
+
+      {showFilters && (
+        <div className="glass-panel addsearch-filters" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', margin: '0.5rem 0 0.75rem', padding: '0.75rem 0.9rem' }}>
+          <div className="filter-section-title">{t('mtg.sectionCard')}</div>
+          <div className="mtg-color-row">
+            <Field label={t('mtg.color')}>
+              <ColorPicker label={t('mtg.color')} value={filters.colors} onChange={setF('colors')} mode={filters.colorMode} onModeChange={setF('colorMode')} />
+            </Field>
+            <Field label={t('mtg.identity')}>
+              <ColorPicker label={t('mtg.identity')} value={filters.identity} onChange={setF('identity')} withColorless={false} />
+            </Field>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
+            <Field label={t('mtg.cardType')}>
+              <MultiSelectDropdown label={t('mtg.cardType')} allLabel={t('collection.allTypes')} value={filters.types} onChange={setF('types')}
+                options={CARD_TYPES.filter(v => v !== 'Tribal').map(v => ({ value: v, label: v }))} />
+            </Field>
+            <Field label={t('mtg.subtype')}>
+              <MultiSelectDropdown label={t('mtg.subtype')} allLabel={t('mtg.allSubtypes')} value={filters.subtypes} onChange={setF('subtypes')}
+                options={COMMON_SUBTYPES.map(v => ({ value: v, label: v }))} />
+            </Field>
+            <Field label={t('collection.fManaValue')}>
+              <MultiSelectDropdown label={t('collection.fManaValue')} allLabel={t('collection.allManaValues')} value={filters.mv} onChange={setF('mv')}
+                options={MANA_VALUES.map(v => ({ value: v, label: v }))} />
+            </Field>
+            <Field label={t('collection.fRarity')}>
+              <MultiSelectDropdown label={t('collection.fRarity')} allLabel={t('collection.allRarities')} value={filters.rarities} onChange={setF('rarities')}
+                options={SEARCH_RARITIES.map(v => ({ value: v, label: v[0].toUpperCase() + v.slice(1) }))} />
+            </Field>
+            <Field label={t('collection.fSet')}>
+              <MultiSelectDropdown label={t('collection.fSet')} allLabel={t('collection.allSets')} value={filters.sets} onChange={setF('sets')}
+                options={setOptions} />
+            </Field>
+          </div>
+          <div className="filter-section-title">{t('addsearch.sectionPrinting')}</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
+            <Field label={t('addsearch.finish')}>
+              <MultiSelectDropdown label={t('addsearch.finish')} allLabel={t('addsearch.allFinishes')} value={filters.finishes} onChange={setF('finishes')}
+                options={SEARCH_FINISHES.map(v => ({ value: v, label: t(`addsearch.finishOpt.${v}`) }))} />
+            </Field>
+            <Field label={t('card.language')}>
+              <MultiSelectDropdown label={t('card.language')} allLabel={t('collection.allLanguages')} value={filters.languages} onChange={setF('languages')}
+                options={LANGUAGE_TABLE.map(l => ({ value: l.scryfall || l.code, label: l.name }))} />
+            </Field>
+            <Field label={t('collection.fMinPrice')}>
+              <input type="number" min="0" inputMode="decimal" className="input-control" placeholder={t('collection.minPricePlaceholder')} value={filters.minUsd} onChange={(e) => setF('minUsd')(e.target.value)} />
+            </Field>
+            <Field label={t('collection.fMaxPrice')}>
+              <input type="number" min="0" inputMode="decimal" className="input-control" placeholder={t('collection.maxPricePlaceholder')} value={filters.maxUsd} onChange={(e) => setF('maxUsd')(e.target.value)} />
+            </Field>
+          </div>
+          {activeFilterCount > 0 && (
+            <div style={{ display: 'flex', borderTop: '1px solid var(--border-glass)', paddingTop: '0.75rem' }}>
+              <button type="button" className="btn btn-secondary" onClick={() => setFilters(EMPTY_SEARCH_FILTERS)} style={{ marginLeft: 'auto', fontSize: '0.72rem', padding: '0.3rem 0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                <X size={13} /> {t('collection.clearFilters')}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {searchError && (
         <div className="addsearch-error">
