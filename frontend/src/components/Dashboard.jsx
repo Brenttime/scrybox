@@ -362,7 +362,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
           )}
         </div>
 
-        <div className="dash-tile dash-rarity">
+        <div className="dash-tile dash-wide dash-rarity">
           <div className="dash-k">{t('dash.rarity')}</div>
           <div className="dash-rbars">
             {rarityRows.map(r => (
