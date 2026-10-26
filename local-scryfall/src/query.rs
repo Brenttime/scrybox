@@ -82,6 +82,13 @@ pub enum Filter {
     Artist(String),
     Cmp { field: NumField, op: Cmp, val: f32 },
     CmpRange { field: NumField, lo: f32, hi: f32 },
+    /// cn: comparator (wave-4 golden-fit): upstream range ops compare the
+    /// numeric part over PURE-digit printings only (suffixed prints like 12a
+    /// / 116★ are NULL for </>/<=/>=), while = matches the collector-number
+    /// string exactly (cn=12a -> 290 gold, cn=12 -> 12-only). Predicate runs
+    /// per-print over GATED printings (oracle-exists after dedup): golden
+    /// cn=1 449 / cn>1 33723 / cn>=1 33826 match only with print-gating.
+    CnCmp { op: Cmp, num: u32, full: Option<String> },
     Rarity(u8),
     Set(String),
     Format(usize),
@@ -541,6 +548,10 @@ struct Parser {
     toks: Vec<Tok>,
     pos: usize,
     pub warnings: Vec<String>,
+    /// closed keyword-enum set (full lowercased phrases) from the live index.
+    /// None = offline/test parse(): keyword values fall through to the legacy
+    /// eval-side heuristics instead of parse-time drop semantics.
+    kwenum: Option<std::collections::HashSet<String>>,
 }
 
 impl Parser {
@@ -896,16 +907,7 @@ impl Parser {
             "year" => cmp_filter(NumField::Year, &v),
             "date" => cmp_filter(NumField::Date, &v),
             "cn" | "number" | "collector" | "collector_number" | "collectornumber" => {
-                match parse_cn_value(&v) {
-                    Some(n) => Node::Filter(Filter::Cmp {
-                        field: NumField::Cn,
-                        op: n.0,
-                        val: n.1,
-                    }),
-                    None => Node::Filter(Filter::Warn0(format!(
-                        "unsupported collector-number value '{value}'"
-                    ))),
-                }
+                cn_atom(&v)
             }
             "r" | "rarity" => {
                 let (op, rest) = split_op(&v);
@@ -984,6 +986,20 @@ impl Parser {
                     "bounceland",
                 ];
                 if KW_JUNK.contains(&v.as_str()) {
+                    return Node::Filter(Filter::Ignored(format!(
+                        "unknown keyword \"{v}\""
+                    )));
+                }
+                if let Some(en) = &self.kwenum {
+                    if en.contains(v.as_str()) {
+                        return Node::Filter(Filter::Keyword(v));
+                    }
+                    // unknown value: upstream drops the keyword term (the
+                    // all-terms-ignored rule turns the empty case into 400).
+                    // Quoted multi-word values ("level up") that miss the
+                    // enum are junk too; unquoted multi-word values never
+                    // reach here (the tokenizer splits them, so the residual
+                    // words arrive as independent text atoms).
                     return Node::Filter(Filter::Ignored(format!(
                         "unknown keyword \"{v}\""
                     )));
@@ -1347,7 +1363,7 @@ fn color_filter(v: &str, op: SubOp, identity: bool) -> Node {
 /// Named color groups from the Scryfall color: docs (guilds, shards, wedges,
 /// 4-color, chaos/order). Returns None for anything not a known name.
 pub(crate) fn color_nickname(v: &str) -> Option<u8> {
-    const NAMES: [(&str, u8); 36] = [
+    const NAMES: [(&str, u8); 45] = [
         ("azorius", 1 | 2), ("dimir", 2 | 4), ("rakdos", 4 | 8), ("gruul", 8 | 16),
         ("selesnya", 1 | 16), ("orzhov", 1 | 4), ("izzet", 2 | 8), ("golgari", 4 | 16),
         ("boros", 1 | 8), ("simic", 2 | 16),
@@ -1360,7 +1376,17 @@ pub(crate) fn color_nickname(v: &str) -> Option<u8> {
         ("naya", 1 | 8 | 16),
         ("protean", 1 | 2 | 8), ("edge", 1 | 4 | 8), ("temur", 2 | 8 | 16),
         ("quartet", 1 | 2 | 4), ("trinity", 1 | 4 | 8),
-        ("chaos", 2 | 4 | 8), ("order", 1 | 4 | 16),
+        ("chaos", 2 | 4 | 8 | 16), ("order", 1 | 4 | 16),
+        // Strixhaven colleges + Tarkir clan philosophies + Brothers' War
+        // "artifice": bare c:<name> = >=1 FACE containing all group colours
+        // (golden-fit vs cached upstream sets: quandrix GU 645/647,
+        // silverquill WB 626/625, witherbloom BG 606/612, prismari RU 675/670,
+        // artifice WUBR 65/65, altruism WURG 69/68, growth WUBG 64/64,
+        // chaos UBRG 63/63, aggression WBRG 63/63).
+        ("quandrix", 2 | 16), ("silverquill", 1 | 4), ("witherbloom", 4 | 16),
+        ("prismari", 2 | 8), ("lumra", 1 | 8),
+        ("artifice", 1 | 2 | 4 | 8), ("aggression", 1 | 4 | 8 | 16),
+        ("altruism", 1 | 2 | 8 | 16), ("growth", 1 | 2 | 4 | 16),
         ("white", 1), ("blue", 2), ("black", 4), ("red", 8), ("green", 16),
         ("w", 1), ("u", 2), ("b", 4), ("r", 8), ("g", 16),
     ];
@@ -1540,6 +1566,46 @@ fn parse_cn_value(v: &str) -> Option<(Cmp, f32)> {
         return None;
     }
     digits.parse::<f32>().ok().map(|x| (op, x))
+}
+
+/// cn: comparator builder (wave-4). Upstream model proven against golden
+/// counts (cn=1 449, cn>1 33723, cn>=1 33826, cn=10 395, cn>10 32713,
+/// cn<=10 3600, cn<100 19483): predicate runs per-printing over GATED
+/// printings (oracle-exists after dedup) and RANGE ops only consider
+/// PURE-digit collector numbers — suffixed prints (12a, 116★, 2024-12-06)
+/// are NULL for </>/<=/>=. '=' compares the exact collector-number string
+/// (cn=12a matches prints whose string IS 12a).
+fn cn_atom(v: &str) -> Node {
+    let (op, rest) = split_op(v);
+    if rest.is_empty() {
+        return Node::Filter(Filter::Warn0(format!(
+            "unsupported collector-number value '{v}'"
+        )));
+    }
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        // no numeric prefix at all: exact-string equality only
+        return Node::Filter(Filter::CnCmp {
+            op,
+            num: u32::MAX,
+            full: Some(rest.to_lowercase()),
+        });
+    }
+    let num: u32 = digits.parse().unwrap_or(u32::MAX);
+    let suffix = &rest[digits.len()..];
+    if suffix.is_empty() {
+        Node::Filter(Filter::CnCmp {
+            op,
+            num,
+            full: None,
+        })
+    } else {
+        Node::Filter(Filter::CnCmp {
+            op,
+            num,
+            full: Some(rest.to_lowercase()),
+        })
+    }
 }
 
 /// m: / mana: router. Recognises exact-symbol specs (brace bodies with '/',
@@ -1870,10 +1936,26 @@ fn parse_produces(v: &str) -> u8 {
 
 /// Parse a query string into an AST (top-level AND of or-expressions).
 pub fn parse(q: &str) -> (Vec<Node>, Vec<String>) {
+    parse_with(q, None)
+}
+
+/// `kw_enum` = Index::kw_enum (closed keyword phrase space). When present,
+/// kw:/keyword: values are validated at PARSE time the way Scryfall drops
+/// invalid-expression terms: unknown value -> Filter::Ignored (pruned from
+/// AND/OR, 400 only via the all-terms-ignored rule). Proven against the
+/// golden keyword family: `keyword:Level Up` (unquoted tokenizer split) drops
+/// keyword:Level and answers the leftover word as text-search (333 = names
+/// containing "up"), and `keyword:Double` = 138 is the exact "Double"
+/// keyword, not the word-prefix union (288).
+pub fn parse_with(
+    q: &str,
+    kw_enum: Option<&std::collections::HashSet<String>>,
+) -> (Vec<Node>, Vec<String>) {
     let mut p = Parser {
         toks: tokenize(q),
         pos: 0,
         warnings: Vec::new(),
+        kwenum: kw_enum.cloned(),
     };
     let mut nodes = Vec::new();
     while p.peek().is_some() {

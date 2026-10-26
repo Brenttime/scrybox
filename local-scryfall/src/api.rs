@@ -139,7 +139,7 @@ pub async fn search(
     let desc = p.get("dir").map(|d| d == "desc").unwrap_or(false);
 
     let ix = &st.ix;
-    let (nodes, mut warnings) = parse(&q);
+    let (nodes, mut warnings) = crate::query::parse_with(&q, Some(&ix.kw_enum));
     let mut bm = eval(&nodes, ix, &mut warnings);
     // Wave-4 reject parity: filters/parse arms that mirror upstream's hard
     // 400s (unknown k: enums, id: junk letters, frame:/lang:/r:/has: bad

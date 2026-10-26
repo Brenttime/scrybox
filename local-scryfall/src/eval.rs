@@ -1,7 +1,7 @@
 //! AST evaluation -> RoaringBitmap of card ids.
 
 use crate::index::{
-    Card, Index, NFORMATS, F2_HIDDEN, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES,
+    Card, Index, NFORMATS, F2_HIDDEN, F2_TOKEN, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES,
     F_SPOTLIGHT, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
 };
 use crate::query::{
@@ -204,6 +204,12 @@ fn eval_text(word: &str, ix: &Index) -> RoaringBitmap {
         if bm.len() < 24 && word.len() >= 3 {
             bm |= &ix.fuzzy_name_cards(word);
         }
+        // Upstream bare-word text is a NAME-SUBSTRING match, not token-only
+        // (golden keyword-family residues: 'Up' after keyword:Level drop =
+        // 333 names containing "up" incl. Abrupt Decay; 'strike' = 93 incl.
+        // Sunstriker; 'night' = 332 incl. Nightmare). Union the substring
+        // scan on top of exact/prefix instead of early-returning.
+        bm |= &scan(ix, |i| ix.name_lc(i).contains(word));
         if !bm.is_empty() {
             return bm;
         }
@@ -290,6 +296,48 @@ fn prefix_union(_ix: &Index, map: &std::collections::HashMap<String, RoaringBitm
 
 fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     match f {
+        Filter::CnCmp { op, num, full } => {
+            // Per-print collector-number compare over GATED printings (aux
+            // token/asset/stock prints excluded — golden cn>=1 33826 vs our
+            // ungated 38322, delta = aux). Alphanumeric suffixes: '=' is
+            // exact-string (cn=12a 290); inequalities order the full lower
+            // string lexicographically within the numeric tie class
+            // (golden cn<12a 3082 < cn<=12a 3296, both vs cn=12a 290).
+            let op = *op;
+            let num = *num;
+            let full = full.clone();
+            scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0
+                    || crate::index::is_aux_layout(&ix.strings[c.layout as usize])
+                    || crate::index::is_aux_set_type(&ix.strings[c.set_type as usize])
+                {
+                    return false;
+                }
+                let raw: &str = &ix.strings[c.collector_number as usize];
+                let flat = raw.trim_end_matches('★').trim_end_matches('*').to_lowercase();
+                match (&full, op) {
+                    (Some(f), Cmp::Eq) => flat == *f,
+                    (Some(f), Cmp::Ne) => flat != *f,
+                    (None, Cmp::Eq) => flat == num.to_string(),
+                    (None, Cmp::Ne) => flat != num.to_string(),
+                    (Some(f), _) => {
+                        let qs = f.trim_end_matches('★').trim_end_matches('*');
+                        match op {
+                            Cmp::Lt => c.cn_val < num || (c.cn_val == num && flat.as_str() < qs),
+                            Cmp::Le => c.cn_val < num || (c.cn_val == num && flat.as_str() <= qs),
+                            Cmp::Gt => c.cn_val > num || (c.cn_val == num && flat.as_str() > qs),
+                            Cmp::Ge => c.cn_val > num || (c.cn_val == num && flat.as_str() >= qs),
+                            _ => unreachable!(),
+                        }
+                    }
+                    (None, Cmp::Lt) => c.cn_val < num,
+                    (None, Cmp::Le) => c.cn_val <= num,
+                    (None, Cmp::Gt) => c.cn_val > num,
+                    (None, Cmp::Ge) => c.cn_val >= num,
+                }
+            })
+        }
         Filter::Colors { mask, op, identity } => {
             let (bits, subsets, exacts) = if *identity {
                 (&ix.ci_bits, &ix.ci_subsets, &ix.ci_exacts)
@@ -302,6 +350,10 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 SubOp::Include => {
                     if *mask == 0 {
                         return exacts[0].clone();
+                    }
+                    if !*identity {
+                        // bare c:/c> = ANY-FACE superset (see Index::color_incl)
+                        return ix.color_incl[*mask as usize].clone();
                     }
                     let mut bm: Option<RoaringBitmap> = None;
                     for b in 0..5 {
@@ -479,6 +531,14 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             }
         }
         Filter::Keyword(v) => {
+            // EXACT keyword-phrase semantics (golden: keyword:Double = 138
+            // "Double" keyword, not 288 word-token union; keyword:Companion
+            // = 10, keyword:Void = 15). Hit on the full-phrase index wins
+            // unconditionally; the word/prefix/fuzzy chain below is only the
+            // legacy path for offline parse() callers without the enum.
+            if let Some(b) = ix.keyword_phrase.get(v.as_str()) {
+                return b.clone();
+            }
             let mut bm = RoaringBitmap::new();
             if let Some(b) = ix.keyword_tokens.get(v.as_str()) {
                 bm |= b;
@@ -1169,10 +1229,19 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::NotVal(v) => match v.as_str() {
             "reprint" | "reprints" => {
+                // upstream not:reprint is a PER-PRINT predicate: the
+                // query's AND must land on the same printing (golden:
+                // 'frame:2015 not:reprint' 19792 vs 25197 when the two
+                // terms are evaluated per-oracle separately; 'not:reprint
+                // game:paper' 33127 vs oracle-complement 15491). A card
+                // matches when it has >=1 non-token/non-hidden/non-aux
+                // printing WITHOUT the bulk reprint flag.
                 scan(ix, |i| {
                     let c = &ix.cards[i as usize];
-                    let st = &ix.oracle_stats[ix.card_oracle[i as usize] as usize];
-                    st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
+                    !c.reprint
+                        && c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                        && !crate::index::is_aux_layout(&ix.strings[c.layout as usize])
+                        && !crate::index::is_aux_set_type(&ix.strings[c.set_type as usize])
                 })
             }
             "universesbeyond" | "universes_beyond" | "beyond" => scan(ix, |i| {
