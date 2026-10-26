@@ -11,6 +11,7 @@ const { checkedOutAllocation, logicalInventoryStatus, withAllocationLock, setSta
 const { sqlCardKey } = require('../utils/cardIdentity');
 const { validateDeckAddition } = require('../utils/deckRules');
 const { splitPrice } = require('../utils/splitPrice');
+const { mergeSearchPrices } = require('../utils/searchPrices');
 const { buildCardListText } = require('../../../shared/cardListText.js');
 
 const router = express.Router();
@@ -184,6 +185,13 @@ async function searchCards(req, res) {
       }
     }
     if (scope !== 'collection') await attachOwnedQty(cards, req.user.id);
+    // Sidecar answers carry no prices: fill them from card_cache / upstream so
+    // Add Cards never shows $0.00 for a card that has a market price.
+    if (scope === 'internet') {
+      await mergeSearchPrices(cards, {
+        db, bulkFetchByIdentifier: scryfallApi.bulkFetchByIdentifier, cacheCards: scryfallApi.cacheCards,
+      }).catch(e => console.error('search price merge failed:', e.message));
+    }
     // Header, not the body: every existing caller expects a bare array here.
     if (total != null) {
       res.set('X-Total-Count', String(total));
@@ -222,6 +230,29 @@ async function searchCards(req, res) {
 // base64 scan image that is too large and sensitive for a query string.
 router.get('/search', searchLimiter, searchCards);
 router.post('/search', searchLimiter, searchCards);
+
+// As-you-type name suggestions from the local scryfall sidecar. Without the
+// sidecar there is nothing cheap to ask, so the box simply gets none.
+router.get('/suggest', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2 || !scryfallApi.LOCAL_SCRYFALL) return res.json({ suggestions: [] });
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    const r = await fetch(`${scryfallApi.LOCAL_SCRYFALL_URL}/api/suggest?q=${encodeURIComponent(q.slice(0, 80))}`, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return res.json({ suggestions: [] });
+    const data = await r.json();
+    const seen = new Set();
+    const suggestions = (Array.isArray(data.suggestions) ? data.suggestions : [])
+      .filter(s => s && s.name && !seen.has(s.name.toLowerCase()) && seen.add(s.name.toLowerCase()))
+      .slice(0, 8)
+      .map(s => ({ name: s.name, set: s.set || '', type_line: s.type_line || '', image_small: s.image_small || '', id: s.id || '' }));
+    res.json({ suggestions });
+  } catch {
+    res.json({ suggestions: [] });
+  }
+});
 
 // 1b. Identify a scanned card image by visual-feature match.
 // Which sets the scanner can actually answer for, and how completely.

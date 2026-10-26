@@ -353,6 +353,10 @@ function normalizeCard(raw, lang) {
     // so the currency names the marketplace too (see the fallback above).
     price_source: hasPrices ? 'scryfall' : null,
     price_currency: currency,
+    // Not card_cache columns: response-only hints for Add Cards (which finishes
+    // the printing exists in, and its release date for newest-first sorting).
+    finishes: Array.isArray(raw.finishes) ? raw.finishes : undefined,
+    released_at: raw.released_at || undefined,
     ...oracleFields(raw)
   };
 }
