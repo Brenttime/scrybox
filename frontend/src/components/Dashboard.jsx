@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { TrendingUp, Mountain, BookOpen, Sparkles } from 'lucide-react';
+import { TrendingUp, Mountain, BookOpen, Sparkles, Crown } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { priceText } from '../utils/formatPrice';
 import { useT } from '../utils/i18n';
@@ -182,6 +182,18 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
   // /api/decks is served from the trigger-revision deck-list cache, so the
   // counts cost nothing extra on the server.
+  // Some days the art tile features a random legal commander instead of the
+  // top card. The server picks it from the date, so it is stable all day.
+  const [cotd, setCotd] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/stats/commander-of-the-day')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (alive && d && d.card) setCotd(d); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
   const fetchDecks = async () => {
     try {
       const r = await fetch('/api/decks');
@@ -313,7 +325,17 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
           {decks && <span className="dash-sub dim">{t('dash.decksSub', { built: decks.built, need: decks.needCards })}</span>}
         </button>
 
-        {top && (
+        {cotd && cotd.show ? (
+          <a className="dash-tile dash-art" href={cotd.card.edhrec_url} target="_blank" rel="noreferrer" title={cotd.card.type_line}>
+            <img src={cotd.card.art_crop || cotd.card.image_url} className="dash-art-img" alt="" loading="lazy" />
+            <span className="dash-art-shade" />
+            <span className="dash-art-cap">
+              <span className="dash-k"><Crown size={12} style={{ verticalAlign: '-1px', marginRight: 4 }} />{t('dash.commanderOfDay')}</span>
+              <span className="dash-art-name">{cotd.card.name}</span>
+              <span className="dash-sub dim">{t('dash.commanderOfDaySub')}</span>
+            </span>
+          </a>
+        ) : top && (
           <button type="button" className="dash-tile dash-art" onClick={() => setInspectorCard(top)}>
             <CardImage card={top} src={artCrop(top.image_url)} fallbackSrc={top.image_url} className="dash-art-img" alt="" />
             <span className="dash-art-shade" />
