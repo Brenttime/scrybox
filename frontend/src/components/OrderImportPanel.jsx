@@ -1,19 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
-import { ShoppingCart, Loader2, ShieldAlert, KeyRound, Bookmark, Copy, Smartphone, ChevronUp, ChevronDown } from 'lucide-react';
+import { ShoppingCart, Loader2, ShieldAlert, KeyRound, ChevronUp, ChevronDown } from 'lucide-react';
 import CardImage from './CardImage';
 import { LANGUAGES } from '../utils/cardOptions';
 import { useT } from '../utils/i18n';
-import { buildBookmarklet, takePendingTcgImport } from '../utils/tcgBookmarklet';
 
-// Pull every card from a ManaPool or TCGplayer ORDER into the collection in one
+// Pull every card from a ManaPool ORDER into the collection in one
 // action. The flow mirrors SecretLairPanel (enter -> preview resolved lines ->
 // commit): what you approve is exactly what gets filed, with per-line quantity,
 // unit price and condition visible before anything is written.
 //
-// Credentials deliberately do NOT live here. A ManaPool token and a TCGplayer
-// session cookie are account-level secrets, so they are stored per user under
+// Credentials deliberately do NOT live here. A ManaPool token is an
+// account-level secret, so it is stored per user under
 // Settings > Marketplace Accounts and only ever read back masked; this panel
-// just shows whether each source is ready and links there when it is not. The
+// just shows whether ManaPool is ready and links there when it is not. The
 // order number is the only thing this screen sends. (The app-wide fetch
 // interceptor in App.jsx attaches the session Bearer automatically, so no
 // Authorization header is built here.)
@@ -33,9 +32,9 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
   const { t } = useT();
   const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
-  const [source, setSource] = useState('manapool');
+  const source = 'manapool';
   const [orderNumber, setOrderNumber] = useState('');
-  const [status, setStatus] = useState(null);            // {manapool:{configured},tcgplayer:{configured}}
+  const [status, setStatus] = useState(null);            // {manapool:{configured}}
   const [phase, setPhase] = useState('form');            // form | preview | done
   const [preview, setPreview] = useState(null);
   const [error, setError] = useState('');
@@ -44,24 +43,6 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
   const [language, setLanguage] = useState('English');
   const [printingMode, setPrintingMode] = useState('auto');
   const previewSeq = useRef(0);
-  // TCGplayer runs through the bookmarklet: the order arrives already read off
-  // the user's logged-in TCGplayer page, so no cookie is needed or used.
-  const [pageImport, setPageImport] = useState(null);   // {orders, lines}
-  const bookmarkRef = useRef(null);
-  // Installed app (PWA) or touch device: there is no bookmarks bar to drag to,
-  // so lead with the copy-code steps instead of the drag button.
-  const [phoneSetup] = useState(() => {
-    try {
-      return !!(window.navigator.standalone
-        || window.matchMedia('(display-mode: standalone)').matches
-        || window.matchMedia('(pointer: coarse)').matches);
-    } catch { return false; }
-  });
-  useEffect(() => {
-    // React refuses javascript: hrefs in JSX; set it on the element directly.
-    if (bookmarkRef.current) bookmarkRef.current.setAttribute('href', buildBookmarklet(window.location.origin));
-  });
-
   // Which sources are usable right now. A missing credential is not an error —
   // the panel says so and points at Settings rather than showing a form that
   // could only fail.
@@ -74,7 +55,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
     return () => { cancelled = true; };
   }, []);
 
-  const readyFor = (src) => src === 'tcgplayer' || (!!status && !!(status[src] && status[src].configured));
+  const readyFor = (src) => (!!status && !!(status[src] && status[src].configured));
   const needsSetup = status && !readyFor(source);
 
   // Recent-order picker: fetch the source's list when the form opens (and when
@@ -83,7 +64,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
   const [recent, setRecent] = useState({ loading: false, orders: null, error: '', offset: 0, hasMore: false });
   const recentSeq = useRef(0);
   const loadRecent = async (src, offset = 0) => {
-    if (src === 'tcgplayer' || !readyFor(src)) return;
+    if (!readyFor(src)) return;
     const seq = ++recentSeq.current;
     setRecent((r) => ({ ...r, loading: true }));
     try {
@@ -127,56 +108,8 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
     }
   };
 
-  const doPagePreview = async (handoff, includeImported = false) => {
-    const seq = ++previewSeq.current;
-    // Keep the current preview on screen while re-previewing ("Include them
-    // anyway"): the preview view dereferences it, so nulling it mid-phase crashes.
-    setBusy(true); setError('');
-    try {
-      const res = await fetch('/api/marketplace/tcg-page/preview', {
-        method: 'POST', headers: JSON_HEADERS,
-        body: JSON.stringify({ orders: handoff.orders, lines: handoff.lines, include_imported: includeImported }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (seq !== previewSeq.current) return;
-      if (!res.ok) { setError(data.error || t('orderimport.errPreview')); return; }
-      setPageImport({ ...handoff, includeImported });
-      setPreview(data);
-      setPhase('preview');
-    } catch {
-      if (seq === previewSeq.current) setError(t('orderimport.errPreview'));
-    } finally {
-      if (seq === previewSeq.current) setBusy(false);
-    }
-  };
-
-  useEffect(() => {
-    const handoff = takePendingTcgImport();
-    if (handoff) { setSource('tcgplayer'); doPagePreview(handoff); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const doAdd = async () => {
     if (!preview) return;
-    if (pageImport) {
-      setBusy(true); setError('');
-      try {
-        const res = await fetch('/api/marketplace/tcg-page/add', {
-          method: 'POST', headers: JSON_HEADERS,
-          body: JSON.stringify({ lines: pageImport.lines, printing_mode: printingMode, language, include_imported: !!pageImport.includeImported }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) { setError(data.error || t('orderimport.errAdd')); return; }
-        setResult(data); setPhase('done'); setPageImport(null);
-        if (data.added) showToast?.(t('orderimport.added', { count: data.added }));
-        onAddSuccess?.();
-      } catch {
-        setError(t('orderimport.errAdd'));
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
     setBusy(true);
     setError('');
     try {
@@ -207,7 +140,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
 
   const reset = () => {
     previewSeq.current += 1;
-    setPreview(null); setResult(null); setError(''); setPhase('form'); setBusy(false); setPageImport(null);
+    setPreview(null); setResult(null); setError(''); setPhase('form'); setBusy(false);
   };
 
   const dollars = (cents) => cents == null ? null : `$${(cents / 100).toFixed(2)}`;
@@ -222,62 +155,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
         </div>
         <p style={{ margin: 0, color: 'var(--text-secondary)', fontSize: '.85rem' }}>{t('orderimport.subtitle')}</p>
 
-        <div className="sub-nav-tabs" role="tablist" aria-label={t('orderimport.sourceAria')}>
-          {['manapool', 'tcgplayer'].map((k) => (
-            <button key={k} type="button" role="tab" aria-selected={source === k}
-              className={`sub-nav-tab${source === k ? ' active' : ''}`} onClick={() => setSource(k)}>
-              {t(`orderimport.source.${k}`)}
-            </button>
-          ))}
-        </div>
-
-        {source === 'tcgplayer' && (
-          <div className="tcg-bookmarklet" style={{ display: 'flex', flexDirection: 'column', gap: '.6rem', fontSize: '.82rem', color: 'var(--text-secondary)' }}>
-            <div>{t('orderimport.tcgHow')}</div>
-            {!phoneSetup && (<>
-            <ol style={{ margin: 0, paddingLeft: '1.2rem', display: 'flex', flexDirection: 'column', gap: '.3rem' }}>
-              <li>{t('orderimport.tcgStep1')}</li>
-              <li>{t('orderimport.tcgStep2')}</li>
-              <li>{t('orderimport.tcgStep3')}</li>
-            </ol>
-            <a ref={bookmarkRef} className="btn btn-primary tcg-bookmarklet-link" draggable="true"
-              onClick={(e) => { e.preventDefault(); showToast?.(t('orderimport.tcgDragHint')); }}
-              style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: '.4rem', cursor: 'grab' }}>
-              <Bookmark size={14} /> {t('orderimport.tcgBookmarkName')}
-            </a>
-            </>)}
-            {phoneSetup && <div className="tcg-pwa-note">{t('orderimport.tcgPwaNote')}</div>}
-            <details className="tcg-phone-setup" open={phoneSetup || undefined} style={{ fontSize: '.8rem' }}>
-              <summary style={{ cursor: 'pointer', fontWeight: 700, color: 'var(--text-strong)', display: 'inline-flex', alignItems: 'center', gap: '.35rem' }}>
-                <Smartphone size={14} /> {t('orderimport.tcgPhoneTitle')}
-              </summary>
-              <ol style={{ margin: '.5rem 0 0', paddingLeft: '1.2rem', display: 'flex', flexDirection: 'column', gap: '.3rem' }}>
-                <li>
-                  <button type="button" className="btn btn-small btn-secondary tcg-copy-bookmarklet" style={{ display: 'inline-flex', alignItems: 'center', gap: '.3rem' }}
-                    onClick={async () => {
-                      const code = buildBookmarklet(window.location.origin);
-                      let ok = false;
-                      try { await navigator.clipboard.writeText(code); ok = true; } catch {
-                        const ta = document.createElement('textarea'); ta.value = code; document.body.append(ta); ta.select();
-                        try { ok = document.execCommand('copy'); } catch { /* reported below */ } ta.remove();
-                      }
-                      showToast?.(ok ? t('orderimport.tcgCopied') : t('orderimport.tcgCopyFailed'));
-                    }}>
-                    <Copy size={12} /> {t('orderimport.tcgCopyCode')}
-                  </button>
-                </li>
-                <li>{t('orderimport.tcgPhoneIos')}</li>
-                <li>{t('orderimport.tcgPhoneAndroid')}</li>
-                <li>{t('orderimport.tcgPhoneUse')}</li>
-              </ol>
-            </details>
-            <div style={{ fontSize: '.72rem', color: 'var(--text-muted)' }}>{t('orderimport.tcgPrivacy')}</div>
-            {busy && <div><Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> {t('orderimport.retrieving')}</div>}
-            {error && <div style={{ color: 'var(--accent-red)' }}>{error}</div>}
-          </div>
-        )}
-
-        {source !== 'tcgplayer' && status && (
+        {status && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem', fontSize: '.78rem', color: readyFor(source) ? 'var(--text-secondary)' : 'var(--accent-yellow)' }}>
             {readyFor(source)
               ? <>{t('orderimport.ready', { source: t(`orderimport.source.${source}`) })}</>
@@ -288,7 +166,6 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
           </div>
         )}
 
-        {source !== 'tcgplayer' && (<>
         {/* Recent orders: a quick-pick list when the provider exposes one. */}
         {readyFor(source) && recent.loading && !Array.isArray(recent.orders) && (
           <div style={{ fontSize: '.78rem', color: 'var(--text-secondary)' }}>{t('orderimport.recentLoading')}</div>
@@ -311,7 +188,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
               </button>
             ))}
             </div>
-            {source === 'manapool' && (
+            {(
               <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', gap: '.35rem' }}>
                 <button type="button" className="btn btn-small btn-secondary" aria-label="Newer orders"
                   style={{ flex: 1, padding: '0 .5rem' }}
@@ -356,7 +233,6 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
             {busy ? <><Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> {t('orderimport.retrieving')}</> : t('orderimport.retrieve')}
           </button>
         </div>
-        </>)}
       </div>
     );
   }
@@ -386,9 +262,7 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
       <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
         <button type="button" className="btn btn-small btn-secondary" onClick={reset} disabled={busy}>{t('orderimport.back')}</button>
         <h3 style={{ margin: 0, color: 'var(--text-strong)', fontSize: '1.02rem' }}>
-          {preview.orderCount > 1
-            ? t('orderimport.ordersSummary', { count: preview.orderCount })
-            : t('orderimport.orderSummary', { number: preview.number || orderNumber, count: preview.totalListed ?? cards.length })}
+          {t('orderimport.orderSummary', { number: preview.number || orderNumber, count: preview.totalListed ?? cards.length })}
         </h3>
       </div>
 
@@ -413,16 +287,8 @@ export default function OrderImportPanel({ onAddSuccess, showToast, setActiveTab
         </select>
       </div>
 
-      {pageImport && Array.isArray(preview.alreadyImported) && preview.alreadyImported.length > 0 && (
-        <div className="oi-already" style={{ display: 'flex', alignItems: 'center', gap: '.6rem', flexWrap: 'wrap', fontSize: '.8rem', color: 'var(--text-secondary)' }}>
-          <span>{t('orderimport.alreadyImported', { count: preview.alreadyImported.length })}</span>
-          <button type="button" className="btn btn-small btn-secondary" disabled={busy}
-            onClick={() => doPagePreview(pageImport, true)}>{t('orderimport.importAnyway')}</button>
-        </div>
-      )}
-
       {cards.length === 0 ? (
-        <p style={{ color: 'var(--text-secondary)', margin: 0 }}>{preview.allImported ? t('orderimport.allImported') : t('orderimport.noCards')}</p>
+        <p style={{ color: 'var(--text-secondary)', margin: 0 }}>{t('orderimport.noCards')}</p>
       ) : (
         <div className="sl-cardlist" style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '.5rem' }}>
           {cards.map((c, i) => (

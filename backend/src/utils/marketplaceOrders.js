@@ -1,10 +1,10 @@
-// Buy-from-marketplace order import: turn a ManaPool or TCGplayer order number
+// Buy-from-marketplace order import: turn a ManaPool order number
 // into collection entries, the same way the Secret Lair importer turns a product
 // card list into entries — resolve each line through the proven
 // bulkFetchByIdentifier -> card_cache path, then file through the shared
 // bulk-add core. The user picks the order; Scrybox does the rest.
 //
-// Why the two providers are built differently (verified against their live
+// How the provider is reached (verified against its live
 // endpoints, see the probes in the commit that introduced this file):
 //
 //   ManaPool — has a real buyer-facing REST API. base https://manapool.com/api/v1,
@@ -35,22 +35,8 @@
 //     with a JSON {"status":401,...} — so the two failure classes are tellable
 //     apart, which is what makes a server-side "Test" button honest here.
 //
-//   TCGplayer — its public API is closed to new keys and every documented
-//     order endpoint is `Stores_*` (seller-side, needs the store's own
-//     bearer). There is NO buyer order-history API. What the logged-in site
-//     itself calls is the private SPA gateway: `GET {base}/customers/{id}/orders`
-//     (cookie-authenticated, `withCredentials`), discovered by mining the
-//     site's shipped JS bundle — the shape is `{ data: [...orders] }` style
-//     list. Because that is an UNVERIFIED private contract (it can change
-//     without notice, and we could not exercise it without a logged-in
-//     account), the TCGplayer path is deliberately forgiving: it probes the
-//     id, the me-alias, and the list endpoint, tolerates either response
-//     shape, and — when the shape is not recognizable — returns the observed
-//     keys so the Settings panel can say exactly what came back instead of a
-//     silent "no cards". It also accepts a paste-JSON escape hatch: the
-//     browser's own network response for that call can be pasted and parsed
-//     locally, so the feature keeps working even if the private contract
-//     shifts. Cookies are the user's own session, entered once in Settings.
+//   TCGplayer order import was removed (it never worked reliably); the
+//   line parser below still tolerates TCGplayer-shaped rows, which is harmless.
 const crypto = require('crypto');
 
 // --- endpoints (pinned; never user-supplied, so the saved credential can only
@@ -67,13 +53,6 @@ const MANAPOOL_LIST_PATH = '/buyer/orders';
 const RECENT_LIMIT = 3;
 const MANAPOOL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const TCG_GATEWAY_BASES = [
-  process.env.TCG_ORDER_BASE, // single-base override for testing
-].filter(Boolean).length ? [process.env.TCG_ORDER_BASE] : [
-  'https://mpapi.tcgplayer.com/',
-  'https://mpgateway.tcgplayer.com/',
-];
-const TCG_REFERER = 'https://www.tcgplayer.com/';
 const HTTP_TIMEOUT_MS = Number(process.env.MARKETPLACE_TIMEOUT_MS || 16000);
 
 // The legal collection.printing values (mirrors the CHECK constraint in db.js).
@@ -127,43 +106,7 @@ function unitPriceCents(item) {
   return d > 500 ? Math.round(d) : Math.round(d * 100);
 }
 
-// --- credentials normalisation -------------------------------------------------
-// Cookies arrive either as a raw `Cookie:` header string or as a JSON array of
-// {name,value,domain?} objects (what a browser export/extension hands over).
-// Both normalise to a clean header string; junk that could not be read
-// through is rejected rather than half-stored, because a broken cookie jar is
-// indistinguishable from an expired one at fetch time.
-function normalizeCookies(input) {
-  if (typeof input !== 'string' || !input.trim()) {
-    if (Array.isArray(input)) {
-      const pairs = input
-        .filter((c) => c && typeof c.name === 'string' && c.name && typeof c.value === 'string')
-        .map((c) => `${c.name.trim()}=${c.value.trim()}`);
-      return pairs.length ? pairs.join('; ') : null;
-    }
-    return null;
-  }
-  const raw = input.replace(/[\r\n]+/g, ' ').trim();
-  if (raw.startsWith('cookie:') || raw.toLowerCase().startsWith('cookie:')) {
-    // A pasted `Cookie:` header line is the whole jar, not a cookie pair; the
-    // prefix itself would poison the very header we're assembling.
-    return normalizeCookies(raw.replace(/^cookie:\s*/i, ''));
-  }
-  const pairs = raw.split(';').map((p) => p.trim()).filter((p) => p && p.includes('=') && !p.includes('\0'));
-  const clean = pairs.map((p) => {
-    const i = p.indexOf('=');
-    return `${p.slice(0, i).trim()}=${p.slice(i + 1).trim()}`;
-  });
-  // De-dupe by name, last write wins (a re-export repeats names).
-  const byName = new Map();
-  for (const c of clean) byName.set(c.slice(0, c.indexOf('=')), c);
-  const joined = [...byName.values()].join('; ');
-  return joined.length && joined.length <= 64 * 1024 ? joined : null;
-}
-function cookieCount(cookies) {
-  if (!cookies) return 0;
-  return cookies.split(';').filter((p) => p.trim() && p.includes('=')).length;
-}
+// --- credential masking ------------------------------------------------------
 // Never echo a token back over GET (the UI shows "configured?" state instead),
 // and mask the account email so a shared screen/screenshot cannot leak it.
 function maskSecret(s) {
@@ -179,23 +122,6 @@ function maskEmail(email) {
   const [user, domain] = [str.slice(0, at), str.slice(at + 1)];
   return `${user.slice(0, 2)}${'•'.repeat(Math.max(2, Math.min(8, user.length - 2)))}@${domain}`;
 }
-// The gateway wants a customer id; the SPA keeps it in a same-origin cookie,
-// so we can often discover it without the user. Try the obvious cookie names
-// before any network call (a cheap win when they exist).
-function customerIdHints(cookies) {
-  const out = [];
-  for (const pair of String(cookies || '').split(';')) {
-    const i = pair.indexOf('=');
-    if (i < 0) continue;
-    const name = pair.slice(0, i).trim().toLowerCase();
-    const value = pair.slice(i + 1).trim();
-    if (value && /^(tcg_)?(customer|customerid|cust_id|customer_id|person|member|buyer|party|account)([_-]?id)?$/i.test(name)) {
-      out.push(value);
-    }
-  }
-  return [...new Set(out)].slice(0, 5);
-}
-
 // --- order fetch ----------------------------------------------------------------
 // Both fetchers share the shape: return the parsed JSON body plus enough
 // context for the route's error copy. `validateStatus: () => false` so we can
@@ -375,60 +301,10 @@ async function manapoolRecentOrderSummaries({ email, token, limit = RECENT_LIMIT
   return out;
 }
 
-async function fetchTcgOrder({ cookies, customerId, orderNumber, httpGet: http = httpGet, requireMatch = true }) {
-  if (!cookies) throw Object.assign(new Error('TCGplayer session cookie is not configured'), { status: 400 });
-  const num = String(orderNumber || '').trim();
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(num)) throw Object.assign(new Error('Order number is not valid'), { status: 400 });
-  // requireMatch=false is the recent-list path: the caller wants the LIST,
-  // not a specific order, so a 404 on every probe path means "no list",
-  // not "unknown number" - keep the status honest for that caller.
-  const headers = { Cookie: cookies, Referer: TCG_REFERER };
-  const ids = [customerId, ...customerIdHints(cookies)].filter(Boolean);
-  const seen = new Set();
-  let last = null;
-  for (const base of TCG_GATEWAY_BASES) {
-    const paths = [];
-    for (const id of ids) {
-      if (!seen.has(String(id))) { seen.add(String(id)); paths.push(`customers/${encodeURIComponent(id)}/orders`); }
-    }
-    paths.push('customers/me/orders');
-    for (const p of paths) {
-      const url = `${base}${p}${p.includes('?') ? '&' : '?'}per_page=200&page=1`;
-      const r = await http(url, headers);
-      last = r;
-      if (r.status >= 200 && r.status < 300 && looksLikeOrderList(r.body)) return { ...r, path: p };
-      if (r.status === 401 || r.status === 403) {
-        throw Object.assign(new Error('TCGplayer rejected the saved cookies (session expired or password-protected). Re-export them from a logged-in browser and save them again in Settings.'), { status: 401 });
-      }
-      // A gateway that 404s this path just does not speak it; keep looking.
-    }
-  }
-  if (last && last.status >= 200 && last.status < 300) {
-    // 2xx but not a recognisable list — report what DID come back rather than
-    // a bare "no orders", so the private-contract drift is visible.
-    return { ...last, unrecognised: true, keys: bodyKeys(last.body) };
-  }
-  throw Object.assign(new Error(`TCGplayer did not return an order list (last status ${last ? last.status : 'none'}).`), { status: 502 });
-}
 function bodyKeys(body) {
   if (!body || typeof body !== 'object') return [];
   const keys = Object.keys(body);
   return keys.length <= 25 ? keys : [...keys.slice(0, 25), `(+${keys.length - 25} more)`];
-}
-// One row proves the shape: an array of order-ish objects, under any of the
-// keys the gateway/SPA dialects put their list under.
-function looksLikeOrderList(body) {
-  if (Array.isArray(body)) return body.length > 0 && body.every((o) => o && typeof o === 'object');
-  if (!body || typeof body !== 'object') return false;
-  for (const k of ['data', 'orders', 'results', 'items', 'list', 'records', 'orderResults']) {
-    const v = body[k];
-    if (Array.isArray(v) && v.length && v.every((o) => o && typeof o === 'object')) return true;
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const inner = v.data || v.orders || v.results;
-      if (Array.isArray(inner) && inner.length && inner.every((o) => o && typeof o === 'object')) return true;
-    }
-  }
-  return false;
 }
 function orderArray(body) {
   if (Array.isArray(body)) return body;
@@ -444,43 +320,6 @@ function orderArray(body) {
   return [];
 }
 
-// --- the recent-order list ("most recent 3") ---------------------------------
-// The picker's data lives in the source's own order list; see
-// manapoolRecentOrderSummaries (whose card counts need the detail) and
-// fetchTcgRecentOrders below.
-
-async function fetchTcgRecentOrders({ cookies, customerId, httpGet: http = httpGet } = {}) {
-  // The recent-list IS what fetchTcgOrder's path-probing already retrieves
-  // (per_page=200, page 1); reuse it without requiring an order number by
-  // passing a sentinel the matcher ignores.
-  return fetchTcgOrder({ cookies, customerId, orderNumber: '0', httpGet: http, requireMatch: false });
-}
-
-// Normalise a provider list response into the small header-only shape the
-// picker UI needs. Deliberately NO addresses/emails/payment data.
-function recentOrderSummaries(body, limit = RECENT_LIMIT) {
-  const list = orderArray(body);
-  const rows = list.map((o) => {
-    const lines = orderLines(o, { includeExtras: false });
-    const number = pick(o, ['number', 'orderNumber', 'order_number', 'friendly_id', 'friendlyId', 'id', 'orderId', 'order_id']);
-    const placed = pick(o, ['created', 'createdAt', 'created_at', 'date', 'placedAt', 'orderDate']);
-    return {
-      number: number != null ? String(number) : null,
-      placedAt: placed || null,
-      status: pick(o, ['status', 'orderStatus', 'fulfillmentStatus', 'fulfillment_status']) || null,
-      cardCount: lines.__cardCopies || 0,
-      lineCount: lines.length,
-      total_cents: pick(o, ['total_cents', 'totalCents', 'total', 'orderTotal']) ?? null,
-    };
-  }).filter((r) => r.number);
-  // Newest first on whatever timestamp the provider gave; providers that sort
-  // already are left untouched.
-  const withDates = rows.filter((r) => r.placedAt);
-  if (withDates.length === rows.length && rows.length > 1) {
-    rows.sort((a, b) => String(b.placedAt).localeCompare(String(a.placedAt)));
-  }
-  return rows.slice(0, limit);
-}
 
 // --- normalising one order's lines ---------------------------------------------
 // Both providers arrive as: a header (number/date/status/prices) + line items.
@@ -839,131 +678,14 @@ async function previewOrder({ lines, userId, includeExtras = false }, deps = {})
   };
 }
 
-// --- TCGplayer page import (bookmarklet) -------------------------------------
-// The bookmarklet reads an order off the user's own logged-in TCGplayer page
-// and hands over lines keyed by TCGplayer product id. That id is exactly what
-// Scryfall stores as tcgplayer_id, so the printing is matched by identity, not
-// by name: first against card_cache (already-known printings, English row
-// preferred), then Scryfall's /cards/tcgplayer/:id for anything not cached.
-// A product id that resolves nowhere (sealed, tokens TCGplayer sells that
-// Scryfall lacks) stays unresolved and is reported, never guessed.
-const TCG_PAGE_MAX_LINES = 1000;
-function cleanTcgPageLines(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  for (const l of raw.slice(0, TCG_PAGE_MAX_LINES)) {
-    if (!l || typeof l !== 'object') continue;
-    const pid = String(l.tcgplayer_product_id ?? '').trim();
-    if (!/^\d{1,10}$/.test(pid)) continue;
-    const qty = Math.floor(Number(l.quantity));
-    const cents = l.price_cents == null ? null : Math.round(Number(l.price_cents));
-    out.push({
-      tcgplayer_product_id: pid,
-      name: String(l.name || '').slice(0, 200).trim(),
-      quantity: Number.isFinite(qty) && qty > 0 && qty < 1000 ? qty : 1,
-      price_cents: Number.isFinite(cents) && cents >= 0 && cents < 10_000_000 ? cents : null,
-      is_foil: l.is_foil === true,
-      condition: mapCondition(l.condition, null),
-      order: l.order ? String(l.order).slice(0, 64) : null,
-    });
-  }
-  return out;
-}
-
-// TCGplayer order numbers already filed for this user. The bookmarklet can be
-// tapped on the same Order History page again and again; lines from an order
-// that was imported before are held back unless the user asks to re-import.
-const ORDER_NO_RE = /^[0-9A-F]{8}-[0-9A-F]{6}-[0-9A-F]{5}$/;
-async function importedTcgOrders(userId, orders, database = require('../db')) {
-  const list = [...new Set((orders || []).map((o) => String(o || '').toUpperCase()).filter((o) => ORDER_NO_RE.test(o)))];
-  if (!list.length) return new Set();
-  const rows = await database.all(
-    `SELECT order_number FROM tcg_imported_orders WHERE user_id = ? AND order_number IN (${list.map(() => '?').join(',')})`,
-    [userId, ...list]
-  );
-  return new Set(rows.map((r) => r.order_number));
-}
-async function recordTcgOrders(userId, orders, database = require('../db')) {
-  const list = [...new Set((orders || []).map((o) => String(o || '').toUpperCase()).filter((o) => ORDER_NO_RE.test(o)))];
-  for (const o of list) {
-    await database.run('INSERT OR IGNORE INTO tcg_imported_orders (user_id, order_number) VALUES (?, ?)', [userId, o]);
-  }
-  return list;
-}
-
-async function resolveTcgPageLines(rawLines, deps = {}) {
-  const lines = cleanTcgPageLines(rawLines);
-  const database = deps.db || require('../db');
-  const scryGet = deps.scryGet || require('../scryfallApi').scryGetRetried;
-  const ids = [...new Set(lines.map((l) => l.tcgplayer_product_id))];
-  const byPid = new Map();
-  if (ids.length) {
-    const ph = ids.map(() => '?').join(',');
-    const rows = await database.all(
-      `SELECT id, tcgplayer_product_id AS pid, language FROM card_cache
-        WHERE id LIKE 'mtg-%' AND tcgplayer_product_id IN (${ph})
-        ORDER BY CASE WHEN language IS NULL OR language = 'English' THEN 0 ELSE 1 END`,
-      ids.map(Number)
-    );
-    for (const r of rows) {
-      const k = String(r.pid);
-      if (!byPid.has(k)) byPid.set(k, String(r.id).slice(4));
-    }
-  }
-  for (const pid of ids) {
-    if (byPid.has(pid)) continue;
-    try {
-      // tcgplayer_id lookups need live price data the sidecar does not carry,
-      // so pin this one upstream even when LOCAL_SCRYFALL_ENABLED is on.
-      const resp = await scryGet(`/cards/tcgplayer/${pid}`, { upstream: true });
-      if (resp && resp.data && resp.data.id) byPid.set(pid, String(resp.data.id));
-    } catch { /* 404: not a card Scryfall knows; stays unresolved */ }
-  }
-  const out = lines.map((l) => {
-    const sid = byPid.get(l.tcgplayer_product_id) || null;
-    return {
-      name: l.name,
-      set_code: null,
-      number: null,
-      scryfall_id: sid,
-      tcgplayer_product_id: l.tcgplayer_product_id,
-      quantity: l.quantity,
-      price_cents: l.price_cents,
-      is_foil: l.is_foil,
-      condition: l.condition,
-      order: l.order,
-      year: null,
-      sealed: false,
-      // Unresolvable ids are not sent to the name resolver: TCGplayer product
-      // names carry set/variant suffixes that would match the wrong printing.
-      junk: !sid,
-    };
-  });
-  out.__extras = out.filter((l) => l.junk).length;
-  out.__cardCopies = out.reduce((n, l) => n + (l.junk ? 0 : l.quantity), 0);
-  out.__cardLines = out.filter((l) => !l.junk).length;
-  out.__unmatched = out.filter((l) => l.junk).map((l) => l.name || `#${l.tcgplayer_product_id}`);
-  return out;
-}
-
 module.exports = {
   MANAPOOL_BASE,
-  cleanTcgPageLines,
-  resolveTcgPageLines,
-  importedTcgOrders,
-  recordTcgOrders,
   RECENT_LIMIT,
-  normalizeCookies,
-  cookieCount,
   maskSecret,
   maskEmail,
-  customerIdHints,
   fetchManapoolOrder,
   fetchManapoolOrderList,
   manapoolRecentOrderSummaries,
-  fetchTcgRecentOrders,
-  recentOrderSummaries,
-  fetchTcgOrder,
   parseOrderPayload,
   orderLines,
   mapCondition,

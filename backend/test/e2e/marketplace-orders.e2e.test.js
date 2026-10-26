@@ -7,8 +7,8 @@ const { spawn } = require('child_process');
 
 // "Import from order" driven through the real HTTP stack: the real Express app
 // on a throwaway DB, the real credential routes, the real fetchers, the real
-// bulk-add core. Two local fake markets stand in for ManaPool and the TCGplayer
-// gateway (their bases are env-overridable for exactly this reason), and
+// bulk-add core. A local fake market stands in for ManaPool (its base
+// is env-overridable for exactly this reason), and
 // scryfall-mock.js is preloaded so card resolution never leaves the box.
 //
 // What this proves that the unit test cannot: the routes are actually mounted,
@@ -33,15 +33,6 @@ const MP_ORDER = {
     { quantity: 1, price_cents: 1000, product: { sealed: { name: 'Collector Booster', kind: 'sealed' } } },
   ],
 };
-const TCG_ORDER = {
-  data: [{
-    number: '77001',
-    name: 'Order',
-    status: 'shipped',
-    items: [{ productName: 'Lightning Bolt', set: 'm10', number: '146', quantity: 3, pricePaid: 1.25 }],
-  }],
-};
-
 // The buyer routes answer in the captured live contract (same files the unit
 // test asserts against), so the picker is exercised against what ManaPool
 // actually sends: a list whose rows carry NO items, plus per-order details that
@@ -60,9 +51,8 @@ function fakeMarkets() {
       res.end(JSON.stringify(obj));
     };
     const mpToken = String(req.headers['x-manapool-access-token'] || '');
-    const cookie = String(req.headers.cookie || '');
-    // A dead token / expired jar must read as an auth problem, not an empty order.
-    if (mpToken === '401' || cookie.includes('tcgexpired')) return send(401, { message: 'Unauthorized' });
+    // A dead token must read as an auth problem, not an empty order.
+    if (mpToken === '401') return send(401, { message: 'Unauthorized' });
     if (mpToken === '429') return send(429, { message: 'too many requests' });
 
     if (url.startsWith('/mp/')) {
@@ -76,7 +66,6 @@ function fakeMarkets() {
       if (buyer && BUYER_DETAILS[buyer[1]]) return send(200, BUYER_DETAILS[buyer[1]]);
       return send(404, { message: 'not found' });
     }
-    if (url.includes('/customers/') && url.includes('/orders')) return send(200, TCG_ORDER);
     return send(404, { error: 'unhandled' });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, hits })));
@@ -91,7 +80,6 @@ async function waitForServer(url) {
 }
 
 const MP_CRED = { email: 'collector@example.test', token: 'mp-token-supercalifragilistic-5150' };
-const TCG_JAR = 'tcg_customer_id=42; tcgplayer_session=abcdef123456; junk_no_value';
 
 async function runTests() {
   const markets = await fakeMarkets();
@@ -107,7 +95,6 @@ async function runTests() {
       HTTPS_PORT: '',
       DEFAULT_ADMIN_PASSWORD: 'test-admin-password',
       MANAPOOL_API_BASE: `${baseMkt}/mp`,
-      TCG_ORDER_BASE: `${baseMkt}/tcg/`,
       MARKETPLACE_TIMEOUT_MS: '4000',
     },
   });
@@ -147,8 +134,7 @@ async function runTests() {
     // the response carries no secret material.
     const boot = await getAccounts();
     assert.strictEqual(boot.manapool.configured, false);
-    assert.strictEqual(boot.tcgplayer.configured, false);
-    assert.ok(!JSON.stringify(boot).includes('abcdef123456'), 'GET must not echo a cookie value');
+    assert.strictEqual(boot.tcgplayer, undefined, 'TCGplayer order import was removed');
     console.log('PASS: F9-TC2');
 
     // F9-TC3: saving ManaPool persists it (masked) and never returns the token.
@@ -168,20 +154,6 @@ async function runTests() {
     assert.ok(!String(accMP.manapool.email).includes('collector@'), `local part is masked, got ${accMP.manapool.email}`);
     assert.ok(String(accMP.manapool.email).includes('\u2022') || /\*/.test(String(accMP.manapool.email)), 'masking characters are shown');
     console.log('PASS: F9-TC3');
-
-    // F9-TC4: TCGplayer cookies normalize on save; a jar with no usable pair is
-    // refused rather than stored.
-    const badJar = await put({ tcgplayer: { cookies: 'garbage-with-no-pair' } });
-    assert.strictEqual(badJar.status, 400, 'a jar with no usable pair must be refused');
-    const savedTCG = await put({ tcgplayer: { cookies: `Cookie: ${TCG_JAR}` } });
-    assert.strictEqual(savedTCG.status, 200, `save tcgplayer returned ${savedTCG.status}`);
-    assert.ok(!(await savedTCG.text()).includes('abcdef123456'), 'the cookie jar must not be echoed back');
-    const accts = await getAccounts();
-    assert.strictEqual(accts.tcgplayer.configured, true);
-    assert.strictEqual(accts.tcgplayer.cookies, '2 cookies saved', 'the jar is counted, never reproduced');
-    assert.ok(!JSON.stringify(accts).includes('tcgplayer_session'), 'no cookie NAME may leak either');
-    assert.ok(!JSON.stringify(accts).includes('junk_no_value'), 'the unusable fragment was dropped, not stored');
-    console.log('PASS: F9-TC4');
 
     // F9-TC4b: the master switch moves on its own. With a token already stored,
     // a PUT carrying only {enabled:true} keeps the credential instead of
@@ -269,20 +241,11 @@ async function runTests() {
     assert.ok(ownedLotus && ownedLotus.owned >= 4, `preview should report the copies already held, got ${ownedLotus && ownedLotus.owned}`);
     console.log('PASS: F9-TC7');
 
-    // F9-TC8: TCGplayer flows through the gateway list shape, with the customer
-    // id discovered from the saved cookie jar.
+    // F9-TC8: TCGplayer order import was removed; the source is refused.
     const tPrev = await post('preview', { source: 'tcgplayer', order_number: '77001' });
-    assert.strictEqual(tPrev.status, 200, `tcg preview returned ${tPrev.status}: ${JSON.stringify(tPrev.body)}`);
-    assert.strictEqual(tPrev.body.lineCount, 1);
-    assert.strictEqual(tPrev.body.resolvedCount, 1, 'the gateway card resolved through the mock');
-    assert.strictEqual(tPrev.body.totalCopies, 3);
-    // The gateway quotes dollars where ManaPool quotes cents; the line's UNIT
-    // price is the thing that must normalise (125c), and the order total is
-    // unit x copies like every other preview.
-    assert.strictEqual(tPrev.body.price_cents, 375, 'preview total is the unit price times copies');
-    assert.strictEqual(tPrev.body.cards[0].price_cents, 125, 'a dollar-denominated gateway price is normalised to cents');
-    assert.ok(markets.hits.some((h) => h.startsWith('/tcg/customers/42/orders')), 'the discovered customer id was used');
-    assert.ok(markets.hits.some((h) => h.includes('per_page=')), 'the list endpoint is paged');
+    assert.strictEqual(tPrev.status, 400, `tcgplayer source must be refused, got ${tPrev.status}`);
+    const tPut = await put({ tcgplayer: { cookies: 'a=1' } });
+    assert.strictEqual(tPut.status, 400, 'a tcgplayer-only save has nothing to save');
     console.log('PASS: F9-TC8');
 
     // F9-TC9: an auth rejection is surfaced as auth (never "no orders"), and an
@@ -356,12 +319,12 @@ async function runTests() {
     console.log('PASS: F9-TC11b (recent-orders picker)');
 
     // F9-TC12: clearing a provider's credentials works and empties the status.
-    const cleared = await put({ tcgplayer: { clear: true } });
+    const cleared = await put({ manapool: { clear: true } });
     assert.strictEqual(cleared.status, 200);
     const afterClear = await getAccounts();
-    assert.strictEqual(afterClear.tcgplayer.configured, false);
-    const blocked = await post('preview', { source: 'tcgplayer', order_number: '77001' });
-    assert.strictEqual(blocked.status, 400, 'a cleared provider must refuse, not fetch with an empty jar');
+    assert.strictEqual(afterClear.manapool.configured, false);
+    const blocked = await post('preview', { source: 'manapool', order_number: '90001' });
+    assert.strictEqual(blocked.status, 400, 'a cleared provider must refuse, not fetch without a credential');
     assert.ok(/not configured/i.test(blocked.body.error), `cleared provider should say so, got ${blocked.body.error}`);
     console.log('PASS: F9-TC11');
   } finally {
