@@ -327,7 +327,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
         {cotd && cotd.show ? (
           <a className="dash-tile dash-art" href={cotd.card.edhrec_url} target="_blank" rel="noreferrer" title={cotd.card.type_line}>
-            <img src={cotd.card.art_crop || cotd.card.image_url} className="dash-art-img" alt="" loading="lazy" />
+            <img src={cotd.card.art_crop || artCrop(cotd.card.image_url)} onError={(e) => { if (e.currentTarget.src !== cotd.card.image_url) e.currentTarget.src = cotd.card.image_url; }} className="dash-art-img" alt="" loading="lazy" />
             <span className="dash-art-shade" />
             <span className="dash-art-cap">
               <span className="dash-k"><Crown size={12} style={{ verticalAlign: '-1px', marginRight: 4 }} />{t('dash.commanderOfDay')}</span>
