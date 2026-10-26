@@ -12,7 +12,7 @@ use std::time::Instant;
 
 /// Formats tracked in the packed `legalities` field (2 bits each, u64 total).
 /// Full Scryfall format set (docs list), so f:/banned:/restricted: mirror upstream.
-pub const FORMATS: [&str; 23] = [
+pub const FORMATS: [&str; 24] = [
     "standard",
     "future",
     "historic",
@@ -36,8 +36,9 @@ pub const FORMATS: [&str; 23] = [
     "premodern",
     "predh",
     "tlr",
+    "explorer",
 ];
-pub const NFORMATS: usize = 23;
+pub const NFORMATS: usize = 24;
 
 // status codes stored in 2 bits
 pub const L_NOT_LEGAL: u32 = 0;
@@ -232,11 +233,12 @@ pub const FIN_ETCHED: u8 = 4;
 pub const PR_C: u8 = 32;
 
 // frame_effects bitset (Card::ffx) — interned over this list
-pub const FFX_LIST: [&str; 26] = [
+pub const FFX_LIST: [&str; 27] = [
     "legendary", "inverted", "extendedart", "showcase", "enchantment", "etched", "sunmoondfc",
     "devoid", "tombstone", "snow", "fullart", "lesson", "companion", "colorshifted",
     "compasslanddfc", "miracle", "fandfc", "mooneldrazidfc", "spree", "draft", "originpwdfc",
     "convertdfc", "shatteredglass", "waxingandwaningmoondfc", "upsidedowndfc", "borderless",
+    "textless",
 ];
 
 // new_flags bits (Card::new_flags): first-in-oracle occurrences
@@ -396,6 +398,10 @@ pub struct Index {
     pub name_lc: Vec<u32>,
     pub type_lc: Vec<u32>,
     pub oracle_lc: Vec<u32>,
+    /// reminder-stripped, lowercased oracle text (upstream o: search field)
+    pub otext_lc: Vec<u32>,
+    /// mana cost incl. DFC face costs joined by " /// " (m:{…} search)
+    pub cost_all: Vec<u32>,
     pub artist_lc: Vec<u32>,
     pub set_name_lc: Vec<u32>,
     pub mana_norm: Vec<u32>, // {R}{G} -> "rg"
@@ -1042,6 +1048,9 @@ struct RawC {
     type_line: String,
     type_tokens: Vec<String>,
     mana_cost: String,
+    /// mana_cost with DFC face costs joined by " /// " when the top-level
+    /// cost is empty (this dump stores back/front costs on the faces).
+    mana_cost_all: String,
     oracle_text: String,
     artist: String,
     keywords_joined: String,
@@ -1325,7 +1334,7 @@ fn parse_line(line: &str) -> Option<RawC> {
     if has("sorcery") {
         flags |= F_SORCERY;
     }
-    let colors = color_mask(
+    let mut colors = color_mask(
         &v.get("colors")
             .and_then(|x| x.as_array())
             .map(|a| {
@@ -1335,7 +1344,7 @@ fn parse_line(line: &str) -> Option<RawC> {
             })
             .unwrap_or_default(),
     );
-    let ci = color_mask(
+    let mut ci = color_mask(
         &v.get("color_identity")
             .and_then(|x| x.as_array())
             .map(|a| {
@@ -1345,6 +1354,27 @@ fn parse_line(line: &str) -> Option<RawC> {
             })
             .unwrap_or_default(),
     );
+    // Upstream c:/ci:/is:mono see the card's FULL colour profile — for DFC
+    // prints this dump stores only the front face at top level, so union in
+    // every face's colors/color_identity (Delver of Secrets is U+R upstream,
+    // not U). Golden: c:w ours 7085 vs upstream 7179; ci:gu 873 vs 13276.
+    if (colors | ci).count_ones() < 5 {
+        if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
+            let face_vec = |key: &str| -> Vec<String> {
+                faces
+                    .iter()
+                    .filter_map(|f| f.get(key).and_then(|x| x.as_array()))
+                    .flat_map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect::<Vec<String>>()
+                    })
+                    .collect()
+            };
+            colors |= color_mask(&face_vec("colors"));
+            ci |= color_mask(&face_vec("color_identity"));
+        }
+    }
     if colors.count_ones() > 1 {
         flags |= F_MULTICOLORED;
     }
@@ -1628,6 +1658,23 @@ fn parse_line(line: &str) -> Option<RawC> {
         }
     }
 
+    let mc = str_of(&v, "mana_cost").to_string();
+    let mc_all = if mc.trim().is_empty() {
+        match v.get("card_faces").and_then(|x| x.as_array()) {
+            Some(faces) => {
+                let j: Vec<String> = faces
+                    .iter()
+                    .filter_map(|f| f.get("mana_cost").and_then(|x| x.as_str()))
+                    .map(str::to_string)
+                    .filter(|t| !t.trim().is_empty())
+                    .collect();
+                j.join(" /// ")
+            }
+            None => mc.clone(),
+        }
+    } else {
+        mc.clone()
+    };
     Some(RawC {
         id: str_of(&v, "id").to_string(),
         oracle_id: str_of(&v, "oracle_id").to_string(),
@@ -1639,7 +1686,8 @@ fn parse_line(line: &str) -> Option<RawC> {
         cn_key,
         type_line,
         type_tokens,
-        mana_cost: str_of(&v, "mana_cost").to_string(),
+        mana_cost: mc.clone(),
+        mana_cost_all: mc_all.clone(),
         oracle_text,
         artist: str_of(&v, "artist").to_string(),
         keywords_joined,
@@ -1797,6 +1845,8 @@ impl Index {
             name_lc: Vec::with_capacity(raws.len()),
             type_lc: Vec::with_capacity(raws.len()),
             oracle_lc: Vec::with_capacity(raws.len()),
+            otext_lc: Vec::with_capacity(raws.len()),
+            cost_all: Vec::with_capacity(raws.len()),
             artist_lc: Vec::with_capacity(raws.len()),
             set_name_lc: Vec::with_capacity(raws.len()),
             mana_norm: Vec::with_capacity(raws.len()),
@@ -1954,6 +2004,9 @@ impl Index {
             ix.name_lc.push(s(&r.name.to_lowercase()));
             ix.type_lc.push(s(&r.type_line.to_lowercase()));
             ix.oracle_lc.push(s(&r.oracle_text.to_lowercase()));
+            ix.otext_lc
+                .push(s(&crate::index::strip_paren_text(&r.oracle_text).to_lowercase()));
+            ix.cost_all.push(s(&r.mana_cost_all));
             ix.artist_lc.push(s(&r.artist.to_lowercase()));
             ix.set_name_lc.push(s(&r.set_name.to_lowercase()));
             ix.mana_norm.push(s(
@@ -3089,6 +3142,14 @@ impl Index {
     #[inline]
     pub fn oracle_lc(&self, i: u32) -> &str {
         self.s(self.oracle_lc[i as usize])
+    }
+    #[inline]
+    pub fn otext_lc(&self, i: u32) -> &str {
+        self.s(self.otext_lc[i as usize])
+    }
+    #[inline]
+    pub fn cost_all(&self, i: u32) -> &str {
+        self.s(self.cost_all[i as usize])
     }
     #[inline]
     pub fn artist_lc(&self, i: u32) -> &str {

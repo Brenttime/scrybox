@@ -129,6 +129,15 @@ print("OK" if ok else "BAD total=%s warn=%s"%(d.get("total"),d.get("warnings")[:
   report "$label" "${out%% *}" "q=$q  ${out#* }"
 }
 
+# check_400 <label> <q>: HTTP 400 (mirrors upstream invalid_search_syntax
+# rejects for closed-enum values: id: junk letters, bad k:/frame:/r: values)
+check_400() {
+  local label="$1" q="$2" st out
+  st=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/search" --get --data-urlencode "q=$q" --data-urlencode limit=1)
+  if [ "$st" = 400 ]; then out=OK; else out="BAD http=$st"; fi
+  report "$label" "${out%% *}" "q=$q  ${out#* }"
+}
+
 # check_eq <label> <q1> <q2>: same total for both queries
 check_eq() {
   local label="$1" q1="$2" q2="$3" out
@@ -151,8 +160,8 @@ check_eq    "id:rb == id:br"            "id:rb"             "id:br"
 check_eq    "id:w id:u == id:c"         "id:w id:u"         "id:c"
 check_eq    "id:RB == id:rb (case)"     "id:RB"             "id:rb"
 # values Scryfall ignores (400 'all terms ignored') => warning + 0, never a crash
-check_warn0 "id:zz ignored"             "id:zz"
-check_warn0 "id:jb ignored"             "id:jb"
+check_400    "id:zz rejected"            "id:zz"
+check_400    "id:jb rejected"            "id:jb"
 check_warn0 "id:rc mixed-c ignored"     "id:rc"
 check_warn0 "id:6 digit-range"          "id:6"
 check_warn0 "id:11 multi-digit"         "id:11"

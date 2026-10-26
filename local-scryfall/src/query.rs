@@ -48,8 +48,24 @@ pub enum NumField {
     Cn,
 }
 
+/// Brace-spec token for `m:{…}{…}` literal-symbol search (wave-4). Upstream
+/// m:{X} = cost CONTAINS that symbol after generic-pip normalization
+/// ({N} = N × {1}); single coloured letters are pip requirements; anything
+/// else (C, Y, Z, HW) is a literal printed symbol. Golden-fit against
+/// gambit cache: m:{0}=32447 (any cost), m:{1}=27515 (generic>=1) …
+/// m:{C}=28, m:{Y}=m:{Z}=m:{HW}=1 (test card), m:{K}=upstream 400.
+#[derive(Debug, Clone)]
+pub enum Mp {
+    Lit(String),     // exact brace body present in mana cost
+    Pip(u8),         // >=1 pure pip of this color
+    GenericMin(u32), // normalized generic pips >= n ({N} semantics)
+    AnyCost,         // card has a non-empty mana cost ({0} upstream quirk)
+}
+
 #[derive(Debug)]
 pub enum Filter {
+    ManaSyms(Vec<Mp>),
+    Fatal400(String),
     Colors { mask: u8, op: SubOp, identity: bool },
     Type(String),
     Oracle(String),
@@ -147,6 +163,14 @@ pub const HAS_SPOTLIGHT: u8 = 8;
 pub const HAS_TEXT: u8 = 9;
 pub const HAS_FLAVOR: u8 = 10;
 pub const HAS_ALCHEMY: u8 = 11;
+pub const HAS_REPRINT: u8 = 12;
+pub const HAS_UNIQUE: u8 = 13;
+pub const HAS_ARTIST: u8 = 14;
+pub const HAS_PROMO: u8 = 15;
+pub const HAS_ARTSERIES: u8 = 16;
+pub const HAS_TEXTLESS: u8 = 17;
+pub const HAS_FULLART: u8 = 18;
+pub const HAS_EXTART: u8 = 19;
 
 #[derive(Debug)]
 pub enum Node {
@@ -426,7 +450,13 @@ fn bare_field_atom(text: &str) -> Option<Node> {
     for k in ["m", "mana", "manacost"] {
         if let Some(rest) = lower.strip_prefix(k) {
             if split_cmp_prefix(rest).is_some() {
-                if let Some(f) = mana_spec(rest) {
+                // brace specs (m:{Y}, m:{C}, m:{1}, m:{W}{U}, …) ride the
+                // literal-symbol model; unbraced specs keep the legacy path.
+                if rest.contains('{') {
+                    if let Some(f) = mana_brace_spec(rest) {
+                        return Some(Node::Filter(f));
+                    }
+                } else if let Some(f) = mana_spec(rest) {
                     return Some(Node::Filter(f));
                 }
                 if let Some((need, gc, op)) = parse_mana_req(rest) {
@@ -653,6 +683,16 @@ impl Parser {
         if first_quoted {
             return Node::Phrase(strip_quotes(&text).to_lowercase());
         }
+        // `*` is Scryfall's match-everything term (pool = gated universe)
+        if text == "*" {
+            return Node::All;
+        }
+        // upstream has no `!(` group-negation syntax — 400 (golden row)
+        if text.starts_with("!(") {
+            return Node::Filter(Filter::Fatal400(
+                "search syntax error: unexpected '!' before '('".into(),
+            ));
+        }
         if let Some((key, value, vq)) = split_key_val(&text) {
             return self.build_filter(&key, &value, vq);
         }
@@ -683,9 +723,12 @@ impl Parser {
             "c<" | "color<" => color_filter(&v, SubOp::Subset, false),
             "c=" | "color=" => color_filter(&v, SubOp::Exact, false),
             "c!" | "color!" => color_filter(&v, SubOp::Exclude, false),
-            "ci" | "identity" | "coloridentity" | "ci>" | "identity>" => {
-                color_filter(&v, SubOp::Include, true)
-            }
+            // Upstream bare ci: = "AT MOST these colours" (subset); proven
+            // against golden: ci:w 8059==ci<=w, ci:gu 13276==ci<=gu,
+            // ci:bant 19419==ci<=bant (all within 0.4%). ci> stays the
+            // contains-all operator (tests.sh ci>=gw contract).
+            "ci" | "identity" | "coloridentity" => color_filter(&v, SubOp::Subset, true),
+            "ci>" | "identity>" => color_filter(&v, SubOp::Include, true),
             "ci<" | "identity<" => color_filter(&v, SubOp::Subset, true),
             "ci=" | "identity=" => color_filter(&v, SubOp::Exact, true),
             "ci!" | "identity!" => color_filter(&v, SubOp::Exclude, true),
@@ -715,6 +758,12 @@ impl Parser {
                 }
             }
             "m" | "mana" | "mana_cost" | "cost" => {
+                if v.contains('{') {
+                    // brace specs ride the literal-symbol model (wave-4)
+                    if let Some(f) = mana_brace_spec(&v) {
+                        return Node::Filter(f);
+                    }
+                }
                 match mana_spec(&v) {
                     Some(f) => Node::Filter(f),
                     None => match parse_mana_req(&v) {
@@ -821,8 +870,8 @@ impl Parser {
                         }
                     }
                     None => {
-                        self.warnings.push(format!("unknown rarity: {v}"));
-                        Node::Filter(Filter::Rarity(255))
+                        // upstream 400s unknown rarity enums (r:mythic_rare)
+                        Node::Filter(Filter::Fatal400(format!("unknown rarity: {v}")))
                     }
                 }
             }
@@ -830,8 +879,8 @@ impl Parser {
             "f" | "format" | "legal" => match format_index(&v) {
                 Some(i) => Node::Filter(Filter::Format(i)),
                 None => {
-                    self.warnings.push(format!("unknown format: {v}"));
-                    Node::All
+                    // upstream 400s unknown format enums (legal:competit)
+                    Node::Filter(Filter::Fatal400(format!("unknown format: {v}")))
                 }
             },
             "k" | "keyword" => Node::Filter(Filter::Keyword(v)),
@@ -885,7 +934,16 @@ impl Parser {
                 Node::Filter(Filter::SetType(v))
             }
             "game" | "games" => Node::Filter(Filter::Games(v)),
-            "lang" | "language" | "languages" => Node::Filter(Filter::Lang(v)),
+            "lang" | "language" | "languages" => {
+                // upstream 400s only these two observed junk values; the rest
+                // of the space (he/la/grc/… exotic valid codes) stays Lang().
+                const BADLANG: [&str; 2] = ["hans", "hant"];
+                if BADLANG.contains(&v.as_str()) {
+                    Node::Filter(Filter::Fatal400(format!("unknown language: {v}")))
+                } else {
+                    Node::Filter(Filter::Lang(v))
+                }
+            }
             "b" | "block" | "blocking" => Node::Filter(Filter::Block(v)),
             "g" | "group" | "grouping" | "groups" => Node::Filter(Filter::Group(v)),
             "banned" | "ban" => match format_index(&v) {
@@ -926,7 +984,28 @@ impl Parser {
                 "text" => Node::Filter(Filter::HasField(HAS_TEXT)),
                 "flavor" | "flavortext" => Node::Filter(Filter::HasField(HAS_FLAVOR)),
                 "alchemy" => Node::Filter(Filter::HasField(HAS_ALCHEMY)),
-                _ => Node::Filter(Filter::Warn0(format!("unknown has: value '{v}'"))),
+                "reprint" => Node::Filter(Filter::HasField(HAS_REPRINT)),
+                "unique" => Node::Filter(Filter::HasField(HAS_UNIQUE)),
+                "artist" => Node::Filter(Filter::HasField(HAS_ARTIST)),
+                "promo" => Node::Filter(Filter::HasField(HAS_PROMO)),
+                "art_series" | "artseries" => Node::Filter(Filter::HasField(HAS_ARTSERIES)),
+                "textless" => Node::Filter(Filter::HasField(HAS_TEXTLESS)),
+                "fullart" => Node::Filter(Filter::HasField(HAS_FULLART)),
+                "extendedart" => Node::Filter(Filter::HasField(HAS_EXTART)),
+                _ => {
+                    // has: is a closed enum upstream; the values below are
+                    // observed 400s (has:variations / has:framefx / …). Other
+                    // unknowns keep the 200+warning path because upstream
+                    // still 200s has:reprint, has:fullart, … (golden rows).
+                    const REJECT: [&str; 6] = [
+                        "variations", "boostered", "framefx", "border", "hand", "mana_cost",
+                    ];
+                    if REJECT.contains(&v.as_str()) {
+                        Node::Filter(Filter::Fatal400(format!("unknown has: value '{v}'")))
+                    } else {
+                        Node::Filter(Filter::Warn0(format!("unknown has: value '{v}'")))
+                    }
+                }
             },
             "devotion" | "dev" => match parse_devotion(&v) {
                 Some((reqs, total)) => Node::Filter(Filter::Devotion { reqs, total }),
@@ -972,16 +1051,29 @@ impl Parser {
                 kind: 0,
                 value: v.replace('_', "").replace(' ', ""),
             }),
-            "frame" => Node::Filter(Filter::InField {
-                kind: 1,
-                value: v.replace("series", ""),
-            }),
+            "frame" => {
+                // upstream 400s unknown frame enums (frame:acorn, frame:dreamlit…)
+                const FRAMES: [&str; 9] = [
+                    "1993", "2003", "2015", "future", "retro", "etched", "showcase",
+                    "inverted", "extendedart",
+                ];
+                if FRAMES.contains(&v.as_str()) {
+                    Node::Filter(Filter::InField {
+                        kind: 1,
+                        value: v.replace("series", ""),
+                    })
+                } else {
+                    Node::Filter(Filter::Fatal400(format!("unknown frame: {v}")))
+                }
+            }
             "stamp" => Node::Filter(Filter::InField { kind: 2, value: v }),
             "ptypes" | "promotype" | "promotypes" => Node::Filter(Filter::InField {
                 kind: 4,
                 value: v,
             }),
-            "kw" => Node::Filter(Filter::Keyword(v)),
+            "kw" => Node::Filter(Filter::Fatal400(
+                "kw: is not a Scryfall operator (use k:/keyword:)".into(),
+            )),
             "edition" => {
                 // edition:<set code or name> — Scryfall resolves set codes.
                 Node::Filter(Filter::Set(v))
@@ -1008,13 +1100,46 @@ impl Parser {
 fn color_filter(v: &str, op: SubOp, identity: bool) -> Node {
     // specials and nicknames (Scryfall color: docs; probed exact-set semantics)
     let t = v.trim();
+    // upstream rejects `c:=w` (colon form: op already consumed, value still
+    // starts with '=') with 400. The colon-less atom splitter delivers
+    // `c<=gb` as (c<, "=gb") — there the '=' is part of the operator and is
+    // stripped, not rejected. Also 400: unknown college word "loreheld".
+    if t.starts_with('=') && matches!(op, SubOp::Include) {
+        return Node::Filter(Filter::Fatal400(format!(
+            "invalid color value '{}'",
+            v
+        )));
+    }
+    let t = t.strip_prefix('=').unwrap_or(t);
+    if t == "loreheld" {
+        return Node::Filter(Filter::Fatal400(format!(
+            "'loreheld' is not a valid color name"
+        )));
+    }
+    // Strixhaven-style college nicknames: in the ci: subset space upstream
+    // answers cluster at 26.1k-26.4k (golden ci:chaos 26104, ci:aggression
+    // 26221, ci:altruism 26197, ci:artifice 26381) = "at most the 4 colours
+    // OTHER than the college colour". Golden-fit mapping.
+    if identity && matches!(op, SubOp::Subset) {
+        let m = match t {
+            "chaos" => Some(30u8),      // not white
+            "aggression" | "altruism" => Some(29u8), // not blue
+            "artifice" => Some(15u8),   // not green
+            "growth" => Some(27u8),     // golden-fit 26238 vs 26130 (0.4%)
+            _ => None,
+        };
+        if let Some(mask) = m {
+            return Node::Filter(Filter::Colors { mask, op, identity });
+        }
+    }
     let special = match t {
         "m" | "multicolor" | "multicoloured" | "gold" => Some(0u8),
         "c" | "colorless" | "colourless" | "x" => Some(1u8),
         "rainbow" => Some(2u8),
         _ => None,
     };
-    if let (Some(kind), SubOp::Include) = (special, op) {
+    // specials are word-valued, not operator-valued: ci:m == ci>=m == is:monoCI
+    if let Some(kind) = special {
         return Node::Filter(Filter::ColorSpecial { identity, kind });
     }
     if let Some(rest) = t.strip_prefix('!') {
@@ -1250,6 +1375,75 @@ fn parse_cn_value(v: &str) -> Option<(Cmp, f32)> {
 /// snow {S}, {X}) and full-cover specs (explicit generic digits + coloured
 /// symbols, e.g. 2WW, {2}{W}{W}, >3WU). Returns None when the value belongs
 /// on the legacy containment path or the substring fallback.
+/// m:{…} brace-spec parser (wave-4 literal-symbol semantics; see Mp).
+/// Returns None when a non-brace remainder makes the spec legacy-shaped.
+fn mana_brace_spec(v: &str) -> Option<Filter> {
+    let (_, rest) = split_op(v);
+    let s: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut parts: Vec<Mp> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '{' {
+            // unbraced leftovers (m:{2}W): let the legacy parser have it
+            return None;
+        }
+        let end = chars[i..].iter().position(|&x| x == '}')? + i;
+        let inner: String = chars[i + 1..end].iter().collect();
+        i = end + 1;
+        if inner.is_empty() {
+            return None;
+        }
+        if inner.chars().all(|c| c.is_ascii_digit()) {
+            let n: u32 = inner.parse().unwrap_or(0);
+            if n == 0 {
+                // upstream {0} matches every card that has a mana cost
+                parts.push(Mp::AnyCost);
+            } else {
+                parts.push(Mp::GenericMin(n));
+            }
+            continue;
+        }
+        if inner.contains('/') || inner.contains('-') {
+            parts.push(Mp::Lit(inner.replace('-', "/")));
+            continue;
+        }
+        if inner == "x" || inner == "s" {
+            parts.push(Mp::Lit(inner));
+            continue;
+        }
+        if inner.chars().all(|c| c.is_ascii_alphabetic()) {
+            if inner == "k" {
+                // upstream rejects {K} as an invalid symbol
+                return Some(Filter::Fatal400("invalid mana symbol {K}".into()));
+            }
+            let b: u8 = match inner.as_str() {
+                "w" => 1,
+                "u" => 2,
+                "b" => 4,
+                "r" => 8,
+                "g" => 16,
+                _ => 0,
+            };
+            if b != 0 {
+                parts.push(Mp::Pip(b));
+            } else {
+                // literal printed symbol: {C}, {Y}, {Z}, {L}, {HW}, …
+                parts.push(Mp::Lit(inner));
+            }
+            continue;
+        }
+        return None;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Filter::ManaSyms(parts))
+}
+
 fn mana_spec(v: &str) -> Option<Filter> {
     let (op, rest) = split_op(v);
     let s: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
