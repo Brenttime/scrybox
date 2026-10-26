@@ -583,4 +583,60 @@ router.get('/cards/:id/price-history', async (req, res) => {
   }
 });
 
+// Commander of the day: one legal commander per US-Eastern calendar day,
+// chosen deterministically from the date so every device agrees all day.
+// `show` says whether the dashboard should feature it today instead of the
+// top card (roughly every other day, also date-seeded). Served from the local
+// Scryfall mirror; cached in memory per day.
+const COTD_QUERY = 'is:commander legal:commander game:paper -is:digital';
+const cotdCache = new Map(); // day -> payload
+function easternDay(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+}
+function dayHash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function edhrecSlug(n) {
+  return String(n || '').split(' // ')[0].normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/['’,.]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+router.get('/stats/commander-of-the-day', async (req, res) => {
+  try {
+    const day = typeof req.query.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.day) ? req.query.day : easternDay();
+    if (cotdCache.has(day)) return res.json(cotdCache.get(day));
+    const { fetchWindow } = require('../scryfallApi');
+    const first = await fetchWindow(COTD_QUERY, null, 0, 1, 'name');
+    const total = first.total || 0;
+    if (!total) return res.status(503).json({ error: 'No commanders available' });
+    const idx = dayHash(`cotd:${day}`) % total;
+    const { cards } = idx === 0 ? first : await fetchWindow(COTD_QUERY, null, idx, 1, 'name');
+    const raw = cards[0];
+    if (!raw) return res.status(503).json({ error: 'No commander found' });
+    const face = (raw.card_faces && raw.card_faces[0]) || raw;
+    const img = raw.image_uris || face.image_uris || {};
+    const payload = {
+      day,
+      show: (dayHash(`show:${day}`) % 2) === 0,
+      card: {
+        id: raw.id,
+        name: raw.name,
+        type_line: raw.type_line || face.type_line || '',
+        color_identity: raw.color_identity || [],
+        set: raw.set,
+        image_url: img.normal || img.large || '',
+        art_crop: img.art_crop || '',
+        edhrec_url: `https://edhrec.com/commanders/${edhrecSlug(raw.name)}`,
+      },
+    };
+    cotdCache.set(day, payload);
+    if (cotdCache.size > 7) cotdCache.delete(cotdCache.keys().next().value);
+    res.json(payload);
+  } catch (err) {
+    console.error('commander-of-the-day failed:', err.message);
+    res.status(502).json({ error: 'Commander of the day unavailable' });
+  }
+});
+
 module.exports = router;

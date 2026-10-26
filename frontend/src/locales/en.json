@@ -120,6 +120,8 @@
   "dash.decks": "Decks",
   "dash.decksSub": "{built} built · {need} need cards",
   "dash.topCard": "Top card",
+  "dash.commanderOfDay": "Commander of the day",
+  "dash.commanderOfDaySub": "Open on EDHREC",
   "dash.colorGroups": "{count} groups",
   "dash.rarity": "Rarity",
   "dash.mostValuable": "Most valuable",
