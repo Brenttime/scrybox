@@ -25,13 +25,18 @@ const num = (v) => (v == null || v === '' || Number.isNaN(Number(v)) ? null : Nu
 // Upsert, not INSERT OR REPLACE. REPLACE deletes the row and inserts a new one, so
 // every column this list does NOT name is silently reset to its default — which
 // would cost the English name learned below the same way.
+const PRICE_COLUMNS = new Set(['price_trend', 'price_normal', 'price_holofoil', 'price_etched', 'price_currency', 'price_source']);
 const SET_CLAUSE = COLUMNS
   .filter(c => c !== 'id' && c !== 'name')
   // Partial set/catalog rows may not carry identity or layout eligibility.
   // Never erase durable values learned from a complete Scryfall card response.
   .map(c => (c === 'oracle_id' || c === 'scryfall_search_eligible' || c === 'oracle_text' || c === 'oracle_faces')
     ? `${c} = COALESCE(excluded.${c}, card_cache.${c})`
-    : `${c} = excluded.${c}`)
+    // A row with no price_source came from a price-less source (local sidecar,
+    // partial catalog rows): keep the last real quote rather than zero it.
+    : PRICE_COLUMNS.has(c)
+      ? `${c} = CASE WHEN excluded.price_source IS NULL THEN card_cache.${c} ELSE excluded.${c} END`
+      : `${c} = excluded.${c}`)
   .join(', ');
 
 // `name` is the one column an incoming row can be WORSE at. A non-English card
