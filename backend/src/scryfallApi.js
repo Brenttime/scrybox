@@ -285,6 +285,11 @@ function normalizeCard(raw, lang) {
   // hardcoded one silently misprices a collection. Falling back per row also keeps
   // every column in a row in ONE currency — a normal price in USD next to a foil
   // price in EUR would make the pair meaningless.
+  // A response WITHOUT a `prices` object (the local scryfall sidecar answers
+  // from bulk data it serves price-less) says nothing about the market. Leave
+  // the price fields undefined and price_source null so cacheNormalizedCards
+  // keeps the row's last real quote instead of overwriting it with $0.
+  const hasPrices = !!(raw.prices && typeof raw.prices === 'object');
   const prices = raw.prices || {};
   const money = (v) => (v != null ? parseFloat(v) : null);
   const eurOnly = money(prices.usd) == null && money(prices.usd_foil) == null
@@ -316,7 +321,7 @@ function normalizeCard(raw, lang) {
     set_name: raw.set_name || '',
     number: raw.collector_number || '',
     image_url: imgSrc.normal || imgSrc.large || imgSrc.small || '',
-    price_trend: usd != null ? usd : (usdFoil != null ? usdFoil : (usdEtched != null ? usdEtched : 0)),
+    price_trend: !hasPrices ? null : (usd != null ? usd : (usdFoil != null ? usdFoil : (usdEtched != null ? usdEtched : 0))),
     price_normal: usd,
     price_holofoil: usdFoil,
     price_etched: usdEtched,
@@ -346,7 +351,7 @@ function normalizeCard(raw, lang) {
     tcgplayer_product_id: raw.tcgplayer_id ?? raw.tcgplayer_etched_id ?? null,
     // Scryfall's `prices.usd` is TCGplayer's number and `prices.eur` Cardmarket's,
     // so the currency names the marketplace too (see the fallback above).
-    price_source: 'scryfall',
+    price_source: hasPrices ? 'scryfall' : null,
     price_currency: currency,
     ...oracleFields(raw)
   };
@@ -418,7 +423,9 @@ const scryfallUuid = (id) => {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw) ? raw : null;
 };
 
-async function bulkFetchByIdentifier(rows) {
+// `opts.upstream` pins the lookup to api.scryfall.com even when the local
+// sidecar is enabled: only the real API carries current TCGplayer prices.
+async function bulkFetchByIdentifier(rows, opts = {}) {
   const cards = [];
   const pairs = [];
   let notFound = 0;
@@ -442,7 +449,8 @@ async function bulkFetchByIdentifier(rows) {
       return { name: row.name || '' };
     });
 
-    const resp = await scryPostRetried('/cards/collection', { identifiers });
+    const resp = await scryPostRetried('/cards/collection', { identifiers },
+      opts.upstream ? { upstream: true } : undefined);
     notFound += ((resp.data && resp.data.not_found) || []).length;
     for (const raw of (resp.data && resp.data.data) || []) {
       const norm = normalizeCard(raw);
@@ -936,7 +944,7 @@ async function updateCollectionPrices(force = false) {
     // every code edit. /cards/collection takes 75 identifiers at a time, so the
     // same sweep is a handful of calls. Verified contract: { data, not_found }.
     try {
-      const { cards: fresh, pairs, notFound } = await bulkFetchByIdentifier(cards);
+      const { cards: fresh, pairs, notFound } = await bulkFetchByIdentifier(cards, { upstream: true });
       if (fresh.length) await cacheCards(fresh);
       for (const { row, card } of pairs) {
         await recordPrice(row.card_id, card.price_trend);
