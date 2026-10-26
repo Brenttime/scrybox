@@ -1167,6 +1167,45 @@ async function initDb() {
     `);
   }
 
+  // Revision for the cached GET /api/decks response (utils/deckListCache.js).
+  // Triggers on every table the deck list reads from bump it, so background
+  // writers (Moxfield sync, price sweeps, scans) invalidate the cache too, not
+  // just HTTP writes. card_cache only counts when a value the list shows moves.
+  await run(`
+    CREATE TABLE IF NOT EXISTS deck_list_revision (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      revision INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await run(`INSERT OR IGNORE INTO deck_list_revision (id, revision) VALUES (1, 0)`);
+  const deckListBump = `UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1;`;
+  for (const table of ['decks', 'deck_cards', 'collection', 'list_cards']) {
+    for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+      await run(`
+        CREATE TRIGGER IF NOT EXISTS deck_list_rev_${table}_${operation.toLowerCase()}
+        AFTER ${operation} ON ${table}
+        BEGIN ${deckListBump} END
+      `);
+    }
+  }
+  for (const operation of ['INSERT', 'DELETE']) {
+    await run(`
+      CREATE TRIGGER IF NOT EXISTS deck_list_rev_card_cache_${operation.toLowerCase()}
+      AFTER ${operation} ON card_cache
+      BEGIN ${deckListBump} END
+    `);
+  }
+  await run(`
+    CREATE TRIGGER IF NOT EXISTS deck_list_rev_card_cache_update
+    AFTER UPDATE ON card_cache
+    WHEN OLD.price_trend IS NOT NEW.price_trend OR OLD.price_normal IS NOT NEW.price_normal
+      OR OLD.price_holofoil IS NOT NEW.price_holofoil OR OLD.price_etched IS NOT NEW.price_etched
+      OR OLD.price_currency IS NOT NEW.price_currency OR OLD.image_url IS NOT NEW.image_url
+      OR OLD.name IS NOT NEW.name OR OLD.oracle_id IS NOT NEW.oracle_id
+      OR OLD.color_identity IS NOT NEW.color_identity OR OLD.subtypes IS NOT NEW.subtypes
+    BEGIN ${deckListBump} END
+  `);
+
   // TCGplayer orders already imported through the bookmarklet, so tapping it
   // again on the same Order History page does not file the cards twice.
   await run(`

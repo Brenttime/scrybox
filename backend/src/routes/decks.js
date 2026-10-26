@@ -8,6 +8,7 @@ const { withAllocationLock } = require('../utils/collectionHelpers');
 const { getDeckMinimumValues, emptyDeckMinimumValue, getCheapestPrices, currentPrintingPrice, deckCurrentPrintValues } = require('../utils/deckPricing');
 const { getDeckCommanders } = require('../utils/deckCommander');
 const { getDeckOwnership } = require('../utils/deckOwnership');
+const deckListCache = require('../utils/deckListCache');
 
 const router = express.Router();
 
@@ -78,6 +79,17 @@ async function getDeckCoverageRows(deckId, userId) {
 // Get User Decks
 router.get('/', async (req, res) => {
   try {
+    const { body, hit } = await deckListCache.getOrBuild(req.user.id, () => buildDeckList(req.user.id));
+    res.set('X-Deck-List-Cache', hit ? 'hit' : 'miss');
+    res.json(body);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to retrieve decks' });
+  }
+});
+
+async function buildDeckList(userId) {
+  {
     const query = `
       SELECT
         d.id,
@@ -110,15 +122,15 @@ router.get('/', async (req, res) => {
       GROUP BY d.id
       ORDER BY d.created_at DESC
     `;
-    const rows = await db.all(query, [req.user.id]);
+    const rows = await db.all(query, [userId]);
     // Value and commander art are both deck-wide scans that must stay one-pass,
     // but they are independent, so they run together.
     const [values, commanders, ownership] = await Promise.all([
       getDeckMinimumValues(db, rows.map(row => row.id)),
-      getDeckCommanders(db, req.user.id),
-      getDeckOwnership(db, req.user.id),
+      getDeckCommanders(db, userId),
+      getDeckOwnership(db, userId),
     ]);
-    res.json(rows.map(row => {
+    return rows.map(row => {
       const commander = commanders.get(Number(row.id));
       const own = ownership.get(Number(row.id)) || { missing_card_types: 0, missing_copies: 0 };
       return {
@@ -134,12 +146,9 @@ router.get('/', async (req, res) => {
         // from the card id, not from the provider URL.
         commander_card_id: commander ? commander.commander_card_id : null,
       };
-    }));
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Failed to retrieve decks' });
+    });
   }
-});
+}
 
 // Create Deck
 router.post('/', async (req, res) => {
