@@ -1875,6 +1875,7 @@ select optgroup,
 @media (max-width: 720px) {
   .list-editor-header-actions {
     width: 100%;
+    align-items: stretch !important;
     display: grid !important;
     grid-auto-flow: column;
     grid-auto-columns: minmax(0, 1fr);
@@ -1885,7 +1886,8 @@ select optgroup,
     justify-content: center;
     gap: 0.25rem !important;
     width: 100%;
-    min-height: 56px;
+    height: 60px !important;
+    min-height: 0 !important;
     padding: 0.45rem 0.2rem;
     font-size: 0.68rem;
     line-height: 1.1;
