@@ -49,10 +49,10 @@ import PackPriceSplitter from './PackPriceSplitter';
 import CardImage from './CardImage';
 import MultiSelectDropdown from './MultiSelectDropdown';
 import ColorPicker from './ColorPicker';
+import Field from './FilterField';
 import { getScrollTop, getViewportHeight, getScrollHeight, offsetInScroller, scrollToTop } from '../utils/scrollRoot';
 import { CARD_TYPES, MANA_VALUES, mvBucket, cardTypes, cardSubtypes, uniqueSorted, sortRarities, matchMtgFilters } from '../utils/mtgFilters';
 
-const labelStyle = { fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.03em' };
 const BACKGROUND_PAGE_SIZE = 2000;
 const BACKGROUND_PAGE_CONCURRENCY = 2;
 
@@ -74,16 +74,6 @@ const SORT_CRITERIA = {
   'type-asc': [{ by: 'type', dir: 'asc' }, { by: 'name', dir: 'asc' }],
   'language-asc': [{ by: 'language', dir: 'asc' }, { by: 'name', dir: 'asc' }],
 };
-
-// Small labelled field wrapper to keep the filter grid uniform.
-function Field({ label, children, style }) {
-  return (
-    <div className="form-group" style={{ marginBottom: 0, ...style }}>
-      <label style={labelStyle}>{label}</label>
-      {children}
-    </div>
-  );
-}
 
 function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCardFilter, setSelectedCardFilter }) {
   const { t } = useT();
