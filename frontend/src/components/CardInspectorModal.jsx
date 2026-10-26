@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Maximize2, RefreshCw } from 'lucide-react';
+import { X, RefreshCw } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
 import { formatPrice, priceText } from '../utils/formatPrice';
@@ -15,12 +15,6 @@ import { useBackGuard } from '../utils/useBackGuard';
 import { useT } from '../utils/i18n';
 
 // MTG color identity pip colors (WUBRG), approximating the printed mana colors.
-const MTG_COLOR_BG = {
-  White: '#f8f6d8', Blue: '#0e68ab', Black: '#2b2422', Red: '#d3202a', Green: '#00733e'
-};
-const MTG_COLOR_FG = {
-  White: '#3a3520', Blue: '#fff', Black: '#fff', Red: '#fff', Green: '#fff'
-};
 
 // Shared card detail popup used by Dashboard and CollectionList.
 // Self-contained: owns its edit form (PUT) and delete (DELETE) so every screen
@@ -323,28 +317,8 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 <span>{t('inspector.flip')}</span>
               </button>
             )}
-            <div style={{
-              position: 'absolute',
-              bottom: '0.6rem',
-              right: '0.6rem',
-              background: 'rgba(0,0,0,0.65)',
-              backdropFilter: 'blur(6px)',
-              padding: '0.25rem 0.5rem',
-              borderRadius: 'var(--radius-sm)',
-              color: '#fff',
-              fontSize: '0.65rem',
-              fontWeight: 700,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.3rem',
-              pointerEvents: 'none',
-              border: '1px solid rgba(255,255,255,0.15)'
-            }}>
-              <Maximize2 size={12} />
-              <span>{t('inspector.fullScreen')}</span>
-            </div>
           </div>
-          <CardImageActions card={card} compact getSrc={() => (flipped && backUrl) || document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
+          <CardImageActions card={card} compact onEdit={!readOnly && mode !== 'edit' ? () => setMode('edit') : null} getSrc={() => (flipped && backUrl) || document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
         </div>
 
         {/* Right side: Information / Edit */}
@@ -388,24 +362,8 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {' • '}{t('inspector.owned', { count: card.quantity ?? 1 })}
             </p>
 
-            {/* MTG cards: show color pips + type line. */}
-            {card.supertype === 'MTG' && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.5rem' }}>
-                {(Array.isArray(card.types) ? card.types : []).map(color => (
-                  <span key={color} className={`mtg-color-pip mtg-color-${color.toLowerCase()}`} style={{
-                    fontSize: '0.6rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.03em',
-                    padding: '0.15rem 0.45rem', borderRadius: '999px',
-                    background: MTG_COLOR_BG[color] || 'rgba(255,255,255,0.1)',
-                    color: MTG_COLOR_FG[color] || '#fff', border: '1px solid rgba(0,0,0,0.2)'
-                  }}>{color}</span>
-                ))}
-                {(!card.types || card.types.length === 0) && (
-                  <span style={{ fontSize: '0.6rem', fontWeight: 800, textTransform: 'uppercase', padding: '0.15rem 0.45rem', borderRadius: '999px', background: 'rgba(180,180,180,0.25)', color: '#eee' }}>{t('inspector.colorless')}</span>
-                )}
-                {Array.isArray(card.subtypes) && card.subtypes.length > 0 && (
-                  <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{card.subtypes.join(' ')}</span>
-                )}
-              </div>
+            {Array.isArray(card.subtypes) && card.subtypes.length > 0 && (
+              <p className="ci-subtypes" style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>{card.subtypes.join(' ')}</p>
             )}
           </div>
 
@@ -423,7 +381,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
           )}
 
           {mode !== 'edit' && oracle && (oracle.faces?.length || oracle.oracle_text) ? (
-            <div className="ci-oracle" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.7rem 0.85rem' }}>
+            <div className="ci-oracle" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
               {(oracle.faces?.length ? oracle.faces : [{ oracle_text: oracle.oracle_text }]).map((face, i) => (
                 <div key={i}>
                   {face.name && (
@@ -500,42 +458,28 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
             </form>
           ) : (
             <>
-              {/* Price Panel */}
-              <div style={{ borderTop: '1px solid var(--border-glass)', borderBottom: '1px solid var(--border-glass)', padding: '0.75rem 0', display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '1rem' }}>
-                <div>
-                  <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700 }}>{t('inspector.marketPrice')}</div>
-                  <div style={{ fontSize: '1.25rem', fontWeight: 800, color: 'var(--accent-yellow)', marginTop: '0.15rem' }}>
-                    {priceText(displayPrice, card.price_currency)}
+              {/* Price: one line. Market (accent) and what was paid (muted). */}
+              <div className="ci-price-line" style={{ borderTop: '1px solid var(--border-glass)', paddingTop: '0.7rem', display: 'flex', alignItems: 'baseline', gap: '0.75rem', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--accent-yellow)' }}>{priceText(displayPrice, card.price_currency)}</span>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{t('inspector.market')}</span>
+                {!readOnly && (
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginLeft: 'auto' }}>{t('inspector.paid')} ${formatPrice(card.purchase_price)}</span>
+                )}
+                {priceSource(card) && (
+                  <div style={{ flexBasis: '100%', fontSize: '0.62rem', color: 'var(--text-muted)' }}>
+                    {t('inspector.priceVia', { source: priceSource(card).name, currency: priceSource(card).currency })}
                   </div>
-                  {/* Say where a non-English price came from and in what currency —
-                      it is Cardmarket's EUR figure rendered with the app's $. */}
-                  {priceSource(card) && (
-                    <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)', marginTop: '0.1rem' }}>
-                      {t('inspector.priceVia', { source: priceSource(card).name, currency: priceSource(card).currency })}
-                    </div>
-                  )}
-                  {/* Printings are priced separately; conditions are not, by anyone
-                      Scrybox talks to — TCGplayer, Scryfall and Cardmarket all quote
-                      a Near Mint copy. Saying so beats letting a played card show a
-                      NM price with nothing to explain it, and beats inventing a
-                      condition multiplier, which would be a made-up number wearing
-                      the same styling as a real one. */}
-                  {condition && condition !== 'Near Mint' && (
-                    <div style={{ fontSize: '0.62rem', color: 'var(--text-muted)', marginTop: '0.1rem', lineHeight: 1.35 }}>
-                      {t('inspector.priceNearMintOnly', { condition })}
-                    </div>
-                  )}
-                </div>
-                {!readOnly && <div>
-                  <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', fontWeight: 700 }}>{t('inspector.purchaseValue')}</div>
-                  <div style={{ fontSize: '1.25rem', fontWeight: 800, color: 'var(--text-strong)', marginTop: '0.15rem' }}>
-                    ${formatPrice(card.purchase_price)}
+                )}
+                {/* Sources quote Near Mint only; say so rather than invent a condition multiplier. */}
+                {condition && condition !== 'Near Mint' && (
+                  <div style={{ flexBasis: '100%', fontSize: '0.62rem', color: 'var(--text-muted)', lineHeight: 1.35 }}>
+                    {t('inspector.priceNearMintOnly', { condition })}
                   </div>
-                </div>}
+                )}
               </div>
 
               {/* Price History Area Chart */}
-              <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={100} defaultRange="30d" />
+              <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={80} defaultRange="30d" />
 
               {!readOnly && card.notes && (
                 <div style={{ background: 'rgba(0,0,0,0.15)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.6rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
@@ -546,12 +490,6 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               {/* Caller-specific controls (e.g. deck quantity) sit above Edit. */}
               {children}
 
-              {/* One clear entry point: every per-copy change lives in Edit. */}
-              {!readOnly && (
-                <button type="button" className="btn btn-primary ci-edit-btn" style={{ width: '100%', padding: '0.8rem 1rem', fontSize: '0.95rem', fontWeight: 700 }} onClick={() => setMode('edit')}>
-                  {t('inspector.editCard')}
-                </button>
-              )}
 
             </>
           )}
