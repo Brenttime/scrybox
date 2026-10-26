@@ -182,9 +182,12 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
   // /api/decks is served from the trigger-revision deck-list cache, so the
   // counts cost nothing extra on the server.
-  // Some days the art tile features a random legal commander instead of the
-  // top card. The server picks it from the date, so it is stable all day.
+  // Commander of the day: the server picks one per day; whether this load
+  // features it instead of the top card is a coin flip below.
   const [cotd, setCotd] = useState(null);
+  // Coin flip per page load: roughly every other load/reload features the
+  // commander (the commander itself is fixed for the day).
+  const [showCotd] = useState(() => Math.random() < 0.5);
   useEffect(() => {
     let alive = true;
     fetch('/api/stats/commander-of-the-day')
@@ -325,7 +328,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
           {decks && <span className="dash-sub dim">{t('dash.decksSub', { built: decks.built, need: decks.needCards })}</span>}
         </button>
 
-        {cotd && cotd.show ? (
+        {cotd && showCotd ? (
           <a className="dash-tile dash-art" href={cotd.card.edhrec_url} target="_blank" rel="noreferrer" title={cotd.card.type_line}>
             <img src={cotd.card.art_crop || artCrop(cotd.card.image_url)} onError={(e) => { if (e.currentTarget.src !== cotd.card.image_url) e.currentTarget.src = cotd.card.image_url; }} className="dash-art-img" alt="" loading="lazy" />
             <span className="dash-art-shade" />
