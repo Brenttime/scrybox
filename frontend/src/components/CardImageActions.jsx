@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Copy, Check, Share2 } from 'lucide-react';
+import { Copy, Check, Share2, Pencil } from 'lucide-react';
 import { useT } from '../utils/i18n';
 import { copyCardImage, shareCardImage, canShareFiles } from '../utils/cardImageShare';
 
@@ -7,7 +7,9 @@ import { copyCardImage, shareCardImage, canShareFiles } from '../utils/cardImage
 // and the full-screen viewer so both behave identically. `getSrc` returns the
 // URL actually displayed (contributed art, Scryfall, or card back); falls back
 // to the card's provider image.
-export default function CardImageActions({ card, getSrc, compact = false }) {
+// `onEdit` adds a pencil pill beside Share (card details only), so editing a
+// copy is one tap from the top of the sheet instead of a button below the fold.
+export default function CardImageActions({ card, getSrc, compact = false, onEdit = null }) {
   const { t } = useT();
   const [status, setStatus] = useState(null); // 'copied' | 'shared' | 'saved' | 'error'
   const [busy, setBusy] = useState(false);
@@ -46,6 +48,12 @@ export default function CardImageActions({ card, getSrc, compact = false }) {
         <button type="button" className="zoom-action" onClick={run(shareCardImage)} disabled={busy}>
           <Share2 size={18} />
           <span>{t('zoom.share')}</span>
+        </button>
+      )}
+      {onEdit && (
+        <button type="button" className="zoom-action zoom-action-edit" onClick={(e) => { e.stopPropagation(); onEdit(); }} aria-label={t('inspector.editCard')}>
+          <Pencil size={18} />
+          <span>{t('inspector.edit')}</span>
         </button>
       )}
     </div>
