@@ -977,28 +977,26 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             {activeList.description && <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{activeList.description}</div>}
           </div>
         </div>
-        <div className="list-editor-header-actions" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-          {(listDetail?.cards || []).some(c => (c.owned_qty || 0) < c.quantity) ? (
+        <div className="list-editor-header-actions" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          {/* Everyday actions sit in view (one sideways row on a phone); the
+              menu keeps only the rare and destructive ones. */}
+          {(listDetail?.cards || []).some(c => (c.owned_qty || 0) < c.quantity) && (
             <button className="btn btn-primary" onClick={openBuy} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               <ShoppingCart size={16} /> {t('lists.buyMissing')}
             </button>
-          ) : (
-            <button className="btn btn-primary" onClick={openCopy} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <Copy size={16} /> {t('lists.copyList')}
-            </button>
           )}
+          <button className="btn btn-secondary" onClick={openCopy} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <Copy size={15} /> {t('lists.copyShort')}
+          </button>
+          <button className="btn btn-secondary" onClick={moveToCheapestPrintings} disabled={movingCheapest || savingCard} title={t('lists.cheapestTitle')} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <Wand2 size={15} /> {movingCheapest ? t('lists.cheapestWorking') : t('lists.cheapestShort')}
+          </button>
+          <button className="btn btn-secondary" onClick={registerInCollection} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <PackagePlus size={15} /> {t('lists.registerShort')}
+          </button>
           <OverflowMenu label={t('lists.moreActions')}>
-            <button role="menuitem" style={menuItem} onClick={openCopy}>
-              <Copy size={14} /> {t('lists.copyList')}
-            </button>
             <button role="menuitem" style={menuItem} onClick={openBuy}>
               <ShoppingCart size={14} /> {t('lists.buyList')}
-            </button>
-            <button role="menuitem" style={menuItem} onClick={moveToCheapestPrintings} disabled={movingCheapest || savingCard}>
-              <Wand2 size={14} /> {movingCheapest ? t('lists.cheapestWorking') : t('lists.cheapestButton')}
-            </button>
-            <button role="menuitem" style={menuItem} onClick={registerInCollection}>
-              <PackagePlus size={14} /> {t('lists.registerButton')}
             </button>
             <button role="menuitem" style={{ ...menuItem, color: 'var(--accent-red)' }} onClick={pullFromCollection}>
               <PackageMinus size={14} /> {t('lists.pullButton')}
