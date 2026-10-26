@@ -29,8 +29,9 @@ const isIOSBrowserTab = () => {
 
 const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-function blocked(target) {
-  for (let el = target; el && el !== document.body; el = el.parentElement) {
+function blocked(target, root = null) {
+  if (root && !root.contains(target)) return true;
+  for (let el = target; el && el !== document.body && el !== root; el = el.parentElement) {
     if (el.matches?.('input, textarea, select, [contenteditable="true"], [data-no-swipe-back]')) return true;
     const cs = getComputedStyle(el);
     if (cs.position === 'fixed' && !el.querySelector('main')) return true;
@@ -41,9 +42,14 @@ function blocked(target) {
 
 const page = () => document.querySelector('main .view-transition');
 
-export function useSwipeBack(enabled, onBack) {
+// `opts.el` (() => Element) swipes that element instead of the page, for fixed
+// layers such as the card details modal: drags must start inside it, it slides
+// off by itself (its own backdrop goes with it, revealing the page), and there
+// is no index to ease in afterwards.
+export function useSwipeBack(enabled, onBack, opts = null) {
   const onBackRef = useRef(onBack);
   onBackRef.current = onBack;
+  const getEl = opts?.el || null;
 
   useEffect(() => {
     if (!enabled) return undefined;
@@ -83,7 +89,9 @@ export function useSwipeBack(enabled, onBack) {
       if (busy || e.touches.length !== 1) { s = null; return; }
       const t = e.touches[0];
       if (skipEdge && t.clientX < EDGE) { s = null; return; }
-      if (blocked(e.target)) { s = null; return; }
+      const root = getEl ? getEl() : null;
+      if (getEl && !root) { s = null; return; }
+      if (blocked(e.target, root)) { s = null; return; }
       s = { x: t.clientX, y: t.clientY, mode: null, dx: 0, lastX: t.clientX, lastT: e.timeStamp, v: 0, el: null };
     };
 
@@ -96,7 +104,7 @@ export function useSwipeBack(enabled, onBack) {
         if (Math.abs(dx) < LOCK && Math.abs(dy) < LOCK) return;
         s.mode = dx > 0 && Math.abs(dx) > Math.abs(dy) * 1.3 ? 'h' : 'v';
         if (s.mode === 'h') {
-          s.el = page();
+          s.el = getEl ? getEl() : page();
           if (!s.el) { s = null; return; }
           s.x = t.clientX; // track from here so the page doesn't jump
           s.el.classList.add('swipe-back-card');
@@ -110,7 +118,7 @@ export function useSwipeBack(enabled, onBack) {
       s.lastX = t.clientX; s.lastT = e.timeStamp;
       s.dx = Math.max(0, t.clientX - s.x);
       s.el.style.transform = `translate3d(${s.dx}px,0,0)`;
-      setShade(s.dx / window.innerWidth, s.el);
+      if (!getEl) setShade(s.dx / window.innerWidth, s.el);
     };
 
     const end = () => {
@@ -135,6 +143,11 @@ export function useSwipeBack(enabled, onBack) {
       el.style.transition = `transform ${ms}ms ${EASE}`;
       if (shade) { shade.style.transition = `opacity ${ms}ms ${EASE}`; shade.style.opacity = '0'; }
       el.style.transform = `translate3d(${w}px,0,0)`;
+      if (getEl) {
+        // A modal just leaves; whatever was under it is already in place.
+        after(el, ms, () => { busy = false; onBackRef.current?.(); });
+        return;
+      }
       after(el, ms, () => {
         // Swap to the index while off-screen, then ease it in from the left.
         dropShade();
@@ -164,5 +177,5 @@ export function useSwipeBack(enabled, onBack) {
       // runs and cleans up after itself, so only reset when idle.
       if (!busy) clear(null);
     };
-  }, [enabled]);
+  }, [enabled, getEl]);
 }

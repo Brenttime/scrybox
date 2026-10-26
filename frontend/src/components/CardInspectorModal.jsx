@@ -12,6 +12,7 @@ import CardImageActions from './CardImageActions';
 import CardEntryFields from './CardEntryFields';
 import PriceHistoryChart from './PriceHistoryChart';
 import { useBackGuard } from '../utils/useBackGuard';
+import { useSwipeBack } from '../utils/useSwipeBack';
 import { useT } from '../utils/i18n';
 
 // MTG color identity pip colors (WUBRG), approximating the printed mana colors.
@@ -20,6 +21,8 @@ import { useT } from '../utils/i18n';
 // Self-contained: owns its edit form (PUT) and delete (DELETE) so every screen
 // gets the same rich view + edit without duplicating the form. onUpdate() lets
 // the parent refetch after a change.
+const SWIPE_OPTS = { el: () => document.querySelector('.modal-overlay.ci-overlay') };
+
 function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false, children = null }) {
   const { t } = useT();
   const [mode, setMode] = useState('view');
@@ -103,6 +106,8 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   };
 
   useBackGuard(!!card, handleClose);
+  // Swipe right to close, like open decks and lists (not over the full-screen viewer).
+  useSwipeBack(!!card && !isFullScreen, handleClose, SWIPE_OPTS);
 
   if (!card) return null;
 
@@ -248,7 +253,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   const displayPrice = resolveCardPrice(card, printing);
 
   return (
-    <div className="modal-overlay" style={{
+    <div className="modal-overlay ci-overlay" style={{
       position: 'fixed',
       top: 0, left: 0, right: 0, bottom: 0,
       backgroundColor: 'rgba(0,0,0,0.75)',
