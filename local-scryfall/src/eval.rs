@@ -81,17 +81,28 @@ fn node_has_id(n: &Node) -> bool {
 /// return the sheets, is:token returns tokens, plain text search does NOT).
 /// api.rs skips the default-search pool gate for these queries.
 pub fn wants_extras(nodes: &[Node]) -> bool {
-    nodes.iter().any(node_wants_extras)
+    nodes.iter().any(|n| node_wants_extras(n, false))
 }
 
-fn node_wants_extras(n: &Node) -> bool {
+fn node_wants_extras(n: &Node, in_not: bool) -> bool {
     match n {
-        Node::And(v) | Node::Or(v) => v.iter().any(node_wants_extras),
-        Node::Not(b) => node_wants_extras(b),
-        Node::Filter(f) => filter_wants_extras(f),
+        Node::And(v) | Node::Or(v) => v.iter().any(|x| node_wants_extras(x, in_not)),
+        Node::Not(b) => node_wants_extras(b, true),
+        Node::Filter(f) => filter_wants_extras(f, in_not),
         _ => false,
     }
 }
+
+/// parity w5 §9 (borrow report): NEGATIVE print-attribute terms (-is:fnm,
+/// -is:judge_gift, …) are oracle predicates over the VISIBLE pool upstream
+/// (−is:fnm 33,827 = pool), unlike the positives which search the hidden
+/// promo printings themselves (extras semantics, no dedup). Inside NOT(),
+/// these tags therefore do NOT unlock extras.
+const PRINT_ATTR_NEG: &[&str] = &[
+    "datestamped", "buyabox", "boosterfun", "fnm", "judgegift", "judge_gift", "prerelease",
+    "inset", "promopack", "league", "openrunner", "bundle", "emergency", "stamped",
+    "textlesspromo", "serialized", "invitational", "gameday",
+];
 
 const EXTRAS_TYPE_WORDS: &[&str] = &[
     "token", "tokens", "scheme", "schemes", "vanguard", "vanguards", "phenomenon",
@@ -115,7 +126,7 @@ const EXTRAS_LAYOUTS: &[&str] = &[
     "phenomenon", "contraption", "art_series", "front_card",
 ];
 
-fn filter_wants_extras(f: &Filter) -> bool {
+fn filter_wants_extras(f: &Filter, in_not: bool) -> bool {
     match f {
         Filter::IncludeVal(v) => v == "extras" || v == "all",
         // explicit set/collection targeting shows the printings searched
@@ -134,7 +145,10 @@ fn filter_wants_extras(f: &Filter) -> bool {
         Filter::Layout(v) => EXTRAS_LAYOUTS.contains(&v.as_str()),
         Filter::Regex { field, .. } => *field == 2 || *field == 0, // t~/re/, name~/re/
         Filter::Type(v) => v.split_whitespace().any(|w| EXTRAS_TYPE_WORDS.contains(&w)),
-        Filter::Is(v) => EXTRAS_IS_WORDS.contains(&v.as_str()),
+        Filter::Is(v) => {
+            EXTRAS_IS_WORDS.contains(&v.as_str())
+                && !(in_not && PRINT_ATTR_NEG.contains(&v.as_str()))
+        }
         _ => false,
     }
 }
@@ -1722,7 +1736,10 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         // = has at least one non-atypical printing (print-level predicate;
         // upstream: is:default is:atypical == 0 per-print, both can hold at
         // oracle level).
-        "atypical" => return scan(ix, |i| ix.cards[i as usize].atypical),
+        // parity w5 §9: is:atypical = the printing carries ANY frame_effects
+        // (borrow report: ∃ any frame_effects → 10,341 vs 10,562 golden; the
+        // old bulk `atypical` bool only flagged 8,300).
+        "atypical" => return scan(ix, |i| ix.cards[i as usize].ffx != 0),
         "default" => return scan(ix, |i| !ix.cards[i as usize].atypical),
         "masterpiece" => return scan(ix, |i| ix.cards[i as usize].masterpiece),
         // Universes Beyond prints (bulk promo_types carries 'universesbeyond').
@@ -2003,7 +2020,15 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "modal" => return scan(ix, |i| ix.oracle_lc(i).contains("choose one")),
         "datestamped" | "buyabox" | "boosterfun" | "fnm" | "judgegift" | "judge_gift"
         | "prerelease" | "inset" | "promopack" | "league" | "boxtopper" | "openrunner"
-        | "bundle" | "planeswalkerdeck" | "emergency" | "stamped" | "textlesspromo" => {
+        | "bundle" | "planeswalkerdeck" | "planeswalker_deck" | "emergency" | "stamped"
+        | "textlesspromo" | "gameday" | "giftbox" | "glossy" | "intropack" | "intro_pack"
+        | "mediainsert" | "media_insert" | "setpromo" | "set_promo" | "arenaleague"
+        | "arena_league" | "convention" | "playerrewards" | "player_rewards" | "release"
+        | "instore" | "in_store" | "storechampionship" | "store_championship" => {
+            // parity w5 §9: bulk promo_types values match upstream totals on
+            // the visible pool — gameday 81/81, giftbox 16/16, glossy 7/7,
+            // intropack 40/40, mediainsert 595/595 EXACT (probe-verified).
+            // Not in EXTRAS_IS_WORDS: these dedup/gate like normal search.
             let q = t.trim_end_matches('s').to_string();
             let q2 = t.to_string();
             let q3 = t.replace('_', "");
