@@ -116,6 +116,11 @@ pub const F2_SC_PREVIEW: u64 = 1 << 22;
 /// misfired on both: is:hybrid 927 vs golden 624). Regex-validated in the
 /// w7 replay: 631 vs 624, page-1 members all present.
 pub const F2_HYBRID: u64 = 1 << 23;
+/// Parity w7 (borrow A6c): some face type line (top-level or card_faces[])
+/// is simultaneously 'legendary' and creature/vehicle/spacecraft — the
+/// is:duelcommander commander-candidate shape (vehicles crew, so a
+/// legendary Vehicle from a duel deck counts; validated veh=1 in the sim).
+pub const F2_LEGCRE_ANY: u64 = 1 << 24;
 
 /// True when a raw mana string contains a hybrid pip: `{A/B}` with A,B in
 /// WUBRG, `{2/A}`, or the three-symbol hybrid-phyrexian `{A/B/P}`. Pure
@@ -1837,6 +1842,34 @@ fn parse_line(line: &str) -> Option<RawC> {
         || faces_arr.iter().any(|f| has_hybrid_pip(&fstr(f, "mana_cost")))
     {
         flags2 |= F2_HYBRID;
+    }
+    // Parity w7 (borrow A6c): legendary creature/vehicle on one face —
+    // per-face word check (LEG_MAIN ∧ CRE_MAIN misses duel-deck cards
+    // whose back face is the commander; has_any() word-union would
+    // cross-faces and let a legendary land + nonlegendary creature leak).
+    {
+        let mut tl_ok = false;
+        let mut tls: Vec<&str> = vec![type_line.as_str()];
+        let mut ftls: Vec<&str> = Vec::new();
+        for f in &faces_arr {
+            if let Some(x) = f.get("type_line").and_then(|x| x.as_str()) {
+                ftls.push(x);
+            }
+        }
+        tls.extend(ftls.iter().copied());
+        for tl in tls {
+            let tl_lc = tl.to_lowercase();
+            let words: Vec<&str> = tl_lc.split(|c: char| !c.is_alphabetic()).filter(|x| !x.is_empty()).collect();
+            let legend = words.iter().any(|w| *w == "legendary");
+            let shape = words.iter().any(|w| *w == "creature" || *w == "vehicle" || *w == "spacecraft");
+            if legend && shape {
+                tl_ok = true;
+                break;
+            }
+        }
+        if tl_ok {
+            flags2 |= F2_LEGCRE_ANY;
+        }
     }
     let mut pts: Vec<(Option<f64>, Option<f64>, Option<f64>)> = vec![(
         opt_num(&v, "power"),

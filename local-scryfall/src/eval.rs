@@ -2440,21 +2440,23 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "duelcommander" | "duel-commander" => {
+            // Parity w7 (borrow A6c): duels-legal AND (legendary
+            // creature/vehicle on some face — vehicles crew, validated
+            // veh=1 — OR a Planeswalker face ONLY when the text carries
+            // the CBC clause; the old arm accepted every duels-legal PW,
+            // 3,718 vs golden 3,409). Funny set_types are NOT excluded
+            // (nofunny=0 validated); per-row token/hidden exclusions
+            // removed — replay quantified over all default printings and
+            // let the pool gate do the visibility work (api id_vis_bits).
+            // Replay: 3,475 vs 3,409, page-1 miss 0.
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
-                    return false;
-                }
                 let legal_duel = ((c.legal >> (18 * 2)) & 3) as u32 == L_LEGAL;
                 if !legal_duel {
                     return false;
                 }
-                if c.flags2 & F2_CBC != 0 {
-                    return true;
-                }
-                c.flags2 & F2_LEG_MAIN != 0
-                    && (c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
-                        || c.flags2 & F2_PW_ANY != 0)
+                c.flags2 & F2_LEGCRE_ANY != 0
+                    || (c.flags2 & F2_PW_ANY != 0 && c.flags2 & F2_CBC != 0)
             });
         }
         "partner" => {
