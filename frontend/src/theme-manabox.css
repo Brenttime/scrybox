@@ -209,7 +209,7 @@
 }
 
 /* Phone: ManaBox bottom tab bar */
-@media (max-width: 768px) {
+@media (max-width: 768px), (pointer: coarse) and (max-width: 940px) {
   :root[data-theme="manabox"] .nav-tabs {
     background: #1a1d22;
     border-top: 1px solid var(--mb-line);
