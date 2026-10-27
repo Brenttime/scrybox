@@ -36,6 +36,9 @@ pub enum NumField {
     PriceTix,
     PriceEur,
     PriceEurFoil,
+    /// Parity w6a: etched-price market field — never present on the slimmed
+    /// default dump; compared purely via the all_cards side index.
+    PriceUsdEtched,
     Edhrec,
     Prints,
     Sets,
@@ -194,6 +197,11 @@ pub enum Node {
     Or(Vec<Node>),
     Not(Box<Node>),
     Text(String),
+    /// Bare word left over after the tokenizer split `keyword:A B` (the
+    /// keyword: term was dropped as unknown). Upstream answers these residuals
+    /// with a STRICT name-substring search — no prefix/fuzzy/apostrophe
+    /// guessing (golden: 'gigas' = 2, upstream; fuzzy union = 183).
+    TextKw(String),
     Phrase(String),
     Filter(Filter),
 }
@@ -406,6 +414,8 @@ fn bare_field_atom(text: &str) -> Option<Node> {
     for (k, f) in [
         ("usd_foil", NumField::PriceUsdFoil),
         ("usdfoil", NumField::PriceUsdFoil),
+        ("usd_etched", NumField::PriceUsdEtched),
+        ("usdetched", NumField::PriceUsdEtched),
         ("usd", NumField::PriceUsd),
         ("eur_foil", NumField::PriceEurFoil),
         ("eurfoil", NumField::PriceEurFoil),
@@ -557,6 +567,9 @@ struct Parser {
     toks: Vec<Tok>,
     pos: usize,
     pub warnings: Vec<String>,
+    /// true right after a keyword:/kw: atom was DROPPED as unknown; the next
+    /// bare-word atom is the split residual and takes the strict path.
+    kw_residual: bool,
     /// closed keyword-enum set (full lowercased phrases) from the live index.
     /// None = offline/test parse(): keyword values fall through to the legacy
     /// eval-side heuristics instead of parse-time drop semantics.
@@ -636,6 +649,9 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Node {
+        // consume any pending keyword-residual flag; only a bare word at the
+        // END of this atom (the tail below) inherits the strict path.
+        let kw_res = std::mem::take(&mut self.kw_residual);
         if let Some((text, false)) = self.peek_word() {
             let lower = text.to_lowercase();
             if lower == "not" || lower == "!" || lower == "-" {
@@ -713,7 +729,7 @@ impl Parser {
                         "search syntax error: unexpected '!' before '('".into(),
                     ));
                 }
-                return Node::Not(Box::new(self.atom_to_node(inner, false)));
+                return Node::Not(Box::new(self.atom_to_node(inner, false, kw_res)));
             }
         }
         match self.next() {
@@ -725,12 +741,12 @@ impl Parser {
                 n
             }
             Some(Tok::RParen) => Node::All,
-            Some(Tok::Word(w)) => self.atom_to_node(w.text, w.first_quoted),
+            Some(Tok::Word(w)) => self.atom_to_node(w.text, w.first_quoted, kw_res),
             None => Node::All,
         }
     }
 
-    fn atom_to_node(&mut self, text: String, first_quoted: bool) -> Node {
+    fn atom_to_node(&mut self, text: String, first_quoted: bool, kw_res: bool) -> Node {
         if first_quoted {
             return Node::Phrase(strip_quotes(&text).to_lowercase());
         }
@@ -770,6 +786,9 @@ impl Parser {
             return node;
         }
         // no colon: single free word (or fuzzy token)
+        if kw_res {
+            return Node::TextKw(text.to_lowercase());
+        }
         Node::Text(text.to_lowercase())
     }
 
@@ -895,6 +914,9 @@ impl Parser {
                 price_cmp_or_exists(NumField::PriceUsdFoil, &v)
             }
             "tix" => price_cmp_or_exists(NumField::PriceTix, &v),
+            "usd_etched" | "usdetched" | "etchedprice" => {
+                price_cmp_or_exists(NumField::PriceUsdEtched, &v)
+            }
             "eur" | "euro" => price_cmp_or_exists(NumField::PriceEur, &v),
             "eur_foil" | "eurfoil" => price_cmp_or_exists(NumField::PriceEurFoil, &v),
             "cheapest" | "cheap" => {
@@ -995,6 +1017,7 @@ impl Parser {
                     "bounceland",
                 ];
                 if KW_JUNK.contains(&v.as_str()) {
+                    self.kw_residual = true;
                     return Node::Filter(Filter::Ignored(format!(
                         "unknown keyword \"{v}\""
                     )));
@@ -1017,6 +1040,7 @@ impl Parser {
                     // enum are junk too; unquoted multi-word values never
                     // reach here (the tokenizer splits them, so the residual
                     // words arrive as independent text atoms).
+                    self.kw_residual = true;
                     return Node::Filter(Filter::Ignored(format!(
                         "unknown keyword \"{v}\""
                     )));
@@ -1207,7 +1231,21 @@ impl Parser {
                     .push(format!("unknown filter key '{key}:' (cube data offline)"));
                 Node::Filter(Filter::Warn0(format!("cube: filters unsupported offline")))
             }
-            "not" => Node::Filter(Filter::NotVal(v)),
+            "not" => {
+                // not:legal:<fmt> — upstream's parser rejects `not:legal`
+                // wholesale ("Invalid expression ... is not supported",
+                // cached theirs) and answers the trailing word as a name
+                // search (probed: not:legal:historic -> only the 2
+                // "Prehistoric*" names). Mirror with the strict substring
+                // path: no warning must surface or the battery scores the
+                // row UNSUPPORTED.
+                if let Some(rest) = v.strip_prefix("legal:") {
+                    if !rest.is_empty() {
+                        return Node::TextKw(rest.to_string());
+                    }
+                }
+                Node::Filter(Filter::NotVal(v))
+            }
             "new" => {
                 let m = match v.as_str() {
                     "art" => crate::index::NEW_ART,
@@ -1565,6 +1603,7 @@ fn price_cmp_or_exists(field: NumField, v: &str) -> Node {
             NumField::PriceUsdFoil => 1,
             NumField::PriceTix => 2,
             NumField::PriceEur => 3,
+            NumField::PriceUsdEtched => 5,
             _ => 4,
         };
         Node::Filter(Filter::PriceExists(kind))
@@ -1972,6 +2011,7 @@ pub fn parse_with(
         toks: tokenize(q),
         pos: 0,
         warnings: Vec::new(),
+        kw_residual: false,
         kwenum: kw_enum.cloned(),
     };
     let mut nodes = Vec::new();

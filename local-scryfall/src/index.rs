@@ -543,6 +543,9 @@ pub struct Index {
     pub lang_idx: HashMap<Box<str>, RoaringBitmap>,
     /// b: (block name or any member set code) -> printings; built in load_set_meta.
     pub block_idx: HashMap<Box<str>, RoaringBitmap>,
+    /// set name (lowercase) -> block name; powers the b: member-set-name
+    /// fallback (b:legacy -> "Urza's Legacy" -> block "Urza").
+    pub block_setname: HashMap<Box<str>, Box<str>>,
     /// g: (set code/name) -> printings of the set's release group (self, parent,
     /// siblings, children); built in load_set_meta.
     pub group_idx: HashMap<Box<str>, RoaringBitmap>,
@@ -568,6 +571,10 @@ pub struct Index {
     /// printings whose oracle is id-pool visible (id_bitmap ANDs with this).
     pub id_vis_bits: RoaringBitmap,
     pub oracle_intern: HashMap<Box<str>, u32>,
+    /// Parity w6a: per-printing side index from the all_cards bulk (see
+    /// prints.rs). Empty/!loaded when the bulk file is absent — every
+    /// predicate then behaves exactly as the default-cards baseline.
+    pub side: crate::prints::SideIdx,
 
     // oracle tags (otag:)
     pub otags: Vec<OTag>,
@@ -604,7 +611,7 @@ fn color_mask(v: &[String]) -> u8 {
     m
 }
 
-fn rarity_rank(s: &str) -> u8 {
+pub(crate) fn rarity_rank(s: &str) -> u8 {
     match s {
         "common" => 0,
         "uncommon" => 1,
@@ -1108,7 +1115,7 @@ fn parse_released(s: &str) -> u32 {
     }
 }
 
-fn parse_cn(s: &str) -> u32 {
+pub(crate) fn parse_cn(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(u32::MAX)
 }
@@ -2044,6 +2051,7 @@ impl Index {
             ptype_idx: HashMap::new(),
             lang_idx: HashMap::new(),
             block_idx: HashMap::new(),
+            block_setname: HashMap::new(),
             group_idx: HashMap::new(),
             land_cycles: HashMap::new(),
             today: {
@@ -2071,6 +2079,7 @@ impl Index {
             oracle_id_vis: Vec::new(),
             id_vis_bits: RoaringBitmap::new(),
             oracle_intern: HashMap::with_capacity(40_000),
+            side: Default::default(),
             otags: Vec::new(),
             otag_slug: HashMap::new(),
             otag_alias: HashMap::new(),
@@ -3302,7 +3311,31 @@ impl Index {
                     block_bm.insert(code.into(), bm.clone());
                 }
             }
+            // parser lowercases filter values, so expose case-insensitive
+            // block-name keys too (b:Urza and b:urza both resolve).
+            let name_keys: Vec<String> = block_bm.keys().map(|k| k.to_string()).collect();
+            for k in name_keys {
+                let lk = k.to_lowercase();
+                if lk != k {
+                    if let Some(bm) = block_bm.get(k.as_str()) {
+                        block_bm.insert(lk.into(), bm.clone());
+                    }
+                }
+            }
             self.block_idx = block_bm;
+
+            // set-name -> block-name map for the b: member-set fallback
+            // (b:legacy matches set "Urza's Legacy" -> block "Urza").
+            let mut sn: HashMap<Box<str>, Box<str>> = HashMap::new();
+            for i in 0..self.sets.len() {
+                let e = &self.sets[i];
+                if e.block != u32::MAX {
+                    let name = self.s(e.name).to_lowercase();
+                    let blk = self.s(e.block).to_lowercase();
+                    sn.entry(name.into()).or_insert(blk.into());
+                }
+            }
+            self.block_setname = sn;
 
             let mut group_bm: HashMap<Box<str>, RoaringBitmap> = HashMap::new();
             let codes: Vec<String> = name_of.keys().cloned().collect();
