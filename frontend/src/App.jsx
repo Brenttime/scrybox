@@ -382,7 +382,7 @@ function App() {
       case 'limited':
         return <LimitedLands showToast={showToast} onNavigate={goTab} />;
       case 'scryfall':
-        return <ScryfallPortal onNavigate={goTab} />;
+        return <ScryfallPortal onNavigate={goTab} showToast={showToast} />;
       case 'rules':
         return <Rules onNavigate={goTab} />;
       case 'keywords':

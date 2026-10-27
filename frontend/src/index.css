@@ -2469,10 +2469,28 @@ a.dash-art { color: inherit; text-decoration: none; }
   .dash-sections { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
 }
 
-/* Local Scryfall portal tool (ScryfallPortal.jsx) */
-.sfp-view { display: flex; flex-direction: column; gap: 0.75rem; height: calc(100dvh - 170px); min-height: 420px; }
-.sfp-head { display: flex; align-items: center; gap: 0.6rem; }
-.sfp-title { margin: 0; font-size: 1.4rem; font-weight: 800; color: var(--text-strong); display: flex; align-items: center; gap: 0.5rem; }
-.sfp-frame-wrap { position: relative; flex: 1; min-height: 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--glass-border, rgba(255,255,255,0.08)); }
-.sfp-frame { width: 100%; height: 100%; border: 0; display: block; background: #111; }
-.sfp-swipe-edge { position: absolute; left: 0; top: 0; bottom: 0; width: 22px; z-index: 2; touch-action: pan-y; }
+/* Local Scryfall tool (ScryfallPortal.jsx) */
+.sfp-view { display: flex; flex-direction: column; gap: 0.75rem; }
+.sfp-head { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+.sfp-title { margin: 0; font-size: 1.4rem; font-weight: 800; color: var(--text-strong); display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.sfp-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sfp-seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border-radius: 12px; background: var(--bg-tertiary, rgba(255,255,255,0.05)); }
+.sfp-seg-btn { border: 0; border-radius: 9px; padding: 0.5rem; font-weight: 700; background: transparent; color: var(--text-muted); cursor: pointer; }
+.sfp-seg-btn.on { background: var(--bg-secondary, rgba(255,255,255,0.12)); color: var(--text-strong); }
+.sfp-searchbox { display: flex; flex-direction: column; gap: 0.6rem; }
+.sfp-search-ic { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
+.sfp-input { width: 100%; padding-left: 36px !important; padding-right: 34px !important; }
+.sfp-clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); border: 0; background: none; color: var(--text-muted); cursor: pointer; padding: 4px; }
+.sfp-suggest { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 20; display: flex; flex-direction: column; padding: 4px; border-radius: 12px; }
+.sfp-suggest button { text-align: left; border: 0; background: none; color: var(--text-strong); padding: 0.55rem 0.7rem; border-radius: 8px; cursor: pointer; }
+.sfp-suggest button:hover { background: rgba(255,255,255,0.06); }
+.sfp-chips { display: flex; gap: 0.4rem; overflow-x: auto; scrollbar-width: none; }
+.sfp-chips .deck-chip-btn { white-space: nowrap; flex: none; }
+.sfp-msg { text-align: center; padding: 1.5rem 0.5rem; color: var(--text-secondary); }
+.sfp-count { font-size: 0.75rem; color: var(--text-muted); }
+.sfp-more { align-self: center; }
+.sfp-sets { display: flex; flex-direction: column; gap: 6px; }
+.sfp-set { display: grid; grid-template-columns: 28px minmax(0,1fr) auto; align-items: center; gap: 0.7rem; padding: 0.7rem 0.8rem; border-radius: 12px; border: 1px solid var(--border-glass); background: var(--bg-secondary, rgba(255,255,255,0.04)); color: var(--text-strong); text-align: left; cursor: pointer; }
+.sfp-set-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.sfp-set-meta { font-size: 0.75rem; color: var(--text-muted); }
+.sfp-set-ic { width: 22px; height: 22px; object-fit: contain; filter: invert(1) opacity(0.85); }
