@@ -182,6 +182,7 @@ pub async fn search(
     let art_mode = unique == Some(2);
     let dedup = unique != Some(1);
     if dedup && !art_mode && !crate::eval::uses_otag(&nodes) && !crate::eval::wants_extras(&nodes)
+        && !crate::eval::uses_print_mode(&nodes)
     {
         bm &= &ix.id_vis_bits;
     }

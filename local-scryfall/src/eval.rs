@@ -189,6 +189,20 @@ pub fn uses_otag(nodes: &[Node]) -> bool {
     nodes.iter().any(node_has_otag)
 }
 
+/// Parity w7 (borrow A4): true when the WHOLE query is a bare layout-level
+/// negative (`-is:mdfc`) answered in print-count mode by the Not arm in
+/// eval_node — the all-printings minus-set is already oracle-ungated, so
+/// api.rs must NOT apply the default-search pool gate (upstream's golden is
+/// 38,899 distinct oracles — far beyond the 33,909-card visible pool).
+/// Combos (`t:creature -is:mdfc`) keep the normal gate: only the leading
+/// minus-set is ungated, the query itself stays a pool query.
+pub fn uses_print_mode(nodes: &[Node]) -> bool {
+    matches!(
+        nodes,
+        [Node::Not(b)] if matches!(**b, Node::Filter(Filter::Is(ref t)) if t == "mdfc")
+    )
+}
+
 fn node_has_otag(n: &Node) -> bool {
     match n {
         Node::And(v) | Node::Or(v) => v.iter().any(node_has_otag),
@@ -324,6 +338,25 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             acc
         }
         Node::Not(inner) => {
+            // Parity w7 (borrow A4): a BARE layout-negative query answers in
+            // PRINT-COUNT mode: upstream subtracts oracles carrying the
+            // layout anywhere in the UNGATED all-printings table — -is:mdfc
+            // = distinct oracles with zero modal_dfc printings anywhere
+            // (replay 38,878 vs cached golden 38,899 → CLOSE; the pool-
+            // deduped w5 model gave 33,810 = DRIFT). api.rs skips the pool
+            // gate for exactly this AST shape (uses_print_mode). Promo-attr
+            // negatives (-is:fnm / -is:judge_gift) keep the w5 pool model —
+            // this arm covers LAYOUT tags only.
+            if let Node::Filter(Filter::Is(t)) = &**inner {
+                if t == "mdfc" && ix.side.loaded {
+                    let mdfc = scan(ix, |i| {
+                        ix.side.mdfc_or[ix.card_oracle[i as usize] as usize] & 1 != 0
+                    });
+                    let mut r = ix.universe.clone();
+                    r -= &mdfc;
+                    return r;
+                }
+            }
             let a = eval_node(inner, ix, w);
             let mut r = ix.universe.clone();
             r -= &a;
