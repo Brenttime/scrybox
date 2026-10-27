@@ -114,6 +114,7 @@
   "priceHistory.sourceCardmarket": "Cardmarket 30-day averages",
   "dash.retry": "Retry",
   "dash.tools": "Tools",
+  "portal.title": "Local Scryfall",
   "dash.range": "Range",
   "dash.gain": "Gain",
   "dash.avgCard": "avg ${price}/card",

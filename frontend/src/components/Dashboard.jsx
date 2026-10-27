@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { TrendingUp, Mountain, BookOpen, Sparkles, Crown } from 'lucide-react';
+import { TrendingUp, Mountain, BookOpen, Sparkles, Crown, Database } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { priceText } from '../utils/formatPrice';
 import { useT } from '../utils/i18n';
@@ -150,6 +150,15 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
   const [decks, setDecks] = useState(() => readCache('decks'));
   const [activeColor, setActiveColor] = useState(null);
   const [inspectorCard, setInspectorCard] = useState(null);
+  // Local Scryfall tool tile shows only when the backend mounted the portal.
+  const [portalOn, setPortalOn] = useState(false);
+  useEffect(() => {
+    let live = true;
+    fetch('/api/settings').then(r => (r.ok ? r.json() : null))
+      .then(d => { if (live && d) setPortalOn(!!d.scryfall_portal_enabled); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
 
   useEffect(() => {
     fetchStats();
@@ -438,6 +447,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
                 { key: 'rules', icon: BookOpen, label: t('rules.title') },
                 { key: 'limited', icon: Mountain, label: t('nav.limited') },
                 { key: 'keywords', icon: Sparkles, label: t('kw.title') },
+                ...(portalOn ? [{ key: 'scryfall', icon: Database, label: t('portal.title') }] : []),
               ].map(({ key, icon: Icon, label }) => (
                 <button key={key} type="button" className="dash-tile dash-tool" onClick={() => onNavigate && onNavigate(key)}>
                   <span className="dash-tool-ic"><Icon size={17} /></span>
