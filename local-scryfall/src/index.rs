@@ -1608,8 +1608,23 @@ fn parse_line(line: &str) -> Option<RawC> {
     if !watermark.is_empty() {
         flags |= F_HAS_WM;
     }
-    if v.get("color_indicator").is_some() {
-        flags |= F_HAS_IND;
+    // Parity w7 (borrow A3): has:color_indicator = ∃ printing whose
+    // color_indicator[] is nonempty OR any card_faces[i].color_indicator[]
+    // nonempty (transform/ADVENTURE backs carry the indicator only on the
+    // face; the top-level key is absent). w7 replay 362/362 exact vs the
+    // cached goldens — top-level-only returned 39. Empty arrays don't count.
+    {
+        let ci_nonempty = |x: &serde_json::Value| -> bool {
+            x.get("color_indicator").and_then(|c| c.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+        };
+        let face_ci = v
+            .get("card_faces")
+            .and_then(|x| x.as_array())
+            .map(|fs| fs.iter().any(ci_nonempty))
+            .unwrap_or(false);
+        if ci_nonempty(&v) || face_ci {
+            flags |= F_HAS_IND;
+        }
     }
     if v.get("card_faces").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
         flags |= F_HAS_FACES;
