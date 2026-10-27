@@ -568,6 +568,10 @@ pub struct Index {
     /// printings whose oracle is id-pool visible (id_bitmap ANDs with this).
     pub id_vis_bits: RoaringBitmap,
     pub oracle_intern: HashMap<Box<str>, u32>,
+    /// Parity w6a: per-printing side index from the all_cards bulk (see
+    /// prints.rs). Empty/!loaded when the bulk file is absent — every
+    /// predicate then behaves exactly as the default-cards baseline.
+    pub side: crate::prints::SideIdx,
 
     // oracle tags (otag:)
     pub otags: Vec<OTag>,
@@ -604,7 +608,7 @@ fn color_mask(v: &[String]) -> u8 {
     m
 }
 
-fn rarity_rank(s: &str) -> u8 {
+pub(crate) fn rarity_rank(s: &str) -> u8 {
     match s {
         "common" => 0,
         "uncommon" => 1,
@@ -1108,7 +1112,7 @@ fn parse_released(s: &str) -> u32 {
     }
 }
 
-fn parse_cn(s: &str) -> u32 {
+pub(crate) fn parse_cn(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(u32::MAX)
 }
@@ -2071,6 +2075,7 @@ impl Index {
             oracle_id_vis: Vec::new(),
             id_vis_bits: RoaringBitmap::new(),
             oracle_intern: HashMap::with_capacity(40_000),
+            side: Default::default(),
             otags: Vec::new(),
             otag_slug: HashMap::new(),
             otag_alias: HashMap::new(),

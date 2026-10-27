@@ -3,6 +3,7 @@
 mod api;
 mod eval;
 mod index;
+mod prints;
 mod query;
 
 use api::{card, collection, health, search, set_detail, sets, sets_list_scryfall, suggest, AppState};
@@ -140,6 +141,42 @@ async fn main() {
     let langs_ok = ix.load_langs(&lang_map_path);
     let (blocks_path, meta_path) = resolve_blocks_path();
     let meta_ok = ix.load_set_meta(&blocks_path, &meta_path);
+
+    // Parity w6a: all_cards per-printing side index (price/cn/artist/rarity/
+    // finish predicates quantify over ALL printings, incl. gated/variant/
+    // promo/foreign rows default-cards omits). Optional: absent file = exact
+    // pre-w6a behaviour, so prod without the bulk is unaffected.
+    let side_src: Option<PathBuf> = [
+        std::env::var("SCRYFALL_ALL_CARDS_FILE").ok().map(PathBuf::from),
+        data_dir().map(|d| d.join("all-cards.jsonl.gz")),
+        Some(PathBuf::from(
+            "/home/brenttime/projects/local-scryfall-allprints/all-cards.jsonl.gz",
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists());
+    let mut side_ms = 0u128;
+    if let Some(src) = &side_src {
+        let t = Instant::now();
+        let stem = src
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "all-cards.jsonl".into());
+        let cache = src.with_file_name(format!("{stem}.sideidx"));
+        if !prints::load_side_cache(&mut ix, &cache, src) {
+            if prints::load_side_gz(&mut ix, src) {
+                prints::write_side_cache(&ix, &cache, src);
+            }
+        }
+        side_ms = t.elapsed().as_millis();
+    }
+    eprintln!(
+        "all_cards side index: {} ({} printings, {} ms)",
+        if ix.side.loaded { "loaded" } else { "ABSENT — price/cn/artist predicates default-cards-only" },
+        ix.side.prints.len(),
+        side_ms,
+    );
     eprintln!(
         "ready: {} cards in {} ms (oracle tags: {} from {}; set meta: {} from {})",
         ix.cards.len(),

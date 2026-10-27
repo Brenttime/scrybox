@@ -36,6 +36,9 @@ pub enum NumField {
     PriceTix,
     PriceEur,
     PriceEurFoil,
+    /// Parity w6a: etched-price market field — never present on the slimmed
+    /// default dump; compared purely via the all_cards side index.
+    PriceUsdEtched,
     Edhrec,
     Prints,
     Sets,
@@ -406,6 +409,8 @@ fn bare_field_atom(text: &str) -> Option<Node> {
     for (k, f) in [
         ("usd_foil", NumField::PriceUsdFoil),
         ("usdfoil", NumField::PriceUsdFoil),
+        ("usd_etched", NumField::PriceUsdEtched),
+        ("usdetched", NumField::PriceUsdEtched),
         ("usd", NumField::PriceUsd),
         ("eur_foil", NumField::PriceEurFoil),
         ("eurfoil", NumField::PriceEurFoil),
@@ -895,6 +900,9 @@ impl Parser {
                 price_cmp_or_exists(NumField::PriceUsdFoil, &v)
             }
             "tix" => price_cmp_or_exists(NumField::PriceTix, &v),
+            "usd_etched" | "usdetched" | "etchedprice" => {
+                price_cmp_or_exists(NumField::PriceUsdEtched, &v)
+            }
             "eur" | "euro" => price_cmp_or_exists(NumField::PriceEur, &v),
             "eur_foil" | "eurfoil" => price_cmp_or_exists(NumField::PriceEurFoil, &v),
             "cheapest" | "cheap" => {
@@ -1565,6 +1573,7 @@ fn price_cmp_or_exists(field: NumField, v: &str) -> Node {
             NumField::PriceUsdFoil => 1,
             NumField::PriceTix => 2,
             NumField::PriceEur => 3,
+            NumField::PriceUsdEtched => 5,
             _ => 4,
         };
         Node::Filter(Filter::PriceExists(kind))
