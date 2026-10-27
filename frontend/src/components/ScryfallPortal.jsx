@@ -1,5 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, Database, Search, X } from 'lucide-react';
+import { ChevronLeft, Database, Minus, Plus, Search, Undo2, X } from 'lucide-react';
+import { pickPrinting } from '../utils/directAdd';
 import { useT } from '../utils/i18n';
 import { useSwipeBack } from '../utils/useSwipeBack';
 import CardImage from './CardImage';
@@ -15,7 +16,76 @@ const CHIPS = ['t:legendary t:creature', 'is:commander', 'r:mythic', 'otag:ramp'
 const setCode = (s) => (s.set_code || String(s.id || '').replace(/^mtg-/, '')).toLowerCase();
 const numKey = (n) => { const m = String(n || '').match(/^(\d+)(.*)$/); return m ? [Number(m[1]), m[2]] : [1e9, String(n || '')]; };
 
-export default function ScryfallPortal({ onNavigate, showToast }) {
+// Add-to-collection controls for the card details sheet: qty stepper, a
+// Foil / Non-foil chip (only when the printing has both), Add, then Undo for
+// the rows just created. NM / English, one stacked row like Add Cards' +.
+function AddToCollection({ card, showToast, onAdded }) {
+  const { t } = useT();
+  const f = Array.isArray(card.finishes) ? card.finishes : [];
+  const both = f.includes('nonfoil') && (f.includes('foil') || f.includes('etched'));
+  const [qty, setQty] = useState(1);
+  const [foil, setFoil] = useState(() => pickPrinting(card, 'Normal') === 'Holofoil');
+  const [busy, setBusy] = useState(false);
+  const [last, setLast] = useState(null);
+  const printing = foil ? 'Holofoil' : 'Normal';
+
+  const add = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch('/api/collection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ card_id: card.id, quantity: qty, condition: 'Near Mint', printing, language: 'English', purchase_price: 0, stackable: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || t('search.errAddCard'));
+      const ids = Array.isArray(data.ids) && data.ids.length ? data.ids : [data.id];
+      setLast({ ids, qty });
+      onAdded(qty);
+      showToast?.(t('portal.added', { count: qty, name: card.name }));
+    } catch (e) { showToast?.(e.message); } finally { setBusy(false); }
+  };
+
+  const undo = async () => {
+    if (!last) return;
+    setBusy(true);
+    try {
+      for (const id of last.ids) {
+        const res = await fetch(`/api/collection/${id}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(t('search.errUndo'));
+      }
+      onAdded(-last.qty);
+      setLast(null);
+    } catch (e) { showToast?.(e.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="sfp-add">
+      <div className="sfp-add-row">
+        <div className="sfp-stepper">
+          <button type="button" aria-label="-" disabled={qty <= 1 || busy} onClick={() => setQty(n => Math.max(1, n - 1))}><Minus size={14} /></button>
+          <span>{qty}</span>
+          <button type="button" aria-label="+" disabled={busy} onClick={() => setQty(n => Math.min(99, n + 1))}><Plus size={14} /></button>
+        </div>
+        {both && (
+          <button type="button" className={`deck-chip deck-chip-btn${foil ? ' on' : ''}`} disabled={busy} onClick={() => setFoil(v => !v)}>
+            {foil ? t('portal.foil') : t('portal.nonfoil')}
+          </button>
+        )}
+        <button type="button" className="btn btn-primary sfp-add-btn" disabled={busy} onClick={add}>
+          <Plus size={16} /> {t('portal.addToCollection')}
+        </button>
+      </div>
+      {last && (
+        <button type="button" className="sfp-undo" disabled={busy} onClick={undo}>
+          <Undo2 size={13} /> {t('portal.undoAdd', { count: last.qty })}
+        </button>
+      )}
+    </div>
+  );
+}
+
+export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
   const { t } = useT();
   const [mode, setMode] = useState('search');
   const [q, setQ] = useState('');
@@ -111,6 +181,15 @@ export default function ScryfallPortal({ onNavigate, showToast }) {
   }, [sets, setFilter]);
 
   const openSet = (s) => { setQ(`s:${setCode(s)}`); run(`s:${setCode(s)} unique:prints`, s); };
+  // Owned counts are per card name (as /api/search reports them): bump every
+  // printing of that name in the grid and the open sheet.
+  const bumpOwned = (n) => {
+    const name = inspect?.name;
+    const adj = c => (c.name === name ? { ...c, owned_qty: Math.max(0, (c.owned_qty || 0) + n) } : c);
+    setResults(prev => prev.map(adj));
+    setInspect(c => (c ? adj(c) : c));
+    onUpdate?.();
+  };
   const submit = (e) => { e.preventDefault(); run(q); };
   const title = fromSet ? fromSet.name : t('portal.title');
 
@@ -220,7 +299,9 @@ export default function ScryfallPortal({ onNavigate, showToast }) {
 
       {inspect && (
         <Suspense fallback={null}>
-          <CardInspectorModal card={{ ...inspect, card_id: inspect.id, quantity: inspect.owned_qty || 0 }} readOnly onClose={() => setInspect(null)} showToast={showToast} />
+          <CardInspectorModal card={{ ...inspect, card_id: inspect.id, quantity: inspect.owned_qty || 0 }} readOnly onClose={() => setInspect(null)} showToast={showToast}>
+            <AddToCollection key={inspect.id} card={inspect} showToast={showToast} onAdded={bumpOwned} />
+          </CardInspectorModal>
         </Suspense>
       )}
     </div>

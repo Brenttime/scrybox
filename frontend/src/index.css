@@ -2486,3 +2486,11 @@ a.dash-art { color: inherit; text-decoration: none; }
 .sfp-set-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .sfp-set-meta { font-size: 0.75rem; color: var(--text-muted); }
 .sfp-set-ic { width: 22px; height: 22px; object-fit: contain; filter: invert(1) opacity(0.85); }
+.sfp-add { display: flex; flex-direction: column; gap: 0.5rem; padding-top: 0.25rem; }
+.sfp-add-row { display: flex; align-items: center; gap: 0.5rem; }
+.sfp-stepper { display: inline-flex; align-items: center; border: 1px solid var(--border-glass); border-radius: 999px; height: 40px; flex: none; }
+.sfp-stepper button { width: 36px; height: 100%; border: 0; background: none; color: var(--text-strong); display: grid; place-items: center; cursor: pointer; }
+.sfp-stepper button:disabled { opacity: 0.35; }
+.sfp-stepper span { min-width: 22px; text-align: center; font-weight: 700; }
+.sfp-add-btn { flex: 1; height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem; white-space: nowrap; }
+.sfp-undo { align-self: flex-start; border: 0; background: none; color: var(--text-muted); font-size: 0.8rem; display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; padding: 0.2rem 0; }
