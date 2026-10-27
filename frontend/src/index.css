@@ -2494,3 +2494,12 @@ a.dash-art { color: inherit; text-decoration: none; }
 .sfp-stepper span { min-width: 22px; text-align: center; font-weight: 700; }
 .sfp-add-btn { flex: 1; height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem; white-space: nowrap; }
 .sfp-undo { align-self: flex-start; border: 0; background: none; color: var(--text-muted); font-size: 0.8rem; display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; padding: 0.2rem 0; }
+
+/* Dual-screen (Surface Duo) spanned mode, set by utils/dualScreen.js: the app
+   is a phone on the left screen; dialogs open on the right screen; nothing
+   sits under the hinge. #root's transform makes it the containing block for
+   the app's own fixed shell and bars. */
+html.duo-span #root { position: fixed; left: 0; top: 0; bottom: 0; width: var(--duo-left-w); transform: translateZ(0); }
+html.duo-span body { overflow: hidden; }
+html.duo-span body::after { content: ''; position: fixed; top: 0; bottom: 0; left: var(--duo-right-x); right: 0; background: url(/logo.svg) center / 88px no-repeat; opacity: 0.07; pointer-events: none; }
+html.duo-span .modal-overlay { left: var(--duo-right-x) !important; right: auto !important; width: calc(100vw - var(--duo-right-x)) !important; }
