@@ -330,6 +330,7 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             r
         }
         Node::Text(word) => eval_text(word, ix),
+        Node::TextKw(word) => eval_text_kw(word, ix),
         Node::Phrase(phrase) => eval_phrase(phrase, ix),
         Node::Filter(f) => eval_filter(f, ix, w),
     }
@@ -377,6 +378,16 @@ fn eval_text(word: &str, ix: &Index) -> RoaringBitmap {
     // fallback: substring on name
     let q = word.to_string();
     scan(ix, |i| ix.name_lc(i).contains(&q))
+}
+
+/// STRICT free-word path (keyword-split residuals and `not:legal:X` trailing
+/// words). Empirically calibrated against cached theirs (w6b): the upstream
+/// answer for these trailing words is plain name-substring — adding the
+/// exact-oracle-token OR (parent's original spec) overshoots every small
+/// total (gigas 3 vs theirs 2, agenda 16 vs 1), so it is left out.
+fn eval_text_kw(word: &str, ix: &Index) -> RoaringBitmap {
+    let q = word.to_string();
+    scan(ix, |i| ix.name_lc(i).contains(q.as_str()))
 }
 
 fn eval_phrase(phrase: &str, ix: &Index) -> RoaringBitmap {
@@ -1096,6 +1107,11 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             let q = match (kind, value.as_str()) {
                 (0, "no-border") | (0, "noborder") => "borderless",
                 (1, "futureseries") | (1, "future-series") => "future",
+                // frame:retro (cached theirs 7289): bulk has no frame
+                // "retro" value; the retro-frame printings are exactly the
+                // frame_effects "inverted" population (Kamigawa-style
+                // retro reprints) — resolve against the ffx index.
+                (1, "retro") => "inverted",
                 (_, s) => s,
             }
             .to_string();
@@ -1563,6 +1579,27 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if k.replace(' ', "") == q {
                     return b.clone();
                 }
+            }
+            // Upstream resolves unknown block values against member-SET
+            // names (cached theirs: b:legacy -> 621 = Urza block, matched
+            // via set "Urza's Legacy"). OR every block that owns a set whose
+            // name has the value as an alphanumeric word.
+            let mut acc = RoaringBitmap::new();
+            let mut found = false;
+            for (setname, blk) in &ix.block_setname {
+                let hit = setname.as_ref() == q.as_str()
+                    || setname
+                        .split(|c: char| !c.is_alphanumeric())
+                        .any(|t| t == q.as_str());
+                if hit {
+                    if let Some(b) = ix.block_idx.get(&**blk) {
+                        acc |= b;
+                        found = true;
+                    }
+                }
+            }
+            if found {
+                return acc;
             }
             w.push(format!("unknown block '{v}'"));
             RoaringBitmap::new()
@@ -2407,7 +2444,13 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         // land cycles: exact name sets loaded from data/land_cycles.json
         "dual" | "fetchland" | "shockland" | "pathway" | "painland" | "bounceland" | "karoo"
         | "triland" | "bikeland" | "checkland" | "fastland" | "scryland" | "surveilland"
-        | "canopyland" | "tricycleland" | "shadowland" => {
+        | "canopyland" | "tricycleland" | "shadowland"
+        // w6b: archetype land groups harvested from cached theirs page-1 lists
+        // (bondland aliases crowdland/bbdland/battlebondland, tangoland alias
+        // battleland are duplicated keys in land_cycles.json).
+        | "bondland" | "crowdland" | "bbdland" | "battlebondland" | "creatureland"
+        | "filterland" | "gainland" | "slowland" | "storageland" | "tangoland"
+        | "battleland" | "canland" => {
             match ix.land_cycles.get(t) {
                 Some(names) => {
                     return scan(ix, |i| {
