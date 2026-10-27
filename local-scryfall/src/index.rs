@@ -156,6 +156,249 @@ pub fn has_hybrid_pip(s: &str) -> bool {
     false
 }
 
+/// Parity w7 (borrow A6b): the computed french-vanilla keyword VOCAB —
+/// every <=6-word oracle-text segment an upstream is:frenchvanilla member
+/// carries (learned from the full cached upstream population; the w7
+/// replay: ours 1,105 vs golden 1,094, d<1% CLOSE). A printing is
+/// is:frenchvanilla iff it has >=1 'creature' face, some creature face has
+/// text or keywords, and EVERY segment of every creature face's oracle
+/// text (reminder costs/parens stripped, split on , . \n ; / em-dash /
+/// ": ") is in this vocab. DOCUMENTED ALTERNATIVE (otag route): the tagger
+/// dump ships an 'isfrenchvanilla' oracle tag and Filter::OracleTag would
+/// carry it verbatim — rejected: the offline otag dump is a trimmed
+/// vocabulary whose membership drifted from the live population (ward/
+/// vigilance-with-extra-sentences band), while this vocab is reproduced
+/// from the golden answer set itself.
+pub const FV_VOCAB: &[&str] = &[
+    "an opponent gains life",
+    "assist",
+    "basic landcycling",
+    "battle cry",
+    "cascade",
+    "changeling",
+    "collect evidence",
+    "convoke",
+    "cumulative upkeep",
+    "cycling",
+    "dash",
+    "daybound",
+    "deathtouch",
+    "defender",
+    "delve",
+    "dethrone",
+    "devoid",
+    "discard a zombie card",
+    "disguise",
+    "double strike",
+    "double team",
+    "echo",
+    "embalm",
+    "enlist",
+    "escape",
+    "eternalize",
+    "evolve",
+    "exalted",
+    "exile a land you control",
+    "exile five other cards from your graveyard",
+    "exile four cards from your graveyard",
+    "exile three other cards from your graveyard",
+    "extort",
+    "fear",
+    "first strike",
+    "flanking",
+    "flash",
+    "flying",
+    "forestcycling",
+    "forestwalk",
+    "foretell",
+    "freerunning",
+    "haste",
+    "hexproof",
+    "horsemanship",
+    "improvise",
+    "increment",
+    "indestructible",
+    "infect",
+    "ingest",
+    "intimidate",
+    "islandcycling",
+    "islandwalk",
+    "lifelink",
+    "madness",
+    "mayhem",
+    "megamorph",
+    "melee",
+    "menace",
+    "mentor",
+    "miracle",
+    "morph",
+    "mountaincycling",
+    "mountainwalk",
+    "myriad",
+    "nightbound",
+    "ninjutsu",
+    "nonbasic landwalk",
+    "outlast",
+    "partner",
+    "pay life",
+    "pay life equal to this creature s power",
+    "persist",
+    "phasing",
+    "plainscycling",
+    "plainswalk",
+    "protection from black and from green",
+    "protection from black and from red",
+    "protection from black borders",
+    "protection from blue and from red",
+    "protection from demons and from dragons",
+    "protection from dragons",
+    "protection from each color",
+    "protection from enchantments",
+    "protection from even collector numbers",
+    "protection from lands",
+    "protection from loose lips",
+    "protection from mana value or greater",
+    "protection from odd collector numbers",
+    "protection from red and from green",
+    "protection from red and from white",
+    "protection from two word names",
+    "protection from watermarks",
+    "protection from zombies",
+    "prototype",
+    "provoke",
+    "prowess",
+    "put a counter on a creature an opponent controls",
+    "put two cards from a single graveyard on the bottom of their owner s library",
+    "reach",
+    "return a bird you control to its owner s hand",
+    "riot",
+    "sacrifice two lands",
+    "say toy boat quickly",
+    "scavenge",
+    "shroud",
+    "skulk",
+    "specialize",
+    "spectacle",
+    "squad",
+    "sunburst",
+    "surge",
+    "swampcycling",
+    "swampwalk",
+    "training",
+    "trample",
+    "transfigure",
+    "transmute",
+    "undying",
+    "unearth",
+    "unleash",
+    "vigilance",
+    "ward",
+    "warp",
+    "web slinging",
+    "wither",];
+
+fn fv_vocab() -> &'static std::collections::HashSet<&'static str> {
+    static V: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(|| FV_VOCAB.iter().copied().collect())
+}
+
+/// Strip {…} mana costs and (…) reminder text, replacing both with a SPACE
+/// (mirrors the replay's regex replacements — the space matters: "X(a)Y"
+/// must not become "XY").
+fn fv_strip(t: &str) -> String {
+    let mut s = t.to_string();
+    loop {
+        let mut out = String::with_capacity(s.len());
+        let mut depth = 0i32;
+        for ch in s.chars() {
+            match ch {
+                '{' | '(' => depth += 1,
+                '}' | ')' => depth = (depth - 1).max(0),
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        if out == s {
+            break;
+        }
+        s = out;
+    }
+    s
+}
+
+/// The replay's segment split: quotes -> space; split on runs of
+/// [,.\n;], single em-dashes, or ': '; fold each segment to
+/// lowercase-[a-z] words separated by single spaces (every other character
+/// becomes a space).
+fn fv_segments(t: &str) -> Vec<String> {
+    let s: String = fv_strip(t)
+        .chars()
+        .map(|c| if c == '"' || c == '\u{201C}' || c == '\u{201D}' { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ',' || c == '.' || c == ';' || c == '\n' {
+            while i < chars.len() && matches!(chars[i], ',' | '.' | ';' | '\n') {
+                i += 1;
+            }
+            out.push(std::mem::take(&mut cur));
+        } else if c == '\u{2014}' {
+            i += 1;
+            out.push(std::mem::take(&mut cur));
+        } else if c == ':' && i + 1 < chars.len() && chars[i + 1] == ' ' {
+            i += 2;
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+            i += 1;
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|seg| {
+            seg.to_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_lowercase() { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// The is:frenchvanilla predicate over one printing's face list —
+/// `faces: Vec<(type_line, oracle_text, has_keywords)>`, entry 0 = top
+/// level. Mirrors the validated replay (oracle_faces + fv_rule in
+/// scratch/w7/w7_verify.py): creature faces only, non-vanilla (some text/
+/// keyword), every segment a vocab keyword phrase.
+pub fn fv_printing_ok(faces: &[(&str, &str, bool)]) -> bool {
+    let cre: Vec<&(&str, &str, bool)> = faces
+        .iter()
+        .filter(|(tl, _, _)| tl.to_lowercase().contains("creature"))
+        .collect();
+    if cre.is_empty() {
+        return false;
+    }
+    if !cre.iter().any(|(_, ot, kw)| !ot.trim().is_empty() || *kw) {
+        return false;
+    }
+    for (_, ot, _) in cre {
+        for seg in fv_segments(ot) {
+            if seg.split(' ').count() > 6 || !fv_vocab().contains(seg.as_str()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// True when oracle text (reminder parens already absent or removed) consists
 /// only of keyword abilities — the is:frenchvanilla test (calibrated against
 /// upstream's 1094-card list: sentence openers are keywords, ward/cube/prowess
@@ -1638,7 +1881,8 @@ fn parse_line(line: &str) -> Option<RawC> {
     if colors == 0 {
         flags |= F_COLORLESS;
     }
-    let mut oracle_text = str_of(&v, "oracle_text").to_string();
+    let raw_top_ot = str_of(&v, "oracle_text").to_string();
+    let mut oracle_text = raw_top_ot.clone();
     if oracle_text.trim().is_empty() {
         // DFC prints in this dump put the text on the faces
         if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
@@ -1932,10 +2176,37 @@ fn parse_line(line: &str) -> Option<RawC> {
     if has_any("angel") {
         flags2 |= F2_ANGEL;
     }
-    if (flags2 & (F2_CRE_MAIN | F2_MAIN_TEXT | F2_PW_MAIN)) == (F2_CRE_MAIN | F2_MAIN_TEXT)
-        && keyword_only_text(&main_text)
+    // Parity w7 (borrow A6b): is:frenchvanilla via the computed keyword
+    // VOCAB (see FV_VOCAB) — ALL creature faces (main AND backs), every
+    // oracle-text segment a vocab keyword phrase, and the card is not
+    // vanilla (some creature face carries text or keywords). Replaces the
+    // old main-face-only keyword_only_text heuristic (840 vs golden 1,094
+    // DRIFT; replay with the vocab: 1,105, page-1 members all present).
     {
-        flags2 |= F2_FRENCH;
+        let mut fv_faces: Vec<(&str, &str, bool)> = vec![(
+            type_line.as_str(),
+            raw_top_ot.as_str(),
+            !keywords_joined.trim().is_empty(),
+        )];
+        let fv_ftls: Vec<(String, String, bool)> = faces_arr
+            .iter()
+            .map(|f| {
+                (
+                    fstr(f, "type_line"),
+                    fstr(f, "oracle_text"),
+                    f.get("keywords")
+                        .and_then(|x| x.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false),
+                )
+            })
+            .collect();
+        for (a, b, c) in &fv_ftls {
+            fv_faces.push((a.as_str(), b.as_str(), *c));
+        }
+        if fv_printing_ok(&fv_faces) {
+            flags2 |= F2_FRENCH;
+        }
     }
     // duplicate the F_PREVIEW semantic fix: 'preview' present-but-false is not
     // a preview card (bulk data carries preview:false on many prints).
