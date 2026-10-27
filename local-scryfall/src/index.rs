@@ -525,6 +525,12 @@ pub struct Index {
     pub in_set_types: HashMap<Box<str>, RoaringBitmap>,
     pub in_games: HashMap<Box<str>, RoaringBitmap>,
     pub in_langs: HashMap<Box<str>, RoaringBitmap>,
+    /// Wave-5 item 3: lang -> EVERY printing of every oracle that has >=1
+    /// print in that language, sourced from the full Scryfall all-cards
+    /// bulk (default-cards.jsonl.gz is English-slimmed, so the print-level
+    /// lang_idx above only sees ~400 ja prints vs upstream's 30,853 cards).
+    /// Built by load_langs() from bulk-langs/lang_map_full.json.gz.
+    pub oracle_lang_idx: HashMap<Box<str>, RoaringBitmap>,
     pub in_rarities: HashMap<Box<str>, RoaringBitmap>,
     /// printing-level indexes for st:/game:/border:/frame:/stamp:/framefx-ish.
     pub settype_idx: HashMap<Box<str>, RoaringBitmap>,
@@ -2027,6 +2033,7 @@ impl Index {
             in_set_types: HashMap::new(),
             in_games: HashMap::new(),
             in_langs: HashMap::new(),
+            oracle_lang_idx: HashMap::new(),
             in_rarities: HashMap::new(),
             settype_idx: HashMap::new(),
             border_idx: HashMap::new(),
@@ -2900,6 +2907,58 @@ impl Index {
             .map(|(k, v)| k.len() + 48 + v.serialized_size())
             .sum();
         (jsons + strs + toks + std::mem::size_of::<Card>() * self.cards.len()) / (1 << 20)
+    }
+
+    /// Wave-5 item 3: load the language side-table
+    /// ({oracle_id: [lang codes...]} gzipped JSON, from the FULL
+    /// all-cards bulk — default-cards is English-slimmed) and build
+    /// oracle_lang_idx: lang -> all printings of oracles with >=1 print
+    /// in that lang. `en` is skipped: the print-level lang_idx built from
+    /// the dump already answers lang:en (33,909 vs upstream 33,827,
+    /// CLOSE). Codes kept verbatim (zhs/zht); `zh` aliases to zhs in the
+    /// evaluator. ~1 MB resident (31.8k entries). Returns false when the
+    /// file is absent (offline deployments keep the slimmed-dump behavior).
+    pub fn load_langs(&mut self, path: &Path) -> bool {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let raw: HashMap<String, Vec<String>> =
+            match serde_json::from_reader(BufReader::new(GzDecoder::new(file))) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+        // lang -> oracle rows that have that language
+        let mut by_lang: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        for (oid, langs) in &raw {
+            let row = match self.oracle_intern.get(oid.as_str()) {
+                Some(&r) => r,
+                None => continue, // oracle not in the searchable dump
+            };
+            for l in langs {
+                if l == "en" {
+                    continue;
+                }
+                by_lang.entry(l.clone().into()).or_default().push(row);
+            }
+        }
+        for (lang, rows) in by_lang {
+            let mut rowbm = RoaringBitmap::new();
+            for r in rows {
+                rowbm.insert(r);
+            }
+            // in:<lang> = ever printed in that language. in_langs stores
+            // ORACLE ROW ids (InVal spreads them via oracle_prints).
+            self.in_langs.insert(lang.clone(), rowbm.clone());
+            let mut bm = RoaringBitmap::new();
+            for r in rowbm.iter() {
+                if let Some(p) = self.oracle_prints.get(r as usize) {
+                    bm |= p;
+                }
+            }
+            self.oracle_lang_idx.insert(lang, bm);
+        }
+        true
     }
 
     pub fn load_tags(&mut self, path: &Path) -> bool {

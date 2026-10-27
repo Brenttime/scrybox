@@ -1275,11 +1275,18 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 "portuguese" => "pt",
                 "korean" => "ko",
                 "russian" => "ru",
-                "chinese_simplified" | "simplified_chinese" | "zh_hans" => "zhs",
+                "chinese_simplified" | "simplified_chinese" | "zh_hans" | "zh" => "zhs",
                 "chinese_traditional" | "traditional_chinese" | "zh_hant" => "zht",
                 "any" | "all" => return ix.universe.clone(),
                 s => s,
             };
+            // Wave-5 item 3: prefer the full-bulk oracle side table
+            // (default-cards is English-slimmed; upstream lang:ja = 30,853
+            // cards vs 421 from the dump alone). en falls through to the
+            // print-level index (side table deliberately skips en).
+            if let Some(b) = ix.oracle_lang_idx.get(q) {
+                return b.clone();
+            }
             match ix.lang_idx.get(q) {
                 Some(b) => b.clone(),
                 None => {
