@@ -105,6 +105,299 @@ pub const F2_HIDDEN: u64 = 1 << 18; // printing's set is not in Scryfall's defau
 pub const F2_COMPANION: u64 = 1 << 19; // 'Companion' keyword on an expansion/core printing
 pub const F2_ANGEL: u64 = 1 << 20; // 'angel' on any face type (game:/t: combos)
 pub const F2_FRENCH: u64 = 1 << 21; // main text is keyword-abilities-only
+/// Parity w7 (borrow A1): preview object with source mentioning Scryfall —
+/// is:scryfallpreview additionally requires released_at > today (a preview
+/// stops being one at release).
+pub const F2_SC_PREVIEW: u64 = 1 << 22;
+/// Parity w7 (borrow A6a): the printing's mana cost (top level OR any
+/// card_faces[] cost) carries a HYBRID pip — {W/U} two-colour, {2/W}
+/// hybrid-generic, or {W/U/P} hybrid-phyrexian. Pure phyrexian {W/P} and
+/// colour indicators do NOT count (the old `mana_norm contains('/')` test
+/// misfired on both: is:hybrid 927 vs golden 624). Regex-validated in the
+/// w7 replay: 631 vs 624, page-1 members all present.
+pub const F2_HYBRID: u64 = 1 << 23;
+/// Parity w7 (borrow A6c): some face type line (top-level or card_faces[])
+/// is simultaneously 'legendary' and creature/vehicle/spacecraft — the
+/// is:duelcommander commander-candidate shape (vehicles crew, so a
+/// legendary Vehicle from a duel deck counts; validated veh=1 in the sim).
+pub const F2_LEGCRE_ANY: u64 = 1 << 24;
+
+/// True when a raw mana string contains a hybrid pip: `{A/B}` with A,B in
+/// WUBRG, `{2/A}`, or the three-symbol hybrid-phyrexian `{A/B/P}`. Pure
+/// phyrexian `{A/P}` and indicator text never match (exact analogue of the
+/// validated replay regex `\{(?:[WUBRG]/[WUBRG](?:/P)?|2/[WUBRG])\}` —
+/// three-colour gates {W/U/B} are deliberately NOT matched, replay parity
+/// over cleverness).
+pub fn has_hybrid_pip(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let end = match bytes[i..].iter().position(|&c| c == b'}') {
+            Some(p) => i + p,
+            None => break,
+        };
+        let inner = &s[i + 1..end];
+        let parts: Vec<&str> = inner.split('/').collect();
+        let colored = |p: &str| p.chars().count() == 1 && "WUBRG".contains(p);
+        let hit = match parts.len() {
+            2 => (colored(parts[0]) && colored(parts[1])) || (parts[0] == "2" && colored(parts[1])),
+            3 => colored(parts[0]) && colored(parts[1]) && parts[2] == "P",
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+        i = end + 1;
+    }
+    false
+}
+
+/// Parity w7 (borrow A6b): the computed french-vanilla keyword VOCAB —
+/// every <=6-word oracle-text segment an upstream is:frenchvanilla member
+/// carries (learned from the full cached upstream population; the w7
+/// replay: ours 1,105 vs golden 1,094, d<1% CLOSE). A printing is
+/// is:frenchvanilla iff it has >=1 'creature' face, some creature face has
+/// text or keywords, and EVERY segment of every creature face's oracle
+/// text (reminder costs/parens stripped, split on , . \n ; / em-dash /
+/// ": ") is in this vocab. DOCUMENTED ALTERNATIVE (otag route): the tagger
+/// dump ships an 'isfrenchvanilla' oracle tag and Filter::OracleTag would
+/// carry it verbatim — rejected: the offline otag dump is a trimmed
+/// vocabulary whose membership drifted from the live population (ward/
+/// vigilance-with-extra-sentences band), while this vocab is reproduced
+/// from the golden answer set itself.
+pub const FV_VOCAB: &[&str] = &[
+    "an opponent gains life",
+    "assist",
+    "basic landcycling",
+    "battle cry",
+    "cascade",
+    "changeling",
+    "collect evidence",
+    "convoke",
+    "cumulative upkeep",
+    "cycling",
+    "dash",
+    "daybound",
+    "deathtouch",
+    "defender",
+    "delve",
+    "dethrone",
+    "devoid",
+    "discard a zombie card",
+    "disguise",
+    "double strike",
+    "double team",
+    "echo",
+    "embalm",
+    "enlist",
+    "escape",
+    "eternalize",
+    "evolve",
+    "exalted",
+    "exile a land you control",
+    "exile five other cards from your graveyard",
+    "exile four cards from your graveyard",
+    "exile three other cards from your graveyard",
+    "extort",
+    "fear",
+    "first strike",
+    "flanking",
+    "flash",
+    "flying",
+    "forestcycling",
+    "forestwalk",
+    "foretell",
+    "freerunning",
+    "haste",
+    "hexproof",
+    "horsemanship",
+    "improvise",
+    "increment",
+    "indestructible",
+    "infect",
+    "ingest",
+    "intimidate",
+    "islandcycling",
+    "islandwalk",
+    "lifelink",
+    "madness",
+    "mayhem",
+    "megamorph",
+    "melee",
+    "menace",
+    "mentor",
+    "miracle",
+    "morph",
+    "mountaincycling",
+    "mountainwalk",
+    "myriad",
+    "nightbound",
+    "ninjutsu",
+    "nonbasic landwalk",
+    "outlast",
+    "partner",
+    "pay life",
+    "pay life equal to this creature s power",
+    "persist",
+    "phasing",
+    "plainscycling",
+    "plainswalk",
+    "protection from black and from green",
+    "protection from black and from red",
+    "protection from black borders",
+    "protection from blue and from red",
+    "protection from demons and from dragons",
+    "protection from dragons",
+    "protection from each color",
+    "protection from enchantments",
+    "protection from even collector numbers",
+    "protection from lands",
+    "protection from loose lips",
+    "protection from mana value or greater",
+    "protection from odd collector numbers",
+    "protection from red and from green",
+    "protection from red and from white",
+    "protection from two word names",
+    "protection from watermarks",
+    "protection from zombies",
+    "prototype",
+    "provoke",
+    "prowess",
+    "put a counter on a creature an opponent controls",
+    "put two cards from a single graveyard on the bottom of their owner s library",
+    "reach",
+    "return a bird you control to its owner s hand",
+    "riot",
+    "sacrifice two lands",
+    "say toy boat quickly",
+    "scavenge",
+    "shroud",
+    "skulk",
+    "specialize",
+    "spectacle",
+    "squad",
+    "sunburst",
+    "surge",
+    "swampcycling",
+    "swampwalk",
+    "training",
+    "trample",
+    "transfigure",
+    "transmute",
+    "undying",
+    "unearth",
+    "unleash",
+    "vigilance",
+    "ward",
+    "warp",
+    "web slinging",
+    "wither",];
+
+fn fv_vocab() -> &'static std::collections::HashSet<&'static str> {
+    static V: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(|| FV_VOCAB.iter().copied().collect())
+}
+
+/// Strip {…} mana costs and (…) reminder text, replacing both with a SPACE
+/// (mirrors the replay's regex replacements — the space matters: "X(a)Y"
+/// must not become "XY").
+fn fv_strip(t: &str) -> String {
+    let mut s = t.to_string();
+    loop {
+        let mut out = String::with_capacity(s.len());
+        let mut depth = 0i32;
+        for ch in s.chars() {
+            match ch {
+                '{' | '(' => depth += 1,
+                '}' | ')' => depth = (depth - 1).max(0),
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        if out == s {
+            break;
+        }
+        s = out;
+    }
+    s
+}
+
+/// The replay's segment split: quotes -> space; split on runs of
+/// [,.\n;], single em-dashes, or ': '; fold each segment to
+/// lowercase-[a-z] words separated by single spaces (every other character
+/// becomes a space).
+fn fv_segments(t: &str) -> Vec<String> {
+    let s: String = fv_strip(t)
+        .chars()
+        .map(|c| if c == '"' || c == '\u{201C}' || c == '\u{201D}' { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ',' || c == '.' || c == ';' || c == '\n' {
+            while i < chars.len() && matches!(chars[i], ',' | '.' | ';' | '\n') {
+                i += 1;
+            }
+            out.push(std::mem::take(&mut cur));
+        } else if c == '\u{2014}' {
+            i += 1;
+            out.push(std::mem::take(&mut cur));
+        } else if c == ':' && i + 1 < chars.len() && chars[i + 1] == ' ' {
+            i += 2;
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+            i += 1;
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|seg| {
+            seg.to_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_lowercase() { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// The is:frenchvanilla predicate over one printing's face list —
+/// `faces: Vec<(type_line, oracle_text, has_keywords)>`, entry 0 = top
+/// level. Mirrors the validated replay (oracle_faces + fv_rule in
+/// scratch/w7/w7_verify.py): creature faces only, non-vanilla (some text/
+/// keyword), every segment a vocab keyword phrase.
+pub fn fv_printing_ok(faces: &[(&str, &str, bool)]) -> bool {
+    let cre: Vec<&(&str, &str, bool)> = faces
+        .iter()
+        .filter(|(tl, _, _)| tl.to_lowercase().contains("creature"))
+        .collect();
+    if cre.is_empty() {
+        return false;
+    }
+    if !cre.iter().any(|(_, ot, kw)| !ot.trim().is_empty() || *kw) {
+        return false;
+    }
+    for (_, ot, _) in cre {
+        for seg in fv_segments(ot) {
+            if seg.split(' ').count() > 6 || !fv_vocab().contains(seg.as_str()) {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// True when oracle text (reminder parens already absent or removed) consists
 /// only of keyword abilities — the is:frenchvanilla test (calibrated against
@@ -155,6 +448,40 @@ pub fn keyword_only_text(s: &str) -> bool {
 /// of visibility. mb2/fra/dsk/hbg residuals are stale-dump drift, not hiding.
 pub fn is_hidden_set_code(code: &str) -> bool {
     matches!(code, "unk" | "hho" | "ph18" | "ph19" | "ph21" | "ph22" | "ph23")
+}
+
+/// Parity w7 (borrow A5): the FULL hidden-set-code calibration (OTAG list,
+/// ~196 codes) used by the cn: numeric row gate — distinct from
+/// is_hidden_set_code, the tiny is:unique blocklist above. Mirrors the w7
+/// replay's `set in OTAG_HIDDEN_SETS` gate (replay cn>100 23,208 vs 23,492).
+pub fn is_pool_hidden_set(code: &str) -> bool {
+    OTAG_HIDDEN_SETS.contains(&code)
+}
+
+/// Parity w7 (borrow A1): preview predicate shared by the main index and the
+/// side prints table. The Scryfall bulk encodes a previewed printing as
+/// `"preview": {source, source_uri, previewed_at}` — an object — while
+/// unreleased-and-unpreviewed prints carry preview:false or the key is
+/// absent. Truthy = the key is present, non-null, and not boolean false.
+pub fn json_is_preview(x: Option<&serde_json::Value>) -> bool {
+    match x {
+        None => false,
+        Some(v) => {
+            if let Some(b) = v.as_bool() {
+                b
+            } else if let Some(o) = v.as_object() {
+                !o.is_empty()
+            } else {
+                !v.is_null()
+            }
+        }
+    }
+}
+
+/// Parity w7 (borrow A5): set_type hidden from the default-search pool —
+/// OTAG_HIDDEN_SET_TYPES ∪ ID_EXTRA_HIDDEN_SET_TYPES (the replay's IOT).
+pub fn is_hidden_set_type(st: &str) -> bool {
+    OTAG_HIDDEN_SET_TYPES.contains(&st) || ID_EXTRA_HIDDEN_SET_TYPES.contains(&st)
 }
 
 /// Layouts that never make an oracle 'visible' for is:unique/is:reprint
@@ -455,6 +782,9 @@ pub struct Index {
 
     // lowercased mirror offsets (into `strings`) for scans
     pub name_lc: Vec<u32>,
+    /// Parity w7 (borrow A2): folded name ∪ flavor_name haystack (see
+    /// norm_name_text) for the bare pow*/tou* name-text wildcards.
+    pub name_text: Vec<u32>,
     pub type_lc: Vec<u32>,
     pub oracle_lc: Vec<u32>,
     /// reminder-stripped, lowercased oracle text (upstream o: search field)
@@ -1120,6 +1450,24 @@ pub(crate) fn parse_cn(s: &str) -> u32 {
     digits.parse().unwrap_or(u32::MAX)
 }
 
+/// Parity w7 (borrow A2): fold a card's searchable NAME TEXT to the bare
+/// [0-9a-z] alphabet (lowercase, every other character DROPPED — punctuation
+/// and accents included, mirroring the validated replay's `[^0-9a-z]` strip),
+/// name and flavor_name joined with a space so a stem can never cross the
+/// boundary. `pow*` then answers as a plain substring test.
+pub fn norm_name_text(name: &str, flavor_name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + flavor_name.len() + 1);
+    for src in [name, flavor_name] {
+        for ch in src.to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+            }
+        }
+        out.push(' ');
+    }
+    out
+}
+
 /// Sentinel for a P/T/loyalty box printed as '*' (distinct from NAN=absent).
 /// Upstream treats '*' as a WILDCARD in inequalities: pow<=3 also matches
 /// 0/* creatures (golden pow<1 1064 vs numeric-only 807), but pow=3 does not.
@@ -1175,6 +1523,9 @@ struct RawC {
     edhrec: u32,
     lang: String,
     flavor: String,
+    /// Parity w7 (borrow A2): punctuation-folded lowercase 'name flavor_name'
+    /// — the search haystack for bare pow*/tou* name-text wildcards.
+    name_text: String,
     watermark: String,
     illustration: String,
     ptypes: String,
@@ -1403,6 +1754,9 @@ fn parse_line(line: &str) -> Option<RawC> {
     for_each_token(&tl_lc, 2, &mut |t| type_tokens.push(t.to_string()));
 
     let mut flags = 0u32;
+    // w7: set when the bulk preview object's source mentions Scryfall;
+    // consumed once flags2 exists below (F2_SC_PREVIEW).
+    let mut scryfall_preview = false;
     let has = |tok: &str| type_tokens.iter().any(|t| t == tok);
     let land = has("land");
     if land {
@@ -1527,7 +1881,8 @@ fn parse_line(line: &str) -> Option<RawC> {
     if colors == 0 {
         flags |= F_COLORLESS;
     }
-    let mut oracle_text = str_of(&v, "oracle_text").to_string();
+    let raw_top_ot = str_of(&v, "oracle_text").to_string();
+    let mut oracle_text = raw_top_ot.clone();
     if oracle_text.trim().is_empty() {
         // DFC prints in this dump put the text on the faces
         if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
@@ -1567,14 +1922,42 @@ fn parse_line(line: &str) -> Option<RawC> {
     if !watermark.is_empty() {
         flags |= F_HAS_WM;
     }
-    if v.get("color_indicator").is_some() {
-        flags |= F_HAS_IND;
+    // Parity w7 (borrow A3): has:color_indicator = ∃ printing whose
+    // color_indicator[] is nonempty OR any card_faces[i].color_indicator[]
+    // nonempty (transform/ADVENTURE backs carry the indicator only on the
+    // face; the top-level key is absent). w7 replay 362/362 exact vs the
+    // cached goldens — top-level-only returned 39. Empty arrays don't count.
+    {
+        let ci_nonempty = |x: &serde_json::Value| -> bool {
+            x.get("color_indicator").and_then(|c| c.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+        };
+        let face_ci = v
+            .get("card_faces")
+            .and_then(|x| x.as_array())
+            .map(|fs| fs.iter().any(ci_nonempty))
+            .unwrap_or(false);
+        if ci_nonempty(&v) || face_ci {
+            flags |= F_HAS_IND;
+        }
     }
     if v.get("card_faces").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
         flags |= F_HAS_FACES;
     }
-    if v.get("preview").and_then(|x| x.as_bool()).unwrap_or(false) {
+    // Parity w7 (borrow A1): bulk 'preview' is an OBJECT ({source,
+    // previewed_at,…}) on previewed prints, not a bool — the old as_bool()
+    // test never fired, silently disabling preview suppression (validated
+    // sim treated a truthy dict as preview). present-but-null/false = not a
+    // preview (bulk carries preview:false widely).
+    if json_is_preview(v.get("preview")) {
         flags |= F_PREVIEW;
+        if v.get("preview")
+            .and_then(|p| p.get("source"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_ascii_lowercase().contains("scryfall"))
+            .unwrap_or(false)
+        {
+            scryfall_preview = true;
+        }
     }
     let layout = str_of(&v, "layout").to_string();
     if v
@@ -1664,6 +2047,9 @@ fn parse_line(line: &str) -> Option<RawC> {
         }
     };
     let mut flags2 = 0u64;
+    if scryfall_preview {
+        flags2 |= F2_SC_PREVIEW;
+    }
     if str_of(&v, "set_type") == "token"
         || matches!(layout.as_str(), "token" | "double_faced_token")
         || type_tokens.iter().any(|t| t == "token")
@@ -1715,6 +2101,44 @@ fn parse_line(line: &str) -> Option<RawC> {
     if joined_text.contains("can be your commander") {
         flags2 |= F2_CBC;
     }
+    // Parity w7 (borrow A6a): hybrid pips ({W/U}, {2/U}, {W/U/P}) on the
+    // top-level OR any card_faces[] mana cost — is:hybrid quantifies over
+    // faces (MDFC/modal backs carry their own hybrid costs; the old
+    // mana_norm contains('/') arm also matched phyrexian {W/P} and missed
+    // face costs entirely: 927 vs golden 624).
+    if has_hybrid_pip(&str_of(&v, "mana_cost"))
+        || faces_arr.iter().any(|f| has_hybrid_pip(&fstr(f, "mana_cost")))
+    {
+        flags2 |= F2_HYBRID;
+    }
+    // Parity w7 (borrow A6c): legendary creature/vehicle on one face —
+    // per-face word check (LEG_MAIN ∧ CRE_MAIN misses duel-deck cards
+    // whose back face is the commander; has_any() word-union would
+    // cross-faces and let a legendary land + nonlegendary creature leak).
+    {
+        let mut tl_ok = false;
+        let mut tls: Vec<&str> = vec![type_line.as_str()];
+        let mut ftls: Vec<&str> = Vec::new();
+        for f in &faces_arr {
+            if let Some(x) = f.get("type_line").and_then(|x| x.as_str()) {
+                ftls.push(x);
+            }
+        }
+        tls.extend(ftls.iter().copied());
+        for tl in tls {
+            let tl_lc = tl.to_lowercase();
+            let words: Vec<&str> = tl_lc.split(|c: char| !c.is_alphabetic()).filter(|x| !x.is_empty()).collect();
+            let legend = words.iter().any(|w| *w == "legendary");
+            let shape = words.iter().any(|w| *w == "creature" || *w == "vehicle" || *w == "spacecraft");
+            if legend && shape {
+                tl_ok = true;
+                break;
+            }
+        }
+        if tl_ok {
+            flags2 |= F2_LEGCRE_ANY;
+        }
+    }
     let mut pts: Vec<(Option<f64>, Option<f64>, Option<f64>)> = vec![(
         opt_num(&v, "power"),
         opt_num(&v, "toughness"),
@@ -1752,10 +2176,37 @@ fn parse_line(line: &str) -> Option<RawC> {
     if has_any("angel") {
         flags2 |= F2_ANGEL;
     }
-    if (flags2 & (F2_CRE_MAIN | F2_MAIN_TEXT | F2_PW_MAIN)) == (F2_CRE_MAIN | F2_MAIN_TEXT)
-        && keyword_only_text(&main_text)
+    // Parity w7 (borrow A6b): is:frenchvanilla via the computed keyword
+    // VOCAB (see FV_VOCAB) — ALL creature faces (main AND backs), every
+    // oracle-text segment a vocab keyword phrase, and the card is not
+    // vanilla (some creature face carries text or keywords). Replaces the
+    // old main-face-only keyword_only_text heuristic (840 vs golden 1,094
+    // DRIFT; replay with the vocab: 1,105, page-1 members all present).
     {
-        flags2 |= F2_FRENCH;
+        let mut fv_faces: Vec<(&str, &str, bool)> = vec![(
+            type_line.as_str(),
+            raw_top_ot.as_str(),
+            !keywords_joined.trim().is_empty(),
+        )];
+        let fv_ftls: Vec<(String, String, bool)> = faces_arr
+            .iter()
+            .map(|f| {
+                (
+                    fstr(f, "type_line"),
+                    fstr(f, "oracle_text"),
+                    f.get("keywords")
+                        .and_then(|x| x.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false),
+                )
+            })
+            .collect();
+        for (a, b, c) in &fv_ftls {
+            fv_faces.push((a.as_str(), b.as_str(), *c));
+        }
+        if fv_printing_ok(&fv_faces) {
+            flags2 |= F2_FRENCH;
+        }
     }
     // duplicate the F_PREVIEW semantic fix: 'preview' present-but-false is not
     // a preview card (bulk data carries preview:false on many prints).
@@ -1832,6 +2283,10 @@ fn parse_line(line: &str) -> Option<RawC> {
         id: str_of(&v, "id").to_string(),
         oracle_id: str_of(&v, "oracle_id").to_string(),
         name: str_of(&v, "name").to_string(),
+        name_text: crate::index::norm_name_text(
+            str_of(&v, "name"),
+            str_of(&v, "flavor_name"),
+        ),
         set: str_of(&v, "set").to_string(),
         set_name: str_of(&v, "set_name").to_string(),
         set_type: str_of(&v, "set_type").to_string(),
@@ -2001,6 +2456,7 @@ impl Index {
             jsons: Vec::with_capacity(raws.len()),
             id_map: HashMap::with_capacity(raws.len()),
             name_lc: Vec::with_capacity(raws.len()),
+            name_text: Vec::with_capacity(raws.len()),
             type_lc: Vec::with_capacity(raws.len()),
             oracle_lc: Vec::with_capacity(raws.len()),
             otext_lc: Vec::with_capacity(raws.len()),
@@ -2171,6 +2627,7 @@ impl Index {
             ix.id_map.insert(r.id.as_str().into(), idx);
 
             ix.name_lc.push(s(&r.name.to_lowercase()));
+            ix.name_text.push(s(&r.name_text));
             ix.type_lc.push(s(&r.type_line.to_lowercase()));
             ix.oracle_lc.push(s(&r.oracle_text.to_lowercase()));
             ix.otext_lc

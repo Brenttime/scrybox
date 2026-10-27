@@ -2,7 +2,7 @@
 
 use crate::index::{
     Card, Index, NFORMATS, F2_HIDDEN, F2_NAME_SLASH, F2_TOKEN, F_BOOSTER_FLAG, F_FULLART,
-    F_HAS_IND, F_HAS_TEXT,
+    F_HAS_IND, F_HAS_TEXT, F_PREVIEW,
     F_HAS_WM, F_HIRES, F_PROMO, F_SPOTLIGHT, F_TEXTLESS, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL, STAR,
 };
 use crate::query::{
@@ -155,8 +155,12 @@ fn cn_match(op: Cmp, num: u32, full: Option<&str>, raw: &str, cn_val: u32) -> bo
             }
             let qs = f.trim_end_matches('★').trim_end_matches('*');
             match op {
-                Cmp::Lt => cn_val < num || (cn_val == num && flat.as_str() < qs),
-                Cmp::Le => cn_val < num || (cn_val == num && flat.as_str() <= qs),
+                // Parity w7 (borrow A5, parent approved): for an alpha
+                // query 'cn<12a' the tie at v==12 requires a REAL suffix
+                // ('' < s < 'a') — bare '12' is EXCLUDED (golden cn<12a
+                // 3,082 has no plain-12 oracles; w7 replay 3,135 vs 3,135).
+                Cmp::Lt => cn_val < num || (cn_val == num && flat.len() > digits.len() && flat.as_str() < qs),
+                Cmp::Le => cn_val < num || (cn_val == num && flat.len() > digits.len() && flat.as_str() <= qs),
                 Cmp::Gt => cn_val > num || (cn_val == num && flat.as_str() > qs),
                 Cmp::Ge => cn_val > num || (cn_val == num && flat.as_str() >= qs),
                 _ => unreachable!(),
@@ -169,7 +173,14 @@ fn cn_match(op: Cmp, num: u32, full: Option<&str>, raw: &str, cn_val: u32) -> bo
                 return matches!(op, Cmp::Ge | Cmp::Gt);
             }
             if flat.len() > digits.len() {
-                return false; // suffixed prints are NULL for ranges
+                // Parity w7 (borrow A5): suffixed prints compare by NUMERIC
+                // PREFIX on lower-bound ranges — '100a' satisfies cn>100
+                // (pair order 100a > 100), '99a' does not. (w5 treated ALL
+                // suffixed prints as NULL here; the w7 replay over the
+                // ungated allprints universe — cn>100 23,209 vs golden
+                // 23,492, page-1 members all present — requires the prefix
+                // compare.) Upper bounds stay strict: cn<12 excludes 12a.
+                return matches!(op, Cmp::Ge | Cmp::Gt) && cn_val >= num;
             }
             match op {
                 Cmp::Lt => cn_val < num,
@@ -187,6 +198,20 @@ fn cn_match(op: Cmp, num: u32, full: Option<&str>, raw: &str, cn_val: u32) -> bo
 /// scryfall.com's default-search total_cards semantics.
 pub fn uses_otag(nodes: &[Node]) -> bool {
     nodes.iter().any(node_has_otag)
+}
+
+/// Parity w7 (borrow A4): true when the WHOLE query is a bare layout-level
+/// negative (`-is:mdfc`) answered in print-count mode by the Not arm in
+/// eval_node — the all-printings minus-set is already oracle-ungated, so
+/// api.rs must NOT apply the default-search pool gate (upstream's golden is
+/// 38,899 distinct oracles — far beyond the 33,909-card visible pool).
+/// Combos (`t:creature -is:mdfc`) keep the normal gate: only the leading
+/// minus-set is ungated, the query itself stays a pool query.
+pub fn uses_print_mode(nodes: &[Node]) -> bool {
+    matches!(
+        nodes,
+        [Node::Not(b)] if matches!(**b, Node::Filter(Filter::Is(ref t)) if t == "mdfc")
+    )
 }
 
 fn node_has_otag(n: &Node) -> bool {
@@ -324,6 +349,25 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             acc
         }
         Node::Not(inner) => {
+            // Parity w7 (borrow A4): a BARE layout-negative query answers in
+            // PRINT-COUNT mode: upstream subtracts oracles carrying the
+            // layout anywhere in the UNGATED all-printings table — -is:mdfc
+            // = distinct oracles with zero modal_dfc printings anywhere
+            // (replay 38,878 vs cached golden 38,899 → CLOSE; the pool-
+            // deduped w5 model gave 33,810 = DRIFT). api.rs skips the pool
+            // gate for exactly this AST shape (uses_print_mode). Promo-attr
+            // negatives (-is:fnm / -is:judge_gift) keep the w5 pool model —
+            // this arm covers LAYOUT tags only.
+            if let Node::Filter(Filter::Is(t)) = &**inner {
+                if t == "mdfc" && ix.side.loaded {
+                    let mdfc = scan(ix, |i| {
+                        ix.side.mdfc_or[ix.card_oracle[i as usize] as usize] & 1 != 0
+                    });
+                    let mut r = ix.universe.clone();
+                    r -= &mdfc;
+                    return r;
+                }
+            }
             let a = eval_node(inner, ix, w);
             let mut r = ix.universe.clone();
             r -= &a;
@@ -523,16 +567,37 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             // ∀-path above stays default-cards-only (w5 goldens validated
             // there).
             let alpha = full.is_some();
-            let side = ix.side.loaded && alpha;
+            // Parity w7 (borrow A5): LOWER-BOUND ranges (cn>100, cn>=100)
+            // quantify ∃ over DEF ∪ allprints for BOTH numeric and alpha
+            // query values (w6 kept the side leg alpha-only, leaving
+            // cn>100 at 24,624 vs golden 23,492), and every row — default
+            // or side — must pass the replay's hidden-set / hidden-set_type
+            // row gate (OTAG_HIDDEN_SETS ∪ ID_EXTRA_*). Promos DO feed it
+            // (golden cn>100 is:promo = 4,947; the old promo/variation/
+            // token/nonen side gate cost ~1,400 oracles). ALPHA upper
+            // bounds (cn<12a) join the side leg + row gate (golden 3,082:
+            // replay 3,135, page-1 members all present). NUMERIC upper
+            // bounds (cn<100 19,483, cn<=1 452) stay on the w6 default-only
+            // model — the replay did not validate them and gating their
+            // hidden-set low prints regressed cn<100 19,310→18,507.
+            // Eq/Ne keep the w5 twin model untouched (cn=12a 387/cn=1 445).
+            let lower = matches!(op, Cmp::Gt | Cmp::Ge);
+            let range = lower || (alpha && matches!(op, Cmp::Lt | Cmp::Le));
+            let side = ix.side.loaded && (alpha || range);
+            let ix2 = ix;
+            let own_ok = move |c: &Card| -> bool {
+                if range {
+                    !crate::index::is_pool_hidden_set(&ix2.strings[c.set as usize])
+                        && !crate::index::is_hidden_set_type(&ix2.strings[c.set_type as usize])
+                        && print_ok(c)
+                } else {
+                    // alpha Eq/Ne: w5 model — no extra own-row gate.
+                    print_ok(c)
+                }
+            };
             scan(ix, move |i| {
                 let c = &ix.cards[i as usize];
-                // Pool visibility per candidate print: token sheets and
-                // hidden rows do not satisfy an alpha-suffixed lower-bound
-                // upstream (golden cn<12a 3082 sits well below the fully
-                // ungated ∃ at 4201).
-                let pool_ok = !alpha
-                    || (c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0);
-                let own = pool_ok && print_ok(c);
+                let own = own_ok(c);
                 if !side {
                     return own;
                 }
@@ -546,23 +611,26 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     return own;
                 }
                 own || prints::recs(ix, i).iter().any(|p| {
-                    // only prints from upstream's default search pool
-                    // feed cn: quantification — variant sheets, promos,
-                    // tokens and foreign rows stay out (golden calibration:
-                    // including them pushed cn<12a to 4202 vs 3082).
-                    p.flags
-                        & (prints::SR_PROMO
-                            | prints::SR_VARIATION
-                            | prints::SR_TOKEN
-                            | prints::SR_NONEN)
-                        == 0
-                        && cn_match(
-                            op,
-                            num,
-                            full.as_deref(),
-                            &ix.side.strings[p.cn as usize],
-                            p.cn_val,
-                        )
+                    let pass = if range {
+                        // w7 replay row gate (see above): hidden set codes
+                        // and hidden set_types are the only exclusions.
+                        p.flags & (prints::SR_HIDSET | prints::SR_HIDST) == 0
+                    } else {
+                        // alpha Ne keeps the w6a pool gate.
+                        p.flags
+                            & (prints::SR_PROMO
+                                | prints::SR_VARIATION
+                                | prints::SR_TOKEN
+                                | prints::SR_NONEN)
+                            == 0
+                    };
+                    pass && cn_match(
+                        op,
+                        num,
+                        full.as_deref(),
+                        &ix.side.strings[p.cn as usize],
+                        p.cn_val,
+                    )
                 })
             })
         }
@@ -669,6 +737,13 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 bm
             }
         }
+        Filter::NameText(q) => {
+            // Parity w7 (borrow A2): bare pow*/tou* — substring over the
+            // folded name ∪ flavor_name haystack; NO oracle text, NO type
+            // line. Pool-gated by the api layer (replay ∩ vis = 94/85).
+            let q = q.clone();
+            scan(ix, |i| ix.s(ix.name_text[i as usize]).contains(q.as_str()))
+        }
         Filter::Name(v) => {
             if !v.contains(' ') {
                 let mut bm = RoaringBitmap::new();
@@ -746,6 +821,43 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     let c = &ix.cards[i as usize];
                     num_any(c.defense, c.face_def, o, v)
                 }),
+                // Parity w7 (borrow A1): date:/year: RANGES are ∃-over-all-
+                // printings (DEF rows ∪ side all_cards rows) with preview
+                // suppression: a printing only counts unless it carries the
+                // preview flag AND its release date is still in the future
+                // (upstream hides unreleased preview printings). Result is
+                // pool-gated (∩ id_vis_bits) and oracle-deduped by the api
+                // layer — w7 replay date>2020-01-01 22,375 vs 22,094,
+                // date<2010-06-15 11,146 vs 11,143, year>2020 20,784 vs
+                // 20,480, year>=2020 22,375 vs 22,094. Eq/Ne keep the legacy
+                // own-row model (year=2000 799 vs 736 would inflate under ∃).
+                NumField::Date | NumField::Year
+                    if matches!(o, Cmp::Gt | Cmp::Ge | Cmp::Lt | Cmp::Le) =>
+                {
+                    let is_year = matches!(*field, NumField::Year);
+                    let today = ix.today;
+                    let mut bm = scan(ix, move |i| {
+                        let c = &ix.cards[i as usize];
+                        let pass = |rel: u32| -> bool {
+                            if rel == 0 {
+                                return false;
+                            }
+                            let x = if is_year { (rel / 10_000) as f32 } else { rel as f32 };
+                            cmp_f(x, o, v)
+                        };
+                        let own = pass(c.released);
+                        own || prints::recs(ix, i).iter().any(|p| {
+                            // Side (all_cards) rows contribute only once
+                            // actually released: unreleased side prints are
+                            // preview-pending upstream even when the dump's
+                            // preview key lags. Released preview rows DO
+                            // count (sld 2840 rel 2026-10-12 evidence).
+                            p.released != 0 && p.released <= today && pass(p.released)
+                        })
+                    });
+                    bm &= &ix.id_vis_bits;
+                    bm
+                }
                 _ => {
                     let f = *field;
                     // Parity w6a: price comparisons are ∃-over-printings —
@@ -1711,6 +1823,41 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     w.push(format!("unknown released: value '{v}'"));
                     RoaringBitmap::new()
                 }
+                Some(t) if matches!(o, Cmp::Gt | Cmp::Ge | Cmp::Lt | Cmp::Le) => {
+                    // Parity w7 (borrow A1): range date:/released: are
+                    // ∃-over-all-printings (DEF rows ∪ side all_cards rows),
+                    // pool-gated, excluding rows that are BOTH preview:true
+                    // AND unreleased (released_at > today). Upstream has NO
+                    // today-clamp otherwise: a non-preview unreleased print
+                    // (trk 300, rel 2026-11-13, preview:false) legitimately
+                    // answers date>2020-01-01. w7 replay 22,375 vs upstream
+                    // 22,094 (residual = post-dump growth), date<2010-06-15
+                    // 11,146 vs 11,143. Eq/Ne keep the legacy own-row model.
+                    let today = ix.today;
+                    let mut bm = scan(ix, move |i: u32| -> bool {
+                        let c = &ix.cards[i as usize];
+                        let pass = |r: u32| -> bool {
+                            r != 0
+                                && match o {
+                                    Cmp::Lt => r < t,
+                                    Cmp::Le => r <= t,
+                                    Cmp::Gt => r > t,
+                                    _ => r >= t,
+                                }
+                        };
+                        let own = pass(c.released);
+                        own || prints::recs(ix, i).iter().any(|p| {
+                            // Side (all_cards) rows contribute only once
+                            // actually released: unreleased side prints are
+                            // preview-pending upstream even when the dump's
+                            // preview key lags. Released preview rows DO
+                            // count (sld 2840 rel 2026-10-12 evidence).
+                            p.released != 0 && p.released <= today && pass(p.released)
+                        })
+                    });
+                    bm &= &ix.id_vis_bits;
+                    bm
+                }
                 Some(t) => scan(ix, move |i: u32| -> bool {
                     let r = ix.cards[i as usize].released;
                     if r == 0 {
@@ -1721,10 +1868,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                             || (t % 10_000 >= 100 && r == t)
                             || (t % 10_000 == 0 && r / 10_000 == t / 10_000),
                         Cmp::Ne => r != t,
-                        Cmp::Lt => r < t,
-                        Cmp::Le => r <= t,
-                        Cmp::Gt => r > t,
-                        Cmp::Ge => r >= t,
+                        _ => false,
                     }
                 }),
             }
@@ -1994,7 +2138,17 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "gamechanger" => Some(F_GAMECHANGER),
         "spotlight" => Some(F_SPOTLIGHT),
         "booster" => Some(F_BOOSTER_FLAG),
-        "preview" | "scryfallpreview" => Some(F_PREVIEW),
+        "preview" => Some(F_PREVIEW),
+        // Parity w7 (borrow A1): is:scryfallpreview = previewed BY Scryfall
+        // and not yet released (bulk preview object source == Scryfall).
+        // Upstream's 6 at capture time; the dump's 325 scryfall-sourced
+        // previews have all released since, so the honest answer is 0.
+        "scryfallpreview" => {
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & crate::index::F2_SC_PREVIEW != 0 && c.released > ix.today
+            })
+        }
         "hires" => Some(F_HIRES),
         _ => None,
     };
@@ -2136,10 +2290,13 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             return scan(ix, |i| ix.cards[i as usize].colors.count_ones() == 5)
         }
         "hybrid" => {
-            return scan(ix, |i| {
-                let m = ix.mana_norm(i);
-                m.contains('/') && !m.contains("/p")
-            });
+            // Parity w7 (borrow A6a): ∃ hybrid pip ({W/U}, {2/U}, {W/U/P})
+            // in the top-level OR any face mana cost, computed at build
+            // (F2_HYBRID). The old `mana_norm contains('/') && !contains
+            // ("/p")` arm (a) never saw face costs, (b) dropped EVERY card
+            // carrying a pure-phyrexian pip, and (c) matched colour-
+            // indicator slashes. Replay: 631 vs golden 624, page-1 miss 0.
+            return scan(ix, |i| ix.cards[i as usize].flags2 & F2_HYBRID != 0);
         }
         "phyrexian" => return scan(ix, |i| ix.mana_norm(i).contains("/p")),
         "mirror" => return scan(ix, |i| ix.oracle_lc(i).contains("mirror")),
@@ -2290,21 +2447,23 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             });
         }
         "duelcommander" | "duel-commander" => {
+            // Parity w7 (borrow A6c): duels-legal AND (legendary
+            // creature/vehicle on some face — vehicles crew, validated
+            // veh=1 — OR a Planeswalker face ONLY when the text carries
+            // the CBC clause; the old arm accepted every duels-legal PW,
+            // 3,718 vs golden 3,409). Funny set_types are NOT excluded
+            // (nofunny=0 validated); per-row token/hidden exclusions
+            // removed — replay quantified over all default printings and
+            // let the pool gate do the visibility work (api id_vis_bits).
+            // Replay: 3,475 vs 3,409, page-1 miss 0.
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
-                    return false;
-                }
                 let legal_duel = ((c.legal >> (18 * 2)) & 3) as u32 == L_LEGAL;
                 if !legal_duel {
                     return false;
                 }
-                if c.flags2 & F2_CBC != 0 {
-                    return true;
-                }
-                c.flags2 & F2_LEG_MAIN != 0
-                    && (c.flags2 & (F2_CRE_MAIN | F2_VEH_MAIN) != 0
-                        || c.flags2 & F2_PW_ANY != 0)
+                c.flags2 & F2_LEGCRE_ANY != 0
+                    || (c.flags2 & F2_PW_ANY != 0 && c.flags2 & F2_CBC != 0)
             });
         }
         "partner" => {
