@@ -543,6 +543,9 @@ pub struct Index {
     pub lang_idx: HashMap<Box<str>, RoaringBitmap>,
     /// b: (block name or any member set code) -> printings; built in load_set_meta.
     pub block_idx: HashMap<Box<str>, RoaringBitmap>,
+    /// set name (lowercase) -> block name; powers the b: member-set-name
+    /// fallback (b:legacy -> "Urza's Legacy" -> block "Urza").
+    pub block_setname: HashMap<Box<str>, Box<str>>,
     /// g: (set code/name) -> printings of the set's release group (self, parent,
     /// siblings, children); built in load_set_meta.
     pub group_idx: HashMap<Box<str>, RoaringBitmap>,
@@ -2044,6 +2047,7 @@ impl Index {
             ptype_idx: HashMap::new(),
             lang_idx: HashMap::new(),
             block_idx: HashMap::new(),
+            block_setname: HashMap::new(),
             group_idx: HashMap::new(),
             land_cycles: HashMap::new(),
             today: {
@@ -3302,7 +3306,31 @@ impl Index {
                     block_bm.insert(code.into(), bm.clone());
                 }
             }
+            // parser lowercases filter values, so expose case-insensitive
+            // block-name keys too (b:Urza and b:urza both resolve).
+            let name_keys: Vec<String> = block_bm.keys().map(|k| k.to_string()).collect();
+            for k in name_keys {
+                let lk = k.to_lowercase();
+                if lk != k {
+                    if let Some(bm) = block_bm.get(k.as_str()) {
+                        block_bm.insert(lk.into(), bm.clone());
+                    }
+                }
+            }
             self.block_idx = block_bm;
+
+            // set-name -> block-name map for the b: member-set fallback
+            // (b:legacy matches set "Urza's Legacy" -> block "Urza").
+            let mut sn: HashMap<Box<str>, Box<str>> = HashMap::new();
+            for i in 0..self.sets.len() {
+                let e = &self.sets[i];
+                if e.block != u32::MAX {
+                    let name = self.s(e.name).to_lowercase();
+                    let blk = self.s(e.block).to_lowercase();
+                    sn.entry(name.into()).or_insert(blk.into());
+                }
+            }
+            self.block_setname = sn;
 
             let mut group_bm: HashMap<Box<str>, RoaringBitmap> = HashMap::new();
             let codes: Vec<String> = name_of.keys().cloned().collect();
