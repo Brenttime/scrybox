@@ -8,7 +8,7 @@ import { useSwipeBack } from '../utils/useSwipeBack';
 // this document, so a thin transparent strip along the left edge catches the
 // swipe-back gesture (not position:fixed, or useSwipeBack would skip it).
 export default function ScryfallPortal({ onNavigate }) {
-  const t = useT();
+  const { t } = useT();
   const back = () => onNavigate?.('dashboard');
   useSwipeBack(true, back);
 
