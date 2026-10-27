@@ -109,6 +109,47 @@ pub const F2_FRENCH: u64 = 1 << 21; // main text is keyword-abilities-only
 /// is:scryfallpreview additionally requires released_at > today (a preview
 /// stops being one at release).
 pub const F2_SC_PREVIEW: u64 = 1 << 22;
+/// Parity w7 (borrow A6a): the printing's mana cost (top level OR any
+/// card_faces[] cost) carries a HYBRID pip — {W/U} two-colour, {2/W}
+/// hybrid-generic, or {W/U/P} hybrid-phyrexian. Pure phyrexian {W/P} and
+/// colour indicators do NOT count (the old `mana_norm contains('/')` test
+/// misfired on both: is:hybrid 927 vs golden 624). Regex-validated in the
+/// w7 replay: 631 vs 624, page-1 members all present.
+pub const F2_HYBRID: u64 = 1 << 23;
+
+/// True when a raw mana string contains a hybrid pip: `{A/B}` with A,B in
+/// WUBRG, `{2/A}`, or the three-symbol hybrid-phyrexian `{A/B/P}`. Pure
+/// phyrexian `{A/P}` and indicator text never match (exact analogue of the
+/// validated replay regex `\{(?:[WUBRG]/[WUBRG](?:/P)?|2/[WUBRG])\}` —
+/// three-colour gates {W/U/B} are deliberately NOT matched, replay parity
+/// over cleverness).
+pub fn has_hybrid_pip(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let end = match bytes[i..].iter().position(|&c| c == b'}') {
+            Some(p) => i + p,
+            None => break,
+        };
+        let inner = &s[i + 1..end];
+        let parts: Vec<&str> = inner.split('/').collect();
+        let colored = |p: &str| p.chars().count() == 1 && "WUBRG".contains(p);
+        let hit = match parts.len() {
+            2 => (colored(parts[0]) && colored(parts[1])) || (parts[0] == "2" && colored(parts[1])),
+            3 => colored(parts[0]) && colored(parts[1]) && parts[2] == "P",
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+        i = end + 1;
+    }
+    false
+}
 
 /// True when oracle text (reminder parens already absent or removed) consists
 /// only of keyword abilities — the is:frenchvanilla test (calibrated against
@@ -1786,6 +1827,16 @@ fn parse_line(line: &str) -> Option<RawC> {
     }
     if joined_text.contains("can be your commander") {
         flags2 |= F2_CBC;
+    }
+    // Parity w7 (borrow A6a): hybrid pips ({W/U}, {2/U}, {W/U/P}) on the
+    // top-level OR any card_faces[] mana cost — is:hybrid quantifies over
+    // faces (MDFC/modal backs carry their own hybrid costs; the old
+    // mana_norm contains('/') arm also matched phyrexian {W/P} and missed
+    // face costs entirely: 927 vs golden 624).
+    if has_hybrid_pip(&str_of(&v, "mana_cost"))
+        || faces_arr.iter().any(|f| has_hybrid_pip(&fstr(f, "mana_cost")))
+    {
+        flags2 |= F2_HYBRID;
     }
     let mut pts: Vec<(Option<f64>, Option<f64>, Option<f64>)> = vec![(
         opt_num(&v, "power"),

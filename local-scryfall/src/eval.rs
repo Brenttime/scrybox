@@ -2283,10 +2283,13 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             return scan(ix, |i| ix.cards[i as usize].colors.count_ones() == 5)
         }
         "hybrid" => {
-            return scan(ix, |i| {
-                let m = ix.mana_norm(i);
-                m.contains('/') && !m.contains("/p")
-            });
+            // Parity w7 (borrow A6a): ∃ hybrid pip ({W/U}, {2/U}, {W/U/P})
+            // in the top-level OR any face mana cost, computed at build
+            // (F2_HYBRID). The old `mana_norm contains('/') && !contains
+            // ("/p")` arm (a) never saw face costs, (b) dropped EVERY card
+            // carrying a pure-phyrexian pip, and (c) matched colour-
+            // indicator slashes. Replay: 631 vs golden 624, page-1 miss 0.
+            return scan(ix, |i| ix.cards[i as usize].flags2 & F2_HYBRID != 0);
         }
         "phyrexian" => return scan(ix, |i| ix.mana_norm(i).contains("/p")),
         "mirror" => return scan(ix, |i| ix.oracle_lc(i).contains("mirror")),
