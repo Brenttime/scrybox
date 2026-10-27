@@ -1254,7 +1254,22 @@ fn parse_line(line: &str) -> Option<RawC> {
             flavor = joined.join(" ");
         }
     }
-    let watermark = str_of(&v, "watermark").to_lowercase();
+    let mut watermark = str_of(&v, "watermark").to_lowercase();
+    // Wave-5 item 2: DFC/modals carry watermark on card_faces[], not top
+    // level. Python sim over the bulk: top-level ∪ face-level watermarks =
+    // 4,701 distinct oracles — EXACTLY upstream has:watermark (4,701);
+    // top-level alone is 4,610, and the engine counted 4,567 after gating.
+    if watermark.is_empty() {
+        if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
+            for f in faces {
+                let fw = f.get("watermark").and_then(|x| x.as_str()).unwrap_or("");
+                if !fw.is_empty() {
+                    watermark = fw.to_lowercase();
+                    break;
+                }
+            }
+        }
+    }
     let illustration = str_of(&v, "illustration_id").to_string();
     let ptypes = v
         .get("promo_types")
