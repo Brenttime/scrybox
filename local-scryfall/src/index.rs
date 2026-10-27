@@ -105,6 +105,10 @@ pub const F2_HIDDEN: u64 = 1 << 18; // printing's set is not in Scryfall's defau
 pub const F2_COMPANION: u64 = 1 << 19; // 'Companion' keyword on an expansion/core printing
 pub const F2_ANGEL: u64 = 1 << 20; // 'angel' on any face type (game:/t: combos)
 pub const F2_FRENCH: u64 = 1 << 21; // main text is keyword-abilities-only
+/// Parity w7 (borrow A1): preview object with source mentioning Scryfall —
+/// is:scryfallpreview additionally requires released_at > today (a preview
+/// stops being one at release).
+pub const F2_SC_PREVIEW: u64 = 1 << 22;
 
 /// True when oracle text (reminder parens already absent or removed) consists
 /// only of keyword abilities — the is:frenchvanilla test (calibrated against
@@ -155,6 +159,40 @@ pub fn keyword_only_text(s: &str) -> bool {
 /// of visibility. mb2/fra/dsk/hbg residuals are stale-dump drift, not hiding.
 pub fn is_hidden_set_code(code: &str) -> bool {
     matches!(code, "unk" | "hho" | "ph18" | "ph19" | "ph21" | "ph22" | "ph23")
+}
+
+/// Parity w7 (borrow A5): the FULL hidden-set-code calibration (OTAG list,
+/// ~196 codes) used by the cn: numeric row gate — distinct from
+/// is_hidden_set_code, the tiny is:unique blocklist above. Mirrors the w7
+/// replay's `set in OTAG_HIDDEN_SETS` gate (replay cn>100 23,208 vs 23,492).
+pub fn is_pool_hidden_set(code: &str) -> bool {
+    OTAG_HIDDEN_SETS.contains(&code)
+}
+
+/// Parity w7 (borrow A1): preview predicate shared by the main index and the
+/// side prints table. The Scryfall bulk encodes a previewed printing as
+/// `"preview": {source, source_uri, previewed_at}` — an object — while
+/// unreleased-and-unpreviewed prints carry preview:false or the key is
+/// absent. Truthy = the key is present, non-null, and not boolean false.
+pub fn json_is_preview(x: Option<&serde_json::Value>) -> bool {
+    match x {
+        None => false,
+        Some(v) => {
+            if let Some(b) = v.as_bool() {
+                b
+            } else if let Some(o) = v.as_object() {
+                !o.is_empty()
+            } else {
+                !v.is_null()
+            }
+        }
+    }
+}
+
+/// Parity w7 (borrow A5): set_type hidden from the default-search pool —
+/// OTAG_HIDDEN_SET_TYPES ∪ ID_EXTRA_HIDDEN_SET_TYPES (the replay's IOT).
+pub fn is_hidden_set_type(st: &str) -> bool {
+    OTAG_HIDDEN_SET_TYPES.contains(&st) || ID_EXTRA_HIDDEN_SET_TYPES.contains(&st)
 }
 
 /// Layouts that never make an oracle 'visible' for is:unique/is:reprint
@@ -1403,6 +1441,9 @@ fn parse_line(line: &str) -> Option<RawC> {
     for_each_token(&tl_lc, 2, &mut |t| type_tokens.push(t.to_string()));
 
     let mut flags = 0u32;
+    // w7: set when the bulk preview object's source mentions Scryfall;
+    // consumed once flags2 exists below (F2_SC_PREVIEW).
+    let mut scryfall_preview = false;
     let has = |tok: &str| type_tokens.iter().any(|t| t == tok);
     let land = has("land");
     if land {
@@ -1573,8 +1614,21 @@ fn parse_line(line: &str) -> Option<RawC> {
     if v.get("card_faces").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
         flags |= F_HAS_FACES;
     }
-    if v.get("preview").and_then(|x| x.as_bool()).unwrap_or(false) {
+    // Parity w7 (borrow A1): bulk 'preview' is an OBJECT ({source,
+    // previewed_at,…}) on previewed prints, not a bool — the old as_bool()
+    // test never fired, silently disabling preview suppression (validated
+    // sim treated a truthy dict as preview). present-but-null/false = not a
+    // preview (bulk carries preview:false widely).
+    if json_is_preview(v.get("preview")) {
         flags |= F_PREVIEW;
+        if v.get("preview")
+            .and_then(|p| p.get("source"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_ascii_lowercase().contains("scryfall"))
+            .unwrap_or(false)
+        {
+            scryfall_preview = true;
+        }
     }
     let layout = str_of(&v, "layout").to_string();
     if v
@@ -1664,6 +1718,9 @@ fn parse_line(line: &str) -> Option<RawC> {
         }
     };
     let mut flags2 = 0u64;
+    if scryfall_preview {
+        flags2 |= F2_SC_PREVIEW;
+    }
     if str_of(&v, "set_type") == "token"
         || matches!(layout.as_str(), "token" | "double_faced_token")
         || type_tokens.iter().any(|t| t == "token")

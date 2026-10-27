@@ -2,7 +2,7 @@
 
 use crate::index::{
     Card, Index, NFORMATS, F2_HIDDEN, F2_NAME_SLASH, F2_TOKEN, F_BOOSTER_FLAG, F_FULLART,
-    F_HAS_IND, F_HAS_TEXT,
+    F_HAS_IND, F_HAS_TEXT, F_PREVIEW,
     F_HAS_WM, F_HIRES, F_PROMO, F_SPOTLIGHT, F_TEXTLESS, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL, STAR,
 };
 use crate::query::{
@@ -746,6 +746,43 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     let c = &ix.cards[i as usize];
                     num_any(c.defense, c.face_def, o, v)
                 }),
+                // Parity w7 (borrow A1): date:/year: RANGES are ∃-over-all-
+                // printings (DEF rows ∪ side all_cards rows) with preview
+                // suppression: a printing only counts unless it carries the
+                // preview flag AND its release date is still in the future
+                // (upstream hides unreleased preview printings). Result is
+                // pool-gated (∩ id_vis_bits) and oracle-deduped by the api
+                // layer — w7 replay date>2020-01-01 22,375 vs 22,094,
+                // date<2010-06-15 11,146 vs 11,143, year>2020 20,784 vs
+                // 20,480, year>=2020 22,375 vs 22,094. Eq/Ne keep the legacy
+                // own-row model (year=2000 799 vs 736 would inflate under ∃).
+                NumField::Date | NumField::Year
+                    if matches!(o, Cmp::Gt | Cmp::Ge | Cmp::Lt | Cmp::Le) =>
+                {
+                    let is_year = matches!(*field, NumField::Year);
+                    let today = ix.today;
+                    let mut bm = scan(ix, move |i| {
+                        let c = &ix.cards[i as usize];
+                        let pass = |rel: u32| -> bool {
+                            if rel == 0 {
+                                return false;
+                            }
+                            let x = if is_year { (rel / 10_000) as f32 } else { rel as f32 };
+                            cmp_f(x, o, v)
+                        };
+                        let own = pass(c.released);
+                        own || prints::recs(ix, i).iter().any(|p| {
+                            // Side (all_cards) rows contribute only once
+                            // actually released: unreleased side prints are
+                            // preview-pending upstream even when the dump's
+                            // preview key lags. Released preview rows DO
+                            // count (sld 2840 rel 2026-10-12 evidence).
+                            p.released != 0 && p.released <= today && pass(p.released)
+                        })
+                    });
+                    bm &= &ix.id_vis_bits;
+                    bm
+                }
                 _ => {
                     let f = *field;
                     // Parity w6a: price comparisons are ∃-over-printings —
@@ -1711,6 +1748,41 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     w.push(format!("unknown released: value '{v}'"));
                     RoaringBitmap::new()
                 }
+                Some(t) if matches!(o, Cmp::Gt | Cmp::Ge | Cmp::Lt | Cmp::Le) => {
+                    // Parity w7 (borrow A1): range date:/released: are
+                    // ∃-over-all-printings (DEF rows ∪ side all_cards rows),
+                    // pool-gated, excluding rows that are BOTH preview:true
+                    // AND unreleased (released_at > today). Upstream has NO
+                    // today-clamp otherwise: a non-preview unreleased print
+                    // (trk 300, rel 2026-11-13, preview:false) legitimately
+                    // answers date>2020-01-01. w7 replay 22,375 vs upstream
+                    // 22,094 (residual = post-dump growth), date<2010-06-15
+                    // 11,146 vs 11,143. Eq/Ne keep the legacy own-row model.
+                    let today = ix.today;
+                    let mut bm = scan(ix, move |i: u32| -> bool {
+                        let c = &ix.cards[i as usize];
+                        let pass = |r: u32| -> bool {
+                            r != 0
+                                && match o {
+                                    Cmp::Lt => r < t,
+                                    Cmp::Le => r <= t,
+                                    Cmp::Gt => r > t,
+                                    _ => r >= t,
+                                }
+                        };
+                        let own = pass(c.released);
+                        own || prints::recs(ix, i).iter().any(|p| {
+                            // Side (all_cards) rows contribute only once
+                            // actually released: unreleased side prints are
+                            // preview-pending upstream even when the dump's
+                            // preview key lags. Released preview rows DO
+                            // count (sld 2840 rel 2026-10-12 evidence).
+                            p.released != 0 && p.released <= today && pass(p.released)
+                        })
+                    });
+                    bm &= &ix.id_vis_bits;
+                    bm
+                }
                 Some(t) => scan(ix, move |i: u32| -> bool {
                     let r = ix.cards[i as usize].released;
                     if r == 0 {
@@ -1721,10 +1793,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                             || (t % 10_000 >= 100 && r == t)
                             || (t % 10_000 == 0 && r / 10_000 == t / 10_000),
                         Cmp::Ne => r != t,
-                        Cmp::Lt => r < t,
-                        Cmp::Le => r <= t,
-                        Cmp::Gt => r > t,
-                        Cmp::Ge => r >= t,
+                        _ => false,
                     }
                 }),
             }
@@ -1994,7 +2063,17 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "gamechanger" => Some(F_GAMECHANGER),
         "spotlight" => Some(F_SPOTLIGHT),
         "booster" => Some(F_BOOSTER_FLAG),
-        "preview" | "scryfallpreview" => Some(F_PREVIEW),
+        "preview" => Some(F_PREVIEW),
+        // Parity w7 (borrow A1): is:scryfallpreview = previewed BY Scryfall
+        // and not yet released (bulk preview object source == Scryfall).
+        // Upstream's 6 at capture time; the dump's 325 scryfall-sourced
+        // previews have all released since, so the honest answer is 0.
+        "scryfallpreview" => {
+            return scan(ix, |i| {
+                let c = &ix.cards[i as usize];
+                c.flags2 & crate::index::F2_SC_PREVIEW != 0 && c.released > ix.today
+            })
+        }
         "hires" => Some(F_HIRES),
         _ => None,
     };

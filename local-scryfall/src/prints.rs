@@ -47,6 +47,23 @@ pub const SR_VARIATION: u8 = 2;
 pub const SR_TOKEN: u8 = 4;
 /// lang != "en" — foreign printings stay out of the default search universe.
 pub const SR_NONEN: u8 = 8;
+/// Parity w7 (borrow A1): preview:true on this printing. Upstream hides
+/// printings whose release date is still in the future AND carry the preview
+/// flag from date:/year: quantification (and the pool gate is silent about
+/// them for everything else).
+pub const SR_PREV: u8 = 16;
+/// Parity w7 (borrow A5): printing's set code is in the default-pool hidden
+/// set list (index::is_hidden_set_code). Side prints matching a cn: numeric
+/// range only count when they pass the same hidden set/set_type gate the
+/// default-cards leg applies (w7 replay cn>100 23,208 vs 23,492).
+pub const SR_HIDSET: u8 = 32;
+/// Parity w7 (borrow A5): set_type ∈ OTAG_HIDDEN_SET_TYPES ∪ ID_EXTRA_*.
+pub const SR_HIDST: u8 = 64;
+/// Parity w7 (borrow A4): layout == "modal_dfc" on this printing. Feeds the
+/// print-count mode of LAYOUT-level negatives (-is:mdfc): upstream answers
+/// with DISTINCT ORACLES over the UNGATED allprints table (38,951 vs 38,899
+/// golden) — oracles having zero modal_dfc printings anywhere.
+pub const SR_MDFC: u8 = 128;
 
 /// w6a calibration finding: the side-index price FALLBACK for usd/eur/foil
 /// comparisons systematically overshoots upstream. Upstream prices the
@@ -86,8 +103,12 @@ pub struct PrintRec {
     pub rarity: u8,
     /// border code (index::BD_*).
     pub border: u8,
-    /// SR_* flags (promo).
+    /// SR_* flags (promo, variation, token, nonen, prev, hidset, hidst, mdfc).
     pub flags: u8,
+    /// Parity w7 (borrow A1): released_at as YYYYMMDD, 0 = absent. Feeds the
+    /// ∃-over-prints date:/year: model (pool-gated, preview&&future rows
+    /// excluded — see eval's NumField::Date/Year arm).
+    pub released: u32,
 }
 
 /// The side index, hanging off Index::side. `start`/`prints` give the
@@ -110,6 +131,10 @@ pub struct SideIdx {
     /// 1 ⟺ the oracle has an art_series printing (has:artseries — those
     /// rows are default-cards-omitted; golden upstream 2,352).
     pub art_or: Vec<u8>,
+    /// Parity w7 (borrow A4): 1 ⟺ the oracle has a modal_dfc printing (any
+    /// printing in the ungated allprints table — incl. token/hidden/foreign
+    /// rows). Drives -is:mdfc print-count mode.
+    pub mdfc_or: Vec<u8>,
 }
 
 #[inline]
@@ -174,7 +199,28 @@ struct RawSide {
     rarity: u8,
     border: u8,
     flags: u8,
+    released: u32,
     art_series: bool,
+}
+
+/// "2026-01-01" -> 20260101 (0 on absent/malformed) — w7 side released_at.
+fn parse_ymd(s: &str) -> u32 {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return 0;
+    }
+    let d = |i: usize| -> Option<u32> {
+        if b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+            Some(((b[i] - b'0') as u32) * 10 + (b[i + 1] - b'0') as u32)
+        } else {
+            None
+        }
+    };
+    match (d(0), d(2), d(5), d(8)) {
+        (Some(y0), Some(y1), Some(m), Some(dd)) => Some((y0 * 100 + y1) * 10000 + m * 100 + dd),
+        _ => None,
+    }
+    .unwrap_or(0)
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -255,8 +301,26 @@ fn parse_side_line(line: &str, intern: &HashMap<Box<str>, u32>) -> Option<RawSid
     if v.get("variation").and_then(|x| x.as_bool()).unwrap_or(false) {
         flags |= SR_VARIATION;
     }
-    if str_of(&v, "layout") == "token" {
+    let layout = str_of(&v, "layout");
+    if layout == "token" {
         flags |= SR_TOKEN;
+    }
+    // w7 (borrow A1): bulk 'preview' is an object on previewed prints —
+    // see index::json_is_preview (as_bool alone missed every one).
+    if crate::index::json_is_preview(v.get("preview")) {
+        flags |= SR_PREV;
+    }
+    // w7 (borrow A5): hidden set / hidden set_type on this printing — the
+    // same row gate the default-cards leg applies (index lists).
+    if crate::index::is_pool_hidden_set(str_of(&v, "set")) {
+        flags |= SR_HIDSET;
+    }
+    if crate::index::is_hidden_set_type(str_of(&v, "set_type")) {
+        flags |= SR_HIDST;
+    }
+    // w7 (borrow A4): modal_dfc printings feed the -is:mdfc oracle reduction.
+    if layout == "modal_dfc" {
+        flags |= SR_MDFC;
     }
 
     Some(RawSide {
@@ -283,7 +347,8 @@ fn parse_side_line(line: &str, intern: &HashMap<Box<str>, u32>) -> Option<RawSid
         rarity: crate::index::rarity_rank(str_of(&v, "rarity")),
         border,
         flags,
-        art_series: str_of(&v, "layout") == "art_series",
+        released: parse_ymd(str_of(&v, "released_at")),
+        art_series: layout == "art_series",
     })
 }
 
@@ -368,6 +433,7 @@ pub fn load_side_gz(ix: &mut Index, src: &Path) -> bool {
     let mut rar_or = vec![0u8; n_or];
     let mut promo_or = vec![0u8; n_or];
     let mut art_or = vec![0u8; n_or];
+    let mut mdfc_or = vec![0u8; n_or];
     let mut langs: Vec<Box<str>> = Vec::new();
     let mut lang_int: HashMap<&str, u8> = HashMap::new();
     for (i, r) in raws.iter().enumerate() {
@@ -397,6 +463,7 @@ pub fn load_side_gz(ix: &mut Index, src: &Path) -> bool {
             rarity: r.rarity,
             border: r.border,
             flags: r.flags,
+            released: r.released,
         };
         *p += 1;
         fin_or[r.row as usize] |= r.finishes;
@@ -408,6 +475,9 @@ pub fn load_side_gz(ix: &mut Index, src: &Path) -> bool {
         }
         if r.art_series {
             art_or[r.row as usize] = 1;
+        }
+        if r.flags & SR_MDFC != 0 {
+            mdfc_or[r.row as usize] = 1;
         }
         let _ = i;
     }
@@ -424,6 +494,7 @@ pub fn load_side_gz(ix: &mut Index, src: &Path) -> bool {
         rar_or,
         promo_or,
         art_or,
+        mdfc_or,
     };
     eprintln!(
         "side index: {} printings over {} oracles in {} ms ({} strings)",
@@ -440,7 +511,7 @@ pub fn load_side_gz(ix: &mut Index, src: &Path) -> bool {
 // Raw little-endian dump of the built table; keyed to the gz size+mtime so a
 // refreshed bulk automatically invalidates it.
 
-const CACHE_MAGIC: &[u8; 8] = b"SPSIDE03";
+const CACHE_MAGIC: &[u8; 8] = b"SPSIDE05";
 
 fn put_u32(b: &mut Vec<u8>, x: u32) {
     b.extend_from_slice(&x.to_le_bytes());
@@ -502,8 +573,9 @@ pub fn write_side_cache(ix: &Index, cache: &Path, src: &Path) -> bool {
         b.push(p.rarity);
         b.push(p.border);
         b.push(p.flags);
+        put_u32(&mut b, p.released);
     }
-    for (v, name) in [(&ix.side.fin_or, "fin"), (&ix.side.rar_or, "rar"), (&ix.side.promo_or, "promo"), (&ix.side.art_or, "art")] {
+    for (v, name) in [(&ix.side.fin_or, "fin"), (&ix.side.rar_or, "rar"), (&ix.side.promo_or, "promo"), (&ix.side.art_or, "art"), (&ix.side.mdfc_or, "mdfc")] {
         put_u32(&mut b, v.len() as u32);
         b.extend_from_slice(v);
         let _ = name;
@@ -572,7 +644,8 @@ pub fn load_side_cache(ix: &mut Index, cache: &Path, src: &Path) -> bool {
         let (lang, finishes, rarity, border, flags) =
             (b[p], b[p + 1], b[p + 2], b[p + 3], b[p + 4]);
         p += 5;
-        prints.push(PrintRec { prices, cn, cn_val, artist, ffx, lang, finishes, rarity, border, flags });
+        let released = get_u32(&b, &mut p);
+        prints.push(PrintRec { prices, cn, cn_val, artist, ffx, lang, finishes, rarity, border, flags, released });
     }
     let vec_u8 = |p: &mut usize| -> Vec<u8> {
         let n = get_u32(&b, p) as usize;
@@ -584,7 +657,8 @@ pub fn load_side_cache(ix: &mut Index, cache: &Path, src: &Path) -> bool {
     let rar_or = vec_u8(&mut p);
     let promo_or = vec_u8(&mut p);
     let art_or = vec_u8(&mut p);
-    ix.side = SideIdx { loaded: true, prints, start, strings, langs, fin_or, rar_or, promo_or, art_or };
+    let mdfc_or = vec_u8(&mut p);
+    ix.side = SideIdx { loaded: true, prints, start, strings, langs, fin_or, rar_or, promo_or, art_or, mdfc_or };
     eprintln!(
         "side index (cache): {} printings loaded in {} ms",
         ix.side.prints.len(),
