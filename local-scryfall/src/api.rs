@@ -144,13 +144,18 @@ pub async fn search(
     // Wave-4 reject parity: filters/parse arms that mirror upstream's hard
     // 400s (unknown k: enums, id: junk letters, frame:/lang:/r:/has: bad
     // values, m:{K}, `!(`, c:=) push a \u{1}-sentinel warning; turn that into
-    // the same 400 Scryfall returns.
+    // the same 400 Scryfall returns. Wave-5 item 1: the body code is
+    // "bad_request" — verified against the gambit_w5 cached upstream error
+    // bodies for the 65 THEIRS-REJECT rows (5 carry the full body:
+    // code="bad_request", details="All of your terms were ignored."; the
+    // other 60 are _status=400). Upstream never emits invalid_search_syntax
+    // on /cards/search.
     if let Some(pos) = warnings.iter().position(|x| x.starts_with('\u{1}')) {
         let msg = warnings.remove(pos).trim_start_matches('\u{1}').to_string();
         warnings.retain(|x| !x.starts_with('\u{1}'));
         return json_response(
             format!(
-                "{{\"object\":\"error\",\"code\":\"invalid_search_syntax\",\"details\":{},\"status_code\":400}}",
+                "{{\"object\":\"error\",\"code\":\"bad_request\",\"details\":{},\"status_code\":400}}",
                 json_str(&msg)
             ),
             StatusCode::BAD_REQUEST,
