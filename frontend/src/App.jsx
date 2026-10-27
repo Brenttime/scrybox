@@ -47,6 +47,7 @@ const SharedCollection = lazyView(() => import('./components/SharedCollection'))
 const DeckBuilder = lazyView(() => import('./components/DeckBuilder'));
 const Lists = lazyView(() => import('./components/Lists'));
 const LimitedLands = lazyView(() => import('./components/LimitedLands'));
+const ScryfallPortal = lazyView(() => import('./components/ScryfallPortal'));
 const Rules = lazyView(() => import('./components/Rules'));
 const Keywords = lazyView(() => import('./components/Keywords'));
 
@@ -380,6 +381,8 @@ function App() {
         return <Lists showToast={showToast} handoff={listsHandoff} onHandoffDone={() => setListsHandoff(null)} />;
       case 'limited':
         return <LimitedLands showToast={showToast} onNavigate={goTab} />;
+      case 'scryfall':
+        return <ScryfallPortal onNavigate={goTab} showToast={showToast} onUpdate={triggerRefresh} />;
       case 'rules':
         return <Rules onNavigate={goTab} />;
       case 'keywords':
