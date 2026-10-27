@@ -155,8 +155,12 @@ fn cn_match(op: Cmp, num: u32, full: Option<&str>, raw: &str, cn_val: u32) -> bo
             }
             let qs = f.trim_end_matches('★').trim_end_matches('*');
             match op {
-                Cmp::Lt => cn_val < num || (cn_val == num && flat.as_str() < qs),
-                Cmp::Le => cn_val < num || (cn_val == num && flat.as_str() <= qs),
+                // Parity w7 (borrow A5, parent approved): for an alpha
+                // query 'cn<12a' the tie at v==12 requires a REAL suffix
+                // ('' < s < 'a') — bare '12' is EXCLUDED (golden cn<12a
+                // 3,082 has no plain-12 oracles; w7 replay 3,135 vs 3,135).
+                Cmp::Lt => cn_val < num || (cn_val == num && flat.len() > digits.len() && flat.as_str() < qs),
+                Cmp::Le => cn_val < num || (cn_val == num && flat.len() > digits.len() && flat.as_str() <= qs),
                 Cmp::Gt => cn_val > num || (cn_val == num && flat.as_str() > qs),
                 Cmp::Ge => cn_val > num || (cn_val == num && flat.as_str() >= qs),
                 _ => unreachable!(),
@@ -169,7 +173,14 @@ fn cn_match(op: Cmp, num: u32, full: Option<&str>, raw: &str, cn_val: u32) -> bo
                 return matches!(op, Cmp::Ge | Cmp::Gt);
             }
             if flat.len() > digits.len() {
-                return false; // suffixed prints are NULL for ranges
+                // Parity w7 (borrow A5): suffixed prints compare by NUMERIC
+                // PREFIX on lower-bound ranges — '100a' satisfies cn>100
+                // (pair order 100a > 100), '99a' does not. (w5 treated ALL
+                // suffixed prints as NULL here; the w7 replay over the
+                // ungated allprints universe — cn>100 23,209 vs golden
+                // 23,492, page-1 members all present — requires the prefix
+                // compare.) Upper bounds stay strict: cn<12 excludes 12a.
+                return matches!(op, Cmp::Ge | Cmp::Gt) && cn_val >= num;
             }
             match op {
                 Cmp::Lt => cn_val < num,
@@ -556,16 +567,37 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             // ∀-path above stays default-cards-only (w5 goldens validated
             // there).
             let alpha = full.is_some();
-            let side = ix.side.loaded && alpha;
+            // Parity w7 (borrow A5): LOWER-BOUND ranges (cn>100, cn>=100)
+            // quantify ∃ over DEF ∪ allprints for BOTH numeric and alpha
+            // query values (w6 kept the side leg alpha-only, leaving
+            // cn>100 at 24,624 vs golden 23,492), and every row — default
+            // or side — must pass the replay's hidden-set / hidden-set_type
+            // row gate (OTAG_HIDDEN_SETS ∪ ID_EXTRA_*). Promos DO feed it
+            // (golden cn>100 is:promo = 4,947; the old promo/variation/
+            // token/nonen side gate cost ~1,400 oracles). ALPHA upper
+            // bounds (cn<12a) join the side leg + row gate (golden 3,082:
+            // replay 3,135, page-1 members all present). NUMERIC upper
+            // bounds (cn<100 19,483, cn<=1 452) stay on the w6 default-only
+            // model — the replay did not validate them and gating their
+            // hidden-set low prints regressed cn<100 19,310→18,507.
+            // Eq/Ne keep the w5 twin model untouched (cn=12a 387/cn=1 445).
+            let lower = matches!(op, Cmp::Gt | Cmp::Ge);
+            let range = lower || (alpha && matches!(op, Cmp::Lt | Cmp::Le));
+            let side = ix.side.loaded && (alpha || range);
+            let ix2 = ix;
+            let own_ok = move |c: &Card| -> bool {
+                if range {
+                    !crate::index::is_pool_hidden_set(&ix2.strings[c.set as usize])
+                        && !crate::index::is_hidden_set_type(&ix2.strings[c.set_type as usize])
+                        && print_ok(c)
+                } else {
+                    // alpha Eq/Ne: w5 model — no extra own-row gate.
+                    print_ok(c)
+                }
+            };
             scan(ix, move |i| {
                 let c = &ix.cards[i as usize];
-                // Pool visibility per candidate print: token sheets and
-                // hidden rows do not satisfy an alpha-suffixed lower-bound
-                // upstream (golden cn<12a 3082 sits well below the fully
-                // ungated ∃ at 4201).
-                let pool_ok = !alpha
-                    || (c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0);
-                let own = pool_ok && print_ok(c);
+                let own = own_ok(c);
                 if !side {
                     return own;
                 }
@@ -579,23 +611,26 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     return own;
                 }
                 own || prints::recs(ix, i).iter().any(|p| {
-                    // only prints from upstream's default search pool
-                    // feed cn: quantification — variant sheets, promos,
-                    // tokens and foreign rows stay out (golden calibration:
-                    // including them pushed cn<12a to 4202 vs 3082).
-                    p.flags
-                        & (prints::SR_PROMO
-                            | prints::SR_VARIATION
-                            | prints::SR_TOKEN
-                            | prints::SR_NONEN)
-                        == 0
-                        && cn_match(
-                            op,
-                            num,
-                            full.as_deref(),
-                            &ix.side.strings[p.cn as usize],
-                            p.cn_val,
-                        )
+                    let pass = if range {
+                        // w7 replay row gate (see above): hidden set codes
+                        // and hidden set_types are the only exclusions.
+                        p.flags & (prints::SR_HIDSET | prints::SR_HIDST) == 0
+                    } else {
+                        // alpha Ne keeps the w6a pool gate.
+                        p.flags
+                            & (prints::SR_PROMO
+                                | prints::SR_VARIATION
+                                | prints::SR_TOKEN
+                                | prints::SR_NONEN)
+                            == 0
+                    };
+                    pass && cn_match(
+                        op,
+                        num,
+                        full.as_deref(),
+                        &ix.side.strings[p.cn as usize],
+                        p.cn_val,
+                    )
                 })
             })
         }
