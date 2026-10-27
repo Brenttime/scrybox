@@ -283,6 +283,9 @@ pub struct Card {
     pub loyalty: f32,  // NAN = absent
     pub colors: u8,    // bitmask W U B R G
     pub ci: u8,
+    /// per-face colour masks, 5 bits/slot (slot0 = top/front), max 8 faces;
+    /// drives any-face c: superset matching (see Index::color_incl).
+    pub face_pack: u64,
     pub rarity: u8,
     /// Dense enum code for the card's set_type (see `set_type_code()`), for the
     /// query layer. Groundwork for Scryfall's default search hiding "extras"
@@ -320,6 +323,51 @@ pub struct Card {
     pub ffx: u32,      // frame_effects bitset over FFX_LIST
     pub new_flags: u8, // NEW_* bits (first-in-oracle occurrences), filled post-parse
     pub defense: f32,  // battle defense (NAN = absent)
+    /// parity w5 (borrow-plan §6): per-face numeric attributes packed 8 bits
+    /// per face (max 8 faces): 0 = absent, 1..=254 = value+1, 255 = '*'.
+    /// pow:/tou:/loyalty:/defense: comparisons satisfy on ANY face value.
+    pub face_pow: u64,
+    pub face_tou: u64,
+    pub face_loy: u64,
+    pub face_def: u64,
+}
+
+/// Pack card_faces numeric attributes into the 4×(8-bit×8) words stored on
+/// Card (see face_pow). 0 = absent, 1..=254 = value+1, 255 = '*' wildcard.
+pub fn pack_face_nums(faces: &[serde_json::Value]) -> (u64, u64, u64, u64) {
+    let code = |f: &serde_json::Value, k: &str| -> u64 {
+        match f.get(k) {
+            Some(serde_json::Value::String(s)) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    return 0;
+                }
+                if t == "*" || t == "?" {
+                    return 255;
+                }
+                match t.parse::<f64>() {
+                    Ok(x) if x >= 0.0 => ((x as u32).min(253) + 1) as u64,
+                    _ => 0,
+                }
+            }
+            Some(serde_json::Value::Number(n)) => match n.as_f64() {
+                Some(x) if x >= 0.0 => ((x as u32).min(253) + 1) as u64,
+                _ => 0,
+            },
+            _ => 0,
+        }
+    };
+    let mut pow = 0u64;
+    let mut tou = 0u64;
+    let mut loy = 0u64;
+    let mut def = 0u64;
+    for (k, f) in faces.iter().take(8).enumerate() {
+        pow |= code(f, "power") << (8 * k);
+        tou |= code(f, "toughness") << (8 * k);
+        loy |= code(f, "loyalty") << (8 * k);
+        def |= code(f, "defense") << (8 * k);
+    }
+    (pow, tou, loy, def)
 }
 
 pub struct Orders {
@@ -342,6 +390,13 @@ pub struct OracleStats {
     pub games: u8,
     /// any non-token printing carries the bulk `reprint` flag (is:reprint).
     pub reprint: bool,
+    /// any non-token printing LACKS the bulk `reprint` flag. Upstream
+    /// `not:reprint` is a per-print exists() predicate (its own printing is
+    /// non-reprint), NOT the oracle-level complement of is:reprint: upstream
+    /// is:reprint(17469)+not:reprint(33826) > pool(3383x) with a huge overlap
+    /// (proven vs golden 'not:reprint game:paper' 33127 vs oracle-complement
+    /// 15491).
+    pub nrp: bool,
     /// every printing of this oracle is token-like (is:unique/is:reprint skip
     /// these; t:creature etc still include tokens, matching upstream).
     pub tok_oracle: bool,
@@ -349,6 +404,10 @@ pub struct OracleStats {
     /// hidden) printing — upstream only offers is:unique/is:reprint for such
     /// oracles (proven: full 16168/17469 list coverage).
     pub visible: bool,
+    /// any printing (gated or not) has layout art_series: upstream
+    /// has:art_series = 2352 counts cards whose art got a series print
+    /// (the aux prints themselves stay invisible; only the oracle surfaces).
+    pub has_artseries: bool,
 }
 
 /// Aggregated per-set row for /api/sets (built once at startup, cached).
@@ -420,10 +479,23 @@ pub struct Index {
     /// (which mixes in type-line words and caused o:draw over-matching).
     pub otext_tokens: HashMap<String, RoaringBitmap>,
     pub keyword_tokens: HashMap<String, RoaringBitmap>,
+    /// full-keyword-phrase -> print bitmap, EXACT enum semantics (lowercased
+    /// phrase keys, gate: non-token/non-hidden/non-aux prints). Upstream
+    /// keyword:/kw: matches whole keyword phrases, never word prefixes:
+    /// keyword:Double = 138 (the Spider-Man "Double" keyword), not 288
+    /// (word-token "double" also inside Double strike / Double team).
+    pub keyword_phrase: HashMap<Box<str>, RoaringBitmap>,
+    /// lowercased full-phrase keyword enum (closed value space for kw:).
+    pub kw_enum: std::collections::HashSet<String>,
     /// (name_lc offset, card idx) sorted by lowercased name — prefix search + suggest.
     pub prefix: Vec<(u32, u32)>,
 
     pub color_bits: [RoaringBitmap; 5],
+    /// print membership for bare-c: INCLUDE semantics: print is in
+    /// color_incl[m] iff ANY of its faces (incl. top) has colors ⊇ m.
+    /// Upstream golden c:wb 626 / c:rw 688 / c:gu 645 = any-face superset,
+    /// not the union-mask contains (639/699/657).
+    pub color_incl: [RoaringBitmap; 32],
     pub ci_bits: [RoaringBitmap; 5],
     pub subsets: [RoaringBitmap; 32],   // colors ⊆ m
     pub exacts: [RoaringBitmap; 32],    // colors == m
@@ -453,6 +525,12 @@ pub struct Index {
     pub in_set_types: HashMap<Box<str>, RoaringBitmap>,
     pub in_games: HashMap<Box<str>, RoaringBitmap>,
     pub in_langs: HashMap<Box<str>, RoaringBitmap>,
+    /// Wave-5 item 3: lang -> EVERY printing of every oracle that has >=1
+    /// print in that language, sourced from the full Scryfall all-cards
+    /// bulk (default-cards.jsonl.gz is English-slimmed, so the print-level
+    /// lang_idx above only sees ~400 ja prints vs upstream's 30,853 cards).
+    /// Built by load_langs() from bulk-langs/lang_map_full.json.gz.
+    pub oracle_lang_idx: HashMap<Box<str>, RoaringBitmap>,
     pub in_rarities: HashMap<Box<str>, RoaringBitmap>,
     /// printing-level indexes for st:/game:/border:/frame:/stamp:/framefx-ish.
     pub settype_idx: HashMap<Box<str>, RoaringBitmap>,
@@ -1035,6 +1113,21 @@ fn parse_cn(s: &str) -> u32 {
     digits.parse().unwrap_or(u32::MAX)
 }
 
+/// Sentinel for a P/T/loyalty box printed as '*' (distinct from NAN=absent).
+/// Upstream treats '*' as a WILDCARD in inequalities: pow<=3 also matches
+/// 0/* creatures (golden pow<1 1064 vs numeric-only 807), but pow=3 does not.
+pub const STAR: f32 = -3.0;
+
+fn pt_num(v: Option<&serde_json::Value>) -> f32 {
+    match v {
+        None => f32::NAN,
+        Some(x) => match x.as_str() {
+            Some(s) if s.trim() == "*" || s.trim() == "?" => STAR,
+            _ => num_of(x),
+        },
+    }
+}
+
 /// Owned intermediate record (per line, parsed in parallel).
 struct RawC {
     id: String,
@@ -1060,6 +1153,7 @@ struct RawC {
     uri: String,
     colors: u8,
     ci: u8,
+    face_pack: u64,
     rarity: u8,
     cmc: f32,
     power: f32,
@@ -1088,6 +1182,10 @@ struct RawC {
     reprint: bool,
     atypical: bool,
     masterpiece: bool,
+    face_pow: u64,
+    face_tou: u64,
+    face_loy: u64,
+    face_def: u64,
 }
 
 /// Remove balanced-parenthesis runs (reminder text) from oracle text before
@@ -1162,7 +1260,22 @@ fn parse_line(line: &str) -> Option<RawC> {
             flavor = joined.join(" ");
         }
     }
-    let watermark = str_of(&v, "watermark").to_lowercase();
+    let mut watermark = str_of(&v, "watermark").to_lowercase();
+    // Wave-5 item 2: DFC/modals carry watermark on card_faces[], not top
+    // level. Python sim over the bulk: top-level ∪ face-level watermarks =
+    // 4,701 distinct oracles — EXACTLY upstream has:watermark (4,701);
+    // top-level alone is 4,610, and the engine counted 4,567 after gating.
+    if watermark.is_empty() {
+        if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
+            for f in faces {
+                let fw = f.get("watermark").and_then(|x| x.as_str()).unwrap_or("");
+                if !fw.is_empty() {
+                    watermark = fw.to_lowercase();
+                    break;
+                }
+            }
+        }
+    }
     let illustration = str_of(&v, "illustration_id").to_string();
     let ptypes = v
         .get("promo_types")
@@ -1358,6 +1471,7 @@ fn parse_line(line: &str) -> Option<RawC> {
     // prints this dump stores only the front face at top level, so union in
     // every face's colors/color_identity (Delver of Secrets is U+R upstream,
     // not U). Golden: c:w ours 7085 vs upstream 7179; ci:gu 873 vs 13276.
+    let top_colors = colors;
     if (colors | ci).count_ones() < 5 {
         if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
             let face_vec = |key: &str| -> Vec<String> {
@@ -1373,6 +1487,31 @@ fn parse_line(line: &str) -> Option<RawC> {
             };
             colors |= color_mask(&face_vec("colors"));
             ci |= color_mask(&face_vec("color_identity"));
+        }
+    }
+    // Per-face colour masks (5 bits/slot, max 8) for ANY-FACE superset
+    // matching: upstream bare c:wb wants >=1 face containing both colours,
+    // not the union mask (front-W/back-B DFCs over-count: golden c:wb 626
+    // vs union 639; c:rw 688 vs 699; c:gu 645 vs 657).
+    let mut face_pack: u64 = 0;
+    {
+        let mut masks: Vec<u8> = vec![top_colors];
+        if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
+            for f in faces {
+                let fm = f
+                    .get("colors")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                masks.push(color_mask(&fm));
+            }
+        }
+        for (k, m) in masks.iter().take(8).enumerate() {
+            face_pack |= (*m as u64 & 31) << (5 * k);
         }
     }
     if colors.count_ones() > 1 {
@@ -1464,8 +1603,10 @@ fn parse_line(line: &str) -> Option<RawC> {
         .map(|a| {
             a.iter()
                 .filter_map(|x| x.as_str())
+                // "|" keeps multi-word keyword PHRASE boundaries intact
+                // ("Double|Double strike" must not re-tokenize as words).
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join("|")
         })
         .unwrap_or_default();
 
@@ -1475,6 +1616,8 @@ fn parse_line(line: &str) -> Option<RawC> {
         .and_then(|x| x.as_array())
         .cloned()
         .unwrap_or_default();
+    // per-face power/toughness/loyalty/defense packs (see Card::face_pow)
+    let fnums = pack_face_nums(&faces_arr);
     let fstr = |f: &serde_json::Value, k: &str| -> String {
         f.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
@@ -1506,7 +1649,7 @@ fn parse_line(line: &str) -> Option<RawC> {
         oracle_text.clone()
     };
     let joined_text = oracle_text.to_lowercase();
-    let pt_num = |o: &serde_json::Value, k: &str| -> Option<f64> {
+    let opt_num = |o: &serde_json::Value, k: &str| -> Option<f64> {
         match o.get(k) {
             Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
             Some(serde_json::Value::Number(n)) => n.as_f64(),
@@ -1566,9 +1709,9 @@ fn parse_line(line: &str) -> Option<RawC> {
         flags2 |= F2_CBC;
     }
     let mut pts: Vec<(Option<f64>, Option<f64>, Option<f64>)> = vec![(
-        pt_num(&v, "power"),
-        pt_num(&v, "toughness"),
-        pt_num(&v, "cmc"),
+        opt_num(&v, "power"),
+        opt_num(&v, "toughness"),
+        opt_num(&v, "cmc"),
     )];
     for f in &faces_arr {
         pts.push((fnum(f, "power"), fnum(f, "toughness"), fnum(f, "cmc")));
@@ -1659,21 +1802,24 @@ fn parse_line(line: &str) -> Option<RawC> {
     }
 
     let mc = str_of(&v, "mana_cost").to_string();
-    let mc_all = if mc.trim().is_empty() {
-        match v.get("card_faces").and_then(|x| x.as_array()) {
-            Some(faces) => {
-                let j: Vec<String> = faces
-                    .iter()
-                    .filter_map(|f| f.get("mana_cost").and_then(|x| x.as_str()))
-                    .map(str::to_string)
-                    .filter(|t| !t.trim().is_empty())
-                    .collect();
-                j.join(" /// ")
-            }
-            None => mc.clone(),
+    // cost_all = every printed cost of the card (top + each face) in one
+    // " /// "-joined string: upstream m:/ManaSyms searches BOTH faces even
+    // when the front has a cost (Transform // back-side costs matched m:).
+    let mc_all = {
+        let mut ps: Vec<String> = Vec::new();
+        if !mc.trim().is_empty() {
+            ps.push(mc.clone());
         }
-    } else {
-        mc.clone()
+        if let Some(faces) = v.get("card_faces").and_then(|x| x.as_array()) {
+            for f in faces {
+                if let Some(t) = f.get("mana_cost").and_then(|x| x.as_str()) {
+                    if !t.trim().is_empty() {
+                        ps.push(t.to_string());
+                    }
+                }
+            }
+        }
+        ps.join(" /// ")
     };
     Some(RawC {
         id: str_of(&v, "id").to_string(),
@@ -1697,11 +1843,12 @@ fn parse_line(line: &str) -> Option<RawC> {
         uri: str_of(&v, "scryfall_uri").to_string(),
         colors,
         ci,
+        face_pack,
         rarity: rarity_rank(str_of(&v, "rarity")),
         cmc: v.get("cmc").map(num_of).unwrap_or(f32::NAN),
-        power: v.get("power").map(num_of).unwrap_or(f32::NAN),
-        toughness: v.get("toughness").map(num_of).unwrap_or(f32::NAN),
-        loyalty: v.get("loyalty").map(num_of).unwrap_or(f32::NAN),
+        power: pt_num(v.get("power")),
+        toughness: pt_num(v.get("toughness")),
+        loyalty: pt_num(v.get("loyalty")),
         def: v
             .get("defense")
             .map(num_of)
@@ -1719,6 +1866,10 @@ fn parse_line(line: &str) -> Option<RawC> {
         reprint,
         atypical,
         masterpiece,
+        face_pow: fnums.0,
+        face_tou: fnums.1,
+        face_loy: fnums.2,
+        face_def: fnums.3,
         cn_val: parse_cn(str_of(&v, "collector_number")),
         released: parse_released(str_of(&v, "released_at")),
         prices,
@@ -1856,8 +2007,11 @@ impl Index {
             text_tokens: HashMap::new(),
             otext_tokens: HashMap::new(),
             keyword_tokens: HashMap::new(),
+            keyword_phrase: HashMap::new(),
+            kw_enum: std::collections::HashSet::new(),
             prefix: Vec::with_capacity(raws.len()),
             color_bits: Default::default(),
+            color_incl: Default::default(),
             ci_bits: Default::default(),
             subsets: Default::default(),
             exacts: Default::default(),
@@ -1879,6 +2033,7 @@ impl Index {
             in_set_types: HashMap::new(),
             in_games: HashMap::new(),
             in_langs: HashMap::new(),
+            oracle_lang_idx: HashMap::new(),
             in_rarities: HashMap::new(),
             settype_idx: HashMap::new(),
             border_idx: HashMap::new(),
@@ -1971,6 +2126,7 @@ impl Index {
                 defense: r.def,
                 colors: r.colors,
                 ci: r.ci,
+                face_pack: r.face_pack,
                 rarity: r.rarity,
                 set_type_code: set_type_code(&r.set_type),
                 legal: r.legal,
@@ -1979,6 +2135,10 @@ impl Index {
                 reprint: r.reprint,
                 atypical: r.atypical,
                 masterpiece: r.masterpiece,
+                face_pow: r.face_pow,
+                face_tou: r.face_tou,
+                face_loy: r.face_loy,
+                face_def: r.face_def,
                 cn_val: r.cn_val,
                 released: r.released,
                 prices: r.prices,
@@ -2072,11 +2232,11 @@ impl Index {
                 }
             }
             j.push_str("],\"power\":");
-            j.push_str(&if r.power.is_nan() { "null".into() } else { format!("\"{}\"", fmt_f32(r.power)) });
+            j.push_str(&if r.power.is_nan() { "null".into() } else if r.power == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.power)) });
             j.push_str(",\"toughness\":");
-            j.push_str(&if r.toughness.is_nan() { "null".into() } else { format!("\"{}\"", fmt_f32(r.toughness)) });
+            j.push_str(&if r.toughness.is_nan() { "null".into() } else if r.toughness == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.toughness)) });
             j.push_str(",\"loyalty\":");
-            j.push_str(&if r.loyalty.is_nan() { "null".into() } else { fmt_f32(r.loyalty) });
+            j.push_str(&if r.loyalty.is_nan() { "null".into() } else if r.loyalty == STAR { "\"*\"".into() } else { fmt_f32(r.loyalty) });
             j.push_str(",\"layout\":");
             push_json_str(&mut j, &r.layout);
             j.push_str(",\"image_uris\":{\"small\":");
@@ -2214,10 +2374,11 @@ impl Index {
                 vec![Default::default(); n_or];
             let mut illus_seen: Vec<std::collections::HashSet<u32>> =
                 vec![Default::default(); n_or];
-            // print counting is per (set, cn_key): foil "200★" twins merge with
-            // their "200" sibling (proven against live Scryfall prints=).
-            let mut print_seen: Vec<std::collections::HashSet<(u32, u32)>> =
-                vec![Default::default(); n_or];
+            // parity w5 (borrow-plan §8): prints:N counts ALL bulk rows per
+            // oracle (Scryfall's prints_search_uri size incl. foil twins and
+            // promo/variant prints — gated/(set,cn) dedup over-counted
+            // prints=1 by ~260 oracles: 13,579 vs 13,395 golden). Paper
+            // prints keep the (set, cn_key) twin-merge below.
             let mut pprint_seen: Vec<std::collections::HashSet<(u32, u32)>> =
                 vec![Default::default(); n_or];
             let mut tok_cnt: Vec<u32> = vec![0; n_or];
@@ -2234,15 +2395,18 @@ impl Index {
                 {
                     vis[r] = true;
                 }
-                if print_seen[r].insert((c.set, c.cn_key)) {
-                    st.n_prints = st.n_prints.saturating_add(1);
-                }
+                st.n_prints = st.n_prints.saturating_add(1);
                 if c.flags2 & F2_TOKEN == 0 {
                     if c.reprint {
                         st.reprint = true;
+                    } else {
+                        st.nrp = true;
                     }
                 } else {
                     tok_cnt[r] += 1;
+                }
+                if &*ix.strings[c.layout as usize] == "art_series" {
+                    st.has_artseries = true;
                 }
                 st.games |= c.games;
                 if c.games & G_PAPER != 0 {
@@ -2412,6 +2576,37 @@ impl Index {
             .reduce(HashMap::new, merge);
         ix.type_tokens = mk(|r| r.type_line.clone());
         ix.keyword_tokens = mk(|r| r.keywords_joined.clone());
+        // exact keyword-phrase index: gate to prints that actually count for
+        // keyword matching upstream (non-token, non-hidden, non-aux print).
+        ix.keyword_phrase = (0..raws.len())
+            .into_par_iter()
+            .fold(HashMap::<Box<str>, RoaringBitmap>::new, |mut m, i| {
+                let c = &ix.cards[i];
+                if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
+                    return m;
+                }
+                if is_aux_layout(&ix.strings[c.layout as usize])
+                    || is_aux_set_type(&ix.strings[c.set_type as usize])
+                {
+                    return m;
+                }
+                for kw in ix.strings[c.keywords as usize].split('|') {
+                    if kw.is_empty() {
+                        continue;
+                    }
+                    m.entry(kw.to_lowercase().into_boxed_str())
+                        .or_default()
+                        .insert(i as u32);
+                }
+                m
+            })
+            .reduce(HashMap::new, |mut a, b| {
+                for (k, v) in b {
+                    *a.entry(k).or_default() |= &v;
+                }
+                a
+            });
+        ix.kw_enum = ix.keyword_phrase.keys().map(|k| k.to_string()).collect();
 
         // prefix table sorted by lowercased name
         let n = ix.cards.len();
@@ -2474,6 +2669,29 @@ impl Index {
             }
             ix.exacts[c.colors as usize].insert(i);
             ix.ci_exacts[c.ci as usize].insert(i);
+            // any-face superset buckets: for each distinct face mask, the
+            // print belongs to every sub-mask's include bucket.
+            {
+                let fp = c.face_pack;
+                let mut seen: [u8; 8] = [0xFFu8; 8];
+                let mut cnt = 0usize;
+                for k in 0..8u32 {
+                    let m = ((fp >> (5 * k)) & 31) as u8;
+                    if seen[..cnt].contains(&m) {
+                        continue;
+                    }
+                    seen[cnt] = m;
+                    cnt += 1;
+                    let mut s = m;
+                    loop {
+                        ix.color_incl[s as usize].insert(i);
+                        if s == 0 {
+                            break;
+                        }
+                        s = (s - 1) & m;
+                    }
+                }
+            }
             ix.rarity_idx[c.rarity as usize].insert(i);
             ix.set_idx
                 .entry(ix.strings[c.set as usize].to_string().into_boxed_str())
@@ -2689,6 +2907,58 @@ impl Index {
             .map(|(k, v)| k.len() + 48 + v.serialized_size())
             .sum();
         (jsons + strs + toks + std::mem::size_of::<Card>() * self.cards.len()) / (1 << 20)
+    }
+
+    /// Wave-5 item 3: load the language side-table
+    /// ({oracle_id: [lang codes...]} gzipped JSON, from the FULL
+    /// all-cards bulk — default-cards is English-slimmed) and build
+    /// oracle_lang_idx: lang -> all printings of oracles with >=1 print
+    /// in that lang. `en` is skipped: the print-level lang_idx built from
+    /// the dump already answers lang:en (33,909 vs upstream 33,827,
+    /// CLOSE). Codes kept verbatim (zhs/zht); `zh` aliases to zhs in the
+    /// evaluator. ~1 MB resident (31.8k entries). Returns false when the
+    /// file is absent (offline deployments keep the slimmed-dump behavior).
+    pub fn load_langs(&mut self, path: &Path) -> bool {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let raw: HashMap<String, Vec<String>> =
+            match serde_json::from_reader(BufReader::new(GzDecoder::new(file))) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+        // lang -> oracle rows that have that language
+        let mut by_lang: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        for (oid, langs) in &raw {
+            let row = match self.oracle_intern.get(oid.as_str()) {
+                Some(&r) => r,
+                None => continue, // oracle not in the searchable dump
+            };
+            for l in langs {
+                if l == "en" {
+                    continue;
+                }
+                by_lang.entry(l.clone().into()).or_default().push(row);
+            }
+        }
+        for (lang, rows) in by_lang {
+            let mut rowbm = RoaringBitmap::new();
+            for r in rows {
+                rowbm.insert(r);
+            }
+            // in:<lang> = ever printed in that language. in_langs stores
+            // ORACLE ROW ids (InVal spreads them via oracle_prints).
+            self.in_langs.insert(lang.clone(), rowbm.clone());
+            let mut bm = RoaringBitmap::new();
+            for r in rowbm.iter() {
+                if let Some(p) = self.oracle_prints.get(r as usize) {
+                    bm |= p;
+                }
+            }
+            self.oracle_lang_idx.insert(lang, bm);
+        }
+        true
     }
 
     pub fn load_tags(&mut self, path: &Path) -> bool {

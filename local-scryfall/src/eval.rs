@@ -1,13 +1,14 @@
 //! AST evaluation -> RoaringBitmap of card ids.
 
 use crate::index::{
-    Card, Index, NFORMATS, F2_HIDDEN, F_BOOSTER_FLAG, F_HAS_IND, F_HAS_TEXT, F_HAS_WM, F_HIRES,
-    F_SPOTLIGHT, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL,
+    Card, Index, NFORMATS, F2_HIDDEN, F2_TOKEN, F_BOOSTER_FLAG, F_FULLART, F_HAS_IND, F_HAS_TEXT,
+    F_HAS_WM, F_HIRES, F_PROMO, F_SPOTLIGHT, F_TEXTLESS, FIN_ETCHED, FIN_FOIL, FIN_NONFOIL, STAR,
 };
 use crate::query::{
     Cmp, Filter, Mp, Node, NumField, SubOp,
-    HAS_ALCHEMY, HAS_BOOSTER, HAS_ETCHED, HAS_FLAVOR, HAS_FOIL, HAS_HIRES, HAS_INDICATOR,
-    HAS_NONFOIL, HAS_SPOTLIGHT, HAS_TEXT, HAS_VIDEO, HAS_WATERMARK,
+    HAS_ALCHEMY, HAS_ARTIST, HAS_ARTSERIES, HAS_BOOSTER, HAS_ETCHED, HAS_EXTART, HAS_FLAVOR,
+    HAS_FOIL, HAS_FULLART, HAS_HIRES, HAS_INDICATOR, HAS_NONFOIL, HAS_PROMO, HAS_REPRINT,
+    HAS_SPOTLIGHT, HAS_TEXT, HAS_TEXTLESS, HAS_UNIQUE, HAS_VIDEO, HAS_WATERMARK,
 };
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
@@ -80,17 +81,28 @@ fn node_has_id(n: &Node) -> bool {
 /// return the sheets, is:token returns tokens, plain text search does NOT).
 /// api.rs skips the default-search pool gate for these queries.
 pub fn wants_extras(nodes: &[Node]) -> bool {
-    nodes.iter().any(node_wants_extras)
+    nodes.iter().any(|n| node_wants_extras(n, false))
 }
 
-fn node_wants_extras(n: &Node) -> bool {
+fn node_wants_extras(n: &Node, in_not: bool) -> bool {
     match n {
-        Node::And(v) | Node::Or(v) => v.iter().any(node_wants_extras),
-        Node::Not(b) => node_wants_extras(b),
-        Node::Filter(f) => filter_wants_extras(f),
+        Node::And(v) | Node::Or(v) => v.iter().any(|x| node_wants_extras(x, in_not)),
+        Node::Not(b) => node_wants_extras(b, true),
+        Node::Filter(f) => filter_wants_extras(f, in_not),
         _ => false,
     }
 }
+
+/// parity w5 §9 (borrow report): NEGATIVE print-attribute terms (-is:fnm,
+/// -is:judge_gift, …) are oracle predicates over the VISIBLE pool upstream
+/// (−is:fnm 33,827 = pool), unlike the positives which search the hidden
+/// promo printings themselves (extras semantics, no dedup). Inside NOT(),
+/// these tags therefore do NOT unlock extras.
+const PRINT_ATTR_NEG: &[&str] = &[
+    "datestamped", "buyabox", "boosterfun", "fnm", "judgegift", "judge_gift", "prerelease",
+    "inset", "promopack", "league", "openrunner", "bundle", "emergency", "stamped",
+    "textlesspromo", "serialized", "invitational", "gameday",
+];
 
 const EXTRAS_TYPE_WORDS: &[&str] = &[
     "token", "tokens", "scheme", "schemes", "vanguard", "vanguards", "phenomenon",
@@ -114,7 +126,7 @@ const EXTRAS_LAYOUTS: &[&str] = &[
     "phenomenon", "contraption", "art_series", "front_card",
 ];
 
-fn filter_wants_extras(f: &Filter) -> bool {
+fn filter_wants_extras(f: &Filter, in_not: bool) -> bool {
     match f {
         Filter::IncludeVal(v) => v == "extras" || v == "all",
         // explicit set/collection targeting shows the printings searched
@@ -133,7 +145,10 @@ fn filter_wants_extras(f: &Filter) -> bool {
         Filter::Layout(v) => EXTRAS_LAYOUTS.contains(&v.as_str()),
         Filter::Regex { field, .. } => *field == 2 || *field == 0, // t~/re/, name~/re/
         Filter::Type(v) => v.split_whitespace().any(|w| EXTRAS_TYPE_WORDS.contains(&w)),
-        Filter::Is(v) => EXTRAS_IS_WORDS.contains(&v.as_str()),
+        Filter::Is(v) => {
+            EXTRAS_IS_WORDS.contains(&v.as_str())
+                && !(in_not && PRINT_ATTR_NEG.contains(&v.as_str()))
+        }
         _ => false,
     }
 }
@@ -204,6 +219,12 @@ fn eval_text(word: &str, ix: &Index) -> RoaringBitmap {
         if bm.len() < 24 && word.len() >= 3 {
             bm |= &ix.fuzzy_name_cards(word);
         }
+        // Upstream bare-word text is a NAME-SUBSTRING match, not token-only
+        // (golden keyword-family residues: 'Up' after keyword:Level drop =
+        // 333 names containing "up" incl. Abrupt Decay; 'strike' = 93 incl.
+        // Sunstriker; 'night' = 332 incl. Nightmare). Union the substring
+        // scan on top of exact/prefix instead of early-returning.
+        bm |= &scan(ix, |i| ix.name_lc(i).contains(word));
         if !bm.is_empty() {
             return bm;
         }
@@ -290,6 +311,81 @@ fn prefix_union(_ix: &Index, map: &std::collections::HashMap<String, RoaringBitm
 
 fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     match f {
+        Filter::CnCmp { op, num, full } => {
+            // Parity w5 §1 (borrow-plan): per-printing collector-number
+            // compare with (numeric_prefix, alpha_suffix) PAIR ordering —
+            // "12b" > "12" > "9". Quantifier model validated on the bulk
+            // dump against cached upstream answers: pure-numeric query
+            // values use ∃-over-printings (suffixed prints are NULL for
+            // range ops; alpha-only bonus prints satisfy >=/>), while an
+            // alpha-suffixed query value ("12a") uses ∀-over-printings —
+            // golden cn>12a 24987 EXACT, cn>=12a 24989 vs 25064 (−0.3%).
+            // '=' keeps exact-string semantics (cn=12a). Pool visibility is
+            // enforced uniformly by the api layer's id_vis_bits gate.
+            let op = *op;
+            let num = *num;
+            let full = full.clone();
+            let print_ok = |c: &Card| -> bool {
+                let raw: &str = &ix.strings[c.collector_number as usize];
+                let flat = raw.trim_end_matches('★').trim_end_matches('*').to_lowercase();
+                let digits: String = flat.chars().take_while(|x| x.is_ascii_digit()).collect();
+                match (&full, op) {
+                    (Some(f), Cmp::Eq) => flat == *f,
+                    (Some(f), Cmp::Ne) => flat != *f,
+                    (None, Cmp::Eq) => !digits.is_empty() && c.cn_val == num,
+                    (None, Cmp::Ne) => digits.is_empty() || c.cn_val != num,
+                    (Some(f), _) => {
+                        if digits.is_empty() {
+                            return false; // alpha-only print never passes
+                        }
+                        let qs = f.trim_end_matches('★').trim_end_matches('*');
+                        match op {
+                            Cmp::Lt => c.cn_val < num || (c.cn_val == num && flat.as_str() < qs),
+                            Cmp::Le => c.cn_val < num || (c.cn_val == num && flat.as_str() <= qs),
+                            Cmp::Gt => c.cn_val > num || (c.cn_val == num && flat.as_str() > qs),
+                            Cmp::Ge => c.cn_val > num || (c.cn_val == num && flat.as_str() >= qs),
+                            _ => unreachable!(),
+                        }
+                    }
+                    (None, _) => {
+                        if digits.is_empty() {
+                            // pure-alpha bonus printing: sorts high, matches
+                            // lower-bound comparisons only.
+                            return matches!(op, Cmp::Ge | Cmp::Gt);
+                        }
+                        if flat.len() > digits.len() {
+                            return false; // suffixed prints are NULL for ranges
+                        }
+                        match op {
+                            Cmp::Lt => c.cn_val < num,
+                            Cmp::Le => c.cn_val <= num,
+                            Cmp::Gt => c.cn_val > num,
+                            Cmp::Ge => c.cn_val >= num,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            };
+            if full.is_some() && matches!(op, Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge) {
+                // ∀-over-printings: oracle matches only when EVERY printing
+                // satisfies the pair comparison.
+                let mut bm = RoaringBitmap::new();
+                for pr in ix.oracle_prints.iter() {
+                    let mut all = true;
+                    for i in pr.iter() {
+                        if !print_ok(&ix.cards[i as usize]) {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if all && !pr.is_empty() {
+                        bm |= pr;
+                    }
+                }
+                return bm;
+            }
+            scan(ix, move |i| print_ok(&ix.cards[i as usize]))
+        }
         Filter::Colors { mask, op, identity } => {
             let (bits, subsets, exacts) = if *identity {
                 (&ix.ci_bits, &ix.ci_subsets, &ix.ci_exacts)
@@ -302,6 +398,10 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 SubOp::Include => {
                     if *mask == 0 {
                         return exacts[0].clone();
+                    }
+                    if !*identity {
+                        // bare c:/c> = ANY-FACE superset (see Index::color_incl)
+                        return ix.color_incl[*mask as usize].clone();
                     }
                     let mut bm: Option<RoaringBitmap> = None;
                     for b in 0..5 {
@@ -412,23 +512,56 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::Cmp { field, op, val } => {
             let v = *val;
-            if v.is_nan() && *field != NumField::Pt {
+            if v.is_nan() {
+                if matches!(
+                    *field,
+                    NumField::Pt
+                        | NumField::Power
+                        | NumField::Toughness
+                        | NumField::Loyalty
+                        | NumField::Defense
+                ) {
+                    // non-numeric p/t/loyalty/defense value (pow=3+, tou=2+…):
+                    // upstream 404s — mirror with an empty result instead of
+                    // leaking the pool through the ignored-filter universe.
+                    return RoaringBitmap::new();
+                }
                 w.push("ignored numeric filter with non-numeric value".into());
                 return ix.universe.clone();
             }
             let o = *op;
-            if *field == NumField::Pt {
-                // p/t "either" semantics: pow:X matches power OR toughness
-                return scan(ix, |i| {
+            // parity w5 §6: pow/tou/loyalty/defense comparisons satisfy on the
+            // top-level value OR any card_faces[] value (packed), '*'
+            // satisfies every inequality; pt: keeps "either" semantics.
+            match *field {
+                NumField::Pt => scan(ix, move |i| {
                     let c = &ix.cards[i as usize];
-                    cmp_f(c.power, o, v) || cmp_f(c.toughness, o, v)
-                });
+                    num_any(c.power, c.face_pow, o, v) || num_any(c.toughness, c.face_tou, o, v)
+                }),
+                NumField::Power => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.power, c.face_pow, o, v)
+                }),
+                NumField::Toughness => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.toughness, c.face_tou, o, v)
+                }),
+                NumField::Loyalty => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.loyalty, c.face_loy, o, v)
+                }),
+                NumField::Defense => scan(ix, move |i| {
+                    let c = &ix.cards[i as usize];
+                    num_any(c.defense, c.face_def, o, v)
+                }),
+                _ => {
+                    let f = *field;
+                    scan(ix, move |i| {
+                        let x = num_field(ix, i as usize, f);
+                        !x.is_nan() && cmp_f(x, o, v)
+                    })
+                }
             }
-            let f = *field;
-            scan(ix, |i| {
-                let x = num_field(ix, i as usize, f);
-                !x.is_nan() && cmp_f(x, o, v)
-            })
         }
         Filter::CmpRange { field, lo, hi } => {
             let (lo, hi) = (*lo, *hi);
@@ -479,6 +612,14 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             }
         }
         Filter::Keyword(v) => {
+            // EXACT keyword-phrase semantics (golden: keyword:Double = 138
+            // "Double" keyword, not 288 word-token union; keyword:Companion
+            // = 10, keyword:Void = 15). Hit on the full-phrase index wins
+            // unconditionally; the word/prefix/fuzzy chain below is only the
+            // legacy path for offline parse() callers without the enum.
+            if let Some(b) = ix.keyword_phrase.get(v.as_str()) {
+                return b.clone();
+            }
             let mut bm = RoaringBitmap::new();
             if let Some(b) = ix.keyword_tokens.get(v.as_str()) {
                 bm |= b;
@@ -786,58 +927,86 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             })
         }
         Filter::ManaSyms(parts) => {
-            // m:{…} literal-symbol model (see query::Mp / mana_brace_spec).
-            // Multi-part specs must match ADJACENT printed symbols: upstream
-            // m:{W}{U} = "{W}{U}" contiguous, not {W}…gap…{U} (golden fit:
-            // m:{W}{U} ours-gap=682 vs upstream 644; m:{X}{R} 564 vs 155).
+            // parity w5 §6 (borrow report L73–79): containment counts the
+            // UNION of mana_cost and every card_faces[].mana_cost per print;
+            // spec parts must each appear (no adjacency requirement —
+            // golden m:{2}{W} sim 3,731 vs 3,697 needed union+independent,
+            // adjacency starved to 3,308), generic parts compare as the
+            // card's MAX generic pip, and hybrid/phyrexian/gold segments
+            // contribute nothing to plain colour needs (they match only
+            // when spelled explicitly — sim overshoot 686 proved this).
             let parts = parts.clone();
             scan(ix, move |i| {
                 let raw = ix.cost_all(i).to_ascii_lowercase();
-                for face in raw.split("///") {
-                    // exact brace-delimited segments in printed order
-                    let chars: Vec<char> = face.chars().collect();
-                    let mut segs: Vec<String> = Vec::with_capacity(chars.len() / 3 + 1);
-                    let mut k = 0usize;
-                    while k < chars.len() {
-                        if chars[k] == '{' {
-                            match chars[k + 1..].iter().position(|&x| x == '}') {
-                                Some(e) => {
-                                    segs.push(chars[k + 1..k + 1 + e].iter().collect());
-                                    k += e + 2;
-                                }
-                                None => break,
+                let chars: Vec<char> = raw.chars().collect();
+                let mut segs: Vec<String> = Vec::new();
+                let mut k = 0usize;
+                while k < chars.len() {
+                    if chars[k] == '{' {
+                        match chars[k + 1..].iter().position(|&x| x == '}') {
+                            Some(e) => {
+                                segs.push(chars[k + 1..k + 1 + e].iter().collect());
+                                k += e + 2;
                             }
-                        } else {
-                            k += 1;
+                            None => break,
                         }
-                    }
-                    if segs.is_empty() {
-                        continue;
-                    }
-                    let m = |seg: &str, p: &Mp| match p {
-                        Mp::Lit(s) => seg == s,
-                        Mp::Pip(m) => {
-                            let b = m.trailing_zeros() as usize;
-                            let ch = "wubrg".as_bytes()[b] as char;
-                            seg.len() == 1 && seg.chars().next() == Some(ch)
-                        }
-                        Mp::GenericMin(n) => {
-                            seg.chars().all(|c| c.is_ascii_digit())
-                                && seg.parse::<u32>().unwrap_or(0) >= *n
-                        }
-                        Mp::AnyCost => true,
-                    };
-                    let ok = if parts.len() == 1 {
-                        segs.iter().any(|s| m(s, &parts[0]))
                     } else {
-                        segs.windows(parts.len())
-                            .any(|w| w.iter().zip(parts.iter()).all(|(s, p)| m(s, p)))
-                    };
-                    if ok {
-                        return true;
+                        k += 1;
                     }
                 }
-                false
+                if segs.is_empty() {
+                    return parts.is_empty();
+                }
+                let mut pips = [0u8; 5];
+                let mut maxg = 0u32;
+                for s in &segs {
+                    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                        maxg = maxg.max(s.parse::<u32>().unwrap_or(0));
+                    } else if s.len() == 1 {
+                        if let Some(b) = "wubrg".find(s.as_str()) {
+                            pips[b] += 1;
+                        }
+                    }
+                }
+                let mut need = [0u8; 5];
+                for p in &parts {
+                    match p {
+                        Mp::Lit(s) => {
+                            if s.len() == 1 {
+                                if let Some(b) = "wubrg".find(s.as_str()) {
+                                    need[b] += 1;
+                                } else if !segs.iter().any(|x| x == s) {
+                                    return false;
+                                }
+                            } else if !segs.iter().any(|x| x == s) {
+                                return false;
+                            }
+                        }
+                        Mp::Pip(m) => {
+                            if m.count_ones() == 1 {
+                                need[m.trailing_zeros() as usize] += 1;
+                            } else {
+                                for b in 0..5 {
+                                    if m & (1 << b) != 0 && pips[b] < 1 {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        Mp::GenericMin(n) => {
+                            if maxg < *n {
+                                return false;
+                            }
+                        }
+                        Mp::AnyCost => {}
+                    }
+                }
+                for b in 0..5 {
+                    if need[b] > pips[b] {
+                        return false;
+                    }
+                }
+                true
             })
         }
         Filter::Fatal400(msg) => {
@@ -990,24 +1159,31 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     HAS_TEXT => c.flags & F_HAS_TEXT != 0,
                     HAS_FLAVOR => !ix.strings[c.flavor as usize].is_empty(),
                     HAS_ALCHEMY => &*ix.strings[c.set_type as usize] == "alchemy",
+                    // parity w5 §4 (borrow-plan): these arms previously fell
+                    // through to a catch-all binding (the HAS_* constants
+                    // were never imported — the arms compiled as wildcard
+                    // patterns, making every one of them return the reprint
+                    // bitmap: the flat 17,602 for has:artist/textless/…).
+                    // Rules now follow the validated print-attribute spec.
                     HAS_REPRINT => c.reprint,
                     HAS_UNIQUE => {
+                        // has:unique == is:unique: visible oracle never
+                        // flagged reprint (mirrors the is:unique arm).
                         let r = ix.card_oracle[i as usize] as usize;
-                        ix.oracle_stats[r].n_illus == 1
+                        let st = &ix.oracle_stats[r];
+                        st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
                     }
                     HAS_ARTIST => !ix.strings[c.artist as usize].is_empty(),
-                    HAS_PROMO => !ix.strings[c.ptypes as usize].is_empty(),
-                    HAS_ARTSERIES => &*ix.strings[c.layout as usize] == "art_series",
-                    HAS_TEXTLESS => {
-                        c.ffx
-                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "textless").unwrap())
-                            != 0
+                    HAS_PROMO => c.flags & F_PROMO != 0,
+                    HAS_ARTSERIES => {
+                        // oracle-level: upstream counts the base card whose
+                        // (hidden) art_series printing exists — see
+                        // OracleStats::has_artseries (golden 2,352).
+                        let r = ix.card_oracle[i as usize] as usize;
+                        ix.oracle_stats[r].has_artseries && c.flags2 & F2_HIDDEN == 0
                     }
-                    HAS_FULLART => {
-                        c.ffx
-                            & (1u32 << crate::index::FFX_LIST.iter().position(|x| *x == "fullart").unwrap())
-                            != 0
-                    }
+                    HAS_TEXTLESS => c.flags & F_TEXTLESS != 0,
+                    HAS_FULLART => c.flags & F_FULLART != 0,
                     HAS_EXTART => {
                         c.ffx
                             & (1u32 << crate::index::FFX_LIST
@@ -1099,11 +1275,18 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 "portuguese" => "pt",
                 "korean" => "ko",
                 "russian" => "ru",
-                "chinese_simplified" | "simplified_chinese" | "zh_hans" => "zhs",
+                "chinese_simplified" | "simplified_chinese" | "zh_hans" | "zh" => "zhs",
                 "chinese_traditional" | "traditional_chinese" | "zh_hant" => "zht",
                 "any" | "all" => return ix.universe.clone(),
                 s => s,
             };
+            // Wave-5 item 3: prefer the full-bulk oracle side table
+            // (default-cards is English-slimmed; upstream lang:ja = 30,853
+            // cards vs 421 from the dump alone). en falls through to the
+            // print-level index (side table deliberately skips en).
+            if let Some(b) = ix.oracle_lang_idx.get(q) {
+                return b.clone();
+            }
             match ix.lang_idx.get(q) {
                 Some(b) => b.clone(),
                 None => {
@@ -1169,10 +1352,19 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         }
         Filter::NotVal(v) => match v.as_str() {
             "reprint" | "reprints" => {
+                // upstream not:reprint is a PER-PRINT predicate: the
+                // query's AND must land on the same printing (golden:
+                // 'frame:2015 not:reprint' 19792 vs 25197 when the two
+                // terms are evaluated per-oracle separately; 'not:reprint
+                // game:paper' 33127 vs oracle-complement 15491). A card
+                // matches when it has >=1 non-token/non-hidden/non-aux
+                // printing WITHOUT the bulk reprint flag.
                 scan(ix, |i| {
                     let c = &ix.cards[i as usize];
-                    let st = &ix.oracle_stats[ix.card_oracle[i as usize] as usize];
-                    st.visible && !st.reprint && c.flags2 & F2_HIDDEN == 0
+                    !c.reprint
+                        && c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0
+                        && !crate::index::is_aux_layout(&ix.strings[c.layout as usize])
+                        && !crate::index::is_aux_set_type(&ix.strings[c.set_type as usize])
                 })
             }
             "universesbeyond" | "universes_beyond" | "beyond" => scan(ix, |i| {
@@ -1286,7 +1478,19 @@ fn num_field(ix: &Index, i: usize, f: NumField) -> f32 {
         }
         NumField::PriceUsdFoil => c.prices[1],
         NumField::PriceTix => c.prices[2],
-        NumField::PriceEur => c.prices[3],
+        NumField::PriceEur => {
+            // parity w5 §7 (borrow-plan): cardmarket unified listings — a
+            // print with no non-foil eur price is priced by its eur_foil,
+            // mirroring the usd fallback above (golden eur>=5 4,689; our
+            // own-value-only count was 3,478). tix has no *_foil field in
+            // the bulk dump, so PriceTix keeps own-value semantics.
+            let e = c.prices[3];
+            if e.is_nan() {
+                c.prices[4]
+            } else {
+                e
+            }
+        }
         NumField::PriceEurFoil => c.prices[4],
         NumField::Edhrec => {
             if c.edhrec == u32::MAX {
@@ -1385,6 +1589,46 @@ fn mana_pips(cost: &str) -> (u8, [u8; 5]) {
         gc += num.parse::<u8>().unwrap_or(0);
     }
     (gc, pip)
+}
+
+/// parity w5 (borrow-plan §6): does any packed face value satisfy the
+/// comparison? Codes: 0 absent, 1..=254 value+1, 255 = '*'. The wildcard
+/// satisfies every INEQUALITY (golden pow<=3 14,450 vs 14,431 etc.) but never
+/// plain equality — pow=3 must not swallow the ~200 '*' creatures.
+fn face_pack_any(pack: u64, op: Cmp, v: f32) -> bool {
+    let mut p = pack;
+    for _ in 0..8 {
+        let code = (p & 0xFF) as u8;
+        p >>= 8;
+        if code == 0 {
+            continue;
+        }
+        if code == 255 {
+            // '*' sorts above every number: it satisfies upper bounds
+            // (pow<=3 golden 14450 vs 14431) but NEVER lower bounds —
+            // battery-confirmed: pow>1 14,833 vs 14,515 when star matched.
+            if matches!(op, Cmp::Lt | Cmp::Le) {
+                return true;
+            }
+            continue;
+        }
+        if cmp_f((code - 1) as f32, op, v) {
+            return true;
+        }
+    }
+    false
+}
+fn num_any(top: f32, pack: u64, op: Cmp, v: f32) -> bool {
+    if !top.is_nan() {
+        if top == STAR {
+            if matches!(op, Cmp::Lt | Cmp::Le) {
+                return true;
+            }
+        } else if cmp_f(top, op, v) {
+            return true;
+        }
+    }
+    face_pack_any(pack, op, v)
 }
 
 fn cmp_f(x: f32, op: Cmp, v: f32) -> bool {
@@ -1499,7 +1743,10 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         // = has at least one non-atypical printing (print-level predicate;
         // upstream: is:default is:atypical == 0 per-print, both can hold at
         // oracle level).
-        "atypical" => return scan(ix, |i| ix.cards[i as usize].atypical),
+        // parity w5 §9: is:atypical = the printing carries ANY frame_effects
+        // (borrow report: ∃ any frame_effects → 10,341 vs 10,562 golden; the
+        // old bulk `atypical` bool only flagged 8,300).
+        "atypical" => return scan(ix, |i| ix.cards[i as usize].ffx != 0),
         "default" => return scan(ix, |i| !ix.cards[i as usize].atypical),
         "masterpiece" => return scan(ix, |i| ix.cards[i as usize].masterpiece),
         // Universes Beyond prints (bulk promo_types carries 'universesbeyond').
@@ -1780,7 +2027,15 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         "modal" => return scan(ix, |i| ix.oracle_lc(i).contains("choose one")),
         "datestamped" | "buyabox" | "boosterfun" | "fnm" | "judgegift" | "judge_gift"
         | "prerelease" | "inset" | "promopack" | "league" | "boxtopper" | "openrunner"
-        | "bundle" | "planeswalkerdeck" | "emergency" | "stamped" | "textlesspromo" => {
+        | "bundle" | "planeswalkerdeck" | "planeswalker_deck" | "emergency" | "stamped"
+        | "textlesspromo" | "gameday" | "giftbox" | "glossy" | "intropack" | "intro_pack"
+        | "mediainsert" | "media_insert" | "setpromo" | "set_promo" | "arenaleague"
+        | "arena_league" | "convention" | "playerrewards" | "player_rewards" | "release"
+        | "instore" | "in_store" | "storechampionship" | "store_championship" => {
+            // parity w5 §9: bulk promo_types values match upstream totals on
+            // the visible pool — gameday 81/81, giftbox 16/16, glossy 7/7,
+            // intropack 40/40, mediainsert 595/595 EXACT (probe-verified).
+            // Not in EXTRAS_IS_WORDS: these dedup/gate like normal search.
             let q = t.trim_end_matches('s').to_string();
             let q2 = t.to_string();
             let q3 = t.replace('_', "");

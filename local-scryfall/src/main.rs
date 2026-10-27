@@ -78,6 +78,33 @@ fn resolve_tags_path(cards_path: &PathBuf) -> PathBuf {
     PathBuf::from("oracle-tags.jsonl.gz") // load_tags() will fail -> otag warns + 0 results
 }
 
+fn resolve_lang_map_path(cards_path: &PathBuf) -> PathBuf {
+    // Wave-5 item 3: bulk language side-table (see index::load_langs and
+    // scratch/bulk-langs/README-design.md). Same search shape as the tags
+    // file; absence is fine (English-slimmed fallback behavior).
+    if let Ok(p) = std::env::var("LANG_MAP_JSON_GZ") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = data_dir() {
+        cands.push(dir.join("lang_map_full.json.gz"));
+    }
+    if let Some(dir) = cards_path.parent() {
+        cands.push(dir.join("lang_map_full.json.gz"));
+    }
+    cands.push(PathBuf::from("data/lang_map_full.json.gz"));
+    cands.push(PathBuf::from("/home/brenttime/projects/local-scryfall/lang_map_full.json.gz"));
+    for c in cands {
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from("lang_map_full.json.gz")
+}
+
 fn resolve_blocks_path() -> (PathBuf, PathBuf) {
     // (blocks.json, sets-meta.json) — vendored Scryfall set metadata, see
     // data/gen_sets_meta.py. Env SETS_META_DIR overrides the search dirs.
@@ -109,6 +136,8 @@ async fn main() {
     let mut ix = index::Index::load(&path);
     let tags_path = resolve_tags_path(&path);
     let tags_ok = ix.load_tags(&tags_path);
+    let lang_map_path = resolve_lang_map_path(&path);
+    let langs_ok = ix.load_langs(&lang_map_path);
     let (blocks_path, meta_path) = resolve_blocks_path();
     let meta_ok = ix.load_set_meta(&blocks_path, &meta_path);
     eprintln!(
@@ -122,7 +151,13 @@ async fn main() {
         },
         tags_path.display(),
         if meta_ok { "loaded" } else { "MISSING — block/icon fields disabled" },
-        meta_path.display()
+        meta_path.display(),
+    );
+    eprintln!(
+        "lang side-table: {} ({} langs, {} oracles mapped)",
+        if langs_ok { "loaded" } else { "NOT LOADED — lang:/in: fall back to the English-slimmed dump" },
+        ix.oracle_lang_idx.len(),
+        ix.oracle_lang_idx.values().map(|b| b.len()).max().unwrap_or(0),
     );
 
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".into());
