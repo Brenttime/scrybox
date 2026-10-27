@@ -83,6 +83,11 @@ pub enum Filter {
     Name(String),
     Mana(String),
     Artist(String),
+    /// Parity w7 (borrow A2): bare `pow*`/`tou*` (power*/toughness*/p*) —
+    /// upstream answers these as NAME-text wildcard searches: normalized
+    /// (punctuation-folded) substring over name ∪ flavor_name ONLY (oracle
+    /// text never). Validated: pow* 85/85 exact, tou* 94 vs 93.
+    NameText(String),
     Cmp { field: NumField, op: Cmp, val: f32 },
     CmpRange { field: NumField, lo: f32, hi: f32 },
     /// cn: comparator (wave-4 golden-fit): upstream range ops compare the
@@ -784,6 +789,21 @@ impl Parser {
         }
         if let Some(node) = bare_field_atom(&text) {
             return node;
+        }
+        // Parity w7 (borrow A2): bare P/T wildcards are NAME-text searches
+        // upstream (pow* 85 = "Power Armor", "Armed // Powerful", …), NOT
+        // generic word searches — the generic path answered 332 by also
+        // matching oracle text ("~has power 3~"). Stems fold to the bare
+        // alphanumeric alphabet (see index::norm_name_text).
+        if let Some(stem) = text.strip_suffix('*') {
+            let q = match stem.to_lowercase().as_str() {
+                s @ ("pow" | "power") => Some(s.to_string()),
+                s @ ("tou" | "toughness") => Some(s.to_string()),
+                _ => None,
+            };
+            if let Some(q) = q {
+                return Node::Filter(Filter::NameText(q));
+            }
         }
         // no colon: single free word (or fuzzy token)
         if kw_res {

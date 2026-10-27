@@ -539,6 +539,9 @@ pub struct Index {
 
     // lowercased mirror offsets (into `strings`) for scans
     pub name_lc: Vec<u32>,
+    /// Parity w7 (borrow A2): folded name ∪ flavor_name haystack (see
+    /// norm_name_text) for the bare pow*/tou* name-text wildcards.
+    pub name_text: Vec<u32>,
     pub type_lc: Vec<u32>,
     pub oracle_lc: Vec<u32>,
     /// reminder-stripped, lowercased oracle text (upstream o: search field)
@@ -1204,6 +1207,24 @@ pub(crate) fn parse_cn(s: &str) -> u32 {
     digits.parse().unwrap_or(u32::MAX)
 }
 
+/// Parity w7 (borrow A2): fold a card's searchable NAME TEXT to the bare
+/// [0-9a-z] alphabet (lowercase, every other character DROPPED — punctuation
+/// and accents included, mirroring the validated replay's `[^0-9a-z]` strip),
+/// name and flavor_name joined with a space so a stem can never cross the
+/// boundary. `pow*` then answers as a plain substring test.
+pub fn norm_name_text(name: &str, flavor_name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + flavor_name.len() + 1);
+    for src in [name, flavor_name] {
+        for ch in src.to_lowercase().chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch);
+            }
+        }
+        out.push(' ');
+    }
+    out
+}
+
 /// Sentinel for a P/T/loyalty box printed as '*' (distinct from NAN=absent).
 /// Upstream treats '*' as a WILDCARD in inequalities: pow<=3 also matches
 /// 0/* creatures (golden pow<1 1064 vs numeric-only 807), but pow=3 does not.
@@ -1259,6 +1280,9 @@ struct RawC {
     edhrec: u32,
     lang: String,
     flavor: String,
+    /// Parity w7 (borrow A2): punctuation-folded lowercase 'name flavor_name'
+    /// — the search haystack for bare pow*/tou* name-text wildcards.
+    name_text: String,
     watermark: String,
     illustration: String,
     ptypes: String,
@@ -1988,6 +2012,10 @@ fn parse_line(line: &str) -> Option<RawC> {
         id: str_of(&v, "id").to_string(),
         oracle_id: str_of(&v, "oracle_id").to_string(),
         name: str_of(&v, "name").to_string(),
+        name_text: crate::index::norm_name_text(
+            str_of(&v, "name"),
+            str_of(&v, "flavor_name"),
+        ),
         set: str_of(&v, "set").to_string(),
         set_name: str_of(&v, "set_name").to_string(),
         set_type: str_of(&v, "set_type").to_string(),
@@ -2157,6 +2185,7 @@ impl Index {
             jsons: Vec::with_capacity(raws.len()),
             id_map: HashMap::with_capacity(raws.len()),
             name_lc: Vec::with_capacity(raws.len()),
+            name_text: Vec::with_capacity(raws.len()),
             type_lc: Vec::with_capacity(raws.len()),
             oracle_lc: Vec::with_capacity(raws.len()),
             otext_lc: Vec::with_capacity(raws.len()),
@@ -2327,6 +2356,7 @@ impl Index {
             ix.id_map.insert(r.id.as_str().into(), idx);
 
             ix.name_lc.push(s(&r.name.to_lowercase()));
+            ix.name_text.push(s(&r.name_text));
             ix.type_lc.push(s(&r.type_line.to_lowercase()));
             ix.oracle_lc.push(s(&r.oracle_text.to_lowercase()));
             ix.otext_lc

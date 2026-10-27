@@ -737,6 +737,13 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 bm
             }
         }
+        Filter::NameText(q) => {
+            // Parity w7 (borrow A2): bare pow*/tou* — substring over the
+            // folded name ∪ flavor_name haystack; NO oracle text, NO type
+            // line. Pool-gated by the api layer (replay ∩ vis = 94/85).
+            let q = q.clone();
+            scan(ix, |i| ix.s(ix.name_text[i as usize]).contains(q.as_str()))
+        }
         Filter::Name(v) => {
             if !v.contains(' ') {
                 let mut bm = RoaringBitmap::new();
