@@ -146,16 +146,28 @@ async fn main() {
     // finish predicates quantify over ALL printings, incl. gated/variant/
     // promo/foreign rows default-cards omits). Optional: absent file = exact
     // pre-w6a behaviour, so prod without the bulk is unaffected.
-    let side_src: Option<PathBuf> = [
-        std::env::var("SCRYFALL_ALL_CARDS_FILE").ok().map(PathBuf::from),
-        data_dir().map(|d| d.join("all-cards.jsonl.gz")),
-        Some(PathBuf::from(
-            "/home/brenttime/projects/local-scryfall-allprints/all-cards.jsonl.gz",
-        )),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| p.exists());
+    let side_src: Option<PathBuf> = {
+        // Explicit disable sentinel (SCRYFALL_ALL_CARDS_FILE=none|off|0) so
+        // "absent bulk = exact pre-w6a behaviour" can be exercised without
+        // deleting the dev fallback file.
+        let disable = std::env::var("SCRYFALL_ALL_CARDS_FILE")
+            .map(|v| matches!(v.as_str(), "none" | "off" | "0" | ""))
+            .unwrap_or(false);
+        if disable {
+            None
+        } else {
+            [
+                std::env::var("SCRYFALL_ALL_CARDS_FILE").ok().map(PathBuf::from),
+                data_dir().map(|d| d.join("all-cards.jsonl.gz")),
+                Some(PathBuf::from(
+                    "/home/brenttime/projects/local-scryfall-allprints/all-cards.jsonl.gz",
+                )),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+        }
+    };
     let mut side_ms = 0u128;
     if let Some(src) = &side_src {
         let t = Instant::now();

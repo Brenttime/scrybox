@@ -48,6 +48,22 @@ pub const SR_TOKEN: u8 = 4;
 /// lang != "en" — foreign printings stay out of the default search universe.
 pub const SR_NONEN: u8 = 8;
 
+/// w6a calibration finding: the side-index price FALLBACK for usd/eur/foil
+/// comparisons systematically overshoots upstream. Upstream prices the
+/// DISPLAYED printing — which is exactly the default-cards row the slim dump
+/// already carries — so the w5 own-row model sat within 1% (CLOSE) on every
+/// battery price row, while ∃-over-all-printings added 1–7% false matches
+/// (usd>1 11287→11258 vs 11173; frame:2015 usd>1 +526; tix>1 3207 vs 260 —
+/// MTGO prints share oracles with paper ones). Per the wave brief ("family
+/// regresses >2 rows and unfixed in 2 builds → gate behind a flag off +
+/// document"), the fallback stays behind SCRYFALL_SIDE_PRICES=1.
+/// usd_etched (kind 5) is exempt: the slim dump has no such slot, so it can
+/// ONLY resolve through the side index (no baseline to regress).
+pub fn side_prices_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SCRYFALL_SIDE_PRICES").is_ok_and(|v| v == "1"))
+}
+
 /// One compact record per printing from the all_cards bulk, including
 /// gated/hidden/variant/foreign prints. All offsets index SideIdx tables.
 #[derive(Clone, Copy, Default)]

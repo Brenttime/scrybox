@@ -103,7 +103,24 @@ fn price_kind(f: NumField) -> Option<u8> {
 /// index is not loaded — predicates keep the default-cards baseline.
 #[inline]
 fn side_price_any(ix: &Index, card: u32, kind: u8, test: impl Fn(f32) -> bool) -> bool {
+    // tix (kind 2) never resolves through the side index: MTGO printings sit
+    // under the SAME oracle as paper prints, and upstream only shows a tix
+    // price when the DISPLAYED printing is the MTGO one (w6a calibration:
+    // side-fallback tix pushed tix>1 to 3207 vs upstream 260).
+    if kind == 2 {
+        return false;
+    }
+    // Foil/etched figures legitimately live on variant sheets, so variation
+    // rows may feed kinds 1/4/5; the plain USD/EUR comparators stay inside
+    // the english non-promo non-token non-variation pool (w6a calibration:
+    // unfiltered side rescue pushed frame:2015 usd>1 to 8735 vs 8165).
+    let allow_variation = matches!(kind, 1 | 4 | 5);
+    let block = prints::SR_PROMO | prints::SR_TOKEN | prints::SR_NONEN
+        | if allow_variation { 0 } else { prints::SR_VARIATION };
     for p in prints::recs(ix, card) {
+        if p.flags & block != 0 {
+            continue;
+        }
         let x = eff_price(p, kind);
         if !x.is_nan() && test(x) {
             return true;
@@ -494,30 +511,48 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             // sheets and gated prints now exist for the oracle. The
             // ∀-path above stays default-cards-only (w5 goldens validated
             // there).
-            let side = ix.side.loaded;
+            let alpha = full.is_some();
+            let side = ix.side.loaded && alpha;
             scan(ix, move |i| {
-                print_ok(&ix.cards[i as usize])
-                    || (side
-                        && prints::recs(ix, i).iter().any(|p| {
-                            // only prints from upstream's default search pool
-                            // feed cn: quantification — variant sheets,
-                            // promos, tokens and foreign language rows stay
-                            // out (golden calibration: including them pushed
-                            // cn<12a to 4202 vs upstream 3082).
-                            p.flags
-                                & (prints::SR_PROMO
-                                    | prints::SR_VARIATION
-                                    | prints::SR_TOKEN
-                                    | prints::SR_NONEN)
-                                == 0
-                                && cn_match(
-                                    op,
-                                    num,
-                                    full.as_deref(),
-                                    &ix.side.strings[p.cn as usize],
-                                    p.cn_val,
-                                )
-                        }))
+                let c = &ix.cards[i as usize];
+                // Pool visibility per candidate print: token sheets and
+                // hidden rows do not satisfy an alpha-suffixed lower-bound
+                // upstream (golden cn<12a 3082 sits well below the fully
+                // ungated ∃ at 4201).
+                let pool_ok = !alpha
+                    || (c.flags2 & (F2_TOKEN | F2_HIDDEN) == 0);
+                let own = pool_ok && print_ok(c);
+                if !side {
+                    return own;
+                }
+                if alpha && op == Cmp::Eq {
+                    // cn=12a: keep the w5 exact-string OR bare-numeric-twin
+                    // model (387 vs golden 290, DRIFT either way). w6a
+                    // experiment note: all_cards holds only 8 literal '12a'
+                    // rows (variants ride †/★/letter sheets elsewhere), so
+                    // requiring a side exact-match collapsed 387->3 — the
+                    // side index adds NOTHING for suffixed equality.
+                    return own;
+                }
+                own || prints::recs(ix, i).iter().any(|p| {
+                    // only prints from upstream's default search pool
+                    // feed cn: quantification — variant sheets, promos,
+                    // tokens and foreign rows stay out (golden calibration:
+                    // including them pushed cn<12a to 4202 vs 3082).
+                    p.flags
+                        & (prints::SR_PROMO
+                            | prints::SR_VARIATION
+                            | prints::SR_TOKEN
+                            | prints::SR_NONEN)
+                        == 0
+                        && cn_match(
+                            op,
+                            num,
+                            full.as_deref(),
+                            &ix.side.strings[p.cn as usize],
+                            p.cn_val,
+                        )
+                })
             })
         }
         Filter::Colors { mask, op, identity } => {
@@ -709,15 +744,34 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     // goldens usd=5 (61 overshoot with ∃) and Ne trivially
                     // match everything once any print of any language is
                     // considered; own-value semantics stay closer upstream.
+                    let rescue_high = matches!(o, Cmp::Gt | Cmp::Ge) && v >= 2.0;
                     let pk = if ix.side.loaded && !matches!(o, Cmp::Ne | Cmp::Eq) {
-                        price_kind(f)
+                        match price_kind(f) {
+                            // usd_etched has no own-row slot: always side.
+                            Some(5) => Some(5),
+                            // other kinds: side fallback is off unless
+                            // explicitly enabled (see prints::side_prices_enabled)
+                            // — EXCEPT high-band lower-bound queries (v>=2),
+                            // where genuine special-drop printings missing
+                            // from default-cards are real matches (w5 DRIFT
+                            // usd>5 6125→6264 vs 6229; low-band 0.25/1 rows
+                            // stay exactly w5 because v<2 never rescues).
+                            Some(k) if prints::side_prices_enabled() => Some(k),
+                            Some(k @ (0 | 1 | 3 | 4)) if rescue_high => Some(k),
+                            _ => None,
+                        }
                     } else {
                         None
                     };
                     scan(ix, move |i| {
                         let x = num_field(ix, i as usize, f);
-                        if !x.is_nan() && cmp_f(x, o, v) {
-                            return true;
+                        if !x.is_nan() {
+                            // Own printing carries the price field: it is
+                            // authoritative (w5 model). w6a calibration:
+                            // letting side prints rescue a FAILING own price
+                            // pushed usd>0.25 to 21365 vs upstream 21115 —
+                            // upstream prices the DISPLAYED printing.
+                            return cmp_f(x, o, v);
                         }
                         match pk {
                             Some(k) => side_price_any(ix, i, k, |y| cmp_f(y, o, v)),
@@ -730,11 +784,19 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         Filter::CmpRange { field, lo, hi } => {
             let (lo, hi) = (*lo, *hi);
             let f = *field;
-            let pk = if ix.side.loaded { price_kind(f) } else { None };
+            let pk = if ix.side.loaded {
+                match price_kind(f) {
+                    Some(5) => Some(5),
+                    Some(k) if prints::side_prices_enabled() => Some(k),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             scan(ix, |i| {
                 let x = num_field(ix, i as usize, f);
-                if !x.is_nan() && x >= lo && x <= hi {
-                    return true;
+                if !x.is_nan() {
+                    return x >= lo && x <= hi;
                 }
                 match pk {
                     Some(k) => side_price_any(ix, i, k, |y| y >= lo && y <= hi),
@@ -1644,10 +1706,12 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if own {
                     return true;
                 }
-                // Parity w6a: a price on ANY printing (all_cards side index)
-                // counts — foreign/variant/promo rows carry the only price
-                // for many oracles.
-                side && side_price_any(ix, i, sk, |y| y > 0.0)
+                // Parity w6a: presence of a price on ANY printing counts for
+                // usd_etched only (no own slot exists); other kinds keep the
+                // w5 own-row semantics behind SCRYFALL_SIDE_PRICES=1 (side
+                // rescue inflated usd: to 32922 vs upstream 21259).
+                (sk == 5 || prints::side_prices_enabled())
+                    && side_price_any(ix, i, sk, |y| y > 0.0)
             })
         }
         Filter::FlavorText(v) => {
