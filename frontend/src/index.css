@@ -2478,14 +2478,6 @@ a.dash-art { color: inherit; text-decoration: none; }
 .sfp-seg-btn { border: 0; border-radius: 9px; padding: 0.5rem; font-weight: 700; background: transparent; color: var(--text-muted); cursor: pointer; }
 .sfp-seg-btn.on { background: var(--bg-secondary, rgba(255,255,255,0.12)); color: var(--text-strong); }
 .sfp-searchbox { display: flex; flex-direction: column; gap: 0.6rem; }
-.sfp-search-ic { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
-.sfp-input { width: 100%; padding-left: 36px !important; padding-right: 34px !important; }
-.sfp-clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); border: 0; background: none; color: var(--text-muted); cursor: pointer; padding: 4px; }
-.sfp-suggest { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 20; display: flex; flex-direction: column; padding: 4px; border-radius: 12px; }
-.sfp-suggest button { text-align: left; border: 0; background: none; color: var(--text-strong); padding: 0.55rem 0.7rem; border-radius: 8px; cursor: pointer; }
-.sfp-suggest button:hover { background: rgba(255,255,255,0.06); }
-.sfp-chips { display: flex; gap: 0.4rem; overflow-x: auto; scrollbar-width: none; }
-.sfp-chips .deck-chip-btn { white-space: nowrap; flex: none; }
 .sfp-msg { text-align: center; padding: 1.5rem 0.5rem; color: var(--text-secondary); }
 .sfp-count { font-size: 0.75rem; color: var(--text-muted); }
 .sfp-more { align-self: center; }

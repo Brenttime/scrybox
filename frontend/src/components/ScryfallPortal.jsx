@@ -139,23 +139,36 @@ export default function ScryfallPortal({ onNavigate, showToast }) {
       {mode === 'search' && (
         <>
           {!fromSet && (
-            <form onSubmit={submit} className="sfp-searchbox">
-              <div className="deck-toolbar-search" style={{ position: 'relative' }}>
-                <Search size={16} className="sfp-search-ic" />
-                <input className="form-input sfp-input" type="search" enterKeyHint="search" value={q}
-                  onChange={e => setQ(e.target.value)} placeholder={t('portal.placeholder')} aria-label={t('portal.search')} />
-                {q && <button type="button" className="sfp-clear" aria-label={t('common.close')} onClick={() => { setQ(''); setSuggestions([]); }}><X size={14} /></button>}
+            <form onSubmit={submit} className="addsearch-bar sfp-searchbox">
+              <div className="deck-toolbar-search addsearch-input">
+                <Search size={16} />
+                <input className="input-control" type="search" enterKeyHint="search" value={q}
+                  onChange={e => setQ(e.target.value)} placeholder={t('portal.placeholder')} aria-label={t('portal.search')}
+                  autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                  style={/[:<>=]/.test(q) ? { fontFamily: 'var(--font-mono, monospace)' } : undefined} />
+                {q && (
+                  <button type="button" className="deck-toolbar-clear" aria-label={t('common.close')}
+                    onMouseDown={e => e.preventDefault()} onClick={() => { setQ(''); setSuggestions([]); }}>
+                    <X size={13} />
+                  </button>
+                )}
                 {suggestions.length > 0 && (
-                  <div className="sfp-suggest glass-panel">
+                  <ul className="addsearch-suggest" role="listbox">
                     {suggestions.map(s => (
-                      <button key={s} type="button" onClick={() => { setQ(s); run(`!"${s}" unique:prints`); }}>{s}</button>
+                      <li key={s.id || s.name} role="option" aria-selected="false"
+                        onMouseDown={e => e.preventDefault()}
+                        onClick={() => { setQ(s.name); run(`!"${s.name}" unique:prints`); }}>
+                        {s.image_small ? <img src={s.image_small} alt="" loading="lazy" /> : <span className="addsearch-suggest-ph" />}
+                        <span className="addsearch-suggest-name">{s.name}</span>
+                        <span className="addsearch-suggest-type">{s.type_line}</span>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 )}
               </div>
-              <div className="deck-toolbar-chips sfp-chips">
+              <div className="deck-toolbar-chips addsearch-chips">
                 {CHIPS.map(c => (
-                  <button key={c} type="button" className="deck-chip-btn" onClick={() => { setQ(c); run(c); }}>{c}</button>
+                  <button key={c} type="button" className={`deck-chip deck-chip-btn${ran === c ? ' on' : ''}`} onClick={() => { setQ(c); run(c); }}>{c}</button>
                 ))}
               </div>
             </form>
@@ -188,9 +201,9 @@ export default function ScryfallPortal({ onNavigate, showToast }) {
 
       {mode === 'sets' && (
         <>
-          <div className="deck-toolbar-search" style={{ position: 'relative' }}>
-            <Search size={16} className="sfp-search-ic" />
-            <input className="form-input sfp-input" type="search" value={setFilter} onChange={e => setSetFilter(e.target.value)} placeholder={t('portal.filterSets')} aria-label={t('portal.filterSets')} />
+          <div className="deck-toolbar-search addsearch-input">
+            <Search size={16} />
+            <input className="input-control" type="search" value={setFilter} onChange={e => setSetFilter(e.target.value)} placeholder={t('portal.filterSets')} aria-label={t('portal.filterSets')} />
           </div>
           {!sets && <div className="sfp-msg dim">{t('portal.loading')}</div>}
           <div className="sfp-sets">
