@@ -1174,6 +1174,7 @@
   "admin.errUsernameShort.other": "Username must be at least {count} characters.",
   "inspector.owned.one": "x{count} owned",
   "inspector.owned.other": "x{count} owned",
+  "inspector.added": "Added {date}",
   "collection.cardUnit.one": "card",
   "collection.cardUnit.other": "cards",
   "bulk.confirmDelete.one": "Delete {count} selected card? This cannot be undone.",

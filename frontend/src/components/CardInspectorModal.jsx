@@ -23,6 +23,18 @@ import { useT } from '../utils/i18n';
 // the parent refetch after a change.
 const SWIPE_OPTS = { el: () => document.querySelector('.modal-overlay.ci-overlay') };
 
+// When this copy entered the collection, as a short calendar date. added_at is
+// stored as a UTC "YYYY-MM-DD HH:MM:SS" (or ISO) string; read it as UTC and show
+// it in the viewer's local time zone.
+function addedLabel(value) {
+  if (!value) return null;
+  const raw = String(value).trim();
+  const iso = /[zZ]|[+-]\d\d:?\d\d$/.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
 function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false, children = null }) {
   const { t } = useT();
   const [mode, setMode] = useState('view');
@@ -365,6 +377,11 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 </button>
               )}
               {' • '}{t('inspector.owned', { count: card.quantity ?? 1 })}
+              {!readOnly && addedLabel(card.added_at) && (
+                <span className="ci-added-date" style={{ color: 'var(--text-muted)' }}>
+                  {' • '}{t('inspector.added', { date: addedLabel(card.added_at) })}
+                </span>
+              )}
             </p>
 
             {Array.isArray(card.subtypes) && card.subtypes.length > 0 && (
