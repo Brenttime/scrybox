@@ -16,7 +16,7 @@ Identify cards with your phone camera, track prices, and pull decks back out of 
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Scrybox-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/M4M31KYZ9Y)
 
-[Fork differences](#about-this-fork) · [Install](#install) · [Features](#features) · [How it works](PROJECT.md) · [Report a bug](https://github.com/Brenttime/scrybox/issues/new)
+[Fork differences](#about-this-fork) · [Screenshots](#screenshots) · [Install](#install) · [Features](#features) · [How it works](PROJECT.md) · [Report a bug](https://github.com/Brenttime/scrybox/issues/new)
 
 </div>
 
@@ -55,6 +55,26 @@ Compared with upstream, this fork:
   inventory-integrity safeguards, and large-catalog search optimizations.
 
 Those boundaries are product decisions, not missing upstream work.
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.webp" alt="Dashboard: net worth over time, gain, rarity breakdown, most valuable cards and top sets" width="100%" />
+</p>
+
+| Collection | Deck |
+|---|---|
+| <img src="docs/screenshots/collection.webp" alt="Collection grid with card art, rarity, condition and price" /> | <img src="docs/screenshots/deck.webp" alt="Deck view showing owned and missing cards, color balance and deck value" /> |
+
+<p align="center">
+  <img src="docs/screenshots/mobile-dashboard.webp" alt="Dashboard on a phone" width="260" />
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/mobile-collection.webp" alt="Collection on a phone" width="260" />
+</p>
+
+<sub>Screenshots use the built-in demo data.</sub>
 
 ---
 
