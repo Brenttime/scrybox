@@ -26,12 +26,15 @@ export function computeVirtualRange(itemCount, columns, rowStride, scrollTop, vi
   };
 }
 
-export function computeVirtualGeometry(itemCount, width, viewportWidth, gallery) {
+// evenColumns: on a fold spread an odd column count puts a card on the hinge,
+// so round down to an even count (Apple HIG, Designing for iPhone Duo).
+export function computeVirtualGeometry(itemCount, width, viewportWidth, gallery, evenColumns = false) {
   const gap = gallery ? (viewportWidth >= 769 ? 20 : 12) : 0;
   const minCardWidth = viewportWidth >= 769 ? 180 : 130;
-  const columns = gallery
+  let columns = gallery
     ? Math.max(1, Math.floor((width + gap) / (minCardWidth + gap)))
     : 1;
+  if (evenColumns && columns > 2 && columns % 2) columns -= 1;
   const cardWidth = gallery ? (width - gap * (columns - 1)) / columns : width;
   const rowHeight = gallery ? (cardWidth / 0.718) + GALLERY_CARD_INFO_HEIGHT : LIST_ROW_HEIGHT;
   const rowStride = rowHeight + gap;
