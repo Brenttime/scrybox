@@ -1,5 +1,5 @@
 import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { layoutViewportWidth } from '../utils/phoneLayout';
+import { isFoldSpread, layoutViewportWidth } from '../utils/phoneLayout';
 import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Share, Layers, MoreHorizontal, CheckCircle2, Download } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { formatPrice, priceText } from '../utils/formatPrice';
@@ -848,7 +848,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       virtualFrameRef.current = null;
       const width = root.clientWidth;
       const gallery = viewMode === 'gallery';
-      const geometry = computeVirtualGeometry(displayCards.length, width, layoutViewportWidth(), gallery);
+      const geometry = computeVirtualGeometry(displayCards.length, width, layoutViewportWidth(), gallery, isFoldSpread());
       const rootTop = offsetInScroller(root);
       const localScrollTop = Math.max(0, getScrollTop() - rootTop);
       const next = buildVirtualWindow(
@@ -930,6 +930,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
       root.clientWidth,
       layoutViewportWidth(),
       viewMode === 'gallery',
+      isFoldSpread(),
     );
     const anchorRow = Math.floor(anchorIndex / geometry.columns);
     const seedViewportOffset = translateAnchorViewportOffset(
@@ -1103,6 +1104,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         root.clientWidth,
         layoutViewportWidth(),
         nextViewMode === 'gallery',
+        isFoldSpread(),
       );
       const sourceViewportOffset = measuredAnchor?.viewportOffset
         ?? rootTop + fallbackRow * virtualWindow.rowStride - scrollTop;

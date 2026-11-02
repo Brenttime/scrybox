@@ -327,3 +327,10 @@ test('virtual table metadata describes filtered logical rows, not mounted spacer
     /aria-rowindex=\{virtualTableRowIndex\(virtualWindow\.startIndex, virtualIndex\)\}/);
   assert.match(collectionSource, /collection-virtual-list-spacer" aria-hidden="true"/);
 });
+
+test('fold spread rounds gallery columns down to an even count', () => {
+  assert.equal(computeVirtualGeometry(100, 600, 951, true).columns, 3);
+  assert.equal(computeVirtualGeometry(100, 600, 951, true, true).columns, 2);
+  assert.equal(computeVirtualGeometry(100, 990, 951, true, true).columns, 4);
+  assert.equal(computeVirtualGeometry(100, 300, 466, true, true).columns, 2);
+});
