@@ -54,6 +54,36 @@ const B = '5cbc6901-6a4a-4d0a-83ea-7eefa3b35022';
   const fail = [normalizeCard(mk(C))];
   await mergeSearchPrices(fail, { db, bulkFetchByIdentifier: async () => { throw new Error('down'); } });
   assert.strictEqual(fail[0].price_trend, null);
+  // A pre-release cache row (price_source set, no numbers) is not a quote:
+  // the upstream price must replace it, and a still-empty printing is not
+  // re-asked on the next search.
+  const D = '7cbc6901-6a4a-4d0a-83ea-7eefa3b35024';
+  const E = '8cbc6901-6a4a-4d0a-83ea-7eefa3b35025';
+  await cacheNormalizedCards([
+    normalizeCard(mk(D, { prices: { usd: null, usd_foil: null } })),
+    normalizeCard(mk(E, { prices: { usd: null, usd_foil: null } })),
+  ]);
+  const asked = [];
+  const pre = [normalizeCard(mk(D)), normalizeCard(mk(E))];
+  const res3 = await mergeSearchPrices(pre, {
+    db,
+    bulkFetchByIdentifier: async (rows) => {
+      asked.push(rows.map(r => r.id));
+      return { cards: [
+        normalizeCard(mk(D, { prices: { usd: '24.77', usd_foil: '159.59' } })),
+        normalizeCard(mk(E, { prices: { usd: null, usd_foil: null } })),
+      ] };
+    },
+    cacheCards: cacheNormalizedCards,
+  });
+  assert.deepStrictEqual(res3, { cached: 0, fetched: 1 });
+  assert.strictEqual(pre[0].price_trend, 24.77, 'empty pre-release quote refreshed');
+  const fresh = await db.get('SELECT price_normal FROM card_cache WHERE id = ?', [`mtg-${D}`]);
+  assert.strictEqual(fresh.price_normal, 24.77, 'fresh quote written back');
+  const next = [normalizeCard(mk(D)), normalizeCard(mk(E))];
+  await mergeSearchPrices(next, { db, bulkFetchByIdentifier: async (rows) => { asked.push(rows.map(r => r.id)); return { cards: [] }; } });
+  assert.strictEqual(next[0].price_trend, 24.77, 'served from cache now');
+  assert.strictEqual(asked.length, 1, 'still-empty printing not re-asked within the retry window');
   console.log('searchprices: ok');
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });
