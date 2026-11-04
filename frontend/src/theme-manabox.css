@@ -813,6 +813,8 @@
 :root[data-theme="manabox"] .mtg-mode { display: flex; gap: 0.35rem; }
 
 /* ---------------------------------------------------------------- iPhone Duo
+   Home Screen app only (display-mode: standalone). In Safari, Safari owns
+   the right-hand column and the normal bottom tab bar already fits.
    iOS 27 on iPhone Duo moves tab bars, toolbars and Back to a vertical column
    on the RIGHT edge whenever the screen is short and wide: the closed outer
    display (Safari 382x580, Home Screen app 466x657), either display sideways
@@ -823,13 +825,17 @@
    Pure media queries: a fold is just a resize on Safari (no posture API), so
    the layout follows live with no reload. Query mirrored in
    utils/phoneLayout.js SIDE_RAIL_QUERY. */
-@media (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5),
-       (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape),
-       (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5),
+       (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape),
+       (display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
   :root[data-theme="manabox"] {
     --rail-w: 72px;
     --rail-inset-r: max(env(safe-area-inset-right, 0px), var(--sar, 0px));
-    --rail-total: calc(var(--rail-w) + var(--rail-inset-r));
+    /* In the Home Screen app iOS reserves the right edge for its own status
+       column (~84pt: clock, Dynamic Island, camera) and reports it as
+       safe-area-inset-right. Native apps put their tab bar INTO that column,
+       so the rail fills it rather than sitting beside it as a second one. */
+    --rail-total: max(var(--rail-w), var(--rail-inset-r));
   }
   :root[data-theme="manabox"] .app-container {
     padding-right: calc(var(--rail-total) + 0.75rem) !important;
@@ -847,13 +853,15 @@
     right: 0;
     left: auto;
     width: var(--rail-total);
-    z-index: 1000;
+    z-index: 999; /* under sheet/modal backdrops (1000+), like a system bar */
     margin: 0 !important;
-    padding: max(0.6rem, env(safe-area-inset-top, 0px)) var(--rail-inset-r) max(0.5rem, env(safe-area-inset-bottom, 0px), var(--sab, 0px)) 0 !important;
+    padding: max(0.6rem, env(safe-area-inset-top, 0px)) 0 max(0.5rem, env(safe-area-inset-bottom, 0px), var(--sab, 0px)) 0 !important;
     box-sizing: border-box;
     flex-direction: column;
     align-items: center;
-    justify-content: flex-start;
+    /* Everything bottom-aligned: the top of the column belongs to the
+       status bar and the vertically expanding Dynamic Island. */
+    justify-content: flex-end;
     gap: 0.5rem;
     /* Safari tints its own right-hand control column from fixed elements at
        the page edge, so this rail colours that column too. */
@@ -867,6 +875,7 @@
   /* Settings + Log out: the rail's top toolbar slot. Username drops out. */
   :root[data-theme="manabox"] .app-header > div:last-child {
     order: 1;
+    margin-top: auto;
     flex-direction: column;
     gap: 0.4rem !important;
     border: 0;
@@ -883,7 +892,7 @@
   :root[data-theme="manabox"] .nav-tabs {
     order: 2;
     position: static;
-    margin: auto 0 0 !important; /* beats the inline margin: 0 in App.jsx */
+    margin: 0.35rem 0 0 !important; /* beats the inline margin: 0 in App.jsx */
     width: 100%;
     flex-direction: column;
     align-items: stretch;
@@ -919,8 +928,12 @@
 
 /* Short screens (closed + sideways, or a phone on its side): rail tabs are
    icon-only so all five fit in ~370px of height (labels hidden in index.css). */
-@media (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape) {
-  :root[data-theme="manabox"] .nav-tab { min-height: 44px; }
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape) {
+  :root[data-theme="manabox"] .nav-tab { min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
+  :root[data-theme="manabox"] .nav-tabs { gap: 0; }
+  :root[data-theme="manabox"] .app-header { gap: 0.25rem; }
+  :root[data-theme="manabox"] .app-header > div:last-child { gap: 0.15rem !important; }
+  :root[data-theme="manabox"] .app-header > div:last-child .btn-icon-only { width: 40px; height: 36px; }
 }
 
 /* Open Duo held sideways (951 wide): one canvas with the hinge at x = 50%.
@@ -929,7 +942,7 @@
    deck grid | deck panel, 4-up gallery) puts its middle gutter ON the
    crease instead of a card. Collection gallery rounds to an even column
    count on the JS side (utils/phoneLayout.js isFoldSpread). */
-@media (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
+@media (display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
   :root[data-theme="manabox"] {
     --rail-w: 76px;
     --spread-gap: 24px;

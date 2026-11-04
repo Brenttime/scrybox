@@ -661,6 +661,9 @@ select optgroup,
        Android env(safe-area-inset-bottom) is 0, so also honor --sab (set from
        native window insets in MainActivity). */
     padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--sab, 0px));
+    /* Side insets too: landscape notch, or a system column on a foldable. */
+    padding-left: max(0.35rem, env(safe-area-inset-left, 0px), var(--sal, 0px));
+    padding-right: max(0.35rem, env(safe-area-inset-right, 0px), var(--sar, 0px));
     /* Own compositing layer: iOS repaints fixed bars late while the toolbar
        collapses/expands, which briefly floats the bar off the bottom edge. */
     transform: translateZ(0);
@@ -2501,15 +2504,14 @@ a.dash-art { color: inherit; text-decoration: none; }
 
 /* iPhone Duo side rail (theme-manabox.css): what the rail drops. The theme
    file may not hide content, so the hiding lives here. */
-@media (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5),
-       (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape),
-       (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
-  .app-header .logo-text,
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5),
+       (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape),
+       (display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
+  .app-header .logo-section,
   .app-header > div:last-child > div:first-child,
   .nav-tabs::after { display: none !important; }
 }
-@media (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape) {
-  .app-header .logo-section { display: none !important; }
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape) {
   .nav-tabs .nav-tab span {
     position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
   }

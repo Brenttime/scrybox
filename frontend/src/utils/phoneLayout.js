@@ -8,13 +8,13 @@ export const PHONE_QUERY = '(max-width: 768px), (pointer: coarse) and (max-width
 // sideways 594x368 [678x445], open sideways 951x585 [951x648]. Open upright
 // (669x867) keeps the bottom bar, as iOS does. Mirrored in theme-manabox.css.
 export const SIDE_RAIL_QUERY = [
-  '(pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5)',
-  '(pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape)',
-  '(pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px)',
+  '(display-mode: standalone) and (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5)',
+  '(display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape)',
+  '(display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px)',
 ].join(', ');
 
 // The open Duo held sideways: one touch canvas with the hinge at x = 50%.
-export const FOLD_SPREAD_QUERY = '(pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px)';
+export const FOLD_SPREAD_QUERY = '(display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px)';
 
 export function isFoldSpread(win = typeof window !== 'undefined' ? window : null) {
   return !!win?.matchMedia?.(FOLD_SPREAD_QUERY).matches;
