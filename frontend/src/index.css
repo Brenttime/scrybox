@@ -2230,13 +2230,13 @@ select optgroup,
 .dk-jump-chip span { color: var(--text-muted); }
 .dk-jump-chip:hover { background: rgba(255, 255, 255, 0.06); color: var(--text-primary); }
 
-.dk-commander { display: flex; align-items: center; gap: 1rem; width: 100%; margin: 0.75rem 0 1rem; padding: 0.75rem; border-radius: 16px; border: 1px solid var(--border-glass); background: var(--bg-secondary, rgba(255,255,255,0.03)); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.dk-commander { display: flex; align-items: center; gap: 0.7rem; width: 100%; margin: 0.4rem 0 0.6rem; padding: 0.45rem 0.6rem; border-radius: 12px; border: 1px solid var(--border-glass); background: var(--bg-secondary, rgba(255,255,255,0.03)); color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .dk-commander:hover { border-color: var(--border-glass-hover); }
-.dk-commander-img { width: 96px; border-radius: 6px; flex: none; }
-.dk-commander-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.dk-commander-k { font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); }
-.dk-commander-name { font-size: 1.1rem; font-weight: 700; color: var(--text-strong); }
-.dk-commander-meta { font-size: 0.78rem; color: var(--text-secondary); }
+.dk-commander-img { width: 48px; border-radius: 4px; flex: none; }
+.dk-commander-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.dk-commander-k { font-size: 0.62rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-secondary); }
+.dk-commander-name { font-size: 0.95rem; font-weight: 700; color: var(--text-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dk-commander-meta { font-size: 0.72rem; color: var(--text-secondary); }
 
 .dk-sec { margin-bottom: 1rem; scroll-margin-top: 60px; }
 .dk-sec > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 0.5rem; padding: 0.4rem 0; font-weight: 700; font-size: 0.95rem; color: var(--text-strong); }
