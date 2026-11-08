@@ -370,7 +370,6 @@
   "deck.importTitle": "読み込んでコレクションと比較",
   "deck.inPlay": "現在使用中",
   "deck.mulliganCountText": "デッキの一貫性をテストします。シャッフル済みデッキ。マリガン回数: {mulligans}。手札枚数: {handSize} 枚。",
-  "deck.mulliganDraw": "マリガン ({count} 枚ドロー)",
   "deck.namePlaceholder": "例: アタルカレッド、アグロ白など...",
   "deck.noCardsDrawn": "まだカードを引いていません。",
   "deck.noMatches": "条件に一致するデッキがありません",

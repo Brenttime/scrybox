@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { TrendingUp, Mountain, BookOpen, Sparkles, Crown, Database } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
-import { priceText } from '../utils/formatPrice';
+import { cardPriceText, estPrefix } from '../utils/formatPrice';
 import { useT } from '../utils/i18n';
 import CardImage from './CardImage';
 
@@ -129,7 +129,7 @@ function Pip({ name }) {
   return <span className="dash-pip" style={{ background: PIP_COLOR[k] || '#6b7280' }}>{k}</span>;
 }
 
-function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
+function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast, portalOn = false }) {
   const { t, locale } = useT();
   // Money and dates follow the interface language, not the browser's.
   const money = (n) => (Number(n) || 0).toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -146,30 +146,28 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
   const [loading, setLoading] = useState(() => !readCache('stats'));
   const [error, setError] = useState(null);
   const [timePeriod, setTimePeriod] = useState('30d');
+  const hasCards = !!(stats && stats.summary.totalCards > 0);
   const [historyData, setHistoryData] = useState(() => readCache('history_30d') || []);
   const [decks, setDecks] = useState(() => readCache('decks'));
   const [activeColor, setActiveColor] = useState(null);
   const [inspectorCard, setInspectorCard] = useState(null);
   // Local Scryfall tool tile shows only when the backend mounted the portal.
-  const [portalOn, setPortalOn] = useState(false);
-  useEffect(() => {
-    let live = true;
-    fetch('/api/settings').then(r => (r.ok ? r.json() : null))
-      .then(d => { if (live && d) setPortalOn(!!d.scryfall_portal_enabled); })
-      .catch(() => {});
-    return () => { live = false; };
-  }, []);
+  // App already reads /api/settings for the header search and passes the flag
+  // down (portalOn prop), so the Dashboard no longer fetches it a second time.
 
   useEffect(() => {
     fetchStats();
-    fetchDecks();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statsTrigger]);
 
   useEffect(() => {
-    if (stats && stats.summary.totalCards > 0) fetchTimelineHistory();
+    if (hasCards) fetchTimelineHistory();
+  // Keyed on hasCards + statsTrigger, not the stats object: the cached stats
+  // render first and the fresh /api/stats replaces the object, which used to
+  // fetch the same history period twice on every Dashboard visit. statsTrigger
+  // still refreshes it after the collection changes.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timePeriod, stats]);
+  }, [timePeriod, hasCards, statsTrigger]);
 
   const fetchStats = async () => {
     try {
@@ -180,6 +178,12 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
       setStats(data);
       setError(null);
       writeCache('stats', data);
+      // Deck tile counts ride along in /api/stats (server-cached), so the
+      // Dashboard no longer downloads the whole /api/decks list for 3 numbers.
+      if (data && data.decks) {
+        setDecks(data.decks);
+        writeCache('decks', data.decks);
+      }
     } catch (err) {
       console.error(err);
       // Keep showing the cached dashboard if the refresh fails.
@@ -189,8 +193,6 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
     }
   };
 
-  // /api/decks is served from the trigger-revision deck-list cache, so the
-  // counts cost nothing extra on the server.
   // Commander of the day: the server picks one per day; whether this load
   // features it instead of the top card is a coin flip below.
   const [cotd, setCotd] = useState(null);
@@ -198,31 +200,15 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
   // commander (the commander itself is fixed for the day).
   const [showCotd] = useState(() => Math.random() < 0.5);
   useEffect(() => {
+    // Only the coin-flip loads that feature the commander need it.
+    if (!showCotd) return undefined;
     let alive = true;
     fetch('/api/stats/commander-of-the-day')
       .then(r => (r.ok ? r.json() : null))
       .then(d => { if (alive && d && d.card) setCotd(d); })
       .catch(() => {});
     return () => { alive = false; };
-  }, []);
-
-  const fetchDecks = async () => {
-    try {
-      const r = await fetch('/api/decks');
-      if (!r.ok) return;
-      const list = await r.json();
-      if (!Array.isArray(list)) return;
-      const summary = {
-        count: list.length,
-        built: list.filter(d => d.checked_out).length,
-        needCards: list.filter(d => !d.checked_out && Number(d.missing_copies) > 0).length,
-      };
-      setDecks(summary);
-      writeCache('decks', summary);
-    } catch (err) {
-      console.error('Error loading decks:', err);
-    }
-  };
+  }, [showCotd]);
 
   const fetchTimelineHistory = async () => {
     const period = timePeriod;
@@ -284,7 +270,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
     <button key={c.entry_id ?? c.card_id} type="button" className={`dash-cardtile ${cls}`} onClick={() => setInspectorCard(c)}>
       <CardImage card={c} loading="lazy" className="dash-cardtile-img" />
       <span className="dash-cardtile-name">{name(c)}</span>
-      <span className="dash-cardtile-price">{priceText(c.price_trend, c.price_currency)}</span>
+      <span className="dash-cardtile-price">{cardPriceText(c)}</span>
     </button>
   );
 
@@ -304,7 +290,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
       <div className="dash-bento">
         <div className="dash-tile dash-net">
           <div className="dash-k">{t('dash.netWorth')}</div>
-          <div className="dash-val dash-net-val">${money(summary.totalValue)}</div>
+          <div className="dash-val dash-net-val">{estPrefix(summary.estimatedCards > 0, summary.totalValue)}${money(summary.totalValue)}</div>
           <div className="dash-change">
             {change && change.available ? (
               <span className={change.abs >= 0 ? 'up' : 'down'}>
@@ -339,7 +325,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
 
         {cotd && showCotd ? (
           <a className="dash-tile dash-art" href={cotd.card.edhrec_url} target="_blank" rel="noreferrer" title={cotd.card.type_line}>
-            <img src={cotd.card.art_crop || artCrop(cotd.card.image_url)} onError={(e) => { if (e.currentTarget.src !== cotd.card.image_url) e.currentTarget.src = cotd.card.image_url; }} className="dash-art-img" alt="" loading="lazy" />
+            <img crossOrigin="anonymous" src={cotd.card.art_crop || artCrop(cotd.card.image_url)} onError={(e) => { if (e.currentTarget.src !== cotd.card.image_url) e.currentTarget.src = cotd.card.image_url; }} className="dash-art-img" alt="" decoding="async" />
             <span className="dash-art-shade" />
             <span className="dash-art-cap">
               <span className="dash-k"><Crown size={12} style={{ verticalAlign: '-1px', marginRight: 4 }} />{t('dash.commanderOfDay')}</span>
@@ -354,7 +340,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast }) {
             <span className="dash-art-cap">
               <span className="dash-k">{t('dash.topCard')}</span>
               <span className="dash-art-name">{name(top)}</span>
-              <span className="dash-art-price">{priceText(top.price_trend, top.price_currency)}</span>
+              <span className="dash-art-price">{cardPriceText(top)}</span>
             </span>
           </button>
         )}

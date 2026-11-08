@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Zap, ZapOff, ScanLine, Check, X, SwitchCamera, Camera, Sparkles, Trash2, Send, Undo2, Minus, Plus, Layers } from 'lucide-react';
 import { resolveCardPrice, usdPrice } from '../utils/resolveCardPrice';
-import { priceText } from '../utils/formatPrice';
+import { priceText, cardPriceText, estPrefix, isEstimated } from '../utils/formatPrice';
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
 import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, updatePresence, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
@@ -102,7 +102,7 @@ const TrayCard = memo(function TrayCard({ row, dest, t, onEdit, onDismiss, onPat
             <button type="button" className="fs-card-edit fs-card-retry" onClick={() => onRetry(row)} aria-label={t('fastscan.hydrateRetry')} title={t('fastscan.hydrateRetry')} />
           )}
           <button type="button" className="fs-card-x" onClick={() => onDismiss(row.key)} aria-label={t('fastscan.dismiss')}><X size={12} /></button>
-          {price != null && <span className="fs-card-price">{priceText(price, 'USD')}</span>}
+          {price != null && <span className="fs-card-price">{estPrefix(isEstimated(row.card), price)}{priceText(price, 'USD')}</span>}
           {row.sent && <span className="fs-card-badge"><Check size={14} /></span>}
         </div>
         <div className="fs-card-name">{displayName(row.card)}</div>
@@ -815,17 +815,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       }
       if (chunkError && !sentRows.length) throw chunkError;
       const keys = new Set(sentRows.map(row => row.key));
-      // Sent cards stay in the tray, marked sent, so their printing can still
-      // be changed (collection entries); failures stay unsent for retry.
-      // The row keeps the printing that was actually sent; a correction that
-      // arrived during the Send is applied right after, as a re-point.
-      const sentCard = new Map(sentRows.map(row => [row.key, row.card]));
-      setResults(prev => prev.map(x => (keys.has(x.key) ? { ...x, sent: true, sentDest: dest, entryIds: entryIds.get(x.key), card: x.card.id === sentCard.get(x.key).id ? x.card : sentCard.get(x.key) } : x)));
+      // Sent cards leave the tray; Undo (kept until the next Send) puts them
+      // back unsent. Failures stay for retry.
+      setResults(prev => prev.filter(x => !keys.has(x.key)));
       const where = dest === 'collection' ? t('fastscan.destCollection') : (lists.find(l => String(l.id) === dest)?.name || t('fastscan.destList'));
       clearTimeout(undoTimer.current);
       if (sentRows.length) {
         setUndo({ rows: sentRows, dest, where, entryIds: dest === 'collection' ? entries.flatMap(e => (e.ids?.length ? e.ids : [e.id])).filter(Boolean) : null });
-        undoTimer.current = setTimeout(() => setUndo(null), 15000);
       }
       showToast?.(chunkError ? t('fastscan.sendFailed') : t('fastscan.sent', { count: keys.size, where }));
       if (dest === 'collection') onAddSuccess?.();
@@ -924,10 +920,13 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     } finally { setSending(false); sendingRef.current = false; pendingFixRef.current.clear(); }
   };
 
-  const { total, anyPriced } = useMemo(() => {
-    let sum = 0, any = false;
-    for (const r of results) { const p = rowPriceOf(r); if (p != null) { sum += p; any = true; } }
-    return { total: sum, anyPriced: any };
+  const { total, anyPriced, anyEstimated } = useMemo(() => {
+    let sum = 0, any = false, est = false;
+    for (const r of results) {
+      const p = rowPriceOf(r);
+      if (p != null) { sum += p; any = true; if (isEstimated(r.card)) est = true; }
+    }
+    return { total: sum, anyPriced: any, anyEstimated: est };
   }, [results]);
 
   if (service === false) {
@@ -948,7 +947,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div key={flash} className={flash ? 'fs-flash' : ''} />
 
         <div className="fs-topbar">
-          {results.length > 0 && <span className="fs-pill fs-pill-value">{anyPriced ? `${priceText(total, 'USD')} · ` : ''}{results.length}</span>}
+          {results.length > 0 && <span className="fs-pill fs-pill-value">{anyPriced ? `${estPrefix(anyEstimated, total)}${priceText(total, 'USD')} · ` : ''}{results.length}</span>}
           {latency != null && <span className="fs-pill" title={t('fastscan.latencyHint', { read: latency.read })}><Sparkles size={12} /> {latency.total >= 1000 ? `${(latency.total / 1000).toFixed(1)} s` : `${latency.total} ms`}</span>}
           {auto && <span className="fs-pill fs-pill-live"><span className="fs-dot" /> {t('fastscan.autoOn')}</span>}
           {onDevice && <span className="fs-pill" title={t('fastscan.onDeviceHint')}>{t('fastscan.onDevice')}</span>}
@@ -996,7 +995,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
         <div className="fs-tray-head">
           <div>
             <div className="fs-tray-title">{t('fastscan.results', { count: results.length })}</div>
-            {anyPriced && <div className="fs-tray-total">{priceText(total, 'USD')}</div>}
+            {anyPriced && <div className="fs-tray-total">{estPrefix(anyEstimated, total)}{priceText(total, 'USD')}</div>}
           </div>
           {results.length > 0 && (
             <button type="button" className="fs-ghost" onClick={() => setResults([])} aria-label={t('fastscan.clear')}><Trash2 size={14} /></button>
@@ -1030,7 +1029,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
                       <button type="button" className="fs-print" onClick={() => choosePrinting(c)} aria-pressed={c.id === editing.card.id}>
                         <div className="fs-card-art">
                           {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" /> : null}
-                          {priceOf(c) != null && <span className="fs-card-price">{priceText(priceOf(c), 'USD')}</span>}
+                          {priceOf(c) != null && <span className="fs-card-price">{cardPriceText(c, priceOf(c), 'USD')}</span>}
                           {c.id === editing.card.id && <span className="fs-card-badge"><Check size={14} /></span>}
                         </div>
                         <div className="fs-card-name">{c.set_name || String(c.set_id || '').toUpperCase()}</div>

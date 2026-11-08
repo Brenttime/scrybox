@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, Plus, Minus, X, ShieldAlert, Check, Undo2, Braces, Zap, SlidersHorizontal } from 'lucide-react';
 import { usdPrice } from '../utils/resolveCardPrice';
+import { estPrefix, isEstimated } from '../utils/formatPrice';
 import { CONDITIONS, LANGUAGES } from '../utils/cardOptions';
 import { displayName } from '../utils/languages';
 import CardImage from './CardImage';
@@ -15,6 +16,8 @@ import Field from './FilterField';
 import { CARD_TYPES, MANA_VALUES } from '../utils/mtgFilters';
 import { LANGUAGES as LANGUAGE_TABLE } from '../utils/languages';
 import { EMPTY_SEARCH_FILTERS, SEARCH_RARITIES, SEARCH_FINISHES, COMMON_SUBTYPES, compileSearchFilters, countSearchFilters, withFilters } from '../utils/searchFilters';
+import DestinationSelect from './DestinationSelect';
+import { useAddDestination, addToList, undoListAdd } from '../utils/addDestination';
 import { parseDirectAdd, directAddQuery, pickPrinting, sortByRelease } from '../utils/directAdd';
 
 // Add Cards > Search, grid-first (Brent's "C grid" design):
@@ -38,7 +41,7 @@ const SYNTAX_CHIPS = [
 
 const priceLabel = (card, printing) => {
   const p = usdPrice(card, printing);
-  return p == null ? '—' : `$${p.toFixed(2)}`;
+  return p == null ? '—' : `${estPrefix(isEstimated(card), p)}$${p.toFixed(2)}`;
 };
 const hasFoil = (c) => (Array.isArray(c.finishes) ? c.finishes.some(f => f === 'foil' || f === 'etched') : c.price_holofoil > 0);
 
@@ -60,6 +63,8 @@ function CardSearch({ onAddSuccess, showToast }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [searchError, setSearchError] = useState(null);
   const [foil, setFoil] = useState(false);
+  const destination = useAddDestination();
+  const { list: destList } = destination;
   const [chip, setChip] = useState('all');
   const [added, setAdded] = useState({}); // card id -> copies added this session
   const [undo, setUndo] = useState(null); // { ids, card, qty }
@@ -205,6 +210,12 @@ function CardSearch({ onAddSuccess, showToast }) {
 
   // POST one stacked row; returns the created row ids (undo deletes exactly these).
   const addCopies = async (card, { qty = 1, printing, condition = 'Near Mint', language = 'English' }) => {
+    if (destList) {
+      await addToList(destList.id, card.id, qty).catch(() => { throw new Error(t('lists.errCard')); });
+      setAdded(prev => ({ ...prev, [card.id]: (prev[card.id] || 0) + qty }));
+      showUndo({ listId: destList.id, listName: destList.name, card, qty, printing });
+      return [];
+    }
     const res = await fetch('/api/collection', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -240,7 +251,8 @@ function CardSearch({ onAddSuccess, showToast }) {
     setUndo(null);
     clearTimeout(undoTimer.current);
     try {
-      for (const id of entry.ids) {
+      if (entry.listId) await undoListAdd(entry.listId, entry.card.id, entry.qty);
+      for (const id of entry.ids || []) {
         const res = await fetch(`/api/collection/${id}`, { method: 'DELETE' });
         if (!res.ok) throw new Error(t('search.errUndo'));
       }
@@ -250,9 +262,9 @@ function CardSearch({ onAddSuccess, showToast }) {
         if (n > 0) next[entry.card.id] = n; else delete next[entry.card.id];
         return next;
       });
-      setCards(prev => adjustOwnedQuantityByName(prev, entry.card, -entry.qty));
+      if (!entry.listId) setCards(prev => adjustOwnedQuantityByName(prev, entry.card, -entry.qty));
       showToast(t('search.removed', { name: displayName(entry.card) }));
-      onAddSuccess();
+      if (!entry.listId) onAddSuccess();
     } catch (err) {
       showToast(err.message || t('search.errUndoGeneric'));
     }
@@ -373,7 +385,7 @@ function CardSearch({ onAddSuccess, showToast }) {
                 <li key={s.id || s.name} role="option" aria-selected="false"
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => pickSuggestion(s.name)}>
-                  {s.image_small ? <img src={s.image_small} alt="" loading="lazy" /> : <span className="addsearch-suggest-ph" />}
+                  {s.image_small ? <img crossOrigin="anonymous" src={s.image_small} alt="" loading="lazy" /> : <span className="addsearch-suggest-ph" />}
                   <span className="addsearch-suggest-name">{s.name}</span>
                   <span className="addsearch-suggest-type">{s.type_line}</span>
                 </li>
@@ -387,6 +399,7 @@ function CardSearch({ onAddSuccess, showToast }) {
       </form>
 
       <div className="deck-toolbar-chips addsearch-chips">
+        <DestinationSelect {...destination} />
         <div className="addsearch-finish" role="group" aria-label={t('addsearch.finish')}>
           <button type="button" className={!foil ? 'on' : ''} aria-pressed={!foil} onClick={() => setFoil(false)}>{t('addsearch.nonfoil')}</button>
           <button type="button" className={foil ? 'on' : ''} aria-pressed={foil} onClick={() => setFoil(true)}>{t('addsearch.foil')}</button>
@@ -531,11 +544,14 @@ function CardSearch({ onAddSuccess, showToast }) {
         <AddSheet
           sheet={sheet}
           setSheet={setSheet}
+          destination={destination}
           onZoom={setZoom}
           onAdd={async () => {
             try {
               await addCopies(sheet.card, { qty: sheet.qty, printing: sheet.printing, condition: sheet.condition, language: sheet.language });
-              showToast(t('search.addedToCollection', { name: displayName(sheet.card) }));
+              showToast(destList
+                ? t('addDest.addedToList', { name: displayName(sheet.card), list: destList.name })
+                : t('search.addedToCollection', { name: displayName(sheet.card) }));
               setSheet(null);
             } catch (err) {
               showToast(err.message || t('search.errAddCardGeneric'));
@@ -548,7 +564,9 @@ function CardSearch({ onAddSuccess, showToast }) {
 
       {undo && (
         <div className="addsearch-undo" role="status">
-          <span>{t('addsearch.addedToast', { qty: undo.qty, name: displayName(undo.card) })}</span>
+          <span>{undo.listId
+            ? t('addDest.addedToastList', { qty: undo.qty, name: displayName(undo.card), list: undo.listName })
+            : t('addsearch.addedToast', { qty: undo.qty, name: displayName(undo.card) })}</span>
           <button type="button" onClick={undoLast}><Undo2 size={14} /> {t('search.undo')}</button>
         </div>
       )}
@@ -558,7 +576,7 @@ function CardSearch({ onAddSuccess, showToast }) {
 
 // Compact add sheet: big card, printing strip with prices, qty stepper,
 // Nonfoil/Foil, condition/language behind a small "change" disclosure.
-function AddSheet({ sheet, setSheet, onAdd, onZoom }) {
+function AddSheet({ sheet, setSheet, onAdd, onZoom, destination }) {
   const { t } = useT();
   const [printings, setPrintings] = useState([sheet.card]);
   const [adding, setAdding] = useState(false);
@@ -628,6 +646,7 @@ function AddSheet({ sheet, setSheet, onAdd, onZoom }) {
             </select>
           </div>
         )}
+        <DestinationSelect {...destination} className="add-dest-wide" />
         <button type="button" className="btn btn-primary addsheet-add" disabled={adding}
           onClick={async () => { setAdding(true); await onAdd(); setAdding(false); }}>
           {t('addsearch.addN', { qty: sheet.qty })}

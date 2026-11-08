@@ -162,6 +162,7 @@ async function main() {
       roi: { abs: 266, pct: 443.3 },
       avgCardValue: 16.3,
       duplicateCopies: 12,
+      estimatedCards: 0,
       mintRate: 85,
       vintageRatio: 70,
       change7d: { available: true, abs: 22, pct: 29.7 },

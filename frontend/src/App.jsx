@@ -1,45 +1,31 @@
-import React, { useState, useEffect, useRef, lazy, Suspense } from 'react';
-import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, LogOut, Plus, Swords, ListChecks } from 'lucide-react';
-import Login from './components/Login';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
+import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, LogOut, Search, Plus, Swords, ListChecks } from 'lucide-react';
 import Logo from './components/Logo';
 import PullToRefresh from './components/PullToRefresh';
+import SwipeToCloseLayers from './components/SwipeToCloseLayers';
 import { scrollToTop } from './utils/scrollRoot';
 import { pushBackGuard } from './utils/useBackGuard';
 import { getRememberedTab, rememberView, clearRememberedView, forgetOpenSubviews } from './utils/viewMemory';
 import { useT } from './utils/i18n';
+import { isChunkError, lazyView, reloadForNewDeploy } from './utils/lazyView';
 
 // View components are code-split so heavy deps (recharts in the chart views)
-// load on demand instead of in the initial bundle.
-// A deploy replaces the hashed chunk files. A tab opened before the deploy
-// still asks for the old names and gets "Failed to fetch dynamically imported
-// module". Reload once to pick up the new index.html (guarded so a real
-// outage can't loop), and retry once first for a flaky network.
-const CHUNK_RELOAD_KEY = 'scrybox.chunkReloadAt';
-function isChunkError(err) {
-  return /dynamically imported module|Importing a module script failed|error loading dynamically imported|Unable to preload CSS/i.test(String(err?.message || err));
-}
-function reloadForNewDeploy() {
-  const last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) || 0);
-  if (Date.now() - last < 30000) return false;
-  sessionStorage.setItem(CHUNK_RELOAD_KEY, String(Date.now()));
-  window.location.reload();
-  return true;
-}
+// load on demand instead of in the initial bundle. lazyView (utils/lazyView)
+// retries a failed chunk once, then reloads once to pick up a new deploy; the
+// same guarded reload handles Vite's preload failures here.
 if (typeof window !== 'undefined') {
   window.addEventListener('vite:preloadError', (event) => {
     if (reloadForNewDeploy()) event.preventDefault();
   });
 }
-const lazyView = (load) => lazy(() => load().catch(err => {
-  if (!isChunkError(err)) throw err;
-  return new Promise(r => setTimeout(r, 400)).then(load).catch(err2 => {
-    if (isChunkError(err2) && reloadForNewDeploy()) return new Promise(() => {});
-    throw err2;
-  });
-}));
 
 const Dashboard = lazyView(() => import('./components/Dashboard'));
-const AddCards = lazyView(() => import('./components/AddCards'));
+// The scanner is Add Cards' default pane but lives in its own chunk (so the
+// other panes don't need it); fetch it alongside AddCards, not after it.
+const AddCards = lazyView(() => {
+  import('./components/FastScanner').catch(() => {});
+  return import('./components/AddCards');
+});
 const CollectionList = lazyView(() => import('./components/CollectionList'));
 const Settings = lazyView(() => import('./components/Settings'));
 const SetupWizard = lazyView(() => import('./components/SetupWizard'));
@@ -50,6 +36,9 @@ const LimitedLands = lazyView(() => import('./components/LimitedLands'));
 const ScryfallPortal = lazyView(() => import('./components/ScryfallPortal'));
 const Rules = lazyView(() => import('./components/Rules'));
 const Keywords = lazyView(() => import('./components/Keywords'));
+// Login is only ever shown signed-out, so it stays out of the entry chunk that
+// every signed-in load parses.
+const Login = lazyView(() => import('./components/Login'));
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -153,6 +142,16 @@ function App() {
   // so on mobile a page often opened partway down. The browser's own restore
   // is off too: our pushState guards share one URL, so 'auto' re-applied
   // stale offsets on reload/back.
+  // Header search opens the local Scryfall tool; only when the backend mounted it.
+  const [portalOn, setPortalOn] = useState(false);
+  useEffect(() => {
+    if (!user) return undefined;
+    let live = true;
+    fetch('/api/settings').then(r => (r.ok ? r.json() : null))
+      .then(d => { if (live && d) setPortalOn(!!d.scryfall_portal_enabled); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [user]);
   useEffect(() => {
     if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
   }, []);
@@ -355,13 +354,17 @@ function App() {
 
   // Render login screen if unauthenticated
   if (!token || !user) {
-    return <Login onLoginSuccess={handleLoginSuccess} />;
+    return (
+      <Suspense fallback={<ChunkFallback />}>
+        <Login onLoginSuccess={handleLoginSuccess} />
+      </Suspense>
+    );
   }
 
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard':
-        return <Dashboard statsTrigger={statsTrigger} onNavigate={goTab} onUpdate={triggerRefresh} showToast={showToast} />;
+        return <Dashboard statsTrigger={statsTrigger} onNavigate={goTab} onUpdate={triggerRefresh} showToast={showToast} portalOn={portalOn} />;
       case 'add-cards':
         return <AddCards onAddSuccess={triggerRefresh} showToast={showToast} setActiveTab={goTab} />;
       case 'collection':
@@ -390,13 +393,14 @@ function App() {
       case 'settings':
         return <Settings user={user} onUpdateUser={handleUpdateUser} showToast={showToast} target={settingsTarget} />;
       default:
-        return <Dashboard statsTrigger={statsTrigger} onNavigate={goTab} onUpdate={triggerRefresh} showToast={showToast} />;
+        return <Dashboard statsTrigger={statsTrigger} onNavigate={goTab} onUpdate={triggerRefresh} showToast={showToast} portalOn={portalOn} />;
     }
   };
 
   return (
     <div className="app-container">
       <PullToRefresh />
+      <SwipeToCloseLayers />
       {showSetup && (
         <Suspense fallback={null}>
           <SetupWizard user={user} showToast={showToast} onClose={() => setShowSetup(false)} />
@@ -457,6 +461,18 @@ function App() {
             <Sparkles size={14} style={{ color: 'var(--accent-yellow)' }} />
             <span><strong style={{ color: 'var(--text-strong)' }}>{user.username}</strong></span>
           </div>
+          {portalOn && (
+            <button
+              onClick={() => goTab('scryfall')}
+              className={`btn ${activeTab === 'scryfall' ? 'btn-primary' : 'btn-secondary'} btn-icon-only`}
+              title={t('header.searchCards')}
+              aria-label={t('header.searchCards')}
+              aria-current={activeTab === 'scryfall' ? 'page' : undefined}
+              style={{ padding: '0.4rem 0.5rem', borderRadius: 'var(--radius-sm)' }}
+            >
+              <Search size={14} />
+            </button>
+          )}
           <button
             onClick={() => goTab('settings')}
             className={`btn ${activeTab === 'settings' ? 'btn-primary' : 'btn-secondary'} btn-icon-only`}

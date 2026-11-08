@@ -372,7 +372,6 @@
   "deck.importTitle": "Importer et comparer avec la collection",
   "deck.inPlay": "Actuellement en jeu",
   "deck.mulliganCountText": "Testez la régularité de votre deck. Deck mélangé. Nombre de mulligans : {mulligans}. Cartes en main : {handSize}.",
-  "deck.mulliganDraw": "Mulligan (Piocher {count})",
   "deck.namePlaceholder": "p. ex. Atarka Red ou Aggro Blanc...",
   "deck.noCardsDrawn": "Aucune carte piochée pour l'instant.",
   "deck.noMatches": "Aucun deck ne correspond à ton filtre",

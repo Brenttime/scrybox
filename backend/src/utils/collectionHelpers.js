@@ -46,18 +46,22 @@ async function checkedOutAllocation(userId) {
   // required logical card, so a pair of checked-out Commander decks caused about
   // 200 scans of a 20k-row collection before the page could respond. Grouping in
   // memory preserves the same newest-first greedy allocation with two bounded SQL
-  // reads regardless of deck size.
+  // reads regardless of deck size. Only rows for a required card can be
+  // allocated, so the read is restricted to those keys (card_cache first, then
+  // collection via idx_collection_card_user) instead of the whole collection.
   const entries = await db.all(`
     SELECT
       c.id AS entry_id,
       c.quantity,
       ${sqlCardKey('owned_cc')} AS card_key
-    FROM collection c
-    JOIN card_cache owned_cc ON owned_cc.id = c.card_id
-    WHERE c.user_id = ?
+    FROM card_cache owned_cc
+    CROSS JOIN collection c
+    WHERE c.card_id = owned_cc.id
+      AND c.user_id = ?
       AND c.quantity > 0
+      AND ${sqlCardKey('owned_cc')} IN (SELECT value FROM json_each(?))
     ORDER BY c.added_at DESC, c.id DESC
-  `, [userId]);
+  `, [userId, JSON.stringify(required.map(r => r.card_key))]);
 
   const remaining = new Map(required.map(({ card_key, req }) => [card_key, Number(req) || 0]));
   const alloc = new Map();

@@ -811,3 +811,169 @@
 :root[data-theme="manabox"] .mtg-pip-G { background: #9fd3a7; color: #0d3a1b; }
 :root[data-theme="manabox"] .mtg-pip-C { background: #cfcccb; color: #2c2a2a; }
 :root[data-theme="manabox"] .mtg-mode { display: flex; gap: 0.35rem; }
+
+/* ---------------------------------------------------------------- iPhone Duo
+   Home Screen app only (display-mode: standalone). In Safari, Safari owns
+   the right-hand column and the normal bottom tab bar already fits.
+   iOS 27 on iPhone Duo moves tab bars, toolbars and Back to a vertical column
+   on the RIGHT edge whenever the screen is short and wide: the closed outer
+   display (Safari 382x580, Home Screen app 466x657), either display sideways
+   (594x368 / 951x585-648). Only the open display held upright keeps a bottom
+   bar. Same here, so the thumb finds Collection in the same spot when the
+   phone opens. The header becomes the rail: logo + Settings/Log out at the
+   top (top-toolbar slot), tabs bottom-aligned (tab-bar slot), per the HIG.
+   Pure media queries: a fold is just a resize on Safari (no posture API), so
+   the layout follows live with no reload. Query mirrored in
+   utils/phoneLayout.js SIDE_RAIL_QUERY. */
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 560px) and (min-aspect-ratio: 3/5),
+       (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape),
+       (display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
+  :root[data-theme="manabox"] {
+    --rail-w: 72px;
+    --rail-inset-r: max(env(safe-area-inset-right, 0px), var(--sar, 0px));
+    /* In the Home Screen app iOS reserves the right edge for its own status
+       column (~84pt: clock, Dynamic Island, camera) and reports it as
+       safe-area-inset-right. Native apps put their tab bar INTO that column,
+       so the rail fills it rather than sitting beside it as a second one. */
+    --rail-total: max(var(--rail-w), var(--rail-inset-r));
+  }
+  :root[data-theme="manabox"] .app-container {
+    padding-right: calc(var(--rail-total) + 0.75rem) !important;
+    padding-bottom: calc(1.25rem + max(env(safe-area-inset-bottom, 0px), var(--sab, 0px))) !important;
+  }
+  /* Content gets the top inset back now the header has left the top edge. */
+  :root[data-theme="manabox"] .app-container > main {
+    padding-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--sat, 0px));
+    margin-top: 0 !important;
+  }
+  :root[data-theme="manabox"] .app-header {
+    position: fixed !important;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    left: auto;
+    width: var(--rail-total);
+    z-index: 999; /* under sheet/modal backdrops (1000+), like a system bar */
+    margin: 0 !important;
+    padding: max(0.6rem, env(safe-area-inset-top, 0px)) 0 max(0.5rem, env(safe-area-inset-bottom, 0px), var(--sab, 0px)) 0 !important;
+    box-sizing: border-box;
+    flex-direction: column;
+    align-items: center;
+    /* Everything bottom-aligned: the top of the column belongs to the
+       status bar and the vertically expanding Dynamic Island. */
+    justify-content: flex-end;
+    gap: 0.5rem;
+    /* Safari tints its own right-hand control column from fixed elements at
+       the page edge, so this rail colours that column too. */
+    background: #1a1d22;
+    border-bottom: 0;
+    border-left: 1px solid var(--mb-line);
+    overflow: hidden;
+  }
+  :root[data-theme="manabox"] .logo-section { gap: 0; padding: 0; }
+  :root[data-theme="manabox"] .logo-icon { width: 30px !important; height: 30px !important; }
+  /* Settings + Log out: the rail's top toolbar slot. Username drops out. */
+  :root[data-theme="manabox"] .app-header > div:last-child {
+    order: 1;
+    margin-top: auto;
+    flex-direction: column;
+    gap: 0.4rem !important;
+    border: 0;
+    padding: 0;
+  }
+  :root[data-theme="manabox"] .app-header > div:last-child .btn-icon-only {
+    width: 44px;
+    height: 44px;
+    padding: 0 !important;
+    justify-content: center;
+    border-radius: 12px !important;
+  }
+  /* Tabs: bottom-aligned column, the tab-bar slot. */
+  :root[data-theme="manabox"] .nav-tabs {
+    order: 2;
+    position: static;
+    margin: 0.35rem 0 0 !important; /* beats the inline margin: 0 in App.jsx */
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 0 4px !important;
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    transform: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  :root[data-theme="manabox"] .nav-tab {
+    flex: none;
+    min-height: 52px;
+    padding: 6px 2px;
+    gap: 3px;
+    border-radius: 12px;
+    font-size: 0.6rem;
+    letter-spacing: -0.02em;
+    flex-direction: column;
+  }
+  :root[data-theme="manabox"] .nav-tab svg { width: 22px; height: 22px; }
+  :root[data-theme="manabox"] .nav-tab.active { background: var(--mb-accent-soft); }
+  /* Bottom-centred floaters centre on the content column, not the screen. */
+  :root[data-theme="manabox"] .toast,
+  :root[data-theme="manabox"] .coll-actionbar,
+  :root[data-theme="manabox"] .addsearch-undo {
+    left: calc((100% - var(--rail-total)) / 2);
+  }
+  :root[data-theme="manabox"] .coll-actionbar { width: min(460px, calc(100vw - var(--rail-total) - 1.5rem)); }
+}
+
+/* Short screens (closed + sideways, or a phone on its side): rail tabs are
+   icon-only so all five fit in ~370px of height (labels hidden in index.css). */
+@media (display-mode: standalone) and (pointer: coarse) and (max-width: 940px) and (max-height: 500px) and (orientation: landscape) {
+  :root[data-theme="manabox"] .nav-tab { min-height: 40px; padding-top: 2px; padding-bottom: 2px; }
+  :root[data-theme="manabox"] .nav-tabs { gap: 0; }
+  :root[data-theme="manabox"] .app-header { gap: 0.25rem; }
+  :root[data-theme="manabox"] .app-header > div:last-child { gap: 0.15rem !important; }
+  :root[data-theme="manabox"] .app-header > div:last-child .btn-icon-only { width: 40px; height: 36px; }
+}
+
+/* Open Duo held sideways (951 wide): one canvas with the hinge at x = 50%.
+   Book spread: the left margin mirrors the rail, so the content column is
+   centred on the hinge and every even split (bento, dashboard sections,
+   deck grid | deck panel, 4-up gallery) puts its middle gutter ON the
+   crease instead of a card. Collection gallery rounds to an even column
+   count on the JS side (utils/phoneLayout.js isFoldSpread). */
+@media (display-mode: standalone) and (pointer: coarse) and (min-width: 941px) and (max-width: 1023px) and (max-height: 760px) {
+  :root[data-theme="manabox"] {
+    --rail-w: 76px;
+    --spread-gap: 24px;
+  }
+  :root[data-theme="manabox"] .app-container {
+    padding-left: calc(var(--rail-total) + 0.5rem) !important;
+    padding-right: calc(var(--rail-total) + 0.5rem) !important;
+  }
+  :root[data-theme="manabox"] .nav-tab { font-size: 0.64rem; min-height: 56px; }
+  :root[data-theme="manabox"] .logo-icon { width: 36px !important; height: 36px !important; }
+  :root[data-theme="manabox"] .dash-bento { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--spread-gap); }
+  :root[data-theme="manabox"] .dash-sections,
+  :root[data-theme="manabox"] .dk-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: var(--spread-gap);
+  }
+  /* Deck tiles fit three across, which would put the middle one on the hinge. */
+  :root[data-theme="manabox"] .deck-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    column-gap: var(--spread-gap) !important;
+  }
+  /* Picker sheets open on the LEFT page instead of centred on the hinge. */
+  :root[data-theme="manabox"] .fs-sheet-backdrop {
+    justify-content: flex-start;
+    padding-left: calc(var(--rail-total) + 0.5rem);
+  }
+  :root[data-theme="manabox"] .fs-sheet { width: min(440px, calc(50vw - var(--rail-total) - 1rem)); }
+  /* Bottom floaters (toast, undo, selection action bar) centre on the LEFT
+     page so no control straddles the hinge. */
+  :root[data-theme="manabox"] .toast,
+  :root[data-theme="manabox"] .addsearch-undo,
+  :root[data-theme="manabox"] .coll-actionbar { left: calc((var(--rail-total) + 50vw) / 2); }
+  :root[data-theme="manabox"] .coll-actionbar { width: min(440px, calc(50vw - var(--rail-total) - 1rem)); }
+}

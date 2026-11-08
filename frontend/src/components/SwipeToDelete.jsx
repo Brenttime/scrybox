@@ -7,7 +7,7 @@ import { Trash2 } from 'lucide-react';
 const ACTION = 88; // px width of the revealed action
 const FULL = 0.6; // swipe past this fraction of the row width = delete
 
-export default function SwipeToDelete({ onDelete, label, children, className = '' }) {
+export default function SwipeToDelete({ onDelete, label, children, className = '', disabled = false }) {
   const [x, setX] = useState(0);
   const [dragging, setDragging] = useState(false);
   const rowRef = useRef(null);
@@ -30,6 +30,7 @@ export default function SwipeToDelete({ onDelete, label, children, className = '
   const onPointerMove = (e) => {
     const s = g.current;
     if (!s || s.id !== e.pointerId) return;
+    if (disabled) { if (s.axis !== 'x') g.current = null; return; }
     const dx = e.clientX - s.sx;
     const dy = e.clientY - s.sy;
     if (!s.axis) {

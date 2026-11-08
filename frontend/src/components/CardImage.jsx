@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { cardBackFor } from '../utils/cardBack';
 import { artUrl, useCardArtIndex } from '../utils/cardArt';
+import { canDragCards, scryfallDragData, setScryfallDrag } from '../utils/scryfallDrag';
 
 // Every card image in the app. A drop-in for the plain <img src={card.image_url}>
 // this replaced: className, style, loading, draggable and the rest pass straight
@@ -58,9 +59,23 @@ export default function CardImage({ card, src, fallbackSrc, alt, ...imgProps }) 
   const current = chain[Math.min(step, chain.length - 1)];
   const isBack = current === back;
 
+  // Desktop: every card drags out like a Scryfall image, so it can be dropped
+  // straight into a Moxfield deck. Overrides draggable={false} (set on grids
+  // for touch press-and-hold, which canDragCards excludes).
+  const dragOut = canDragCards() && !!scryfallDragData(card);
+
   return (
     <img
+      // Decode off the main thread by default: fast-scrolling the virtualized
+      // Collection grid mounts dozens of 488px JPEGs, and synchronous decode
+      // showed up as dropped frames (>33 ms frames -40% with async). Callers
+      // can still pass decoding="sync".
+      decoding="async"
       {...imgProps}
+      {...(dragOut ? {
+        draggable: true,
+        onDragStart: (e) => { setScryfallDrag(e, card); imgProps.onDragStart?.(e); },
+      } : {})}
       // CORS mode, not overridable: WebKit gets COEP require-corp (backend
       // coep.js), under which a no-cors Scryfall image (no CORP header) is
       // blocked. Scryfall answers CORS with *, so this loads everywhere.

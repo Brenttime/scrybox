@@ -345,7 +345,12 @@ async function runContentSync(authorId, { user } = {}) {
 
   const summaries = await moxfieldApi.getAuthorDeckSummaries(author.moxfield_user);
   const byPublicId = new Map(summaries.map(s => [s.publicId, s]));
-  const tracked = await db.all(`SELECT * FROM moxfield_decks WHERE author_id = ?`, [author.id]);
+  const tracked = await db.all(`
+    SELECT md.*, d.checked_out AS mirror_checked_out
+    FROM moxfield_decks md
+    LEFT JOIN decks d ON d.id = md.bindarr_deck_id
+    WHERE md.author_id = ?
+  `, [author.id]);
 
   let updated = 0;
   let removed = 0;
@@ -379,12 +384,20 @@ async function runContentSync(authorId, { user } = {}) {
     // Stamp moved since we last mirrored this deck (or never mirrored it).
     const stamp = summary.lastUpdatedAtUtc || null;
     const needsPull = !row.last_synced_updated_at || stamp !== row.last_synced_updated_at;
-    if (needsPull) {
+    // A Built (checked-out) mirror refuses content changes, so its synced stamp
+    // never advances and it used to be re-pulled (and logged) on every 20 s
+    // tick. Pull it once per Moxfield change (that pull still mirrors the
+    // maybeboard), then skip it silently while the stamp is unchanged. Checking
+    // the deck in leaves needsPull true, so the next tick syncs it fully.
+    const builtAndSeen = row.mirror_checked_out && stamp === row.last_updated_at;
+    if (needsPull && !builtAndSeen) {
       try {
         await pullDeckContent(author, row.public_id, row);
         updated += 1;
       } catch (err) {
-        console.warn(`Moxfield sync: content pull failed for "${row.name}": ${err.message}`);
+        if (err.code !== 'ALLOCATION_CONFLICT') {
+          console.warn(`Moxfield sync: content pull failed for "${row.name}": ${err.message}`);
+        }
         await db.run(`UPDATE moxfield_decks SET last_error = ? WHERE id = ?`, [err.message, row.id]);
       }
     }

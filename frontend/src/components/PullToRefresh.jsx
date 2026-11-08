@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { RotateCw } from 'lucide-react';
 import { getScrollTop, scrollRoot } from '../utils/scrollRoot';
+import { gestureLocked } from '../utils/gestureLock';
 
 // Pull-to-refresh for the whole app. Browsers' own version is off here
 // (overscroll-behavior: none keeps the header from rubber-banding) and an
@@ -38,6 +39,8 @@ export default function PullToRefresh() {
     };
     const onMove = (e) => {
       if (!start.current) return;
+      // A hold-and-drag (list reorder) owns this touch: drop the pull.
+      if (gestureLocked()) { start.current = null; pullRef.current = 0; setPull(0); return; }
       const dy = e.touches[0].clientY - start.current.y;
       const dx = Math.abs(e.touches[0].clientX - start.current.x);
       if (dy <= 0 || dx > dy || getScrollTop() > 0) { pullRef.current = 0; setPull(0); return; }
@@ -49,6 +52,7 @@ export default function PullToRefresh() {
     };
     const onEnd = () => {
       if (!start.current) return;
+      if (gestureLocked()) { start.current = null; pullRef.current = 0; setPull(0); return; }
       start.current = null;
       if (pullRef.current >= THRESHOLD) {
         setRefreshing(true);

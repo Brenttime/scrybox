@@ -23,10 +23,13 @@
         } catch (e) { /* storage blocked: attribute already set */ }
       })();
     </script>
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Antonio:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- No web fonts: the ManaBox theme (the only theme) sets --font-main to the
+         system UI stack, so the Google Fonts sheet was render-blocking and unused. -->
+    <!-- Card art comes from Scryfall's CDN. CardImage requests it in CORS mode
+         (crossOrigin="anonymous"), so the warm connection must be a crossorigin
+         one to be reused; dns-prefetch covers browsers without preconnect. -->
+    <link rel="preconnect" href="https://cards.scryfall.io" crossorigin>
+    <link rel="dns-prefetch" href="https://cards.scryfall.io">
   </head>
   <body>
     <div id="root"></div>

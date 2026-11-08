@@ -370,7 +370,6 @@
   "deck.importTitle": "가져와서 컬렉션과 비교",
   "deck.inPlay": "현재 사용 중",
   "deck.mulliganCountText": "덱의 일관성을 테스트합니다. 셔플된 덱. 멀리건 횟수: {mulligans}. 손패 크기: {handSize}장.",
-  "deck.mulliganDraw": "멀리건 ({count}장 드로우)",
   "deck.namePlaceholder": "예: Atarka Red, 애그로 화이트 등...",
   "deck.noCardsDrawn": "아직 뽑은 카드가 없습니다.",
   "deck.noMatches": "필터와 일치하는 덱이 없습니다",

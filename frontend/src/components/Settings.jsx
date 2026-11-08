@@ -1,7 +1,6 @@
 import { useState, useEffect, lazy, Suspense } from 'react';
 import { ChevronDown, ShieldAlert, Share2, Clipboard, RefreshCw, KeyRound, Check, Database, Download, Upload, SlidersHorizontal, Info, Bug, Lightbulb, MessagesSquare, ScrollText, Github, Languages, Globe, ShoppingCart, RefreshCcw } from 'lucide-react';
 import { LOCALES, localeName, useT } from '../utils/i18n';
-import { buildCardListText } from '../utils/cardList';
 import { REPO_URL } from '../utils/repo';
 import MoxfieldPanel from './MoxfieldPanel';
 import MarketplaceAccountsPanel from './MarketplaceAccountsPanel';
@@ -269,15 +268,14 @@ function Settings({ user, onUpdateUser, showToast, target }) {
   };
 
   // Text card list of the whole collection, "qty Name" or "qty Name (SET) num".
-  // Formatted in the browser from the same /api/collection data the UI shows —
-  // the server keeps an identical endpoint (/api/collection/cardlist) for
-  // scripts, and cardList.test.js proves the two copies agree.
+  // Built server-side by /api/collection/cardlist with the shared builder
+  // (cardList.test.js proves the browser and shared copies agree): ~115 KB
+  // instead of downloading the full 25 MB /api/collection just to format it.
   const handleExportCardList = async (style) => {
     try {
-      const response = await fetch('/api/collection');
+      const response = await fetch(`/api/collection/cardlist?style=${style === 'detailed' ? 'detailed' : 'plain'}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const cards = await response.json();
-      const text = buildCardListText(cards, style);
+      const text = await response.text();
       if (!text) { showToast(t('settings.cardlistEmpty')); return; }
       await navigator.clipboard.writeText(text);
       showToast(t('settings.cardlistCopied'));

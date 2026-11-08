@@ -373,7 +373,6 @@
   "deck.importTitle": "Импорт и сравнение с коллекцией",
   "deck.inPlay": "Сейчас в игре",
   "deck.mulliganCountText": "Тест стабильности колоды. Колода перетасована. Количество маллиганов: {mulligans}. Карт в руке: {handSize}.",
-  "deck.mulliganDraw": "Маллиган (Взять {count})",
   "deck.namePlaceholder": "например, Atarka Red или Aggro White...",
   "deck.noCardsDrawn": "Карты пока не взяты.",
   "deck.noMatches": "Ни одна колода не подходит под фильтр",

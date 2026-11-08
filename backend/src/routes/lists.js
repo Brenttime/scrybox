@@ -48,7 +48,7 @@ router.get('/', async (req, res) => {
        LEFT JOIN card_cache list_cc ON list_cc.id = lc.card_id
        WHERE l.user_id = ?
        GROUP BY l.id
-       ORDER BY l.created_at DESC`,
+       ORDER BY (l.sort_order IS NULL) DESC, l.sort_order ASC, l.created_at DESC`,
       [req.user.id]
     );
     const values = await getListMinimumValues(db, rows.map(row => row.id));
@@ -59,6 +59,32 @@ router.get('/', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to retrieve lists' });
+  }
+});
+
+// Which of the user's lists hold a card whose name contains `q`
+// (case-insensitive, any printing). Powers the list index's search so
+// "Sol Ring" finds every list with a Sol Ring in it.
+router.get('/card-matches', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({});
+  try {
+    const like = `%${q.replace(/[\\%_]/g, ch => `\\${ch}`)}%`;
+    const rows = await db.all(
+      `SELECT DISTINCT lc.list_id AS list_id, cc.name AS name
+         FROM card_lists l
+         JOIN list_cards lc ON lc.list_id = l.id AND lc.quantity > 0
+         JOIN card_cache cc ON cc.id = lc.card_id
+        WHERE l.user_id = ? AND cc.name LIKE ? ESCAPE '\\'
+        ORDER BY cc.name`,
+      [req.user.id, like]
+    );
+    const out = {};
+    for (const r of rows) (out[r.list_id] ||= []).push(r.name);
+    res.json(out);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to search lists' });
   }
 });
 
@@ -151,9 +177,11 @@ router.get('/:id', async (req, res) => {
          SELECT
            ${sqlCardKey('owned_cc')} AS card_key,
            SUM(collection_row.quantity) AS quantity
-         FROM collection collection_row
-         JOIN card_cache owned_cc ON owned_cc.id = collection_row.card_id
-         WHERE collection_row.user_id = ? AND collection_row.quantity > 0
+         FROM card_cache owned_cc
+         CROSS JOIN collection collection_row
+         WHERE collection_row.card_id = owned_cc.id
+           AND collection_row.user_id = ? AND collection_row.quantity > 0
+           AND ${sqlCardKey('owned_cc')} IN (SELECT card_key FROM requested)
          GROUP BY ${sqlCardKey('owned_cc')}
        )
        SELECT
@@ -161,7 +189,7 @@ router.get('/:id', async (req, res) => {
          cc.id, cc.name, cc.printed_name,
          cc.supertype, cc.subtypes, cc.types,
          cc.rarity, cc.set_id, cc.set_name, cc.number,
-         cc.image_url, cc.price_trend,
+         cc.image_url, cc.price_trend, cc.price_estimated,
          COALESCE(owned.quantity, 0) AS owned_qty
        FROM requested
        JOIN card_cache cc ON cc.id = requested.representative_id
@@ -175,7 +203,7 @@ router.get('/:id', async (req, res) => {
     // counted aside for the "+"), next to the cheapest-printings floor.
     const currentRows = await db.all(`
       SELECT lc.quantity,
-             cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_trend, cc.price_currency
+             cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_trend, cc.price_currency, cc.price_estimated
       FROM list_cards lc
       JOIN card_cache cc ON cc.id = lc.card_id
       WHERE lc.list_id = ? AND lc.quantity > 0
@@ -183,6 +211,7 @@ router.get('/:id', async (req, res) => {
     const currentValues = deckCurrentPrintValues(currentRows.map(row => ({
       quantity: row.quantity,
       current_price: currentPrintingPrice(row),
+      price_estimated: row.price_estimated,
     })));
     res.json({
       ...list,
@@ -243,6 +272,24 @@ router.get('/:id/cardlist', async (req, res) => {
 // price refresh pick up the stragglers. Runs in one transaction: the fold is
 // two statements per card (carry the total, sweep the sibling rows) and must
 // not interleave with a concurrent card edit.
+// Persist the user's hand-arranged list order (hold-and-drag on the index).
+// Unsorted (new) lists keep floating to the top until they are dragged.
+router.put('/order', async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : [];
+  if (!ids.length || ids.length > 1000) return res.status(400).json({ error: 'ids must be 1-1000 list ids' });
+  try {
+    await db.withTransaction(async () => {
+      for (let i = 0; i < ids.length; i += 1) {
+        await db.run(`UPDATE card_lists SET sort_order = ? WHERE id = ? AND user_id = ?`, [i, ids[i], req.user.id]);
+      }
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to reorder lists' });
+  }
+});
+
 router.put('/:id/cheapest-printings', async (req, res) => {
   const { id } = req.params;
   try {
@@ -568,6 +615,46 @@ router.post('/:id/cards/bulk-remove', async (req, res) => {
 });
 
 // Remove a card from the list.
+// Switch a list row to another printing of the SAME card (card details ->
+// Printing). Lists hold one row per logical card, so this re-points that row;
+// a different card is rejected. If the target printing somehow already has a
+// row, the quantities merge.
+router.put('/:id/cards/:card_id/printing', async (req, res) => {
+  const { id, card_id: fromId } = req.params;
+  const toId = req.body && req.body.card_id ? String(req.body.card_id) : '';
+  if (!toId) return res.status(400).json({ error: 'card_id is required' });
+  try {
+    const list = await db.get(`SELECT id FROM card_lists WHERE id = ? AND user_id = ?`, [id, req.user.id]);
+    if (!list) return res.status(404).json({ error: 'List not found or unauthorized' });
+    const row = await db.get(`SELECT quantity FROM list_cards WHERE list_id = ? AND card_id = ?`, [id, fromId]);
+    if (!row) return res.status(404).json({ error: 'Card not in this list' });
+    if (toId === fromId) return res.json({ message: 'Printing unchanged', card_id: toId });
+
+    if (!(await db.get(`SELECT id FROM card_cache WHERE id = ?`, [toId]))) {
+      const apiCard = await cardApi.getCardById(toId);
+      if (!apiCard) return res.status(404).json({ error: `Card ${toId} not found on any card provider.` });
+    }
+    const same = await db.get(`
+      SELECT 1 AS ok FROM card_cache a JOIN card_cache b ON b.id = ?
+      WHERE a.id = ? AND ${sqlCardKey('a')} = ${sqlCardKey('b')}
+    `, [toId, fromId]);
+    if (!same) return res.status(400).json({ error: 'Pick a printing of the same card' });
+
+    await db.withTransaction(async () => {
+      await db.run(
+        `INSERT INTO list_cards (list_id, card_id, quantity) VALUES (?, ?, ?)
+         ON CONFLICT(list_id, card_id) DO UPDATE SET quantity = quantity + excluded.quantity`,
+        [id, toId, row.quantity]
+      );
+      await db.run(`DELETE FROM list_cards WHERE list_id = ? AND card_id = ?`, [id, fromId]);
+    });
+    res.json({ message: 'Printing changed', card_id: toId });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to change printing' });
+  }
+});
+
 router.delete('/:id/cards/:card_id', async (req, res) => {
   const { id, card_id } = req.params;
   try {

@@ -370,7 +370,6 @@
   "deck.importTitle": "导入并与收藏比对",
   "deck.inPlay": "正在使用",
   "deck.mulliganCountText": "测试套牌稳定性。已洗牌。调度次数: {mulligans}。起手手牌: {handSize} 张。",
-  "deck.mulliganDraw": "调度 (抓 {count} 张)",
   "deck.namePlaceholder": "例如：Atarka Red 引擎，或 Aggro White...",
   "deck.noCardsDrawn": "还没有抽牌。",
   "deck.noMatches": "没有符合筛选条件的套牌",

@@ -39,6 +39,10 @@ const SET_CLAUSE = COLUMNS
       : `${c} = excluded.${c}`)
   .join(', ');
 
+// A priced source writing the row replaces any estimate with its real quote;
+// a price-less write leaves both the estimate and its flag alone.
+const ESTIMATE_CLAUSE = `price_estimated = CASE WHEN excluded.price_source IS NULL THEN card_cache.price_estimated ELSE 0 END`;
+
 // `name` is the one column an incoming row can be WORSE at. A non-English card
 // carries its localized name in both `name` and `printed_name` when the source
 // has no English name to give — but one may since have been learned from the
@@ -84,9 +88,18 @@ async function cacheNormalizedCards(cards, opts = {}) {
     await db.run(
       `INSERT INTO card_cache (${COLUMNS.join(', ')}, last_updated)
        VALUES ${chunk.map(() => rowSql).join(', ')}
-       ON CONFLICT(id) DO UPDATE SET ${NAME_CLAUSE}, ${SET_CLAUSE}, last_updated = ${stamp}`,
+       ON CONFLICT(id) DO UPDATE SET ${NAME_CLAUSE}, ${SET_CLAUSE}, ${ESTIMATE_CLAUSE}, last_updated = ${stamp}`,
       params
     );
+  }
+  // Re-estimate the touched logical cards: a new quote can be a cheaper floor
+  // for a sibling, and a row whose quote came back empty needs its estimate back.
+  if (rows.length && !opts.skipEstimates) {
+    try {
+      await require('./priceEstimates').refreshEstimatesForIds(db, rows.map(c => c.id));
+    } catch (e) {
+      console.error('price estimate refresh failed:', e.message);
+    }
   }
 }
 

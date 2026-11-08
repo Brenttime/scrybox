@@ -6,6 +6,7 @@ import {
   Star, Heart, Gift, Flame, Crown, Gem, Swords, Shield, Sparkles, Bookmark, Trophy, Skull, Zap, Target, Package, Coins,
 } from 'lucide-react';
 import SwipeToDelete from './SwipeToDelete';
+import { useHoldReorder } from '../utils/useHoldReorder';
 import OverflowMenu from './OverflowMenu';
 import CardImage from './CardImage';
 import CardInspectorModal from './CardInspectorModal';
@@ -18,7 +19,7 @@ import { cardKey, findSameCard } from '../utils/cardIdentity';
 import { buildManapoolUrl } from '../utils/manapoolUrl';
 import { buildTcgMassEntryUrl } from '../utils/tcgMassEntryUrl';
 import { deckMinimumValueText, deckMinimumValueHint } from '../utils/deckMinimumValue';
-import { priceText } from '../utils/formatPrice';
+import { priceText, cardPriceText, estPrefix } from '../utils/formatPrice';
 
 const LIST_ICONS = [
   ['list-checks', ListChecks], ['star', Star], ['heart', Heart], ['shopping-cart', ShoppingCart],
@@ -95,6 +96,10 @@ function Lists({ showToast, handoff, onHandoffDone }) {
 
   // List filters
   const [searchTerm, setSearchTerm] = useState('');
+  const [moveCopy, setMoveCopy] = useState(false);
+  const [newListName, setNewListName] = useState('');
+  // list_id -> matching card names for the current search term.
+  const [cardMatches, setCardMatches] = useState({});
 
 
   // Create modal
@@ -252,12 +257,20 @@ function Lists({ showToast, handoff, onHandoffDone }) {
 
   // Move = add to the target list, then decrement exactly what was added here.
   // Only rows the target accepted are removed, so a failure never loses cards.
-  const moveSelected = async (target) => {
+  // Move (or copy, keepSource) the selection into `target`. A target of
+  // { newName } creates that list first.
+  const moveSelected = async (target, { keepSource = false } = {}) => {
     const rows = selectedRows();
     if (!rows.length || bulkBusy || !target) return;
     setBulkBusy(true);
     let moved = 0, failedTotal = 0;
     try {
+      if (target.newName) {
+        const res = await postJson('/api/lists', { name: target.newName });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok || !body.id) throw new Error(`create ${res.status}`);
+        target = { id: body.id, name: target.newName };
+      }
       for (const chunk of chunked(rows)) {
         const res = await postJson(`/api/lists/${target.id}/cards/bulk`, { cards: chunk.map(c => ({ card_id: c.id, quantity: c.quantity })) });
         const body = await res.json().catch(() => ({}));
@@ -265,7 +278,8 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         const failed = new Set(body.failed || []);
         const ok = chunk.filter(c => !failed.has(c.id));
         failedTotal += chunk.length - ok.length;
-        if (ok.length) {
+        if (ok.length && keepSource) moved += ok.length;
+        else if (ok.length) {
           const rm = await postJson(`/api/lists/${activeList.id}/cards/bulk-remove`, { cards: ok.map(c => ({ card_id: c.id, quantity: c.quantity })) });
           if (!rm.ok) throw new Error(`remove ${rm.status}`);
           moved += ok.length;
@@ -273,8 +287,11 @@ function Lists({ showToast, handoff, onHandoffDone }) {
       }
       showToast(failedTotal
         ? t('lists.selMovedPartial', { count: moved, failed: failedTotal, name: target.name })
-        : t('lists.selMoved', { count: moved, name: target.name }));
+        : t(keepSource ? 'lists.selCopied' : 'lists.selMoved', { count: moved, name: target.name }));
       clearSelection();
+      setShowMove(false);
+      setNewListName('');
+      fetchLists({ quiet: true });
     } catch (err) {
       console.error(err);
       showToast(t('lists.errCard'));
@@ -805,14 +822,48 @@ function Lists({ showToast, handoff, onHandoffDone }) {
 
   // --- Derived data ---
   const filteredLists = lists.filter(l => {
-    if (searchTerm && !l.name.toLowerCase().includes(searchTerm.toLowerCase())) return false;
-    return true;
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return true;
+    return l.name.toLowerCase().includes(term)
+      || (l.description || '').toLowerCase().includes(term)
+      || Boolean(cardMatches[l.id]?.length);
   });
 
   const cards = (listDetail?.cards || []).filter(c => {
     if (cardFilter === 'missing') return (c.owned_qty || 0) < c.quantity;
     if (cardFilter === 'owned') return (c.owned_qty || 0) > 0;
     return true;
+  });
+
+  // Search also matches cards inside lists (debounced server lookup).
+  useEffect(() => {
+    const term = searchTerm.trim();
+    if (term.length < 2) { setCardMatches({}); return; }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetch(`/api/lists/card-matches?q=${encodeURIComponent(term)}`)
+        .then(r => (r.ok ? r.json() : {}))
+        .then(data => { if (!cancelled) setCardMatches(data || {}); })
+        .catch(() => { if (!cancelled) setCardMatches({}); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [searchTerm]);
+
+  // Hold a tile, then drag to reorder (only on the unfiltered index).
+  const reorder = useHoldReorder({
+    items: lists,
+    getId: l => l.id,
+    setItems: setLists,
+    enabled: !searchTerm.trim(),
+    onCommit: (rows) => {
+      fetch('/api/lists/order', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: rows.map(l => l.id) }),
+      })
+        .then(r => { if (!r.ok) throw new Error(); })
+        .catch(() => { showToast(t('lists.errReorder')); fetchLists({ quiet: true }); });
+    },
   });
 
   // Escape closes the copy and buy modals (the overlay itself is never
@@ -864,7 +915,8 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             {filteredLists.map(list => {
               const accent = list.accent_color || '#10b981';
               return (
-                <SwipeToDelete key={list.id} label={t('lists.deleteList')}
+                <div key={list.id} {...reorder.bind(list.id)}>
+                <SwipeToDelete label={t('lists.deleteList')} disabled={reorder.dragging}
                   onDelete={reset => {
                     if (!window.confirm(t('lists.confirmDelete', { name: list.name }))) { reset(); return; }
                     fetch(`/api/lists/${list.id}`, { method: 'DELETE' })
@@ -894,6 +946,13 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                       </div>
                     </div>
                   </div>
+                  {searchTerm.trim() && cardMatches[list.id]?.length > 0 && (
+                    <div className="list-tile-matches" style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                      title={cardMatches[list.id].join(', ')}>
+                      <Search size={11} style={{ verticalAlign: '-1px', marginRight: '0.3rem' }} />
+                      {t('lists.containsCards', { names: cardMatches[list.id].join(', ') })}
+                    </div>
+                  )}
                   <div className="list-tile-stats" style={{ display: 'flex', gap: '0.75rem', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
                     <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
                       <Layers size={13} /> {t((list.total_card_types || 0) === 1 ? 'lists.cardsOne' : 'lists.cards', { count: list.total_card_types || 0 })}
@@ -906,6 +965,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                   </div>
                 </div>
                 </SwipeToDelete>
+                </div>
               );
             })}
           </div>
@@ -1012,7 +1072,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
           same two axes (and "+" honesty rule) as the deck detail. */}
       {listDetail && showPrices && (() => {
         const currentUnpriced = Number(listDetail.current_unpriced_cards) || 0;
-        const currentText = `${priceText(Number(listDetail.current_printing_value) || 0, listDetail.minimum_value_currency || 'USD')}${currentUnpriced > 0 ? '+' : ''}`;
+        const currentText = `${estPrefix(Number(listDetail.current_estimated_cards) > 0, listDetail.current_printing_value)}${priceText(Number(listDetail.current_printing_value) || 0, listDetail.minimum_value_currency || 'USD')}${currentUnpriced > 0 ? '+' : ''}`;
         const currentHint = currentUnpriced === 1
           ? t('lists.valueCurrentIncompleteOne')
           : currentUnpriced > 0
@@ -1132,7 +1192,7 @@ function Lists({ showToast, handoff, onHandoffDone }) {
                   <div className="tcg-card-name">{displayName(card)}</div>
                   <div className="tcg-card-meta">
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70%' }}>{setReference(card) || card.set_name || ''}</span>
-                    {showPrices && <span className="tcg-card-price">{card.price_trend > 0 ? `$${card.price_trend.toFixed(2)}` : ''}</span>}
+                    {showPrices && <span className="tcg-card-price">{card.price_trend > 0 ? cardPriceText(card) : ''}</span>}
                   </div>
                 </div>
               </div>
@@ -1154,13 +1214,21 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         <div className="fs-sheet-backdrop" onClick={() => setShowMove(false)}>
           <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
             <div className="fs-sheet-head">
-              <strong>{t('lists.selMoveTitle', { count: selected.size })}</strong>
+              <strong>{t(moveCopy ? 'lists.selCopyTitle' : 'lists.selMoveTitle', { count: selected.size })}</strong>
               <button type="button" className="coll-textbtn" onClick={() => setShowMove(false)}>{t('common.cancel')}</button>
             </div>
-            {lists.filter(l => l.id !== activeList.id).length === 0 ? (
-              <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{t('lists.selNoOtherLists')}</div>
-            ) : lists.filter(l => l.id !== activeList.id).map(l => (
-              <button key={l.id} type="button" className="coll-more-row" disabled={bulkBusy} onClick={() => moveSelected(l)}>
+            <div className="addsearch-finish sel-move-mode" role="group" aria-label={t('lists.selMoveMode')}>
+              <button type="button" className={!moveCopy ? 'on' : ''} aria-pressed={!moveCopy} onClick={() => setMoveCopy(false)}>{t('lists.selModeMove')}</button>
+              <button type="button" className={moveCopy ? 'on' : ''} aria-pressed={moveCopy} onClick={() => setMoveCopy(true)}>{t('lists.selModeCopy')}</button>
+            </div>
+            <form className="sel-new-list" onSubmit={e => { e.preventDefault(); const n = newListName.trim(); if (n) moveSelected({ newName: n }, { keepSource: moveCopy }); }}>
+              <Plus size={16} aria-hidden="true" />
+              <input className="input-control" value={newListName} onChange={e => setNewListName(e.target.value)}
+                placeholder={t('lists.selNewListPlaceholder')} aria-label={t('lists.selNewListPlaceholder')} maxLength={120} />
+              <button type="submit" className="btn btn-primary" disabled={bulkBusy || !newListName.trim()}>{t('lists.selNewListGo')}</button>
+            </form>
+            {lists.filter(l => l.id !== activeList.id).map(l => (
+              <button key={l.id} type="button" className="coll-more-row" disabled={bulkBusy} onClick={() => moveSelected(l, { keepSource: moveCopy })}>
                 <span style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', minWidth: 0 }}>
                   <span style={{ width: 10, height: 10, borderRadius: '50%', background: l.accent_color || '#10b981', flex: '0 0 auto' }} />
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l.name}</span>
@@ -1181,6 +1249,28 @@ function Lists({ showToast, handoff, onHandoffDone }) {
           onUpdate={() => { if (activeList) loadList(activeList.id); }}
           onDeleted={() => { setInspectCard(null); if (activeList) loadList(activeList.id); }}
           onClose={() => setInspectCard(null)}
+          printingId={inspectRowId}
+          onChangePrinting={activeList ? async (c) => {
+            try {
+              const res = await fetch(`/api/lists/${activeList.id}/cards/${encodeURIComponent(inspectRowId)}/printing`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ card_id: c.id }),
+              });
+              if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                showToast(body?.error || t('lists.errCard'));
+                return false;
+              }
+              showToast(t('lists.printingChanged'));
+              await loadList(activeList.id);
+              return true;
+            } catch (err) {
+              console.error(err);
+              showToast(t('lists.errCard'));
+              return false;
+            }
+          } : null}
         >
           {(() => {
             const row = (listDetail?.cards || []).find(c => c.id === inspectRowId);

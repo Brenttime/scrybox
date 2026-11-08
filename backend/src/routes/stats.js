@@ -3,7 +3,8 @@ const db = require('../db');
 const { resolveCardPrice, isVintageSet, parseSqliteUtc, applyProxyRarity } = require('../utils/priceHelpers');
 
 const router = express.Router();
-const { cached } = require('../utils/statsCache');
+const { cached, dataRevision } = require('../utils/statsCache');
+const { getDeckOwnership } = require('../utils/deckOwnership');
 
 // 7. Get Collection Statistics & Analytics
 router.get('/stats', cached(() => 'stats', async (req, res) => {
@@ -35,7 +36,8 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
                  WHEN c.printing = 'Holofoil' AND cc.price_holofoil IS NOT NULL AND cc.price_holofoil > 0 THEN cc.price_holofoil
                  WHEN c.printing = 'Normal' AND cc.price_normal IS NOT NULL AND cc.price_normal > 0 THEN cc.price_normal
                  ELSE COALESCE(cc.price_trend, 0)
-               END AS current_price
+               END AS current_price,
+               COALESCE(cc.price_estimated, 0) AS price_estimated
         FROM collection c
         JOIN card_cache cc ON c.card_id = cc.id
         WHERE c.user_id = ?
@@ -138,6 +140,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
       SELECT COALESCE(SUM(qty), 0) AS total_cards,
              COUNT(*) AS unique_cards,
              COALESCE(SUM(qty * current_price), 0) AS total_value,
+             COALESCE(SUM(CASE WHEN price_estimated = 1 AND current_price > 0 THEN qty ELSE 0 END), 0) AS estimated_cards,
              COALESCE(SUM(qty * purchase_price), 0) AS total_spent,
              COALESCE(SUM(CASE WHEN condition = 'Near Mint' THEN qty ELSE 0 END), 0) AS near_mint_count,
              (SELECT json_group_array(json_object('name', name, 'value', value))
@@ -183,7 +186,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
         c.quantity, c.condition, c.printing, c.language, c.purchase_price, c.is_trade, c.is_proxy,
         cc.id as card_id, cc.name, cc.printed_name, cc.rarity, cc.set_name, cc.set_id, cc.number, cc.image_url,
         cc.supertype, cc.subtypes, cc.types, cc.cmc, cc.color_identity, cc.price_trend,
-        cc.price_normal, cc.price_holofoil
+        cc.price_normal, cc.price_holofoil, cc.price_estimated
       FROM collection c
       JOIN card_cache cc ON c.card_id = cc.id
       WHERE c.user_id = ?
@@ -239,7 +242,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
              c.quantity, c.condition, c.printing, c.language, c.added_at, c.is_trade, c.is_proxy,
              cc.id as card_id, cc.name, cc.printed_name, cc.rarity, cc.set_name, cc.set_id, cc.number, cc.image_url,
              cc.supertype, cc.subtypes, cc.types, cc.cmc, cc.color_identity,
-             cc.price_trend, cc.price_normal, cc.price_holofoil
+             cc.price_trend, cc.price_normal, cc.price_holofoil, cc.price_estimated
       FROM collection c
       JOIN card_cache cc ON c.card_id = cc.id
       WHERE c.user_id = ?
@@ -247,6 +250,18 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
       LIMIT 6
     `, [req.user.id]);
     const recentAdditions = recentRows.map(row => ({ ...applyProxyRarity(row), price_trend: resolveCardPrice(row) }));
+
+    // Deck tile counts for the Dashboard, so it needs no full /api/decks.
+    // Same rules as the Dashboard used on the deck list: all decks, Built =
+    // checked out, "need cards" = not built and missing copies (deckOwnership).
+    const deckRows = await db.all(`SELECT id, checked_out FROM decks WHERE user_id = ?`, [req.user.id]);
+    const deckOwnership = deckRows.length ? await getDeckOwnership(db, req.user.id) : new Map();
+    const decks = {
+      count: deckRows.length,
+      built: deckRows.filter(d => d.checked_out).length,
+      needCards: deckRows.filter(d => !d.checked_out
+        && Number((deckOwnership.get(Number(d.id)) || {}).missing_copies) > 0).length,
+    };
 
     const gainAbs = totalValue - totalSpent;
     const roi = {
@@ -260,6 +275,7 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
         totalCards,
         uniqueCards,
         totalValue: parseFloat(totalValue.toFixed(2)),
+        estimatedCards: aggregate.estimated_cards,
         totalSpent: parseFloat(totalSpent.toFixed(2)),
         roi,
         avgCardValue,
@@ -292,13 +308,96 @@ router.get('/stats', cached(() => 'stats', async (req, res) => {
       })).sort((a, b) => b.value - a.value).slice(0, 8),
       topValuable,
       recentAdditions,
-      setProgress: setProgress.slice(0, 4)
+      setProgress: setProgress.slice(0, 4),
+      decks
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to compute statistics' });
   }
 }));
+
+// The expensive half of /stats/history: every owned card's additions and full
+// recorded price stream (~0.6 s of SQL + JSON decoding on a 25k-copy
+// collection). It depends only on DB contents, not on "now", so it is cached
+// per user on the stats data revision (collection + card_cache + price_history
+// triggers) and every request still runs the cheap sweep against its own
+// targets. Results are therefore identical to recomputing from scratch.
+const historyCardCache = new Map(); // userId -> { rev, cards }
+
+async function loadHistoryCards(userId) {
+  // Collection additions and price movements are events. Read each once, then
+  // sweep the (at most 30) targets in order. SQLite packs each card's physical
+  // entries and recorded prices into JSON so the driver returns one row per card,
+  // not tens of thousands of tiny row objects. The CROSS JOIN deliberately keeps
+  // those owned cards on the outer side, making SQLite search price_history's
+  // primary key per card instead of scanning global history. Its parameter count
+  // stays constant; sorting each decoded history by the stored timestamp preserves
+  // the old route's complete recorded_at stream and carry-back rules.
+  const cards = await db.all(`
+    WITH cards AS MATERIALIZED (
+      SELECT c.card_id,
+             json_group_array(json_array(
+               c.quantity, c.added_at, c.printing, COALESCE(c.is_proxy, 0),
+               cc.price_trend, cc.price_normal, cc.price_holofoil
+             )) AS additions
+      FROM collection c
+      JOIN card_cache cc ON cc.id = c.card_id
+      WHERE c.user_id = ?
+      GROUP BY c.card_id
+    ),
+    histories AS MATERIALIZED (
+      SELECT ph.card_id,
+             json_group_array(json_array(ph.price, ph.recorded_at)) AS history
+      FROM cards c
+      CROSS JOIN price_history ph
+      WHERE ph.card_id = c.card_id
+      GROUP BY ph.card_id
+    )
+    SELECT c.card_id, c.additions, COALESCE(h.history, '[]') AS history
+    FROM cards c
+    LEFT JOIN histories h ON h.card_id = c.card_id
+  `, [userId]);
+
+  for (const card of cards) {
+    card.additions = JSON.parse(card.additions || '[]').map(([
+      quantity, added_at, printing, is_proxy, price_trend, price_normal, price_holofoil
+    ]) => {
+      const time = parseSqliteUtc(added_at).getTime();
+      if (!Number.isFinite(time)) return null;
+      return {
+        time,
+        quantity,
+        currentValue: quantity * resolveCardPrice({
+          printing, is_proxy, price_trend, price_normal, price_holofoil
+        })
+      };
+    }).filter(Boolean).sort((a, b) => a.time - b.time);
+    const history = JSON.parse(card.history || '[]').map(([price, recordedAt]) => ({
+      price,
+      recordedAt,
+      time: parseSqliteUtc(recordedAt).getTime()
+    })).sort((a, b) => a.recordedAt < b.recordedAt ? -1 : (a.recordedAt > b.recordedAt ? 1 : 0));
+    // Kept as two flat number arrays (the cache lives across requests, and
+    // ~430k small objects with timestamp strings would hold tens of MB).
+    card.historyTimes = history.map(h => h.time);
+    card.historyPrices = history.map(h => h.price);
+    delete card.history;
+  }
+  return cards;
+}
+
+async function historyCards(userId) {
+  if (process.env.STATS_CACHE === '0') return loadHistoryCards(userId);
+  const rev = await dataRevision();
+  const hit = historyCardCache.get(userId);
+  if (rev != null && hit && hit.rev === rev) return hit.cards;
+  const cards = await loadHistoryCards(userId);
+  // Store only if nothing moved while loading, so a racing write can't pin
+  // pre-write rows under the post-write revision.
+  if (rev != null && (await dataRevision()) === rev) historyCardCache.set(userId, { rev, cards });
+  return cards;
+}
 
 // 7b. Get Collection Net Worth Timeline History
 router.get('/stats/history', cached((req) => `history:${String(req.query.period || '30d')}`, async (req, res) => {
@@ -334,63 +433,10 @@ router.get('/stats/history', cached((req) => `history:${String(req.query.period 
 
     const targets = Array.from({ length: count }, (_, index) => now - ((count - 1 - index) * step));
 
-    // Collection additions and price movements are events. Read each once, then
-    // sweep the (at most 30) targets in order. SQLite packs each card's physical
-    // entries and recorded prices into JSON so the driver returns one row per card,
-    // not tens of thousands of tiny row objects. The CROSS JOIN deliberately keeps
-    // those owned cards on the outer side, making SQLite search price_history's
-    // primary key per card instead of scanning global history. Its parameter count
-    // stays constant; sorting each decoded history by the stored timestamp preserves
-    // the old route's complete recorded_at stream and carry-back rules.
-    const cards = await db.all(`
-      WITH cards AS MATERIALIZED (
-        SELECT c.card_id,
-               json_group_array(json_array(
-                 c.quantity, c.added_at, c.printing, COALESCE(c.is_proxy, 0),
-                 cc.price_trend, cc.price_normal, cc.price_holofoil
-               )) AS additions
-        FROM collection c
-        JOIN card_cache cc ON cc.id = c.card_id
-        WHERE c.user_id = ?
-        GROUP BY c.card_id
-      ),
-      histories AS MATERIALIZED (
-        SELECT ph.card_id,
-               json_group_array(json_array(ph.price, ph.recorded_at)) AS history
-        FROM cards c
-        CROSS JOIN price_history ph
-        WHERE ph.card_id = c.card_id
-        GROUP BY ph.card_id
-      )
-      SELECT c.card_id, c.additions, COALESCE(h.history, '[]') AS history
-      FROM cards c
-      LEFT JOIN histories h ON h.card_id = c.card_id
-    `, [req.user.id]);
-
-    for (const card of cards) {
-      card.additions = JSON.parse(card.additions || '[]').map(([
-        quantity, added_at, printing, is_proxy, price_trend, price_normal, price_holofoil
-      ]) => {
-        const time = parseSqliteUtc(added_at).getTime();
-        if (!Number.isFinite(time)) return null;
-        return {
-          time,
-          quantity,
-          currentValue: quantity * resolveCardPrice({
-            printing, is_proxy, price_trend, price_normal, price_holofoil
-          })
-        };
-      }).filter(Boolean);
-      card.history = JSON.parse(card.history || '[]').map(([price, recordedAt]) => ({
-        price,
-        recordedAt,
-        time: parseSqliteUtc(recordedAt).getTime()
-      })).sort((a, b) => a.recordedAt < b.recordedAt ? -1 : (a.recordedAt > b.recordedAt ? 1 : 0));
-    }
+    const cards = await historyCards(req.user.id);
 
     const totals = Array(count).fill(0);
-    for (const card of cards.values()) {
-      card.additions.sort((a, b) => a.time - b.time);
+    for (const card of cards) {
       let additionIndex = 0;
       let ownedQuantity = 0;
       let ownedCurrentValue = 0;
@@ -403,14 +449,15 @@ router.get('/stats/history', cached((req) => `history:${String(req.query.period 
           ownedCurrentValue += card.additions[additionIndex].currentValue;
           additionIndex++;
         }
-        if (card.history.length === 0) {
+        const times = card.historyTimes;
+        if (times.length === 0) {
           totals[index] += ownedCurrentValue;
           continue;
         }
-        while (historyIndex + 1 < card.history.length && card.history[historyIndex + 1].time <= target) {
+        while (historyIndex + 1 < times.length && times[historyIndex + 1] <= target) {
           historyIndex++;
         }
-        const price = historyIndex >= 0 ? card.history[historyIndex].price : card.history[0].price;
+        const price = historyIndex >= 0 ? card.historyPrices[historyIndex] : card.historyPrices[0];
         totals[index] += ownedQuantity * price;
       }
     }
@@ -436,7 +483,8 @@ router.get('/stats/history', cached((req) => `history:${String(req.query.period 
 //
 // Pair it with an API key (Settings -> API access): that credential is read-only
 // and does not expire, so an external tracker keeps working without a login.
-router.get('/stats/networth', async (req, res) => {
+// Cached in the stats cache on the DB revision (statsCache.js).
+router.get('/stats/networth', cached(() => 'networth', async (req, res) => {
   try {
     const rows = await db.all(`
       SELECT c.quantity, c.purchase_price, c.printing, c.is_proxy, cc.price_currency,
@@ -476,7 +524,10 @@ router.get('/stats/networth', async (req, res) => {
     console.error(error);
     res.status(500).json({ error: 'Failed to compute net worth' });
   }
-});
+}, {
+  // Values are current for the cached revision, so a hit is "as of now".
+  onHit: (body) => ({ ...body, asOf: new Date().toISOString() }),
+}));
 
 // Two windows: the last 30 days of snapshots, or everything Scrybox has recorded.
 const PRICE_HISTORY_RANGES = { '30d': 30 };
@@ -491,6 +542,125 @@ router.get('/cards/:id/oracle', async (req, res) => {
   } catch (err) {
     console.error('oracle text lookup failed:', err.message);
     res.status(502).json({ error: 'Could not load rules text' });
+  }
+});
+
+// Tagger oracle tags: direct + inherited (ancestor) tags, like tagger.scryfall.com.
+router.get('/cards/:id/oracle-tags', async (req, res) => {
+  try {
+    const fallback = typeof req.query.oracle_id === 'string' ? req.query.oracle_id : null;
+    res.json(await require('../utils/cardOracleTags').cardOracleTags(req.params.id, fallback));
+  } catch (err) {
+    console.error('oracle tags lookup failed:', err.message);
+    res.status(500).json({ error: 'Could not load tags' });
+  }
+});
+
+// Which of the requested Tagger tags (slugs) each card carries, directly or
+// via an ancestor (closure). Drives the deck Tag view. Body: { ids, slugs }.
+router.post('/cards/role-tags', async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.filter(x => typeof x === 'string'))] : [];
+  const slugs = Array.isArray(req.body?.slugs) ? [...new Set(req.body.slugs.filter(x => typeof x === 'string'))] : [];
+  if (!ids.length || !slugs.length || ids.length > 1000 || slugs.length > 100) {
+    return res.status(400).json({ error: 'ids (1-1000) and slugs (1-100) are required' });
+  }
+  try {
+    const gen = await db.get(`SELECT id FROM oracle_tag_generations WHERE active = 1`);
+    if (!gen) return res.json({ ready: false, tags: {} });
+    const rows = await db.all(`
+      SELECT DISTINCT cc.id AS card_id, anc.slug AS slug
+      FROM card_cache cc
+      JOIN oracle_tag_assignments a ON a.generation_id = ? AND a.oracle_id = cc.oracle_id
+      JOIN oracle_tag_closure c ON c.generation_id = a.generation_id AND c.descendant_tag_id = a.tag_id
+      JOIN oracle_tags anc ON anc.generation_id = c.generation_id AND anc.tag_id = c.ancestor_tag_id
+      WHERE cc.id IN (${ids.map(() => '?').join(',')})
+        AND anc.slug IN (${slugs.map(() => '?').join(',')})
+    `, [gen.id, ...ids, ...slugs]);
+    const tags = {};
+    for (const r of rows) (tags[r.card_id] ||= []).push(r.slug);
+    res.json({ ready: true, tags });
+  } catch (err) {
+    console.error('role tags lookup failed:', err.message);
+    res.status(500).json({ error: 'Could not load tags' });
+  }
+});
+
+// Deck "Oracle tags" widget: the most common Tagger tags (direct or inherited)
+// across the given cards. Trivia/meta tags (cycles, art, name jokes, generic
+// ability shapes) are dropped so the list reads like deck roles.
+const TAG_NOISE = /^(cycle|synergy-|card-names|alliteration|flavors-of|staple-with|cheaper-than|triggered-ability|activated-ability|static-ability|tap-|discount-|reprint|single-target|multi-target|.*-art$|art-|pun|reference|joke|flavor|vanilla|french-vanilla|keyword-|mechanic-|cast-trigger|etb-trigger|death-trigger|virtual-|unique-type-line|type-line-|name-|has-|mentions-|references-)/;
+router.post('/cards/tag-stats', async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? [...new Set(req.body.ids.filter(x => typeof x === 'string'))] : [];
+  if (!ids.length || ids.length > 1000) return res.status(400).json({ error: 'ids (1-1000) are required' });
+  try {
+    const gen = await db.get(`SELECT id FROM oracle_tag_generations WHERE active = 1`);
+    if (!gen) return res.json({ ready: false, tags: [] });
+    const rows = await db.all(`
+      SELECT anc.slug AS slug, anc.label AS label, cc.id AS card_id
+      FROM card_cache cc
+      JOIN oracle_tag_assignments a ON a.generation_id = ? AND a.oracle_id = cc.oracle_id
+      JOIN oracle_tag_closure c ON c.generation_id = a.generation_id AND c.descendant_tag_id = a.tag_id
+      JOIN oracle_tags anc ON anc.generation_id = c.generation_id AND anc.tag_id = c.ancestor_tag_id
+      WHERE cc.id IN (${ids.map(() => '?').join(',')})
+    `, [gen.id, ...ids]);
+    const bySlug = new Map();
+    for (const r of rows) {
+      if (TAG_NOISE.test(r.slug)) continue;
+      if (!bySlug.has(r.slug)) bySlug.set(r.slug, { slug: r.slug, label: r.label || r.slug, cards: new Set() });
+      bySlug.get(r.slug).cards.add(r.card_id);
+    }
+    const tags = [...bySlug.values()]
+      .filter(t => t.cards.size >= 2)
+      .sort((a, b) => b.cards.size - a.cards.size || a.slug.localeCompare(b.slug))
+      .slice(0, 40)
+      .map(t => ({ slug: t.slug, label: t.label, cards: [...t.cards] }));
+    res.json({ ready: true, tags });
+  } catch (err) {
+    console.error('tag stats failed:', err.message);
+    res.status(500).json({ error: 'Could not load tags' });
+  }
+});
+
+// Deck Highlighter: which of `names` match a full Scryfall-syntax query `q`.
+// Answered by the (local) Scryfall engine as `(q) (!"A" or !"B" ...)`, so
+// every operator works (o:, otag:, is:, kw:, pow ...), not only the subset
+// the stored rows can evaluate. Names go in chunks to keep queries short.
+const HIGHLIGHT_CHUNK = 100;
+router.post('/cards/highlight', async (req, res) => {
+  const q = typeof req.body?.q === 'string' ? req.body.q.trim() : '';
+  const names = Array.isArray(req.body?.names)
+    ? [...new Set(req.body.names.filter(n => typeof n === 'string' && n.trim()))] : [];
+  if (!q || q.length > 500 || !names.length || names.length > 1000) {
+    return res.status(400).json({ error: 'q (1-500 chars) and names (1-1000) are required' });
+  }
+  try {
+    require('../../../shared/scryfallQuery.js').analyze(q);
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'Invalid query' });
+  }
+  try {
+    const { fetchWindow } = require('../scryfallApi');
+    const exact = n => `!"${n.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    const wanted = new Set(names.map(n => n.toLowerCase()));
+    const matched = new Set();
+    for (let i = 0; i < names.length; i += HIGHLIGHT_CHUNK) {
+      const chunk = names.slice(i, i + HIGHLIGHT_CHUNK);
+      const { cards } = await fetchWindow(`(${q}) (${chunk.map(exact).join(' or ')})`, null, 0, chunk.length * 4, 'name');
+      for (const c of cards) {
+        const full = String(c.name || '');
+        const front = full.split(' // ')[0];
+        for (const n of [full, front]) if (wanted.has(n.toLowerCase())) matched.add(n.toLowerCase());
+      }
+    }
+    res.json({ names: names.filter(n => matched.has(n.toLowerCase()) || matched.has(n.split(' // ')[0].toLowerCase())) });
+  } catch (err) {
+    const status = err.status || err.response?.status;
+    if (status === 400 || status === 422 || /syntax|invalid|didn.t match/i.test(err.message || '')) {
+      return res.status(400).json({ error: err.message || 'Invalid query' });
+    }
+    if (status === 404) return res.json({ names: [] });
+    console.error('highlight failed:', err.message);
+    res.status(502).json({ error: 'Search engine unavailable' });
   }
 });
 

@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart } from 'lucide-react';
-import { shuffleArray } from '../utils/shuffle';
+import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart, Tags, Shapes, Highlighter, Infinity as InfinityIcon, Sparkles, BarChart3 } from 'lucide-react';
+import CombosModal from './CombosModal';
+import OtagExplorer from './OtagExplorer';
+import { groupByRole, ROLE_SLUGS, cardTagId } from '../utils/deckRoles';
+import { bottomsOwed, buildLibrary, deal, putOnBottom, isCommanderDeck } from '../utils/mulligan';
 import { displayName } from '../utils/languages';
 import CheckoutWizardModal from './CheckoutWizardModal';
 import OverflowMenu from './OverflowMenu';
@@ -20,7 +23,7 @@ import { deckMinimumValueHint, deckMinimumValueText, deckUnpricedCountText } fro
 import { buildCardListText } from '../utils/cardList';
 import { buildManapoolUrl } from '../utils/manapoolUrl';
 import { buildTcgMassEntryUrl } from '../utils/tcgMassEntryUrl';
-import { priceText } from '../utils/formatPrice';
+import { priceText, estPrefix, isEstimated } from '../utils/formatPrice';
 import { deriveDeckRenderData, isBasicLand } from '../utils/deckRenderData';
 import { deckSidebarStats, findCommander, cardColorLetters, isLandCard } from '../utils/deckStats';
 
@@ -56,6 +59,23 @@ function DeckBuilder({ showToast, onNavigate }) {
     setCardDisplayModeState(mode);
     try { localStorage.setItem('bindarr.deckCardDisplayMode', mode); } catch { /* storage unavailable */ }
   };
+  // Section grouping: card type (default) or Tagger role tags ("Tag view").
+  const [groupMode, setGroupModeState] = useState(() => {
+    try { return localStorage.getItem('scrybox.deckGroupMode') === 'tags' ? 'tags' : 'type'; } catch { return 'type'; }
+  });
+  const setGroupMode = (mode) => {
+    setGroupModeState(mode);
+    try { localStorage.setItem('scrybox.deckGroupMode', mode); } catch { /* storage unavailable */ }
+  };
+  const [roleTags, setRoleTags] = useState({ key: '', tags: {} });
+  // Highlighter (Moxfield-style): Scryfall syntax over the open deck; matching
+  // cards stay lit, the rest dim, and the panel shows stats for the match.
+  const [hlQuery, setHlQuery] = useState('');
+  const [showCombos, setShowCombos] = useState(false);
+  const [tagStats, setTagStats] = useState({ key: '', tags: null });
+  const [tagStatsAll, setTagStatsAll] = useState(false);
+  const [otagOpen, setOtagOpen] = useState(null); // tag row being explored
+  const [hl, setHl] = useState({ q: '', names: null, error: '', busy: false });
   // Deck page: one tap-to-open card sheet ({ id, board }), a desktop hover
   // preview for list rows, and prices behind a persisted $ toggle (off).
   const [sheetRef, setSheetRef] = useState(null);
@@ -132,6 +152,9 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [simulatorDeck, setSimulatorDeck] = useState([]);
   const [hand, setHand] = useState([]);
   const [mulliganCount, setMulliganCount] = useState(0);
+  const [toBottom, setToBottom] = useState(0); // cards still owed to the library bottom
+  const [commandZone, setCommandZone] = useState([]);
+  const [simCommander, setSimCommander] = useState(false);
 
   // Import / Export Modals
   const [showImportModal, setShowImportModal] = useState(false);
@@ -604,44 +627,51 @@ function DeckBuilder({ showToast, onNavigate }) {
   };
 
   // --- DRAW SIMULATOR LOGIC ---
+  // London mulligan; Commander decks keep the commander in the command zone
+  // and get the free first mulligan (utils/mulligan.js).
   const startSimulator = () => {
     if (!activeDeck || activeDeck.cards.length === 0) {
       showToast(t('deck.errEmptyDeck'));
       return;
     }
-
-    // Expand cards into full array based on quantities
-    const fullDeck = [];
-    activeDeck.cards.forEach(c => {
-      for (let i = 0; i < c.quantity; i++) {
-        fullDeck.push({ ...c });
-      }
-    });
-
-    const shuffled = shuffleArray(fullDeck);
-    setSimulatorDeck(shuffled);
-    setHand(shuffled.slice(0, 7));
+    const flagged = activeDeck.cards.filter(c => c.is_commander).map(c => c.id);
+    const commanderIds = flagged.length ? flagged : (commanderCard ? [commanderCard.id] : []);
+    const commander = isCommanderDeck(activeDeck, commanderIds);
+    const { library, commandZone: zone } = buildLibrary(activeDeck.cards, commander ? commanderIds : []);
+    const dealt = deal(library);
+    setSimulatorDeck(dealt.library);
+    setHand(dealt.hand);
+    setCommandZone(zone);
+    setSimCommander(commander);
     setMulliganCount(0);
+    setToBottom(0);
     setShowSimulator(true);
   };
 
   const handleMulligan = () => {
-    const shuffled = shuffleArray(simulatorDeck);
     const nextMulligan = mulliganCount + 1;
-    const drawCount = Math.max(1, 7 - nextMulligan);
-    setSimulatorDeck(shuffled);
-    setHand(shuffled.slice(0, drawCount));
+    const dealt = deal([...hand, ...simulatorDeck]);
+    setSimulatorDeck(dealt.library);
+    setHand(dealt.hand);
     setMulliganCount(nextMulligan);
+    setToBottom(bottomsOwed(nextMulligan, simCommander));
+  };
+
+  const handleBottomCard = (idx) => {
+    if (toBottom <= 0) return;
+    const r = putOnBottom(hand, simulatorDeck, idx);
+    setHand(r.hand);
+    setSimulatorDeck(r.library);
+    setToBottom(toBottom - 1);
   };
 
   const handleDrawCard = () => {
-    // Hand grows by drawing from the rest of the deck.
-    const nextIndex = hand.length;
-    if (nextIndex >= simulatorDeck.length) {
+    if (simulatorDeck.length === 0) {
       showToast(t('deck.errNoCardsLeft'));
       return;
     }
-    setHand([...hand, simulatorDeck[nextIndex]]);
+    setHand([...hand, simulatorDeck[0]]);
+    setSimulatorDeck(simulatorDeck.slice(1));
   };
 
   // --- EXPORT & IMPORT LOGIC ---
@@ -888,7 +918,148 @@ function DeckBuilder({ showToast, onNavigate }) {
       return { ...g, cards, count: g.count - (commanderCard.quantity || 0) };
     })
     .filter(g => g.cards.length > 0), [deckGroups, commanderCard]);
-  const visibleGroups = showMaybe ? maybeGroups : mainGroups;
+  // Tag view: fetch role tags for every card on both boards once per deck
+  // contents; the map is keyed by card id so board switches need no refetch.
+  const tagIdsKey = useMemo(() => [...new Set([...deckCards, ...maybeCards].map(cardTagId).filter(Boolean))].sort().join('|'),
+    [deckCards, maybeCards]);
+  useEffect(() => {
+    if (groupMode !== 'tags' || !tagIdsKey || roleTags.key === tagIdsKey) return undefined;
+    let alive = true;
+    fetch('/api/cards/role-tags', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: tagIdsKey.split('|'), slugs: ROLE_SLUGS }),
+    })
+      .then(r => (r.ok ? r.json() : { tags: {} }))
+      .then(d => { if (alive) setRoleTags({ key: tagIdsKey, tags: d.tags || {} }); })
+      .catch(() => { if (alive) setRoleTags({ key: tagIdsKey, tags: {} }); });
+    return () => { alive = false; };
+  }, [groupMode, tagIdsKey, roleTags.key]);
+  const tagGroups = useMemo(() => {
+    if (groupMode !== 'tags') return null;
+    const cards = showMaybe ? maybeCards : deckCards.filter(c => !commanderCard || c.id !== commanderCard.id);
+    return groupByRole(cards, roleTags.tags, isLandCard);
+  }, [groupMode, showMaybe, maybeCards, deckCards, commanderCard, roleTags]);
+  const visibleGroups = tagGroups || (showMaybe ? maybeGroups : mainGroups);
+
+  const hlBoard = showMaybe ? maybeCards : deckCards;
+  const hlNamesKey = useMemo(() => [...new Set(hlBoard.map(c => c.name).filter(Boolean))].sort().join('\n'), [hlBoard]);
+  useEffect(() => {
+    const q = hlQuery.trim();
+    if (!q || !hlNamesKey) { setHl({ q: '', names: null, error: '', busy: false }); return undefined; }
+    let alive = true;
+    setHl(h => ({ ...h, busy: true }));
+    const timer = setTimeout(() => {
+      fetch('/api/cards/highlight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q, names: hlNamesKey.split('\n') }),
+      })
+        .then(async r => ({ ok: r.ok, body: await r.json().catch(() => ({})) }))
+        .then(({ ok, body }) => {
+          if (!alive) return;
+          if (!ok) setHl({ q, names: null, error: body.error || t('deck.hlError'), busy: false });
+          else setHl({ q, names: new Set((body.names || []).map(n => n.toLowerCase())), error: '', busy: false });
+        })
+        .catch(() => { if (alive) setHl({ q, names: null, error: t('deck.hlError'), busy: false }); });
+    }, 350);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [hlQuery, hlNamesKey, t]);
+  const isHl = (card) => !!hl.names && hl.names.has(String(card.name || '').toLowerCase());
+  const hlStats = useMemo(() => {
+    if (!hl.names) return null;
+    const hits = hlBoard.filter(isHl);
+    const qty = hits.reduce((n, c) => n + (c.quantity || 0), 0);
+    const total = hlBoard.reduce((n, c) => n + (c.quantity || 0), 0);
+    const spells = hits.filter(c => !isLandCard(c));
+    const spellQty = spells.reduce((n, c) => n + (c.quantity || 0), 0);
+    const avgMv = spellQty ? spells.reduce((n, c) => n + (Number(c.cmc) || 0) * (c.quantity || 0), 0) / spellQty : null;
+    const value = hits.reduce((n, c) => n + (Number(c.current_price) || 0) * (c.quantity || 0), 0);
+    const curve = Array(8).fill(0);
+    for (const c of spells) curve[Math.min(7, Math.floor(Number(c.cmc) || 0))] += c.quantity || 0;
+    return { qty, unique: hits.length, total, pct: total ? Math.round((qty / total) * 100) : 0, avgMv, value, curve, lands: qty - spellQty };
+  }, [hl.names, hlBoard]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Oracle tags widget: most common Tagger tags on the main board, counted in
+  // copies; tapping one highlights those cards (otag:<slug>).
+  const mainIdsKey = useMemo(() => [...new Set(deckCards.map(cardTagId).filter(Boolean))].sort().join('|'), [deckCards]);
+  useEffect(() => {
+    if (!mainIdsKey || tagStats.key === mainIdsKey) return undefined;
+    let alive = true;
+    fetch('/api/cards/tag-stats', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: mainIdsKey.split('|') }),
+    })
+      .then(r => (r.ok ? r.json() : { tags: [] }))
+      .then(d => { if (alive) setTagStats({ key: mainIdsKey, tags: d.tags || [] }); })
+      .catch(() => { if (alive) setTagStats({ key: mainIdsKey, tags: [] }); });
+    return () => { alive = false; };
+  }, [mainIdsKey, tagStats.key]);
+  const tagRows = useMemo(() => {
+    if (!tagStats.tags) return null;
+    const qty = new Map();
+    for (const c of deckCards) { const id = cardTagId(c); qty.set(id, (qty.get(id) || 0) + (c.quantity || 0)); }
+    return tagStats.tags
+      .map(tg => ({ ...tg, count: tg.cards.reduce((n, id) => n + (qty.get(id) || 0), 0) }))
+      .filter(tg => tg.count > 0)
+      .sort((a, b) => b.count - a.count);
+  }, [tagStats.tags, deckCards]);
+
+  // Same panel in the desktop sidebar and the mobile palette's sheet.
+  const renderHighlighter = () => (
+              <div className="glass-panel dk-panel dk-hl">
+                <h3 className="dk-panel-h"><span><Highlighter size={13} style={{ verticalAlign: '-2px', marginRight: 4 }} />{t('deck.hlTitle')}</span>
+                  {hl.busy && <span>{t('deck.hlBusy')}</span>}</h3>
+                <div className="dk-hl-input">
+                  <input type="text" enterKeyHint="search" className="input-control" value={hlQuery} onChange={e => setHlQuery(e.target.value)}
+                    placeholder={t('deck.hlPlaceholder')} aria-label={t('deck.hlTitle')}
+                    autoCapitalize="off" autoCorrect="off" spellCheck={false} />
+                  {hlQuery && <button type="button" className="deck-toolbar-clear" aria-label={t('addsearch.clear')} onClick={() => setHlQuery('')}><X size={13} /></button>}
+                </div>
+                {!hlQuery && (
+                  <div className="dk-hl-chips">
+                    {['otag:ramp', 'otag:removal', 'o:"draw a card"', 't:creature mv<=2', 'is:gamechanger'].map(q => (
+                      <button key={q} type="button" className="deck-chip deck-chip-btn" onClick={() => setHlQuery(q)}>{q}</button>
+                    ))}
+                  </div>
+                )}
+                {hl.error && <div className="dk-hl-err">{hl.error}</div>}
+                {hlStats && (
+                  <>
+                    <div className="dk-kv"><span>{t('deck.hlMatches')}</span><strong>{t('deck.hlMatchesValue', { qty: hlStats.qty, total: hlStats.total, pct: hlStats.pct })}</strong></div>
+                    {hlStats.qty > 0 && (
+                      <>
+                        <div className="dk-kv"><span>{t('deck.hlUnique')}</span><strong>{hlStats.unique}{hlStats.lands ? ` · ${t('deck.colorLands', { count: hlStats.lands })}` : ''}</strong></div>
+                        {hlStats.avgMv !== null && <div className="dk-kv"><span>{t('deck.hlAvgMv')}</span><strong>{hlStats.avgMv.toFixed(2)}</strong></div>}
+                        <div className="dk-kv"><span>{t('deck.valueTitle')}</span><strong>{priceText(hlStats.value, 'USD')}</strong></div>
+                        {hlStats.curve.some(n => n > 0) && (
+                          <div className="dk-curve dk-hl-curve">
+                            {hlStats.curve.map((n, i) => (
+                              <div key={i} className="dk-curve-col">
+                                <span className="dk-curve-n">{n || ''}</span>
+                                <div className="dk-curve-bar" style={{ height: `${(n / Math.max(1, ...hlStats.curve)) * 36}px` }} />
+                                <span className="dk-curve-x">{i === 7 ? '7+' : i}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+  );
+  // Mobile palette (bottom-right): one tap to the sidebar tools that are
+  // otherwise below the whole card list on a phone.
+  const [palette, setPalette] = useState(null); // null | 'menu' | 'hl'
+  // Highlighter and deck tools belong to one deck: switching decks (or
+  // leaving) starts the next one clean.
+  const openDeckId = activeDeck?.id ?? null;
+  useEffect(() => {
+    setHlQuery('');
+    setOtagOpen(null);
+    setPalette(null);
+    setShowCombos(false);
+  }, [openDeckId]);
   const sidebarStats = useMemo(() => deckSidebarStats(deckCards, commanderCard?.id), [deckCards, commanderCard]);
   const sheetCard = sheetRef
     ? (sheetRef.board === 'maybe' ? maybeCards : deckCards).find(c => c.id === sheetRef.id) || null
@@ -918,7 +1089,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   // panel sums), one copy. Em dash when the printing has no USD price.
   const cardPriceLabel = (card) => (card.current_price === null || card.current_price === undefined)
     ? '—'
-    : priceText(Number(card.current_price), 'USD');
+    : `${estPrefix(isEstimated(card), card.current_price)}${priceText(Number(card.current_price), 'USD')}`;
 
   const detailOpen = viewMode === 'detail' && !!activeDeck;
 
@@ -928,7 +1099,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   // make the shown number a floor, not a full price.
   const currentUnpricedCards = Number(activeDeck?.current_unpriced_cards) || 0;
   const currentValueText = activeDeck
-    ? `${priceText(Number(activeDeck.current_printing_value) || 0, activeDeck.minimum_value_currency || 'USD')}${currentUnpricedCards > 0 ? '+' : ''}`
+    ? `${estPrefix(Number(activeDeck.current_estimated_cards) > 0, activeDeck.current_printing_value)}${priceText(Number(activeDeck.current_printing_value) || 0, activeDeck.minimum_value_currency || 'USD')}${currentUnpricedCards > 0 ? '+' : ''}`
     : '';
   const currentValueHint = currentUnpricedCards === 1
     ? t('deck.valueCurrentIncompleteOne')
@@ -1586,11 +1757,19 @@ function DeckBuilder({ showToast, onNavigate }) {
                   )}
                 </form>
                 <div className="dk-seg" role="group" aria-label={t('deck.viewMode')}>
-                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'grid' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'grid'} onClick={() => setCardDisplayMode('grid')}>
+                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'grid' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'grid'} onClick={() => setCardDisplayMode('grid')} aria-label={t('deck.viewGrid')} title={t('deck.viewGrid')}>
                     <LayoutGrid size={13} /> <span className="dk-seg-label">{t('deck.viewGrid')}</span>
                   </button>
-                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'list' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'list'} onClick={() => setCardDisplayMode('list')}>
+                  <button type="button" className={`deck-board-tab${cardDisplayMode === 'list' ? ' active' : ''}`} aria-pressed={cardDisplayMode === 'list'} onClick={() => setCardDisplayMode('list')} aria-label={t('deck.viewList')} title={t('deck.viewList')}>
                     <List size={13} /> <span className="dk-seg-label">{t('deck.viewList')}</span>
+                  </button>
+                </div>
+                <div className="dk-seg" role="group" aria-label={t('deck.groupMode')}>
+                  <button type="button" className={`deck-board-tab${groupMode === 'type' ? ' active' : ''}`} aria-pressed={groupMode === 'type'} onClick={() => setGroupMode('type')} aria-label={t('deck.groupType')} title={t('deck.groupType')}>
+                    <Shapes size={13} /> <span className="dk-seg-label">{t('deck.groupType')}</span>
+                  </button>
+                  <button type="button" className={`deck-board-tab${groupMode === 'tags' ? ' active' : ''}`} aria-pressed={groupMode === 'tags'} onClick={() => setGroupMode('tags')} aria-label={t('deck.groupTags')} title={t('deck.groupTags')}>
+                    <Tags size={13} /> <span className="dk-seg-label">{t('deck.groupTags')}</span>
                   </button>
                 </div>
                 <button type="button" className={`deck-chip deck-chip-btn${showPrices ? ' on' : ''}`} aria-pressed={showPrices}
@@ -1600,7 +1779,7 @@ function DeckBuilder({ showToast, onNavigate }) {
               </div>
 
               {/* Deck Cards Header & Display Mode Toggle */}
-              <div className={`deck-pane-cards dk-cards${showPrices ? ' dk-prices' : ''}`}>
+              <div className={`deck-pane-cards dk-cards${showPrices ? ' dk-prices' : ''}${hl.names ? ' dk-hl-on' : ''}`}>
                 {!showMaybe && activeDeck.cards.length === 0 ? (
                   <p className="dk-empty">{t('deck.emptyDeck')}</p>
                 ) : (
@@ -1615,7 +1794,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                     </div>
 
                     {!showMaybe && commanderCard && (
-                      <button type="button" className="dk-commander" onClick={() => openCardSheet(commanderCard, 'main')}>
+                      <button type="button" className={`dk-commander${isHl(commanderCard) ? ' is-hl' : ''}`} onClick={() => openCardSheet(commanderCard, 'main')}>
                         <CardImage card={commanderCard} loading="lazy" decoding="async" className="dk-commander-img" />
                         <span className="dk-commander-text">
                           <span className="dk-commander-k">{t('deck.commanderLabel')}</span>
@@ -1636,7 +1815,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                               const short = Math.max(0, card.quantity - (card.owned_qty || 0));
                               const showShort = short > 0 && !isBasicLand(card);
                               return (
-                                <button key={card.id} type="button" className="dk-row"
+                                <button key={card.id} type="button" className={`dk-row${isHl(card) ? ' is-hl' : ''}`}
                                   onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')}
                                   onMouseMove={(e) => setHoverCard({ card, x: e.clientX, y: e.clientY })}
                                   onMouseLeave={() => setHoverCard(null)}>
@@ -1661,7 +1840,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                             {group.cards.map(card => {
                               const short = Math.max(0, card.quantity - (card.owned_qty || 0));
                               return (
-                                <button key={card.id} type="button" className={`dk-tile${short > 0 && !isBasicLand(card) ? ' is-missing' : ''}`} onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')} aria-label={displayName(card)}>
+                                <button key={card.id} type="button" className={`dk-tile${short > 0 && !isBasicLand(card) ? ' is-missing' : ''}${isHl(card) ? ' is-hl' : ''}`} onClick={() => openCardSheet(card, showMaybe ? 'maybe' : 'main')} aria-label={displayName(card)}>
                                   <CardImage card={card} loading="lazy" decoding="async" className="dk-tile-img" />
                                   {card.quantity > 1 && <span className="dk-tile-qty">×{card.quantity}</span>}
                                   {short > 0 && !isBasicLand(card) && (
@@ -1682,6 +1861,12 @@ function DeckBuilder({ showToast, onNavigate }) {
 
             {/* Right Column: Statistics, Mana Curve & Deck Health */}
             <div className="deck-pane-stats dk-side">
+              {renderHighlighter()}
+
+              <button type="button" className="btn btn-secondary dk-combos-btn" onClick={() => setShowCombos(true)}>
+                <InfinityIcon size={15} /> {t('combos.button')}
+              </button>
+
               {sidebarStats.curve.some(n => n > 0) && (
                 <div className="glass-panel dk-panel">
                   <h3 className="dk-panel-h"><span>{t('deck.manaCurve')}</span><span>{t('deck.avgCmc', { value: sidebarStats.avgCmc.toFixed(2) })}</span></h3>
@@ -1710,6 +1895,29 @@ function DeckBuilder({ showToast, onNavigate }) {
                       <span className="dk-crow-v">{Math.round(c.share * 100)}% · {t('deck.colorLands', { count: c.lands })}</span>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {tagRows && tagRows.length > 0 && (
+                <div className="glass-panel dk-panel dk-otags">
+                  <h3 className="dk-panel-h"><span>{t('deck.otagsTitle')}</span><span>{t('deck.otagsSub')}</span></h3>
+                  {(tagStatsAll ? tagRows : tagRows.slice(0, 10)).map(tg => {
+                    const on = hlQuery.trim() === `otag:${tg.slug}`;
+                    return (
+                      <button key={tg.slug} type="button" className={`dk-otag${on ? ' on' : ''}`} aria-pressed={on}
+                        title={t('deck.otagsHint', { label: tg.label })}
+                        onClick={() => setOtagOpen(tg)}>
+                        <span className="dk-otag-l">{tg.label}</span>
+                        <span className="dk-otag-bar"><span style={{ width: `${(tg.count / tagRows[0].count) * 100}%` }} /></span>
+                        <span className="dk-otag-n">{tg.count}</span>
+                      </button>
+                    );
+                  })}
+                  {tagRows.length > 10 && (
+                    <button type="button" className="coll-textbtn dk-otags-more" onClick={() => setTagStatsAll(v => !v)}>
+                      {tagStatsAll ? t('deck.otagsLess') : t('deck.otagsMore', { count: tagRows.length - 10 })}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1749,6 +1957,58 @@ function DeckBuilder({ showToast, onNavigate }) {
       )}
 
       {/* --- POPUPS & MODALS --- */}
+      {detailOpen && !palette && (
+        <button type="button" className={`dk-fab${hl.names ? ' is-hl' : ''}`} aria-label={t('deck.paletteOpen')} onClick={() => setPalette('menu')}>
+          <Sparkles size={22} />
+        </button>
+      )}
+      {detailOpen && palette && (
+        <div className="fs-sheet-backdrop dk-palette" onClick={() => setPalette(null)}>
+          <div className="fs-sheet glass-panel coll-more" role="dialog" aria-modal="true" aria-label={t('deck.paletteTitle')} onClick={e => e.stopPropagation()}>
+            <div className="fs-sheet-head">
+              <strong>{palette === 'hl' ? t('deck.hlTitle') : t('deck.paletteTitle')}</strong>
+              <button type="button" className="coll-textbtn" onClick={() => setPalette(palette === 'hl' ? 'menu' : null)}>{palette === 'hl' ? t('common.back') : t('common.close')}</button>
+            </div>
+            {palette === 'hl' ? (
+              <>
+                {renderHighlighter()}
+                <button type="button" className="btn btn-primary dk-palette-done" onClick={() => setPalette(null)}>{t('deck.paletteShowDeck')}</button>
+              </>
+            ) : (
+              <>
+                <button type="button" className="coll-more-row" onClick={() => setPalette('hl')}>
+                  <span className="dk-palette-l"><Highlighter size={18} /> {t('deck.hlTitle')}</span>
+                  <span className="dk-palette-v">{hl.names ? hlQuery : ''}</span>
+                </button>
+                {hl.names && (
+                  <button type="button" className="coll-more-row" onClick={() => { setHlQuery(''); setPalette(null); }}>
+                    <span className="dk-palette-l"><X size={18} /> {t('deck.paletteClearHl')}</span>
+                  </button>
+                )}
+                <button type="button" className="coll-more-row" onClick={() => { setPalette(null); setShowCombos(true); }}>
+                  <span className="dk-palette-l"><InfinityIcon size={18} /> {t('combos.button')}</span>
+                </button>
+                <button type="button" className="coll-more-row" onClick={() => setGroupMode(groupMode === 'tags' ? 'type' : 'tags')}>
+                  <span className="dk-palette-l">{groupMode === 'tags' ? <Tags size={18} /> : <Shapes size={18} />} {t('deck.groupMode')}</span>
+                  <span className="dk-palette-v">{groupMode === 'tags' ? t('deck.groupTags') : t('deck.groupType')}</span>
+                </button>
+                <button type="button" className="coll-more-row" onClick={() => { setPalette(null); setEditorTab('stats'); }}>
+                  <span className="dk-palette-l"><BarChart3 size={18} /> {t('deck.paletteStats')}</span>
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      {otagOpen && activeDeck && (
+        <OtagExplorer tag={otagOpen} commander={commanderCard}
+          deckNames={new Set(deckCards.map(c => String(c.name || '').toLowerCase()))}
+          onHighlight={() => setHlQuery(`otag:${otagOpen.slug}`)}
+          onClose={() => setOtagOpen(null)} />
+      )}
+      {showCombos && activeDeck && (
+        <CombosModal deckId={activeDeck.id} deckName={activeDeck.name} onClose={() => setShowCombos(false)} />
+      )}
 
       {/* Deck buy modal — same flow as the Lists buy modal: provider cards for
           ManaPool + TCGplayer prefilled Mass Entry, the plain list selectable
@@ -2010,7 +2270,7 @@ function DeckBuilder({ showToast, onNavigate }) {
       {/* B. Draw Hand Simulator Modal */}
       {showSimulator && (
         <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(5px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
-          <div className="glass-panel" style={{ maxWidth: '1000px', width: '100%', maxHeight: '90vh', overflowY: 'auto', overscrollBehavior: 'contain', padding: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
+          <div className="glass-panel dh-panel" style={{ maxWidth: '1000px', width: '100%', maxHeight: '90vh', overflowY: 'auto', overscrollBehavior: 'contain', padding: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative' }}>
             <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowSimulator(false)} style={{ position: 'absolute', top: '1rem', right: '1rem', borderRadius: '50%' }}>
               <X size={16} />
             </button>
@@ -2020,10 +2280,27 @@ function DeckBuilder({ showToast, onNavigate }) {
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', marginTop: '0.2rem' }}>
                 {t('deck.mulliganCountText', { mulligans: mulliganCount, handSize: hand.length })}
               </p>
+              {simCommander && (
+                <p className="dh-rule">{t('deck.mulliganCommanderRule')}</p>
+              )}
+              {toBottom > 0 && (
+                <p className="dh-bottom-prompt" role="status">{t('deck.mulliganBottomPrompt', { count: toBottom })}</p>
+              )}
             </div>
 
+            {commandZone.length > 0 && (
+              <div className="dh-zone">
+                <span className="dh-zone-label">{t('deck.commandZone')}</span>
+                {commandZone.map((card, idx) => (
+                  <button type="button" key={idx} className="dh-zone-card" onClick={() => setPreviewCard(card)} aria-label={card.name}>
+                    <CardImage card={card} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  </button>
+                ))}
+              </div>
+            )}
+
             {/* Hand Area */}
-            <div style={{ 
+            <div className={`dh-hand${toBottom > 0 ? ' is-bottoming' : ''}`} style={{ 
               background: 'rgba(0,0,0,0.4)', 
               minHeight: '220px', 
               borderRadius: 'var(--radius-md)', 
@@ -2039,7 +2316,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                 <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>{t('deck.noCardsDrawn')}</div>
               ) : (
                 hand.map((card, idx) => (
-                  <div key={idx} style={{ 
+                  <div key={idx} className="dh-card" style={{ 
                     width: '130px', 
                     aspectRatio: 0.718, 
                     borderRadius: '8px', 
@@ -2049,7 +2326,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                     border: '1px solid var(--border-glass)',
                     position: 'relative',
                     cursor: 'pointer'
-                  }} onClick={() => setPreviewCard(card)}>
+                  }} onClick={() => (toBottom > 0 ? handleBottomCard(idx) : setPreviewCard(card))}>
                     <CardImage card={card} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                   </div>
                 ))
@@ -2065,15 +2342,15 @@ function DeckBuilder({ showToast, onNavigate }) {
                 className="btn btn-secondary" 
                 onClick={handleMulligan} 
                 style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
-                disabled={hand.length === 0}
+                disabled={hand.length === 0 || toBottom > 0}
               >
-                {t('deck.mulliganDraw', { count: Math.max(1, 7 - (mulliganCount + 1)) })}
+                {simCommander && mulliganCount === 0 ? t('deck.mulliganFree') : t('deck.mulliganLondon', { count: bottomsOwed(mulliganCount + 1, simCommander) })}
               </button>
               <button 
                 className="btn btn-primary" 
                 onClick={handleDrawCard} 
                 style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
-                disabled={hand.length >= simulatorDeck.length}
+                disabled={toBottom > 0 || simulatorDeck.length === 0}
               >
                 {t('deck.drawOne')}
               </button>
@@ -2255,7 +2532,8 @@ function DeckBuilder({ showToast, onNavigate }) {
           onDeleted={() => { closeInspector(); if (activeDeck) loadDeckDetails(activeDeck.id); }}
           onClose={closeInspector}
         >
-          {sheetCard && sheetRef?.board === 'main' && (
+          {/* Moxfield decks are rewritten by sync, so local card edits are pointless. */}
+          {sheetCard && sheetRef?.board === 'main' && activeDeck?.source !== 'moxfield' && (
             <div className="dk-inspector-deck">
               <div className="dk-stepper">
                 <button type="button" className="btn btn-secondary" disabled={savingCard}
