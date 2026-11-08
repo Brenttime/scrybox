@@ -24,9 +24,12 @@ const OWNERSHIP_SQL = `
   ),
   owned AS (
     SELECT ${sqlCardKey('occ')} AS card_key, SUM(o.quantity) AS owned_qty
-    FROM collection o
-    JOIN card_cache occ ON occ.id = o.card_id
-    WHERE o.user_id = ? AND o.quantity > 0
+    -- Only keys some deck needs; card_cache first so collection is probed by
+    -- idx_collection_card_user instead of aggregated whole.
+    FROM card_cache occ
+    CROSS JOIN collection o
+    WHERE o.card_id = occ.id AND o.user_id = ? AND o.quantity > 0
+      AND ${sqlCardKey('occ')} IN (SELECT card_key FROM need)
     GROUP BY ${sqlCardKey('occ')}
   )
   SELECT

@@ -94,11 +94,12 @@ function normalizeChecks() {
     'ja'
   );
 
+  // USD only: a EUR-only printing is unpriced, not shown or summed in EUR.
   const eur = priced({ usd: null, usd_foil: null, eur: '4.50', eur_foil: '9.00' });
-  assert.strictEqual(eur.price_currency, 'EUR', 'a EUR-only printing is recorded as EUR');
-  assert.strictEqual(eur.price_normal, 4.5);
-  assert.strictEqual(eur.price_holofoil, 9);
-  assert.strictEqual(eur.price_trend, 4.5);
+  assert.strictEqual(eur.price_currency, 'USD', 'never recorded as EUR');
+  assert.strictEqual(eur.price_normal, null);
+  assert.strictEqual(eur.price_holofoil, null);
+  assert.strictEqual(eur.price_trend, 0);
 
   // USD wins when present, and the row must never mix the two: a USD normal price
   // beside a EUR foil price is a pair of numbers that cannot be compared.

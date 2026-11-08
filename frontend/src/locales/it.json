@@ -372,7 +372,6 @@
   "deck.importTitle": "Importa e confronta con la collezione",
   "deck.inPlay": "Attualmente in gioco",
   "deck.mulliganCountText": "Verifica la consistenza del mazzo. Mazzo mescolato. Conteggio mulligan: {mulligans}. Carte in mano: {handSize}.",
-  "deck.mulliganDraw": "Mulligan (Pesca {count})",
   "deck.namePlaceholder": "es. Atarka Red o Aggro Bianco...",
   "deck.noCardsDrawn": "Ancora nessuna carta pescata.",
   "deck.noMatches": "Nessun mazzo corrisponde al tuo filtro",

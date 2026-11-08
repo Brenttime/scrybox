@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { Capacitor } from '@capacitor/core';
-import { App as CapacitorApp } from '@capacitor/app';
+import { isNative } from '../apiBase';
 
 // Make the back gesture (browser edge-swipe, Android system back) mean
 // "close the topmost popup / go back a level" instead of leaving the page or
@@ -33,11 +32,14 @@ function onPopState() {
 // Capacitor Android: drive the hardware back button through the guard stack.
 // If anything is open, step back one history entry (fires popstate -> closes
 // the topmost overlay/tab); otherwise let the app exit.
-if (Capacitor.isNativePlatform()) {
-  CapacitorApp.addListener('backButton', () => {
-    if (stack.length > 0) window.history.back();
-    else CapacitorApp.exitApp();
-  });
+// Imported on demand so the plugin never ships in the web entry chunk.
+if (isNative) {
+  import('@capacitor/app').then(({ App: CapacitorApp }) => {
+    CapacitorApp.addListener('backButton', () => {
+      if (stack.length > 0) window.history.back();
+      else CapacitorApp.exitApp();
+    });
+  }).catch(() => {});
 }
 
 // Push a guard entry: a back gesture pops it and runs onClose instead of

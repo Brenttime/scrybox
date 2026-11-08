@@ -9,11 +9,12 @@ import { copyCardImage, shareCardImage, canShareFiles } from '../utils/cardImage
 // to the card's provider image.
 // `onEdit` adds a pencil pill beside Share (card details only), so editing a
 // copy is one tap from the top of the sheet instead of a button below the fold.
-export default function CardImageActions({ card, getSrc, compact = false, onEdit = null }) {
+export default function CardImageActions({ card, getSrc, compact = false, onEdit = null, share = true }) {
   const { t } = useT();
   const [status, setStatus] = useState(null); // 'copied' | 'shared' | 'saved' | 'error'
   const [busy, setBusy] = useState(false);
-  const showShare = canShareFiles();
+  // Card details hides Share (user request); the full-screen viewer keeps it.
+  const showShare = share && canShareFiles();
 
   const run = (action) => async (e) => {
     e.stopPropagation();

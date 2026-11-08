@@ -290,6 +290,7 @@ function compileCollectionQuery({ ast, userId, limit = 60, offset = 0, eligibleO
     cc.price_etched,
     cc.price_currency,
     cc.price_source,
+    cc.price_estimated,
     cc.tcgplayer_url,
     cc.cardmarket_url,
     cc.tcgplayer_product_id`;

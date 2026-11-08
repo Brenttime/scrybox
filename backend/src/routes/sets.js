@@ -6,6 +6,10 @@ router.get('/', async (req, res) => {
   try {
     const { lang } = req.query;
     void lang;
+    // The set list changes only when Scryfall releases a set (refreshed every
+    // few hours server-side); let the browser reuse it for an hour instead of
+    // revalidating ~285 KB on every view. private: responses sit behind auth.
+    res.set('Cache-Control', 'private, max-age=3600');
     const sets = await db.all(`
       SELECT id, name, series, printed_total, total, release_date, set_code, symbol_url, logo_url
       FROM sets
@@ -32,6 +36,7 @@ router.get('/', async (req, res) => {
     res.json(sets);
   } catch (error) {
     console.error('Error fetching sets:', error);
+    res.set('Cache-Control', 'no-store');
     res.status(500).json({ error: 'Failed to retrieve sets' });
   }
 });

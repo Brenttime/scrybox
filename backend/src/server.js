@@ -26,6 +26,7 @@ const manaboxSyncRoutes = require('./routes/manaboxSync');
 const setsRoutes = require('./routes/sets');
 const decksRoutes = require('./routes/decks');
 const listsRoutes = require('./routes/lists');
+const searchHistoryRoutes = require('./routes/searchHistory');
 const preconsRoutes = require('./routes/precons');
 const secretLairRoutes = require('./routes/secretLair');
 const marketplaceOrdersRoutes = require('./routes/marketplaceOrders');
@@ -343,11 +344,13 @@ db.initDb()
       await scryfallApi.updateCollectionPrices().catch((error) => {
         console.error('MTG boot price catch-up failed:', error.message);
       });
+      await scryfallApi.refreshPriceEstimates();
       await oracleTags.checkpointWal();
     }, 30000);
 
     // Periodically purge expired sessions so the table doesn't grow unbounded
     setInterval(() => {
+      db.run('PRAGMA optimize').catch(() => {});
       db.run(`DELETE FROM sessions WHERE expires_at <= DATETIME('now')`).catch(err => {
         console.error('Failed to purge expired sessions:', err);
       });
@@ -381,14 +384,8 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// gzip. Mounted HERE, above the routes, because it has to see a response to
-// compress it: sitting below the /api mounts it only ever reached the static
-// bundle, and every JSON body — a 5000-row collection among them — went out raw.
-//
-// It matters for the bundle too. The onnxruntime wasm the in-browser detector
-// loads is ~13 MB uncompressed, which is a long wait on a phone over wifi and,
-// worse, a stall that looks like a hang.
-app.use(compression());
+// (compression() is registered once, near the top, above every route; a
+// second registration here only re-wrapped each response for nothing.)
 
 // --- PUBLIC API ROUTES ---
 // Everything mounted above the gate below is reachable without a session, and
@@ -445,6 +442,7 @@ app.use('/api/limited', limitedRoutes);
 app.use('/api/cardscan', cardscanRoutes);
 app.use('/api/rules', rulesRoutes);
 app.use('/api/manabox-sync', manaboxSyncRoutes);
+app.use('/api/search-history', searchHistoryRoutes);
 
 // ---- Local Scryfall card portal (LOCAL_WEB_PORTAL_ENABLED) ----------------
 // Serves the sidecar's card UI (local-scryfall/static/) under

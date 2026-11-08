@@ -1,5 +1,8 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const db = require('../db');
+const { SYNERGY_THRESHOLD, commanderSlug, synergyCards } = require('../utils/edhrecSynergy');
 const cardApi = require('../utils/cardApi');
 const { parseCardRow, recordPrice } = require('../utils/priceHelpers');
 const { validateDeckAddition, isBasicLand } = require('../utils/deckRules');
@@ -9,6 +12,7 @@ const { getDeckMinimumValues, emptyDeckMinimumValue, getCheapestPrices, currentP
 const { getDeckCommanders } = require('../utils/deckCommander');
 const { getDeckOwnership } = require('../utils/deckOwnership');
 const deckListCache = require('../utils/deckListCache');
+const { applyOwnedPrintings } = require('../utils/deckDisplayPrintings');
 
 const router = express.Router();
 
@@ -46,9 +50,10 @@ async function getDeckCoverageRows(deckId, userId) {
     ),
     owned AS (
       SELECT ${sqlCardKey('owned_cc')} AS card_key, SUM(owned.quantity) AS owned_qty
-      FROM collection owned
-      JOIN card_cache owned_cc ON owned_cc.id = owned.card_id
-      WHERE owned.user_id = ? AND owned.quantity > 0
+      FROM card_cache owned_cc
+      CROSS JOIN collection owned
+      WHERE owned.card_id = owned_cc.id AND owned.user_id = ? AND owned.quantity > 0
+        AND ${sqlCardKey('owned_cc')} IN (SELECT card_key FROM requested)
       GROUP BY ${sqlCardKey('owned_cc')}
     ),
     locked AS (
@@ -204,6 +209,131 @@ router.post('/', async (req, res) => {
 });
 
 // Get Deck Details (with Cards)
+// Find My Combos: forwards the deck (commanders + mainboard names) to
+// Commander Spellbook's public find-my-combos API and returns the combos
+// already in the deck plus those one card away. Proxied because Spellbook
+// sends no CORS headers, so the browser cannot call it itself.
+const SPELLBOOK_URL = 'https://backend.commanderspellbook.com/find-my-combos';
+const trimCombo = (combo, inDeck) => ({
+  id: combo.id,
+  cards: (combo.uses || []).map(u => ({
+    name: u.card?.name || '',
+    image: u.card?.imageUriFrontSmall || u.card?.imageUriFrontNormal || null,
+    missing: !inDeck.has(String(u.card?.name || '')),
+  })),
+  templates: (combo.requires || []).map(r => r.template?.name).filter(Boolean),
+  produces: (combo.produces || []).map(p => p.feature?.name).filter(Boolean),
+  manaNeeded: combo.manaNeeded || '',
+  prerequisites: [combo.easyPrerequisites, combo.notablePrerequisites].filter(Boolean).join('\n'),
+  description: combo.description || '',
+  bracketTag: combo.bracketTag || null,
+  popularity: combo.popularity ?? null,
+  identity: combo.identity || '',
+});
+
+router.get('/:id/combos', async (req, res) => {
+  try {
+    const deck = await db.get(`SELECT id FROM decks WHERE id = ? AND user_id = ?`, [req.params.id, req.user.id]);
+    if (!deck) return res.status(404).json({ error: 'Deck not found or unauthorized' });
+    const rows = await db.all(`
+      SELECT cc.name, MAX(dc.is_commander) AS is_commander, SUM(dc.quantity) AS quantity
+      FROM deck_cards dc JOIN card_cache cc ON cc.id = dc.card_id
+      WHERE dc.deck_id = ? AND dc.quantity > 0
+      GROUP BY cc.name`, [deck.id]);
+    if (!rows.length) return res.json({ identity: '', included: [], almostIncluded: [] });
+    const body = {
+      commanders: rows.filter(r => r.is_commander).map(r => ({ card: r.name, quantity: 1 })),
+      main: rows.filter(r => !r.is_commander).map(r => ({ card: r.name, quantity: Number(r.quantity) || 1 })),
+    };
+    const upstream = await fetch(SPELLBOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': 'Scrybox/1.0' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!upstream.ok) return res.status(502).json({ error: `Commander Spellbook answered ${upstream.status}` });
+    const data = await upstream.json();
+    const r = data.results || {};
+    const inDeck = new Set(rows.map(x => String(x.name).toLowerCase()));
+    // Spellbook names double-faced cards by the full "A // B"; the deck may
+    // store only the front face, so accept either.
+    for (const x of rows) inDeck.add(String(x.name).split(' // ')[0].toLowerCase());
+    const has = (n) => inDeck.has(n.toLowerCase()) || inDeck.has(n.split(' // ')[0].toLowerCase());
+    const set = { has: n => has(n) };
+    res.json({
+      identity: r.identity || '',
+      included: (r.included || []).map(c => trimCombo(c, set)),
+      almostIncluded: (r.almostIncluded || []).map(c => trimCombo(c, set)),
+    });
+  } catch (error) {
+    console.error('find-my-combos failed:', error.message);
+    res.status(502).json({ error: 'Commander Spellbook is unreachable right now' });
+  }
+});
+
+// Synergy map: EDHREC's commander page, trimmed to cards with synergy >= 0.35.
+// Server-side because json.edhrec.com sends no CORS headers. Pages are cached
+// per commander slug on the persistent volume (24 h, stale fallback on error).
+const EDHREC_URL = 'https://json.edhrec.com/pages/commanders/';
+const EDHREC_CACHE_DIR = process.env.EDHREC_CACHE_DIR || path.join(__dirname, '../../../database/edhrec-cache');
+const EDHREC_TTL_MS = 24 * 3600e3;
+const edhrecMem = new Map(); // slug -> { t, cards }
+
+async function edhrecSynergyFor(slug) {
+  const mem = edhrecMem.get(slug);
+  if (mem && Date.now() - mem.t < EDHREC_TTL_MS) return mem.cards;
+  const file = path.join(EDHREC_CACHE_DIR, `${slug}.json`);
+  let disk = null;
+  try { disk = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { disk = null; }
+  if (disk && Date.now() - disk.t < EDHREC_TTL_MS) { edhrecMem.set(slug, disk); return disk.cards; }
+  try {
+    const r = await fetch(EDHREC_URL + encodeURIComponent(slug) + '.json', {
+      headers: { Accept: 'application/json', 'User-Agent': 'Scrybox/1.0' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (r.status === 404 || r.status === 403) {
+      const entry = { t: Date.now(), cards: null };
+      edhrecMem.set(slug, entry);
+      return null;
+    }
+    if (!r.ok) throw new Error(`EDHREC answered ${r.status}`);
+    const entry = { t: Date.now(), cards: synergyCards(await r.json()) };
+    edhrecMem.set(slug, entry);
+    try { fs.mkdirSync(EDHREC_CACHE_DIR, { recursive: true }); fs.writeFileSync(file, JSON.stringify(entry)); } catch { /* best effort */ }
+    return entry.cards;
+  } catch (err) {
+    if (disk) return disk.cards;
+    throw err;
+  }
+}
+
+router.get('/:id/synergy', async (req, res) => {
+  try {
+    const deck = await db.get(`SELECT id FROM decks WHERE id = ? AND user_id = ?`, [req.params.id, req.user.id]);
+    if (!deck) return res.status(404).json({ error: 'Deck not found or unauthorized' });
+    const rows = await db.all(`
+      SELECT DISTINCT cc.name FROM deck_cards dc JOIN card_cache cc ON cc.id = dc.card_id
+      WHERE dc.deck_id = ? AND dc.is_commander = 1 ORDER BY cc.name`, [deck.id]);
+    let names = rows.map(r => r.name);
+    const hint = typeof req.query.commander === 'string' ? req.query.commander.slice(0, 200) : '';
+    if (!names.length && hint) names = [hint];
+    if (!names.length) return res.json({ commander: null, threshold: SYNERGY_THRESHOLD, cards: [] });
+    // Partner pairs live on a combined page (names sorted); fall back to the first commander.
+    const slugs = [];
+    if (names.length > 1) slugs.push(names.map(commanderSlug).sort().join('-'));
+    slugs.push(commanderSlug(names[0]));
+    for (const slug of slugs) {
+      if (!slug) continue;
+      const cards = await edhrecSynergyFor(slug);
+      if (cards) return res.json({ commander: names.join(' + '), slug, threshold: SYNERGY_THRESHOLD, cards });
+    }
+    res.json({ commander: names.join(' + '), slug: null, threshold: SYNERGY_THRESHOLD, cards: [] });
+  } catch (error) {
+    console.error('edhrec synergy failed:', error.message);
+    res.status(502).json({ error: 'EDHREC is unreachable right now' });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   try {
@@ -234,9 +364,10 @@ router.get('/:id', async (req, res) => {
       ),
       owned AS (
         SELECT ${sqlCardKey('owned_cc')} AS card_key, SUM(owned.quantity) AS owned_qty
-        FROM collection owned
-        JOIN card_cache owned_cc ON owned_cc.id = owned.card_id
-        WHERE owned.user_id = ? AND owned.quantity > 0
+        FROM card_cache owned_cc
+        CROSS JOIN collection owned
+        WHERE owned.card_id = owned_cc.id AND owned.user_id = ? AND owned.quantity > 0
+          AND ${sqlCardKey('owned_cc')} IN (SELECT card_key FROM requested)
         GROUP BY ${sqlCardKey('owned_cc')}
       )
       SELECT
@@ -262,13 +393,15 @@ router.get('/:id', async (req, res) => {
         cc.price_holofoil,
         cc.price_etched,
         cc.price_currency,
+        cc.price_estimated,
         COALESCE(owned.owned_qty, 0) AS owned_qty
       FROM requested
       JOIN card_cache cc ON cc.id = requested.representative_id
       LEFT JOIN owned ON owned.card_key = requested.card_key
       ORDER BY cc.name
     `;
-    const cards = await db.all(cardsQuery, [id, req.user.id]);
+    // Show the user's own copy, not the deck list's printing.
+    const cards = await applyOwnedPrintings(db, req.user.id, await db.all(cardsQuery, [id, req.user.id]));
 
     // Two value axes on the same card row: current_price is what THIS deck's
     // printing costs (cheapestEligiblePrice over the representative row's own
@@ -284,42 +417,38 @@ router.get('/:id', async (req, res) => {
 
     const values = await getDeckMinimumValues(db, [deck.id]);
 
-    // Current-printings deck total: summed from EVERY deck_cards row, not the
-    // grouped representatives above — a deck holding two printings of one
-    // logical card pays each printing its own price, the same row-level
-    // accounting getDeckRequirements sums for the floor.
-    const currentRows = await db.all(`
-      SELECT dc.quantity,
-             cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_trend, cc.price_currency
-      FROM deck_cards dc
-      JOIN card_cache cc ON cc.id = dc.card_id
-      WHERE dc.deck_id = ? AND dc.quantity > 0
-    `, [id]);
-    const currentValues = deckCurrentPrintValues(currentRows.map(row => ({
+    // Current-printings deck total follows the displayed (owned) printings so
+    // the total and the per-card prices on screen agree.
+    const currentValues = deckCurrentPrintValues(formatted.map(row => ({
       quantity: row.quantity,
-      current_price: currentPrintingPrice(row),
+      current_price: row.current_price,
+      price_estimated: row.price_estimated,
     })));
 
     // Maybeboard: shown on its own tab with own/missing, never in deck stats.
     const maybeRows = await db.all(`
       WITH owned AS (
         SELECT ${sqlCardKey('owned_cc')} AS card_key, SUM(owned.quantity) AS owned_qty
-        FROM collection owned
-        JOIN card_cache owned_cc ON owned_cc.id = owned.card_id
-        WHERE owned.user_id = ? AND owned.quantity > 0
+        FROM card_cache owned_cc
+        CROSS JOIN collection owned
+        WHERE owned.card_id = owned_cc.id AND owned.user_id = ? AND owned.quantity > 0
+          AND ${sqlCardKey('owned_cc')} IN (
+            SELECT ${sqlCardKey('maybe_cc')} FROM deck_maybe_cards maybe_dm
+            JOIN card_cache maybe_cc ON maybe_cc.id = maybe_dm.card_id
+            WHERE maybe_dm.deck_id = ?)
         GROUP BY ${sqlCardKey('owned_cc')}
       )
       SELECT dm.quantity, ${sqlCardKey('cc')} AS card_key,
         cc.id, cc.name, cc.printed_name, cc.supertype, cc.subtypes, cc.types, cc.rarity,
         cc.set_id, cc.set_name, cc.number, cc.image_url, cc.cmc, cc.color_identity,
-        cc.price_trend, cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_currency,
+        cc.price_trend, cc.price_normal, cc.price_holofoil, cc.price_etched, cc.price_currency, cc.price_estimated,
         COALESCE(owned.owned_qty, 0) AS owned_qty
       FROM deck_maybe_cards dm
       JOIN card_cache cc ON cc.id = dm.card_id
       LEFT JOIN owned ON owned.card_key = ${sqlCardKey('cc')}
       WHERE dm.deck_id = ? AND dm.quantity > 0
       ORDER BY cc.name
-    `, [req.user.id, id]);
+    `, [req.user.id, id, id]);
     const maybeboard = maybeRows.map(row => ({ ...parseCardRow(row), current_price: currentPrintingPrice(row) }));
 
     res.json({
@@ -718,12 +847,23 @@ router.put('/:id/checkout', async (req, res) => {
     // rescanning the collection and every checked-out deck for each card group
     // inside the HAVING clause. Same predicate, one pass each.
     const checkedOut = await withAllocationLock(() => db.all(`
-      WITH owned AS (
+      WITH target_keys AS (
+        -- Only this deck's logical cards matter to the guard below. Restricting
+        -- supply to them (card_cache first, then collection by the
+        -- (card_id, user_id) index) avoids aggregating the whole collection.
+        SELECT DISTINCT ${sqlCardKey('target_cc')} AS card_key
+        FROM deck_cards target_dc
+        JOIN card_cache target_cc ON target_cc.id = target_dc.card_id
+        WHERE target_dc.deck_id = ? AND target_dc.quantity > 0
+      ),
+      owned AS (
         SELECT ${sqlCardKey('owned_cc')} AS card_key, SUM(owned.quantity) AS owned_qty
-        FROM collection owned
-        JOIN card_cache owned_cc ON owned_cc.id = owned.card_id
-        WHERE owned.user_id = ?
+        FROM card_cache owned_cc
+        CROSS JOIN collection owned
+        WHERE owned.card_id = owned_cc.id
+          AND owned.user_id = ?
           AND owned.quantity > 0
+          AND ${sqlCardKey('owned_cc')} IN (SELECT card_key FROM target_keys)
         GROUP BY ${sqlCardKey('owned_cc')}
       ),
       locked AS (
@@ -735,6 +875,7 @@ router.put('/:id/checkout', async (req, res) => {
           AND locked_deck.checked_out = 1
           AND locked_dc.quantity > 0
           AND locked_deck.id != ?
+          AND ${sqlCardKey('locked_cc')} IN (SELECT card_key FROM target_keys)
         GROUP BY ${sqlCardKey('locked_cc')}
       )
       UPDATE decks AS target
@@ -781,7 +922,7 @@ router.put('/:id/checkout', async (req, res) => {
             COALESCE(owned.owned_qty, 0) - COALESCE(locked.locked_qty, 0)
         )
       RETURNING id
-    `, [req.user.id, req.user.id, id, id, req.user.id, id]));
+    `, [id, req.user.id, req.user.id, id, id, req.user.id, id]));
 
     if (checkedOut.length) {
       return res.json({ message: 'Deck checked out successfully' });

@@ -71,6 +71,7 @@ async function getCheapestPrintings(client, cardKeys) {
       CROSS JOIN card_cache priced_cc INDEXED BY idx_card_cache_logical_key
       WHERE ${sqlCardKey('priced_cc')} = required.card_key
         AND UPPER(COALESCE(priced_cc.price_currency, 'USD')) = 'USD'
+        AND COALESCE(priced_cc.price_estimated, 0) = 0
     `, keys);
 
     for (const row of rows) {
@@ -186,6 +187,7 @@ function currentPrintingPrice(row) {
 function deckCurrentPrintValues(rows) {
   let value = 0;
   let unpricedCopies = 0;
+  let estimatedCopies = 0;
   for (const row of rows || []) {
     const quantity = Number(row.quantity) || 0;
     if (quantity <= 0) continue;
@@ -194,11 +196,15 @@ function deckCurrentPrintValues(rows) {
       unpricedCopies += quantity;
     } else {
       value += quantity * price;
+      // Priced from the cheapest other printing (utils/priceEstimates): the UI
+      // marks the total "~".
+      if (Number(row.price_estimated) && price > 0) estimatedCopies += quantity;
     }
   }
   return {
     current_printing_value: Math.round((value + Number.EPSILON) * 100) / 100,
     current_unpriced_cards: unpricedCopies,
+    current_estimated_cards: estimatedCopies,
   };
 }
 

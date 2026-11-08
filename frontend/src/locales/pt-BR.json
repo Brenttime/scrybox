@@ -372,7 +372,6 @@
   "deck.importTitle": "Importar e comparar com a coleção",
   "deck.inPlay": "Em jogo agora",
   "deck.mulliganCountText": "Teste a consistência do baralho. Baralho embaralhado. Contagem de mulligan: {mulligans}. Cartas na mão: {handSize}.",
-  "deck.mulliganDraw": "Mulligan (Comprar {count})",
   "deck.namePlaceholder": "ex.: Atarka Red ou Aggro Branco...",
   "deck.noCardsDrawn": "Nenhuma carta comprada ainda.",
   "deck.noMatches": "Nenhum deck corresponde ao seu filtro",

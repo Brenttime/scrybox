@@ -128,6 +128,9 @@ function waitFor(url) {
   };
 }
 
+// True while a 429 cooldown pauses every upstream Scryfall request.
+const scryfallCoolingDown = () => cooldownUntil > Date.now();
+
 function noteRateLimit(error) {
   if (!error.response || error.response.status !== 429) return false;
   const ra = parseInt(error.response.headers?.['retry-after'], 10);
@@ -153,6 +156,13 @@ function scryRequest(url, config) {
 }
 
 function scryGet(url, config) {
+  // Local sidecar requests never join the upstream queue. That queue is paced
+  // and frozen for 60s+ after a 429, so a long upstream job (the daily price
+  // sweep) used to leave every local search spinning behind it.
+  const [lu, lcfg] = scryRequest(url, config);
+  if (isLocalScryfallTarget(lu, lcfg)) {
+    return client.get(lu, lcfg);
+  }
   const run = scryfallQueue.then(async () => {
     const [u, cfg] = scryRequest(url, config);
     // Local sidecar traffic skips the queue's pacing entirely: the gaps and
@@ -184,6 +194,13 @@ const COLLECTION_BATCH = 75;
 // POST twin of scryGet: same one global queue, same gap, same 429 cooldown, so
 // bulk lookups can never race ahead of (or pile on top of) search traffic.
 function scryPost(url, body, config) {
+  // Local sidecar requests never join the upstream queue. That queue is paced
+  // and frozen for 60s+ after a 429, so a long upstream job (the daily price
+  // sweep) used to leave every local search spinning behind it.
+  const [lu, lcfg] = scryRequest(url, config);
+  if (isLocalScryfallTarget(lu, lcfg)) {
+    return client.post(lu, body, lcfg);
+  }
   const run = scryfallQueue.then(async () => {
     const [u, cfg] = scryRequest(url, config);
     // Local target ⇒ no pacing (see scryGet).
@@ -292,15 +309,12 @@ function normalizeCard(raw, lang) {
   const hasPrices = !!(raw.prices && typeof raw.prices === 'object');
   const prices = raw.prices || {};
   const money = (v) => (v != null ? parseFloat(v) : null);
-  const eurOnly = money(prices.usd) == null && money(prices.usd_foil) == null
-    && money(prices.usd_etched) == null
-    && (money(prices.eur) != null || money(prices.eur_foil) != null);
-  const currency = eurOnly ? 'EUR' : 'USD';
-  const usd = eurOnly ? money(prices.eur) : money(prices.usd);
-  const usdFoil = eurOnly ? money(prices.eur_foil) : money(prices.usd_foil);
-  // Scryfall has no EUR etched field. An etched quote therefore always selects
-  // the USD row instead of being mixed into a EUR-normal/EUR-foil row.
-  const usdEtched = eurOnly ? null : money(prices.usd_etched);
+  // USD only (user decision): a printing with no TCGplayer quote is unpriced,
+  // never a Cardmarket EUR number, which also leaked into USD totals.
+  const currency = 'USD';
+  const usd = money(prices.usd);
+  const usdFoil = money(prices.usd_foil);
+  const usdEtched = money(prices.usd_etched);
   const cmc = raw.cmc != null ? parseFloat(raw.cmc) : null;
   const colorIdentity = raw.color_identity || face.color_identity || [];
 
@@ -955,11 +969,26 @@ async function updateCollectionPrices(force = false) {
       }
       await markPricesSwept('mtg');
       console.log(`MTG price update complete: ${pairs.length} priced, ${notFound} not found on Scryfall.`);
+      await refreshPriceEstimates();
     } catch (e) {
       console.error('MTG price update failed:', e.message);
     }
   } catch (err) {
     console.error('Error during MTG price update:', err.message);
+  }
+}
+
+// Unpriced printings borrow their cheapest sibling's quote (utils/priceEstimates).
+// First fetch every printing of owned cards that have no priced sibling cached,
+// then re-estimate the whole cache.
+async function refreshPriceEstimates() {
+  const estimates = require('./utils/priceEstimates');
+  try {
+    const filled = await estimates.fillMissingFloors(db, { scryGet, normalizeCard, cacheCards });
+    const changed = await estimates.refreshAllEstimates(db);
+    console.log(`Price estimates: ${filled.asked} cards looked up upstream, ${changed + filled.estimated} rows estimated.`);
+  } catch (e) {
+    console.error('Price estimate refresh failed:', e.message);
   }
 }
 
@@ -1503,4 +1532,4 @@ async function resolveCollectionQuery({
 // adapter. `collectionQueryCache` is the in-process half of the durable
 // catalog-query cache — exposed so tests can age an entry to drive the
 // stale-while-revalidate paths (production code never reads it directly).
-module.exports = { getOracleText, scryPostRetried, searchCards, normalizeCard, cacheCards, getCardsBySet, fetchAndCacheSets, updateCollectionPrices, getCardById, getPrintingInLang, bulkFetchByIdentifier, scryGetRetried, scryUrl, LOCAL_SCRYFALL, LOCAL_SCRYFALL_URL, client, fetchWindow, resolveCollectionQuery, collectionQueryCache };
+module.exports = { scryfallCoolingDown, refreshPriceEstimates, getOracleText, scryPostRetried, searchCards, normalizeCard, cacheCards, getCardsBySet, fetchAndCacheSets, updateCollectionPrices, getCardById, getPrintingInLang, bulkFetchByIdentifier, scryGetRetried, scryUrl, LOCAL_SCRYFALL, LOCAL_SCRYFALL_URL, client, fetchWindow, resolveCollectionQuery, collectionQueryCache };

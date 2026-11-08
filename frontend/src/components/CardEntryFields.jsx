@@ -19,22 +19,24 @@ export default function CardEntryFields({
   const printings = getPrintings();
   const groupStyle = stacked ? { marginBottom: 0 } : undefined;
 
-  const stepQty = (delta) => onQuantity(String(Math.max(1, (parseInt(quantity, 10) || 1) + delta)));
-  const Quantity = stacked ? (
-    // Scanner quick-add: quantity is the most-changed field, so give it big
-    // tap targets instead of a bare number input.
-    <div className="form-group quick-add-full-width" style={groupStyle}>
+  // Quantity is a whole number: digits only, never below 1, with -/+ steppers
+  // (and the arrow keys) everywhere, not just in the scanner drawer.
+  const qtyNum = Math.max(1, parseInt(quantity, 10) || 1);
+  const stepQty = (delta) => onQuantity(String(Math.max(1, qtyNum + delta)));
+  const onQtyInput = (e) => onQuantity(e.target.value.replace(/\D+/g, ''));
+  const onQtyKey = (e) => {
+    if (e.key === 'ArrowUp') { e.preventDefault(); stepQty(1); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); stepQty(-1); }
+  };
+  const Quantity = (
+    <div className={stacked ? 'form-group quick-add-full-width' : 'form-group'} style={groupStyle}>
       <label>{t('card.quantity')}</label>
-      <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'stretch' }}>
-        <button type="button" className="btn btn-secondary" onClick={() => stepQty(-1)} aria-label={t('card.quantityDown')} style={{ padding: '0 1.1rem', fontSize: '1.3rem', flexShrink: 0 }}>&minus;</button>
-        <input type="number" className="input-control" min="1" value={quantity} onChange={(e) => onQuantity(e.target.value)} required style={{ flex: 1, minWidth: 0, textAlign: 'center', fontWeight: 700 }} />
-        <button type="button" className="btn btn-secondary" onClick={() => stepQty(1)} aria-label={t('card.quantityUp')} style={{ padding: '0 1.1rem', fontSize: '1.3rem', flexShrink: 0 }}>+</button>
+      <div className="qty-stepper">
+        <button type="button" className="btn btn-secondary" onClick={() => stepQty(-1)} disabled={qtyNum <= 1} aria-label={t('card.quantityDown')}>&minus;</button>
+        <input type="text" inputMode="numeric" pattern="[0-9]*" className="input-control" value={quantity}
+          onChange={onQtyInput} onKeyDown={onQtyKey} onBlur={() => onQuantity(String(qtyNum))} required aria-label={t('card.quantity')} />
+        <button type="button" className="btn btn-secondary" onClick={() => stepQty(1)} aria-label={t('card.quantityUp')}>+</button>
       </div>
-    </div>
-  ) : (
-    <div className="form-group" style={groupStyle}>
-      <label>{t('card.quantity')}</label>
-      <input type="number" className="input-control" min="1" value={quantity} onChange={(e) => onQuantity(e.target.value)} required />
     </div>
   );
   const Price = (
@@ -73,7 +75,7 @@ export default function CardEntryFields({
     const foil = printing === 'Holofoil';
     return (
       <>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem' }}>{Quantity}{Price}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.75rem' }}>{Quantity}{Price}</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '0.75rem', alignItems: 'end' }}>
           <div className="form-group">
             <label>{t('card.finish')}</label>
@@ -109,7 +111,7 @@ export default function CardEntryFields({
   }
   return (
     <>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem' }}>{Quantity}{Price}</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '0.75rem' }}>{Quantity}{Price}</div>
       <div className="card-entry-fields-row-3" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>{Condition}{Printing}{Language}</div>
     </>
   );

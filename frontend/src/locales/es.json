@@ -372,7 +372,6 @@
   "deck.importTitle": "Importar y comparar con la colección",
   "deck.inPlay": "En juego ahora mismo",
   "deck.mulliganCountText": "Pruebe la consistencia de su baraja. Baraja mezclada. Conteo de mulligan: {mulligans}. Tamaño de mano: {handSize} cartas.",
-  "deck.mulliganDraw": "Mulligan (Robar {count})",
   "deck.namePlaceholder": "p. ej. Atarka Red o Aggro Blanco...",
   "deck.noCardsDrawn": "Todavía no has robado cartas.",
   "deck.noMatches": "Ningún mazo coincide con tu filtro",

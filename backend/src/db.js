@@ -56,6 +56,16 @@ const dbConnection = new sqlite3.Database(dbPath, (err) => {
     dbConnection.run('PRAGMA foreign_keys = ON');
     dbConnection.run('PRAGMA journal_mode = WAL');
     dbConnection.run('PRAGMA busy_timeout = 5000');
+    // Perf (audit A): WAL makes synchronous=NORMAL durable against app crashes
+    // (only an OS crash can lose the last commits); a 64 MB page cache and
+    // 256 MB mmap keep the hot collection/card_cache pages out of read() calls.
+    dbConnection.run('PRAGMA synchronous = NORMAL');
+    dbConnection.run('PRAGMA cache_size = -65536');
+    dbConnection.run('PRAGMA mmap_size = 268435456');
+    dbConnection.run('PRAGMA temp_store = MEMORY');
+    // Build planner stats on open (the DB had never been analyzed); cheap with a limit.
+    dbConnection.run('PRAGMA analysis_limit = 1000');
+    dbConnection.run('PRAGMA optimize = 0x10002');
   }
 });
 
@@ -250,6 +260,7 @@ async function initDb() {
       price_etched REAL,
       price_currency TEXT DEFAULT 'USD',
       price_source TEXT,
+      price_estimated INTEGER NOT NULL DEFAULT 0,
       cmc REAL,
       color_identity TEXT,
       language TEXT DEFAULT 'English',
@@ -321,6 +332,17 @@ async function initDb() {
       checked_out INTEGER DEFAULT 0,
       PRIMARY KEY(deck_id, card_id),
       FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Local Scryfall search history: one row per user, the whole list stored as
+  // deflated JSON ([[query, unixSeconds], ...], newest first) to keep it small.
+  await run(`
+    CREATE TABLE IF NOT EXISTS search_history (
+      user_id INTEGER PRIMARY KEY,
+      data BLOB NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
 
@@ -516,6 +538,10 @@ async function initDb() {
     // source that ever wrote rows, and its ids are prefixed. No network needed.
     await run(`UPDATE card_cache SET price_source = 'scryfall', price_currency = 'USD' WHERE id LIKE 'mtg-%'`);
   }
+  if (!cardCacheCols.some(c => c.name === 'price_estimated')) {
+    // 1 = price_trend is the cheapest other printing's quote, not this one's.
+    await run(`ALTER TABLE card_cache ADD COLUMN price_estimated INTEGER NOT NULL DEFAULT 0`);
+  }
   if (!cardCacheCols.some(c => c.name === 'price_etched')) {
     await run(`ALTER TABLE card_cache ADD COLUMN price_etched REAL`);
   }
@@ -660,6 +686,9 @@ async function initDb() {
   }
   if (listCols.length && !listCols.some(c => c.name === 'icon')) {
     await run(`ALTER TABLE card_lists ADD COLUMN icon TEXT`);
+  }
+  if (listCols.length && !listCols.some(c => c.name === 'sort_order')) {
+    await run(`ALTER TABLE card_lists ADD COLUMN sort_order INTEGER`);
   }
   await run(`
     CREATE TABLE IF NOT EXISTS manabox_sync_runs (
@@ -1206,6 +1235,49 @@ async function initDb() {
     BEGIN ${deckListBump} END
   `);
 
+  // Revision for conditional GET /api/collection (utils/collectionEtag.js).
+  // The paginated collection read joins only collection + card_cache, so any
+  // write to either bumps it — including background price sweeps and card
+  // hydration, which the HTTP-write hooks never see. Unconditional on purpose:
+  // a spurious bump costs one re-render of a page, a missed one serves stale rows.
+  await run(`
+    CREATE TABLE IF NOT EXISTS collection_read_revision (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      revision INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await run(`INSERT OR IGNORE INTO collection_read_revision (id, revision) VALUES (1, 0)`);
+  for (const table of ['collection', 'card_cache']) {
+    for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+      await run(`
+        CREATE TRIGGER IF NOT EXISTS collection_read_rev_${table}_${operation.toLowerCase()}
+        AFTER ${operation} ON ${table}
+        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+      `);
+    }
+  }
+
+  // Third leg of the stats cache key (utils/statsCache.js): /stats and
+  // /stats/history also read price_history and sets, which neither revision
+  // above covers. Together the three counters change on every write a stats
+  // response depends on, background writers included.
+  await run(`
+    CREATE TABLE IF NOT EXISTS stats_aux_revision (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      revision INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await run(`INSERT OR IGNORE INTO stats_aux_revision (id, revision) VALUES (1, 0)`);
+  for (const table of ['price_history', 'sets']) {
+    for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+      await run(`
+        CREATE TRIGGER IF NOT EXISTS stats_aux_rev_${table}_${operation.toLowerCase()}
+        AFTER ${operation} ON ${table}
+        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+      `);
+    }
+  }
+
   // TCGplayer orders already imported through the bookmarklet, so tapping it
   // again on the same Order History page does not file the cards twice.
   await run(`
@@ -1231,6 +1303,9 @@ async function initDb() {
   await run(`CREATE INDEX IF NOT EXISTS idx_card_cache_logical_key ON card_cache(LOWER(TRIM(COALESCE(name, ''))))`);
   await run(`DROP INDEX IF EXISTS idx_card_cache_logical_name`);
   await run(`CREATE INDEX IF NOT EXISTS idx_deck_cards_checkout ON deck_cards(deck_id, checked_out)`);
+  // Owned-copies lookups by printing (deck/list owned counts, applyOwnedPrintings)
+  // previously had only (user_id, added_at) and re-aggregated the whole collection.
+  await run(`CREATE INDEX IF NOT EXISTS idx_collection_card_user ON collection(card_id, user_id)`);
   // Indexes on the retired tags/audit_logs tables. A fresh database never creates
   // those tables at all now; an upgraded one keeps them (dropping a table is not
   // something a migration should do to data it cannot restore), but nothing reads

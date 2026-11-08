@@ -371,7 +371,6 @@
   "deck.importTitle": "Importieren & mit Sammlung vergleichen",
   "deck.inPlay": "Derzeit im Spiel",
   "deck.mulliganCountText": "Testen Sie Ihre Deck-Konsistenz. Gemischtes Deck. Mulligan-Anzahl: {mulligans}. Handgröße: {handSize} Karten.",
-  "deck.mulliganDraw": "Mulligan ({count} ziehen)",
   "deck.namePlaceholder": "z. B. Atarka Red oder Aggro Weiß...",
   "deck.noCardsDrawn": "Noch keine Karten gezogen.",
   "deck.noMatches": "Keine Decks entsprechen deinem Filter",

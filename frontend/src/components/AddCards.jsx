@@ -1,10 +1,20 @@
-import { useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { Camera, PackageOpen, ScanText, Search, ShoppingCart } from 'lucide-react';
-import FastScanner from './FastScanner';
-import CardSearch from './CardSearch';
-import SecretLairPanel from './SecretLairPanel';
-import OrderImportPanel from './OrderImportPanel';
 import { useT } from '../utils/i18n';
+import { lazyView } from '../utils/lazyView';
+
+// Each pane is its own chunk, so a mode only downloads what it renders: the
+// scanner (and its client-scan pipeline) is the bulk of this tab and Search,
+// Secret Lair and Order import never need it. App.jsx starts the scanner chunk
+// in parallel with this one because it is the default pane.
+const FastScanner = lazyView(() => import('./FastScanner'));
+const loadCardSearch = () => import('./CardSearch');
+const CardSearch = lazyView(loadCardSearch);
+const SecretLairPanel = lazyView(() => import('./SecretLairPanel'));
+const OrderImportPanel = lazyView(() => import('./OrderImportPanel'));
+
+// Holds the pane's space while its chunk arrives so the page doesn't jump.
+const PaneFallback = () => <div style={{ minHeight: '40vh' }} aria-busy="true" />;
 
 // The "Add Cards" tab. It holds four independent ways to put cards in the
 // collection, so it opens on a choice between them rather than assuming the
@@ -27,6 +37,15 @@ export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
   const { t } = useT();
   const [mode, setMode] = useState('fastscan');
 
+  // Search is the next most used pane: warm its chunk once the browser is idle
+  // so switching to it doesn't wait on the network.
+  useEffect(() => {
+    const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 1500));
+    const cancel = window.cancelIdleCallback || clearTimeout;
+    const id = idle(() => { loadCardSearch().catch(() => {}); });
+    return () => cancel(id);
+  }, []);
+
   // Demo build has no backend: neither the camera scanner nor the Secret Lair
   // importer can work, so show a notice instead of two controls that would fail.
   if (import.meta.env.VITE_DEMO) {
@@ -42,10 +61,10 @@ export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
   }
 
   const MODES = [
-    { key: 'fastscan', icon: ScanText, label: t('addcards.tabFastScan') },
-    { key: 'search', icon: Search, label: t('addcards.tabSearch') },
-    { key: 'secretlair', icon: PackageOpen, label: t('addcards.tabSecretLair') },
-    { key: 'orderimport', icon: ShoppingCart, label: t('addcards.tabOrderImport') },
+    { key: 'fastscan', icon: ScanText, label: t('addcards.tabFastScan'), short: t('addcards.shortScan') },
+    { key: 'search', icon: Search, label: t('addcards.tabSearch'), short: t('addcards.shortSearch') },
+    { key: 'secretlair', icon: PackageOpen, label: t('addcards.tabSecretLair'), short: t('addcards.shortSecretLair') },
+    { key: 'orderimport', icon: ShoppingCart, label: t('addcards.tabOrderImport'), short: t('addcards.shortOrder') },
   ];
 
   return (
@@ -61,7 +80,7 @@ export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
         role="tablist"
         aria-label={t('addcards.modePickerAria')}
       >
-        {MODES.map(({ key, icon: Icon, label }, i) => (
+        {MODES.map(({ key, icon: Icon, label, short }, i) => (
           <button
             key={key}
             type="button"
@@ -78,12 +97,17 @@ export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
               setMode(MODES[nextIdx].key);
               e.currentTarget.parentElement?.querySelectorAll('[role="tab"]')[nextIdx]?.focus();
             }}
+            aria-label={label}
+            title={label}
           >
-            <Icon size={16} aria-hidden="true" /> {label}
+            <Icon size={16} aria-hidden="true" />
+            <span className="sl-mode-long" aria-hidden="true">{label}</span>
+            <span className="sl-mode-short" aria-hidden="true">{short}</span>
           </button>
         ))}
       </div>
 
+      <Suspense fallback={<PaneFallback />}>
       {mode === 'fastscan' && <FastScanner onAddSuccess={onAddSuccess} showToast={showToast} />}
       {/* CardSearch takes just the two hooks it uses: it reports an add so the
           stats refresh, and it toasts. It never navigates, so unlike the other
@@ -91,6 +115,7 @@ export default function AddCards({ onAddSuccess, showToast, setActiveTab }) {
       {mode === 'search' && <CardSearch onAddSuccess={onAddSuccess} showToast={showToast} />}
       {mode === 'secretlair' && <SecretLairPanel onAddSuccess={onAddSuccess} showToast={showToast} setActiveTab={setActiveTab} />}
       {mode === 'orderimport' && <OrderImportPanel onAddSuccess={onAddSuccess} showToast={showToast} setActiveTab={setActiveTab} />}
+      </Suspense>
     </div>
   );
 }

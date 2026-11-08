@@ -17,4 +17,16 @@ export const currencySymbol = (currency) => SYMBOLS[currency] || '$';
 // Symbol + amount, e.g. '$4.50' or '€4.50'. Use this anywhere a price is shown; a
 // literal '$' in the markup is how the symbol drifted from the number in the first
 // place.
-export const priceText = (p, currency) => `${currencySymbol(currency)}${formatPrice(p)}`;
+// USD only: a row still carrying a non-USD quote shows as unpriced ($0.00)
+// rather than a euro amount.
+export const priceText = (p, currency) => (currency && currency !== 'USD' ? '$0.00' : `$${formatPrice(p)}`);
+
+// A printing with no quote of its own is priced from the cheapest other
+// printing of the card (backend utils/priceEstimates.js, card_cache
+// price_estimated = 1). Such prices, and totals that include one, read "~$x".
+export const EST_MARK = '~';
+export const isEstimated = (row) => !!(row && Number(row.price_estimated));
+export const estPrefix = (estimated, amount) => (estimated && Number(amount) > 0 ? EST_MARK : '');
+// priceText for one card row: "~" when the shown amount is an estimate.
+export const cardPriceText = (card, amount = card?.price_trend, currency = card?.price_currency) =>
+  `${estPrefix(isEstimated(card), amount)}${priceText(amount, currency)}`;

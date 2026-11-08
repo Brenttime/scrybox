@@ -1,4 +1,5 @@
 const express = require('express');
+const { collectionEtag, matches } = require('../utils/collectionEtag');
 const db = require('../db');
 const scryfallApi = require('../scryfallApi');
 const cvScan = require('../cvScan');
@@ -190,6 +191,7 @@ async function searchCards(req, res) {
     if (scope === 'internet') {
       await mergeSearchPrices(cards, {
         db, bulkFetchByIdentifier: scryfallApi.bulkFetchByIdentifier, cacheCards: scryfallApi.cacheCards,
+        coolingDown: scryfallApi.scryfallCoolingDown,
       }).catch(e => console.error('search price merge failed:', e.message));
     }
     // Header, not the body: every existing caller expects a bare array here.
@@ -363,7 +365,7 @@ router.get('/collection/cardlist', async (req, res) => {
        FROM collection c
        JOIN card_cache cc ON c.card_id = cc.id
        WHERE c.user_id = ? AND c.quantity > 0
-       ORDER BY c.added_at DESC`,
+       ORDER BY c.added_at DESC, c.id DESC`,
       [req.user.id]
     );
     res.type('text/plain').send(buildCardListText(rows, style));
@@ -380,6 +382,18 @@ router.get('/collection', async (req, res) => {
     const paginated = req.query.limit !== undefined || req.query.offset !== undefined;
     const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit, 10) || 100));
     const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+    // Paginated reads without the deck allocation depend only on collection +
+    // card_cache, so they can answer 304 before touching either table.
+    let etag = null;
+    if (paginated && req.query.include_allocation !== '1') {
+      etag = await collectionEtag(db, req.user.id, req.originalUrl);
+      if (etag) {
+        res.set('ETag', etag);
+        res.set('Cache-Control', 'private, no-cache');
+        if (matches(req, etag)) return res.status(304).end();
+      }
+    }
 
     let filterSql = `WHERE c.user_id = ?`;
     let filterParams = [req.user.id];
@@ -427,6 +441,7 @@ router.get('/collection', async (req, res) => {
         cc.price_holofoil,
         cc.price_currency,
         cc.price_source,
+        cc.price_estimated,
         cc.tcgplayer_url,
         cc.cardmarket_url,
         cc.tcgplayer_product_id

@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
-import { X, RefreshCw } from 'lucide-react';
+import { useState, useEffect, lazy, Suspense } from 'react';
+import { X, RefreshCw, Layers } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { translatedName, setCode, isEnglish } from '../utils/languages';
-import { formatPrice, priceText } from '../utils/formatPrice';
+import { formatPrice, cardPriceText } from '../utils/formatPrice';
 import { resolveCardPrice } from '../utils/resolveCardPrice';
 import { displayRarity } from '../utils/cardRarity';
 import { priceSource } from '../utils/marketplaceLinks';
@@ -10,10 +10,17 @@ import CardImage from './CardImage';
 import CardImageZoom from './CardImageZoom';
 import CardImageActions from './CardImageActions';
 import CardEntryFields from './CardEntryFields';
-import PriceHistoryChart from './PriceHistoryChart';
 import { useBackGuard } from '../utils/useBackGuard';
 import { useSwipeBack } from '../utils/useSwipeBack';
+
 import { useT } from '../utils/i18n';
+import OracleTags from './OracleTags';
+import PrintingCarousel from './PrintingCarousel';
+
+// Recharts (~97 KB gzip) is only needed once a card is opened. Collection,
+// Decks and Lists import this modal statically, so a static chart import put
+// Recharts on the critical path of every one of those tabs.
+const PriceHistoryChart = lazy(() => import('./PriceHistoryChart'));
 
 // MTG color identity pip colors (WUBRG), approximating the printed mana colors.
 
@@ -35,7 +42,7 @@ function addedLabel(value) {
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
-function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, startInEdit = false, readOnly = false, children = null }) {
+function CardInspectorModal({ card, onClose, onUpdate, onEntryChanged = null, onChangePrinting = null, printingId = null, onDeleted, showToast, startInEdit = false, readOnly = false, children = null, onTagClick = null }) {
   const { t } = useT();
   const [mode, setMode] = useState('view');
   const [q, setQ] = useState(1);
@@ -154,7 +161,9 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
         // a screen still holding this object does not show the old printing's price.
         card.price_trend = resolveCardPrice(card, printing);
         showToast && showToast(t('inspector.entryUpdated'));
-        onUpdate && onUpdate();
+        // Refresh just this card in place when the parent supports it, so the
+        // list keeps its scroll position instead of reloading.
+        if (onEntryChanged) onEntryChanged([card.card_id]); else if (onUpdate) onUpdate();
         onClose();
       } else {
         const body = await res.json().catch(() => null);
@@ -178,8 +187,18 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
   };
 
   const choosePrinting = async (c) => {
-    if (!targetEntryId || printBusy) return;
-    if (c.id === card.card_id) { setPrints(null); return; }
+    if (printBusy) return;
+    if (c.id === (printingId || card.card_id)) { setPrints(null); return; }
+    // A caller-owned row (e.g. a list) swaps its own printing, not the
+    // collection copy this sheet may be showing.
+    if (onChangePrinting) {
+      setPrintBusy(true);
+      try {
+        if (await onChangePrinting(c)) { setPrints(null); onClose(); }
+      } finally { setPrintBusy(false); }
+      return;
+    }
+    if (!targetEntryId) return;
     setPrintBusy(true);
     try {
       const res = await fetch(`/api/collection/${targetEntryId}`, {
@@ -190,7 +209,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
       if (res.ok) {
         showToast && showToast(t('inspector.entryUpdated'));
         setPrints(null);
-        onUpdate && onUpdate();
+        if (onEntryChanged) onEntryChanged([card.card_id, c.id]); else if (onUpdate) onUpdate();
         onClose();
       } else {
         const body = await res.json().catch(() => null);
@@ -241,7 +260,7 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
         card.rarity = displayRarity(card);
         card.price_trend = resolveCardPrice(card, card.printing);
         setProxyTick(n => n + 1);
-        onUpdate && onUpdate();
+        if (onEntryChanged) onEntryChanged([card.card_id]); else if (onUpdate) onUpdate();
       } else {
         const body = await res.json().catch(() => null);
         showToast && showToast(body?.error || t('inspector.errUpdate'));
@@ -334,8 +353,19 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
                 <span>{t('inspector.flip')}</span>
               </button>
             )}
+            {(onChangePrinting || (!readOnly && targetEntryId)) && (
+              <button
+                type="button"
+                className="ci-flip-btn ci-printing-btn"
+                onClick={(e) => { e.stopPropagation(); openPrintings(); }}
+                title={t('scan.changePrinting')}
+              >
+                <Layers size={13} />
+                <span>{t('printings.short')}</span>
+              </button>
+            )}
           </div>
-          <CardImageActions card={card} compact onEdit={!readOnly && mode !== 'edit' ? () => setMode('edit') : null} getSrc={() => (flipped && backUrl) || document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
+          <CardImageActions card={card} compact share={false} onEdit={!readOnly && mode !== 'edit' ? () => setMode('edit') : null} getSrc={() => (flipped && backUrl) || document.querySelector('.card-inspector .ci-image-wrap img')?.currentSrc} />
         </div>
 
         {/* Right side: Information / Edit */}
@@ -420,6 +450,10 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
             </div>
           ) : null}
 
+          {mode !== 'edit' && onTagClick && (
+            <OracleTags cardId={oracleCardId} oracleId={card?.oracle_id} onTagClick={onTagClick} />
+          )}
+
           {mode === 'edit' ? (
             <form onSubmit={handleSave} className="ci-edit-form" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               <section>
@@ -432,38 +466,9 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               </section>
 
               <section>
-                <button type="button" className="btn btn-secondary ci-change-printing-btn" style={{ width: '100%', padding: '0.65rem 1rem' }} onClick={() => (prints === null ? openPrintings() : setPrints(null))}>
+                <button type="button" className="btn btn-secondary ci-change-printing-btn" style={{ width: '100%', padding: '0.65rem 1rem' }} onClick={openPrintings}>
                   {t('scan.changePrinting')}
                 </button>
-                {prints !== null && (
-                  <div className="ci-printings" style={{ marginTop: '0.5rem', border: '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 700 }}>
-                      <span>{t('scan.changePrinting')}{Array.isArray(prints) ? ` · ${prints.length}` : ''}</span>
-                      <button type="button" className="btn btn-secondary btn-icon-only" style={{ padding: '0.25rem' }} onClick={() => setPrints(null)} aria-label={t('common.close')}><X size={14} /></button>
-                    </div>
-                    {prints === 'loading' ? (
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('fastscan.loadingPrintings')}</div>
-                    ) : prints.length === 0 ? (
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{t('scan.noOtherPrintings')}</div>
-                    ) : (
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(84px, 1fr))', gap: '0.5rem', maxHeight: '320px', overflowY: 'auto' }}>
-                        {prints.map(c => (
-                          <button
-                            key={c.id}
-                            type="button"
-                            disabled={printBusy}
-                            onClick={() => choosePrinting(c)}
-                            aria-pressed={c.id === card.card_id}
-                            style={{ background: 'none', border: c.id === card.card_id ? '2px solid var(--accent-yellow)' : '1px solid var(--border-glass)', borderRadius: 'var(--radius-sm)', padding: '0.2rem', cursor: 'pointer', color: 'inherit', textAlign: 'center' }}
-                          >
-                            {c.image_url ? <img src={c.image_url} alt="" loading="lazy" crossOrigin="anonymous" style={{ width: '100%', borderRadius: '4px', display: 'block' }} /> : null}
-                            <div style={{ fontSize: '0.62rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>{String(c.set_id || '').toUpperCase()} · #{c.number}</div>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
               </section>
 
               <div style={{ display: 'flex', gap: '0.75rem' }}>
@@ -480,9 +485,19 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
             </form>
           ) : (
             <>
+              {!readOnly && card.notes && (
+                <div style={{ background: 'rgba(0,0,0,0.15)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.6rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {card.notes}
+                </div>
+              )}
+
+              {/* Caller-specific controls (deck quantity, add-to-collection) come before
+                  market data, which always sits at the bottom of the sheet. */}
+              {children}
+
               {/* Price: one line. Market (accent) and what was paid (muted). */}
               <div className="ci-price-line" style={{ borderTop: '1px solid var(--border-glass)', paddingTop: '0.7rem', display: 'flex', alignItems: 'baseline', gap: '0.75rem', flexWrap: 'wrap' }}>
-                <span style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--accent-yellow)' }}>{priceText(displayPrice, card.price_currency)}</span>
+                <span style={{ fontSize: '1.3rem', fontWeight: 800, color: 'var(--accent-yellow)' }}>{cardPriceText(card, displayPrice)}</span>
                 <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{t('inspector.market')}</span>
                 {!readOnly && (
                   <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginLeft: 'auto' }}>{t('inspector.paid')} ${formatPrice(card.purchase_price)}</span>
@@ -501,22 +516,19 @@ function CardInspectorModal({ card, onClose, onUpdate, onDeleted, showToast, sta
               </div>
 
               {/* Price History Area Chart */}
-              <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={80} defaultRange="30d" />
-
-              {!readOnly && card.notes && (
-                <div style={{ background: 'rgba(0,0,0,0.15)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-sm)', padding: '0.6rem 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                  {card.notes}
-                </div>
-              )}
-
-              {/* Caller-specific controls (e.g. deck quantity) sit above Edit. */}
-              {children}
+              <Suspense fallback={<div style={{ minHeight: 130 }} aria-hidden="true" />}>
+                <PriceHistoryChart cardId={card.card_id} currency={card.price_currency} height={80} defaultRange="30d" />
+              </Suspense>
 
 
             </>
           )}
         </div>
       </div>
+
+      {prints !== null && (
+        <PrintingCarousel prints={prints} current={printingId ? { ...card, card_id: printingId } : card} busy={printBusy} onPick={choosePrinting} onClose={() => setPrints(null)} />
+      )}
 
       {isFullScreen && (
         <CardImageZoom card={flipped && backUrl ? { ...card, card_id: null, id: null, image_url: backUrl } : card} onClose={() => setIsFullScreen(false)} />

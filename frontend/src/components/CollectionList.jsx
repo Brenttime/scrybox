@@ -2,7 +2,7 @@ import { startTransition, useState, useEffect, useLayoutEffect, useMemo, useRef 
 import { isFoldSpread, layoutViewportWidth } from '../utils/phoneLayout';
 import { Search, Trash2, Edit2, SlidersHorizontal, X, Braces, Share, Layers, MoreHorizontal, CheckCircle2, Download } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
-import { formatPrice, priceText } from '../utils/formatPrice';
+import { formatPrice, cardPriceText, estPrefix, isEstimated } from '../utils/formatPrice';
 import { CONDITIONS, PRINTING_OPTIONS } from '../utils/cardOptions';
 import { getPrintingBadgeLabel, getPrintingBadgeStyle, getFoilOverlayClass, getPrintingLabel } from '../utils/cardPrinting';
 import { getCardRarityBorder, getRarityBadgeLabel, getRarityBadgeStyle } from '../utils/cardRarity';
@@ -22,6 +22,7 @@ import {
   collectionSessionCache,
   makeCollectionSessionQuery,
   waitForCollectionIdle,
+  waitForFirstScreenImages,
 } from '../utils/collectionSessionCache';
 import { useMultiSelect } from '../utils/useMultiSelect';
 import { useT } from '../utils/i18n';
@@ -257,6 +258,8 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         // Yield until after the bounded 96-row paint. requestIdleCallback's
         // timeout prevents starvation; browsers without it use a short timer.
         if (!await waitForCollectionIdle({ signal: controller.signal })) return;
+        // Let the on-screen card images win the bandwidth first (bounded).
+        if (!await waitForFirstScreenImages({ signal: controller.signal })) return;
         if (generation !== fetchGenerationRef.current || controller.signal.aborted) return;
 
         const pageOffsets = [];
@@ -1160,11 +1163,45 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
     () => displayCards.reduce((sum, item) => sum + (item.price_trend || 0) * (item.quantity || 1), 0),
     [displayCards]
   );
+  const totalEstimated = useMemo(
+    () => displayCards.some(item => isEstimated(item) && item.price_trend > 0),
+    [displayCards]
+  );
   const catalogResultsIncomplete = scryfallPredicate.mode === 'catalog'
     && (liveLoading || liveIncomplete);
   const ordinaryResultsIncomplete = scryfallPredicate.mode !== 'catalog'
     && hydrationStatus !== 'complete';
   const resultsIncomplete = catalogResultsIncomplete || ordinaryResultsIncomplete;
+  // Edits from the card details sheet (quantity, finish, printing, proxy)
+  // touch only a card or two. Re-read just those cards' rows and splice them
+  // in where they were, instead of bumping the revision (which reloaded the
+  // whole collection and threw the user back to the top of the list).
+  const refreshCardsInPlace = async (cardIds) => {
+    const ids = [...new Set((cardIds || []).filter(Boolean).map(String))];
+    if (!ids.length) { onUpdate(); return; }
+    try {
+      const lists = await Promise.all(ids.map(async (id) => {
+        const r = await fetch(`/api/collection?card_id=${encodeURIComponent(id)}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      }));
+      let fresh = lists.flat();
+      if (tradeOnly) fresh = fresh.filter(r => r.is_trade);
+      const idSet = new Set(ids);
+      const splice = (rows) => {
+        const at = rows.findIndex(r => idSet.has(String(r.card_id)));
+        const kept = rows.filter(r => !idSet.has(String(r.card_id)));
+        const pos = at < 0 ? 0 : rows.slice(0, at).filter(r => !idSet.has(String(r.card_id))).length;
+        return [...kept.slice(0, pos), ...fresh, ...kept.slice(pos)];
+      };
+      setCollection(prev => splice(prev));
+      collectionSessionCache.patch(collectionSessionQuery, splice);
+    } catch (err) {
+      console.error(err);
+      onUpdate();
+    }
+  };
+
   const retryCollectionHydration = () => {
     collectionSessionCache.invalidate(collectionSessionQuery);
     collectionHydrationRef.current = { key: collectionHydrationKey, status: 'error' };
@@ -1301,7 +1338,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
           </span>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.6rem', marginLeft: 'auto' }}>
             {!resultsIncomplete && (
-              <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>${formatPrice(totalValue)}</strong></span>
+              <span>{t('collection.totalValue')} <strong style={{ color: 'var(--accent-yellow)' }}>{estPrefix(totalEstimated, totalValue)}${formatPrice(totalValue)}</strong></span>
             )}
             <button type="button" className="coll-textbtn" disabled={resultsIncomplete || !filteredCollection.length} onClick={() => setExportOpen(true)} title={t('collection.exportViewHint')}>{t('collection.exportView')}</button>
             <button type="button" className="coll-textbtn" onClick={() => setSelectMode(true)} title={t('collection.selectHint')}>{t('collection.select')}</button>
@@ -1518,7 +1555,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                   <div className="tcg-card-name">{getCardDisplayName(item.name, item.language, item.printed_name)}</div>
                   <div className="tcg-card-meta">
                     <span style={{ fontSize: '0.7rem' }}>{item.set_name} • #{item.number}</span>
-                    <span className="tcg-card-price">{priceText(item.price_trend, item.price_currency)}</span>
+                    <span className="tcg-card-price">{cardPriceText(item)}</span>
                   </div>
                 </div>
               </div>
@@ -1605,7 +1642,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
                       {item.quantity > 1 && (
                         <div style={{ fontWeight: 700, color: 'var(--text-strong)', fontSize: '0.85rem' }}>x{item.quantity}</div>
                       )}
-                      <div style={{ fontSize: '0.7rem', color: 'var(--accent-yellow)', fontWeight: 600 }}>{priceText(item.price_trend, item.price_currency)}</div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--accent-yellow)', fontWeight: 600 }}>{cardPriceText(item)}</div>
                     </td>
                   </tr>
                   );
@@ -1627,6 +1664,7 @@ function CollectionList({ statsTrigger, onUpdate, showToast, token, selectedCard
         startInEdit={inspectorStartEdit}
         onClose={() => { setInspectorCard(null); setInspectorStartEdit(false); }}
         onUpdate={onUpdate}
+        onEntryChanged={refreshCardsInPlace}
         showToast={showToast}
       />
     </div>

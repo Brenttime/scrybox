@@ -84,6 +84,19 @@ const B = '5cbc6901-6a4a-4d0a-83ea-7eefa3b35022';
   await mergeSearchPrices(next, { db, bulkFetchByIdentifier: async (rows) => { asked.push(rows.map(r => r.id)); return { cards: [] }; } });
   assert.strictEqual(next[0].price_trend, 24.77, 'served from cache now');
   assert.strictEqual(asked.length, 1, 'still-empty printing not re-asked within the retry window');
+  // Rate-limited (cooldown): answer at once with cached prices, never wait.
+  const F = '9cbc6901-6a4a-4d0a-83ea-7eefa3b35029';
+  const slow = [normalizeCard(mk(F))];
+  let started = false;
+  const t0 = Date.now();
+  const res4 = await mergeSearchPrices(slow, {
+    db,
+    coolingDown: () => true,
+    bulkFetchByIdentifier: () => { started = true; return new Promise(r => setTimeout(() => r({ cards: [] }), 5000)); },
+  });
+  assert.ok(Date.now() - t0 < 500, 'no wait while Scryfall is cooling down');
+  assert.ok(started, 'the upstream fetch is still queued for next time');
+  assert.deepStrictEqual(res4, { cached: 0, fetched: 0 });
   console.log('searchprices: ok');
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });

@@ -37,6 +37,19 @@ export default defineConfig({
   // is public, so exposing sources costs nothing.
   build: {
     sourcemap: true,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            // lucide-react is tree-shaken per icon, and each icon shared by two
+            // lazy views became its own ~300-byte chunk: opening Collection
+            // cold cost ~24 sequential-ish requests. One icon chunk (only the
+            // icons the app actually imports) is a single cached request.
+            { name: 'icons', test: /node_modules[\\/]lucide-react[\\/]/ },
+          ],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

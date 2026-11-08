@@ -1,9 +1,12 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, Database, Minus, Plus, Search, Undo2, X } from 'lucide-react';
+import DestinationSelect from './DestinationSelect';
+import { useAddDestination, addToList, undoListAdd } from '../utils/addDestination';
+import { ChevronLeft, Database, History, Minus, Plus, Search, Trash2, Undo2, X } from 'lucide-react';
 import { pickPrinting } from '../utils/directAdd';
 import { useT } from '../utils/i18n';
 import { useSwipeBack } from '../utils/useSwipeBack';
 import CardImage from './CardImage';
+import LoadMore from './LoadMore';
 
 const CardInspectorModal = lazy(() => import('./CardInspectorModal'));
 
@@ -12,6 +15,14 @@ const CardInspectorModal = lazy(() => import('./CardInspectorModal'));
 // scope=internet) and Sets (newest first; tap a set to browse its cards).
 // Swipe back: set browse -> Sets, otherwise -> Dashboard.
 const PAGE = 60;
+// Past searches, newest first, stored per user on the server
+// (/api/search-history). The old device-only list is imported once.
+const LEGACY_HISTORY_KEY = 'scrybox_portal_history';
+const historyCall = (method, body) => fetch('/api/search-history', {
+  method,
+  headers: body ? { 'Content-Type': 'application/json' } : undefined,
+  body: body ? JSON.stringify(body) : undefined,
+}).then(r => (r.ok ? r.json() : null)).catch(() => null);
 const CHIPS = ['t:legendary t:creature', 'is:commander', 'r:mythic', 'otag:ramp', 'is:foil', 'year>=2025'];
 const setCode = (s) => (s.set_code || String(s.id || '').replace(/^mtg-/, '')).toLowerCase();
 const numKey = (n) => { const m = String(n || '').match(/^(\d+)(.*)$/); return m ? [Number(m[1]), m[2]] : [1e9, String(n || '')]; };
@@ -20,6 +31,8 @@ const numKey = (n) => { const m = String(n || '').match(/^(\d+)(.*)$/); return m
 // Foil / Non-foil chip (only when the printing has both), Add, then Undo for
 // the rows just created. NM / English, one stacked row like Add Cards' +.
 function AddToCollection({ card, showToast, onAdded }) {
+  const destination = useAddDestination();
+  const destList = destination.list;
   const { t } = useT();
   const f = Array.isArray(card.finishes) ? card.finishes : [];
   const both = f.includes('nonfoil') && (f.includes('foil') || f.includes('etched'));
@@ -32,6 +45,12 @@ function AddToCollection({ card, showToast, onAdded }) {
   const add = async () => {
     setBusy(true);
     try {
+      if (destList) {
+        await addToList(destList.id, card.id, qty).catch(() => { throw new Error(t('lists.errCard')); });
+        setLast({ ids: [], qty, listId: destList.id });
+        showToast?.(t('addDest.addedToastList', { qty, name: card.name, list: destList.name }));
+        return;
+      }
       const res = await fetch('/api/collection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -50,17 +69,19 @@ function AddToCollection({ card, showToast, onAdded }) {
     if (!last) return;
     setBusy(true);
     try {
+      if (last.listId) await undoListAdd(last.listId, card.id, last.qty);
       for (const id of last.ids) {
         const res = await fetch(`/api/collection/${id}`, { method: 'DELETE' });
         if (!res.ok) throw new Error(t('search.errUndo'));
       }
-      onAdded(-last.qty);
+      if (!last.listId) onAdded(-last.qty);
       setLast(null);
     } catch (e) { showToast?.(e.message); } finally { setBusy(false); }
   };
 
   return (
     <div className="sfp-add">
+      <DestinationSelect {...destination} className="add-dest-wide" />
       <div className="sfp-add-row">
         <div className="sfp-stepper">
           <button type="button" aria-label="-" disabled={qty <= 1 || busy} onClick={() => setQty(n => Math.max(1, n - 1))}><Minus size={14} /></button>
@@ -73,7 +94,7 @@ function AddToCollection({ card, showToast, onAdded }) {
           </button>
         )}
         <button type="button" className="btn btn-primary sfp-add-btn" disabled={busy} onClick={add}>
-          <Plus size={16} /> {t('portal.addToCollection')}
+          <Plus size={16} /> {destList ? t('lists.addCard') : t('portal.addToCollection')}
         </button>
       </div>
       {last && (
@@ -101,6 +122,29 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
   const [setFilter, setSetFilter] = useState('');
   const [inspect, setInspect] = useState(null);
   const reqRef = useRef(0);
+  const [history, setHistory] = useState([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  // Optimistic local update, then adopt the server's list.
+  const saveHistory = useCallback((update, method, body) => {
+    setHistory(prev => update(prev));
+    historyCall(method, body).then(list => { if (Array.isArray(list)) setHistory(list); });
+  }, []);
+  useEffect(() => {
+    let live = true;
+    let legacy = [];
+    try { legacy = JSON.parse(localStorage.getItem(LEGACY_HISTORY_KEY) || '[]'); } catch { legacy = []; }
+    const load = Array.isArray(legacy) && legacy.length
+      ? historyCall('POST', { items: legacy }).then(list => { if (list) localStorage.removeItem(LEGACY_HISTORY_KEY); return list; })
+      : historyCall('GET');
+    load.then(list => { if (live && Array.isArray(list)) setHistory(list); });
+    return () => { live = false; };
+  }, []);
+  useEffect(() => {
+    if (!historyOpen) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setHistoryOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [historyOpen]);
 
   const back = useCallback(() => {
     if (fromSet) { setFromSet(null); setMode('sets'); return; }
@@ -125,6 +169,7 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
     if (!query) return;
     const id = ++reqRef.current;
     setMode('search'); setFromSet(set); setRan(query); setSuggestions([]);
+    if (!set) saveHistory(prev => [{ q: query, at: Date.now() }, ...prev.filter(h => h.q !== query)], 'POST', { q: query });
     setLoading(true); setError(''); setResults([]); setTotal(null); setPage(1);
     try {
       const r = await fetchPage(query, 1);
@@ -136,7 +181,7 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
     } finally {
       if (id === reqRef.current) setLoading(false);
     }
-  }, [fetchPage]);
+  }, [fetchPage, saveHistory]);
 
   const more = async () => {
     const id = reqRef.current;
@@ -200,10 +245,49 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
           <ChevronLeft size={16} /> {t('common.back')}
         </button>
         <h2 className="sfp-title">
-          {fromSet?.symbol_url ? <img src={fromSet.symbol_url} alt="" className="sfp-set-ic" /> : <Database size={20} style={{ color: 'var(--accent-yellow)' }} />}
+          {fromSet?.symbol_url ? <img crossOrigin="anonymous" src={fromSet.symbol_url} alt="" className="sfp-set-ic" /> : <Database size={20} style={{ color: 'var(--accent-yellow)' }} />}
           <span>{title}</span>
         </h2>
+        {!fromSet && (
+          <button type="button" className="btn btn-secondary btn-icon-only sfp-hist-btn" onClick={() => setHistoryOpen(true)}
+            aria-label={t('portal.history')} title={t('portal.history')} aria-expanded={historyOpen}>
+            <History size={16} />
+          </button>
+        )}
       </div>
+
+      {historyOpen && (
+        <div className="sfp-hist-backdrop" onClick={() => setHistoryOpen(false)}>
+          <aside className="sfp-hist glass-panel" role="dialog" aria-label={t('portal.history')} onClick={e => e.stopPropagation()}>
+            <div className="sfp-hist-head">
+              <h3>{t('portal.history')}</h3>
+              <button type="button" className="modal-close" aria-label={t('common.close')} onClick={() => setHistoryOpen(false)}><X size={18} /></button>
+            </div>
+            {history.length === 0 ? (
+              <div className="sfp-msg dim">{t('portal.historyEmpty')}</div>
+            ) : (
+              <>
+                <ul className="sfp-hist-list">
+                  {history.map(h => (
+                    <li key={h.q} className="sfp-hist-row">
+                      <button type="button" className="sfp-hist-q" onClick={() => { setHistoryOpen(false); setQ(h.q); run(h.q); }}>
+                        <Search size={13} /> <span>{h.q}</span>
+                      </button>
+                      <button type="button" className="sfp-hist-del" aria-label={t('portal.historyDelete', { query: h.q })}
+                        onClick={() => saveHistory(prev => prev.filter(x => x.q !== h.q), 'DELETE', { q: h.q })}>
+                        <X size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <button type="button" className="btn btn-secondary sfp-hist-clear" onClick={() => saveHistory(() => [], 'DELETE')}>
+                  <Trash2 size={14} /> {t('portal.historyClear')}
+                </button>
+              </>
+            )}
+          </aside>
+        </div>
+      )}
 
       {!fromSet && (
         <div className="sfp-seg" role="tablist">
@@ -237,7 +321,7 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
                       <li key={s.id || s.name} role="option" aria-selected="false"
                         onMouseDown={e => e.preventDefault()}
                         onClick={() => { setQ(s.name); run(`!"${s.name}" unique:prints`); }}>
-                        {s.image_small ? <img src={s.image_small} alt="" loading="lazy" /> : <span className="addsearch-suggest-ph" />}
+                        {s.image_small ? <img crossOrigin="anonymous" src={s.image_small} alt="" loading="lazy" /> : <span className="addsearch-suggest-ph" />}
                         <span className="addsearch-suggest-name">{s.name}</span>
                         <span className="addsearch-suggest-type">{s.type_line}</span>
                       </li>
@@ -272,8 +356,8 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
             </div>
           )}
           {loading && <div className="sfp-msg dim">{t('portal.loading')}</div>}
-          {!loading && total != null && results.length < total && (
-            <button type="button" className="btn btn-secondary sfp-more" onClick={more}>{t('portal.more')}</button>
+          {total != null && results.length > 0 && results.length < total && (
+            <LoadMore onLoad={more} busy={loading}>{t('portal.more')}</LoadMore>
           )}
         </>
       )}
@@ -288,7 +372,7 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
           <div className="sfp-sets">
             {shownSets.map(s => (
               <button key={s.id} type="button" className="sfp-set" onClick={() => openSet(s)}>
-                {s.symbol_url ? <img src={s.symbol_url} alt="" className="sfp-set-ic" loading="lazy" /> : <span className="sfp-set-ic" />}
+                {s.symbol_url ? <img crossOrigin="anonymous" src={s.symbol_url} alt="" className="sfp-set-ic" loading="lazy" /> : <span className="sfp-set-ic" />}
                 <span className="sfp-set-name">{s.name}<span className="dim"> · {setCode(s).toUpperCase()}</span></span>
                 <span className="sfp-set-meta">{String(s.release_date || '').slice(0, 4)}{s.total ? ` · ${s.total}` : ''}</span>
               </button>
@@ -299,7 +383,8 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
 
       {inspect && (
         <Suspense fallback={null}>
-          <CardInspectorModal card={{ ...inspect, card_id: inspect.id, quantity: inspect.owned_qty || 0 }} readOnly onClose={() => setInspect(null)} showToast={showToast}>
+          <CardInspectorModal card={{ ...inspect, card_id: inspect.id, quantity: inspect.owned_qty || 0 }} readOnly onClose={() => setInspect(null)} showToast={showToast}
+            onTagClick={(slug) => { const q2 = `otag:${slug}`; setInspect(null); setQ(q2); run(q2); }}>
             <AddToCollection key={inspect.id} card={inspect} showToast={showToast} onAdded={bumpOwned} />
           </CardInspectorModal>
         </Suspense>

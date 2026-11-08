@@ -5,7 +5,7 @@
 // rate-limited bulkFetchByIdentifier({ upstream: true }). Writing those quotes
 // back goes through cacheCards, whose upsert never lets a price-less row
 // overwrite a real quote.
-const PRICE_FIELDS = ['price_trend', 'price_normal', 'price_holofoil', 'price_etched', 'price_currency', 'price_source'];
+const PRICE_FIELDS = ['price_trend', 'price_normal', 'price_holofoil', 'price_etched', 'price_currency', 'price_source', 'price_estimated'];
 const UPSTREAM_CAP = 150;
 // A cached row can carry price_source but no number at all: it was quoted
 // before the market had one (a set fetched before release, e.g. Mystery
@@ -16,14 +16,19 @@ const UPSTREAM_CAP = 150;
 const EMPTY_RETRY_MS = 6 * 60 * 60 * 1000;
 const emptyCheckedAt = new Map();
 
-const hasQuote = (r) => [r.price_normal, r.price_holofoil, r.price_etched]
-  .some(v => v != null && Number(v) > 0) || Number(r.price_trend) > 0;
+// An estimate (cheapest sibling's quote) is not this printing's quote.
+const hasQuote = (r) => !Number(r.price_estimated) && ([r.price_normal, r.price_holofoil, r.price_etched]
+  .some(v => v != null && Number(v) > 0) || Number(r.price_trend) > 0);
 
 function copyPrices(target, src) {
   for (const f of PRICE_FIELDS) if (src[f] !== undefined) target[f] = src[f];
 }
 
-// deps: { db, bulkFetchByIdentifier, cacheCards, timeoutMs }
+// How long a search page may wait for upstream quotes before it is returned
+// with what card_cache had; the fetch keeps running and caches for next time.
+const UPSTREAM_WAIT_MS = 1500;
+
+// deps: { db, bulkFetchByIdentifier, cacheCards, timeoutMs, coolingDown }
 async function mergeSearchPrices(cards, deps) {
   if (!Array.isArray(cards) || cards.length === 0) return { cached: 0, fetched: 0 };
   const need = cards.filter(c => c && c.id && c.price_source == null);
@@ -56,11 +61,14 @@ async function mergeSearchPrices(cards, deps) {
     if (priced.length && deps.cacheCards) await deps.cacheCards(priced);
     return priced;
   })();
+  // Scryfall rate-limited us: the queue is paused (60 s), so waiting would only
+  // stall the page. Answer now; the queued fetch prices the next view.
+  if (deps.coolingDown && deps.coolingDown()) { work.catch(() => {}); return { cached, fetched: 0 }; }
   let priced = null;
   try {
     priced = await Promise.race([
       work,
-      new Promise(resolve => setTimeout(() => resolve(null), deps.timeoutMs ?? 6000)),
+      new Promise(resolve => setTimeout(() => resolve(null), deps.timeoutMs ?? UPSTREAM_WAIT_MS)),
     ]);
   } catch (e) {
     console.error('search price fetch failed:', e.message);

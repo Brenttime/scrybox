@@ -48,7 +48,8 @@ router.get('/:share_token', async (req, res) => {
         cc.image_url,
         cc.price_trend,
         cc.price_normal,
-        cc.price_holofoil
+        cc.price_holofoil,
+        cc.price_estimated
       FROM collection c
       JOIN card_cache cc ON c.card_id = cc.id
       ${filterSql}
@@ -65,6 +66,7 @@ router.get('/:share_token', async (req, res) => {
     let totalCards = 0;
     let uniqueCards = formatted.length;
     let totalValue = 0;
+    let estimatedCards = 0;
 
     const typeCounts = {};
     const rarityCounts = {};
@@ -76,6 +78,7 @@ router.get('/:share_token', async (req, res) => {
 
       totalCards += qty;
       totalValue += qty * price;
+      if (row.price_estimated && price > 0) estimatedCards += qty;
 
       row.types.forEach(t => {
         typeCounts[t] = (typeCounts[t] || 0) + qty;
@@ -101,7 +104,8 @@ router.get('/:share_token', async (req, res) => {
         summary: {
           totalCards,
           uniqueCards,
-          totalValue: parseFloat(totalValue.toFixed(2))
+          totalValue: parseFloat(totalValue.toFixed(2)),
+          estimatedCards,
         },
         types: Object.keys(typeCounts).map(name => ({ name, value: typeCounts[name] })),
         rarities: Object.keys(rarityCounts).map(name => ({ name, value: rarityCounts[name] })),

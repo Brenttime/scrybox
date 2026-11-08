@@ -139,6 +139,20 @@ export function createCollectionSessionCache({ maxEntries = DEFAULT_MAX_ENTRIES 
       evict();
     },
 
+    // In-place edit of a cached entry's rows (e.g. one card edited in the
+    // details sheet) without starting a new hydration generation.
+    patch(query, fn) {
+      const scope = getScope(query);
+      if (!scope) return false;
+      const entry = entries.get(entryKeyFor(scope, query));
+      if (!entry) return false;
+      const rows = fn(entry.rows);
+      if (!Array.isArray(rows)) return false;
+      entry.total = Math.max(rows.length, entry.total + (rows.length - entry.rows.length));
+      entry.rows = rows;
+      return true;
+    },
+
     invalidate(query) {
       const scope = getScope(query);
       if (!scope) return;
@@ -188,3 +202,49 @@ export function waitForCollectionIdle({ signal, timeout = 250, fallbackDelay = 3
 }
 
 export const collectionSessionCache = createCollectionSessionCache();
+
+// On a slow link the 2000-row background pages (~175 KB gzip each, two in
+// flight) shared bandwidth with the first screen of card images: on an
+// emulated Fast 3G phone the visible cards took ~7 s to appear while the
+// catalog downloaded. Wait (bounded) for the images that are on screen right
+// now before starting the background pages. Fast networks finish this in a
+// frame; the timeout keeps filters/totals from waiting forever.
+export function waitForFirstScreenImages({
+  signal,
+  timeout = 4000,
+  images = typeof document !== 'undefined' ? Array.from(document.images) : [],
+  viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0,
+} = {}) {
+  if (signal?.aborted) return Promise.resolve(false);
+  const pending = images.filter(img => {
+    if (!img || img.complete) return false;
+    const rect = typeof img.getBoundingClientRect === 'function' ? img.getBoundingClientRect() : null;
+    return !rect || (rect.bottom > 0 && rect.top < viewportHeight);
+  });
+  if (!pending.length) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let left = pending.length;
+    let settled = false;
+    const cleanups = [];
+    const finish = (active) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanups.forEach(fn => fn());
+      signal?.removeEventListener('abort', onAbort);
+      resolve(active);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(!signal?.aborted), timeout);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    for (const img of pending) {
+      const done = () => { left -= 1; if (left <= 0) finish(!signal?.aborted); };
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+      cleanups.push(() => {
+        img.removeEventListener('load', done);
+        img.removeEventListener('error', done);
+      });
+    }
+  });
+}

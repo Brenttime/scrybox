@@ -169,28 +169,75 @@ async function list() {
 //     since), and scanning it returns the nearest wrong card rather than nothing.
 //
 // Keyed by lowercased set_id, which is what the scan filter matches on.
-async function setCounts(game, lang = 'English') {
-  const rows = await db.all(
-    `SELECT id, LOWER(set_id) sid FROM card_cache
-      WHERE language = ? AND set_id IS NOT NULL AND set_id != ''
-        AND image_url IS NOT NULL AND image_url != ''`,
-    [lang]
-  );
-  let embedded = null;
-  try {
-    if (fs.existsSync(metaPath(game, lang))) {
-      embedded = new Set(JSON.parse(fs.readFileSync(metaPath(game, lang), 'utf8')).ids);
-    }
-  } catch { embedded = null; }
+// /scan-sets is polled by the scanner's set picker. Each call used to scan
+// card_cache and synchronously read + JSON.parse the catalog meta file. Both
+// halves are memoized: the parsed id Set on the meta file's (mtime, size), and
+// the per-set counts on that plus collection_read_revision (bumped by triggers
+// on every card_cache write). `published` is still checked live (a cheap stat).
+const embeddedMemo = new Map(); // metaPath -> { stamp, ids }
+const setCountMemo = new Map(); // `${game}|${lang}` -> { key, sets, local }
 
-  const sets = {};
-  for (const r of rows) {
-    const e = sets[r.sid] || (sets[r.sid] = { cached: 0, embedded: 0 });
-    e.cached++;
-    if (embedded && embedded.has(r.id)) e.embedded++;
+function metaStamp(file) {
+  try {
+    const st = fs.statSync(file);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function embeddedIds(file, stamp) {
+  if (!stamp) return null;
+  const hit = embeddedMemo.get(file);
+  if (hit && hit.stamp === stamp) return hit.ids;
+  let ids = null;
+  try { ids = new Set(JSON.parse(fs.readFileSync(file, 'utf8')).ids); } catch { ids = null; }
+  embeddedMemo.set(file, { stamp, ids });
+  return ids;
+}
+
+async function cardCacheRevision() {
+  try {
+    const row = await db.get('SELECT revision FROM collection_read_revision WHERE id = 1');
+    return row ? row.revision : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setCounts(game, lang = 'English') {
+  const file = metaPath(game, lang);
+  const stamp = metaStamp(file);
+  const rev = await cardCacheRevision();
+  const memoKey = `${game}|${lang}`;
+  const key = rev == null ? null : `${rev}|${stamp}`;
+  const memo = setCountMemo.get(memoKey);
+  let sets;
+  let embedded;
+  if (key && memo && memo.key === key) {
+    ({ sets, embedded } = memo);
+  } else {
+    const rows = await db.all(
+      `SELECT id, LOWER(set_id) sid FROM card_cache
+        WHERE language = ? AND set_id IS NOT NULL AND set_id != ''
+          AND image_url IS NOT NULL AND image_url != ''`,
+      [lang]
+    );
+    embedded = embeddedIds(file, stamp);
+
+    sets = {};
+    for (const r of rows) {
+      const e = sets[r.sid] || (sets[r.sid] = { cached: 0, embedded: 0 });
+      e.cached++;
+      if (embedded && embedded.has(r.id)) e.embedded++;
+    }
+    // Only keep it if nothing wrote card_cache while we were reading.
+    if (key && (await cardCacheRevision()) === rev) setCountMemo.set(memoKey, { key, sets, embedded });
   }
   return {
-    game, lang, sets,
+    game, lang,
+    // A copy, so a caller mutating the response can't poison the memo.
+    sets: Object.fromEntries(Object.entries(sets).map(([k, v]) => [k, { ...v }])),
     // Whether `embedded` means anything. A published .npz catalog is keyed by
     // provider ids rather than card_cache ids, so it cannot be counted per set —
     // say so instead of reporting zeros that read as "nothing is built".
