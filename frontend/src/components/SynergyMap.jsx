@@ -3,6 +3,8 @@ import cytoscape from 'cytoscape';
 import { X, ZoomIn, ZoomOut, Maximize, Shuffle, Link2 } from 'lucide-react';
 import { useT } from '../utils/i18n';
 import { buildSynergyElements, linksStorageKey, toggleLink } from '../utils/synergyGraph';
+import { DECK_ROLES, ROLE_SLUGS, roleOf, cardTagId } from '../utils/deckRoles';
+import { isLandCard } from '../utils/deckStats';
 
 // Deck Synergy map: the deck as an interactive cytoscape graph, ported from
 // Omenpath. Cards are nodes (basics skipped, commander glows gold); layers add
@@ -99,7 +101,7 @@ export default function SynergyMap({ deck, commander, onClose, onOpenCard }) {
   const boxRef = useRef(null);
   const cyRef = useRef(null);
   const [show, setShow] = useState({ edhrec: true, combos: true, tags: false });
-  const [data, setData] = useState({ synergy: null, combos: null, tags: null });
+  const [data, setData] = useState({ synergy: null, combos: null, tags: null, roleTags: null });
   const [errors, setErrors] = useState({});
   const [linkMode, setLinkMode] = useState(false);
   const [linkedOnly, setLinkedOnly] = useState(false);
@@ -126,13 +128,25 @@ export default function SynergyMap({ deck, commander, onClose, onOpenCard }) {
       const ids = [...new Set((deck.cards || []).map(c => c.card_id || c.id).filter(Boolean))];
       if (ids.length) load('tags', '/api/cards/tag-stats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }, b => b.tags || []);
     }
+    if (show.tags && data.roleTags === null) {
+      const ids = [...new Set((deck.cards || []).map(cardTagId).filter(Boolean))];
+      if (ids.length) load('roleTags', '/api/cards/role-tags', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, slugs: ROLE_SLUGS }) }, b => b.tags || {});
+    }
     return () => { alive = false; };
   }, [show, data, deck.id, deck.cards, commander]);
 
+  // Same roles as the deck's Tag view (first matching role per card); lands stay out.
+  const roles = useMemo(() => {
+    if (!data.roleTags) return null;
+    return DECK_ROLES.map(r => ({
+      key: r.key, slugs: r.slugs, label: t(`deck.group.${r.key}`),
+      ids: (deck.cards || []).filter(c => roleOf(c, data.roleTags, isLandCard) === r.key).map(c => c.id),
+    }));
+  }, [data.roleTags, deck.cards, t]);
   const { elements, counts } = useMemo(() => buildSynergyElements({
     cards: deck.cards, commander,
-    synergy: data.synergy, combos: data.combos, tags: data.tags, show, links,
-  }), [deck.cards, commander, data, show, links]);
+    synergy: data.synergy, combos: data.combos, tags: data.tags, roles, show, links,
+  }), [deck.cards, commander, data, roles, show, links]);
 
   handlers.current.tapCard = (node) => {
     if (linkMode) {
@@ -205,7 +219,7 @@ export default function SynergyMap({ deck, commander, onClose, onOpenCard }) {
   const fit = () => cyRef.current?.animate({ fit: { padding: 48 } }, { duration: 250 });
   const relayout = () => cyRef.current && runLayout(cyRef.current);
   const toggle = (k) => setShow(s => ({ ...s, [k]: !s[k] }));
-  const loading = (show.edhrec && commander && data.synergy === null) || (show.combos && data.combos === null) || (show.tags && data.tags === null);
+  const loading = (show.edhrec && commander && data.synergy === null) || (show.combos && data.combos === null) || (show.tags && (data.tags === null || data.roleTags === null));
   const errText = Object.entries(errors).filter(([k]) => (k === 'synergy' ? show.edhrec : show[k])).map(([, v]) => v).join(' · ');
 
   return (

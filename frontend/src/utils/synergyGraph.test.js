@@ -54,3 +54,12 @@ test('manual links toggle and render', () => {
   assert.equal(links.length, 0);
   assert.deepEqual(toggleLink([], a, a), []);
 });
+
+test('tags layer: deck roles first, then top Oracle tags that are not roles (cap 4)', () => {
+  const deck = ['a', 'b', 'c', 'd'].map(id => ({ id, card_id: id, name: id.toUpperCase(), quantity: 1 }));
+  const roles = [{ key: 'ramp', label: 'Ramp', slugs: ['ramp'], ids: ['a', 'b'] }, { key: 'draw', label: 'Draw', slugs: ['draw'], ids: [] }];
+  const tags = ['ramp', 't1', 't2', 't3', 't4', 't5'].map(slug => ({ slug, cards: ['c', 'd'] }));
+  const out = buildSynergyElements({ cards: deck, roles, tags, show: { tags: true } });
+  const nodes = out.elements.filter(e => e.group === 'nodes' && e.data.kind === 'tag').map(e => e.data.id);
+  assert.deepEqual(nodes, ['role:ramp', 'tag:t1', 'tag:t2', 'tag:t3', 'tag:t4']);
+});

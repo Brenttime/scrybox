@@ -34,11 +34,12 @@ export function graphCards(cards, commander) {
  * @param {Array} [p.combos]     `included` combos from /api/decks/:id/combos
  * @param {Array} [p.tags]       [{slug, label, cards:[cardId]}] from /api/cards/tag-stats
  * @param {object} p.show        { edhrec, combos, tags } layer toggles
- * @param {number} [p.maxTags]   concept-node cap for tags (default 8)
+ * @param {Array} [p.roles]      [{key, label, ids:[cardId]}] deck roles (Ramp, Draw, ...), same as the deck Tag view
+ * @param {number} [p.maxTags]   cap for extra Oracle-tag nodes beyond the roles (default 4)
  * @param {Array} [p.links]      manual links [[keyA, keyB]]
  * @returns {{ elements: Array, counts: {cards, edhrec, combos, tags, links} }}
  */
-export function buildSynergyElements({ cards, commander, synergy, combos, tags, show = {}, maxTags = 8, links = [] }) {
+export function buildSynergyElements({ cards, commander, synergy, combos, tags, roles, show = {}, maxTags = 4, links = [] }) {
   const list = graphCards(cards, commander);
   const elements = [];
   const known = new Map();
@@ -83,8 +84,21 @@ export function buildSynergyElements({ cards, commander, synergy, combos, tags, 
     });
   }
 
+  const roleSlugs = new Set();
+  if (show.tags && Array.isArray(roles)) {
+    for (const r of roles) {
+      for (const s of r.slugs || []) roleSlugs.add(s);
+      const ids = [...new Set((r.ids || []).map(x => byCardId.get(x)).filter(Boolean))];
+      if (!ids.length) continue;
+      const rid = `role:${r.key}`;
+      elements.push({ group: 'nodes', data: { id: rid, kind: 'tag', role: true, label: r.label || r.key, slug: r.key } });
+      for (const p of ids) elements.push({ group: 'edges', data: { id: `${rid}>${p}`, source: rid, target: p, kind: 'tag' } });
+      counts.tags++;
+    }
+  }
   if (show.tags && Array.isArray(tags)) {
     const usable = tags
+      .filter(t => !roleSlugs.has(t.slug))
       .map(t => ({ ...t, ids: [...new Set((t.cards || []).map(x => byCardId.get(x)).filter(Boolean))] }))
       .filter(t => t.ids.length >= 2)
       .slice(0, maxTags);
