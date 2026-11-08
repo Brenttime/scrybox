@@ -1,5 +1,5 @@
 import { useState, useEffect, lazy, Suspense } from 'react';
-import { ChevronDown, ShieldAlert, Share2, Clipboard, RefreshCw, KeyRound, Check, Database, Download, Upload, SlidersHorizontal, Info, Bug, Lightbulb, MessagesSquare, ScrollText, Github, Languages, Globe, ShoppingCart, RefreshCcw } from 'lucide-react';
+import { ChevronDown, ShieldAlert, Share2, Clipboard, RefreshCw, KeyRound, Check, Database, Download, Upload, SlidersHorizontal, Info, Bug, Lightbulb, MessagesSquare, ScrollText, Github, Languages, Globe, ShoppingCart, RefreshCcw, LogOut } from 'lucide-react';
 import { LOCALES, localeName, useT } from '../utils/i18n';
 import { REPO_URL } from '../utils/repo';
 import MoxfieldPanel from './MoxfieldPanel';
@@ -29,7 +29,7 @@ function SettingsSection({ id, icon, title, open, onToggle, children }) {
   );
 }
 
-function Settings({ user, onUpdateUser, showToast, target }) {
+function Settings({ user, onUpdateUser, showToast, target, onLogout }) {
   const { locale, setLocale, t } = useT();
   const [currentPassword, setCurrentPassword] = useState('');
   const [password, setPassword] = useState('');
@@ -756,6 +756,13 @@ function Settings({ user, onUpdateUser, showToast, target }) {
               <AdminPanel showToast={showToast} />
             </Suspense>
           </SettingsSection>
+        )}
+
+        {onLogout && (
+          <button type="button" className="btn btn-secondary settings-logout" onClick={onLogout}
+            style={{ width: '100%', justifyContent: 'center', marginTop: '0.5rem', color: 'var(--accent-red)' }}>
+            <LogOut size={16} /> {t('header.logOut')}
+          </button>
         )}
       </div>
     </div>

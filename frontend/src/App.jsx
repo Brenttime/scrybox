@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, Suspense } from 'react';
-import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, LogOut, Search, Plus, Swords, ListChecks } from 'lucide-react';
+import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, Search, Plus, Swords, ListChecks } from 'lucide-react';
 import Logo from './components/Logo';
 import PullToRefresh from './components/PullToRefresh';
 import SwipeToCloseLayers from './components/SwipeToCloseLayers';
@@ -391,7 +391,7 @@ function App() {
       case 'keywords':
         return <Keywords onNavigate={goTab} />;
       case 'settings':
-        return <Settings user={user} onUpdateUser={handleUpdateUser} showToast={showToast} target={settingsTarget} />;
+        return <Settings user={user} onUpdateUser={handleUpdateUser} showToast={showToast} target={settingsTarget} onLogout={handleLogout} />;
       default:
         return <Dashboard statsTrigger={statsTrigger} onNavigate={goTab} onUpdate={triggerRefresh} showToast={showToast} portalOn={portalOn} />;
     }
@@ -482,15 +482,6 @@ function App() {
             style={{ padding: '0.4rem 0.5rem', borderRadius: 'var(--radius-sm)' }}
           >
             <SettingsIcon size={14} />
-          </button>
-          <button
-            onClick={handleLogout}
-            className="btn btn-secondary btn-icon-only"
-            title={t('header.logOut')}
-            aria-label={t('header.logOut')}
-            style={{ padding: '0.4rem 0.5rem', borderRadius: 'var(--radius-sm)' }}
-          >
-            <LogOut size={14} />
           </button>
         </div>
       </header>
