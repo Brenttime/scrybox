@@ -1,5 +1,8 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const db = require('../db');
+const { SYNERGY_THRESHOLD, commanderSlug, synergyCards } = require('../utils/edhrecSynergy');
 const cardApi = require('../utils/cardApi');
 const { parseCardRow, recordPrice } = require('../utils/priceHelpers');
 const { validateDeckAddition, isBasicLand } = require('../utils/deckRules');
@@ -265,6 +268,69 @@ router.get('/:id/combos', async (req, res) => {
   } catch (error) {
     console.error('find-my-combos failed:', error.message);
     res.status(502).json({ error: 'Commander Spellbook is unreachable right now' });
+  }
+});
+
+// Synergy map: EDHREC's commander page, trimmed to cards with synergy >= 0.35.
+// Server-side because json.edhrec.com sends no CORS headers. Pages are cached
+// per commander slug on the persistent volume (24 h, stale fallback on error).
+const EDHREC_URL = 'https://json.edhrec.com/pages/commanders/';
+const EDHREC_CACHE_DIR = process.env.EDHREC_CACHE_DIR || path.join(__dirname, '../../../database/edhrec-cache');
+const EDHREC_TTL_MS = 24 * 3600e3;
+const edhrecMem = new Map(); // slug -> { t, cards }
+
+async function edhrecSynergyFor(slug) {
+  const mem = edhrecMem.get(slug);
+  if (mem && Date.now() - mem.t < EDHREC_TTL_MS) return mem.cards;
+  const file = path.join(EDHREC_CACHE_DIR, `${slug}.json`);
+  let disk = null;
+  try { disk = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { disk = null; }
+  if (disk && Date.now() - disk.t < EDHREC_TTL_MS) { edhrecMem.set(slug, disk); return disk.cards; }
+  try {
+    const r = await fetch(EDHREC_URL + encodeURIComponent(slug) + '.json', {
+      headers: { Accept: 'application/json', 'User-Agent': 'Scrybox/1.0' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (r.status === 404 || r.status === 403) {
+      const entry = { t: Date.now(), cards: null };
+      edhrecMem.set(slug, entry);
+      return null;
+    }
+    if (!r.ok) throw new Error(`EDHREC answered ${r.status}`);
+    const entry = { t: Date.now(), cards: synergyCards(await r.json()) };
+    edhrecMem.set(slug, entry);
+    try { fs.mkdirSync(EDHREC_CACHE_DIR, { recursive: true }); fs.writeFileSync(file, JSON.stringify(entry)); } catch { /* best effort */ }
+    return entry.cards;
+  } catch (err) {
+    if (disk) return disk.cards;
+    throw err;
+  }
+}
+
+router.get('/:id/synergy', async (req, res) => {
+  try {
+    const deck = await db.get(`SELECT id FROM decks WHERE id = ? AND user_id = ?`, [req.params.id, req.user.id]);
+    if (!deck) return res.status(404).json({ error: 'Deck not found or unauthorized' });
+    const rows = await db.all(`
+      SELECT DISTINCT cc.name FROM deck_cards dc JOIN card_cache cc ON cc.id = dc.card_id
+      WHERE dc.deck_id = ? AND dc.is_commander = 1 ORDER BY cc.name`, [deck.id]);
+    let names = rows.map(r => r.name);
+    const hint = typeof req.query.commander === 'string' ? req.query.commander.slice(0, 200) : '';
+    if (!names.length && hint) names = [hint];
+    if (!names.length) return res.json({ commander: null, threshold: SYNERGY_THRESHOLD, cards: [] });
+    // Partner pairs live on a combined page (names sorted); fall back to the first commander.
+    const slugs = [];
+    if (names.length > 1) slugs.push(names.map(commanderSlug).sort().join('-'));
+    slugs.push(commanderSlug(names[0]));
+    for (const slug of slugs) {
+      if (!slug) continue;
+      const cards = await edhrecSynergyFor(slug);
+      if (cards) return res.json({ commander: names.join(' + '), slug, threshold: SYNERGY_THRESHOLD, cards });
+    }
+    res.json({ commander: names.join(' + '), slug: null, threshold: SYNERGY_THRESHOLD, cards: [] });
+  } catch (error) {
+    console.error('edhrec synergy failed:', error.message);
+    res.status(502).json({ error: 'EDHREC is unreachable right now' });
   }
 });
 

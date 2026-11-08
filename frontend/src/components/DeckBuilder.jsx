@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart, Tags, Shapes, Highlighter, Infinity as InfinityIcon, Sparkles, BarChart3 } from 'lucide-react';
+import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart, Tags, Shapes, Highlighter, Infinity as InfinityIcon, Sparkles, BarChart3, Network } from 'lucide-react';
 import CombosModal from './CombosModal';
+// cytoscape is heavy: only load it when the Synergy map is opened.
+const SynergyMap = lazy(() => import('./SynergyMap'));
 import OtagExplorer from './OtagExplorer';
 import { groupByRole, ROLE_SLUGS, cardTagId } from '../utils/deckRoles';
 import { bottomsOwed, buildLibrary, deal, putOnBottom, isCommanderDeck } from '../utils/mulligan';
@@ -72,6 +74,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   // cards stay lit, the rest dim, and the panel shows stats for the match.
   const [hlQuery, setHlQuery] = useState('');
   const [showCombos, setShowCombos] = useState(false);
+  const [showSynergy, setShowSynergy] = useState(false);
   const [tagStats, setTagStats] = useState({ key: '', tags: null });
   const [tagStatsAll, setTagStatsAll] = useState(false);
   const [otagOpen, setOtagOpen] = useState(null); // tag row being explored
@@ -189,6 +192,7 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   useBackGuard(showCreateModal, () => setShowCreateModal(false));
   useBackGuard(showSimulator, () => setShowSimulator(false));
+  useBackGuard(showSynergy, () => setShowSynergy(false));
   useBackGuard(missingOpen, () => setMissingOpen(false));
 
   // Leaving the detail view has to clear BOTH halves of the view state. The two
@@ -1658,6 +1662,9 @@ function DeckBuilder({ showToast, onNavigate }) {
                 <button role="menuitem" style={moreItem} onClick={startSimulator}>
                   <Play size={14} /> {t('deck.drawHand')}
                 </button>
+                <button role="menuitem" style={moreItem} onClick={() => setShowSynergy(true)}>
+                  <Network size={14} /> {t('deck.synergyMap')}
+                </button>
                 {canRegister && (
                   <button role="menuitem" style={moreItem} onClick={handleRegisterInCollection} disabled={busy} title={t('deck.registerCollectionHint')}>
                     <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
@@ -1988,6 +1995,9 @@ function DeckBuilder({ showToast, onNavigate }) {
                 <button type="button" className="coll-more-row" onClick={() => { setPalette(null); setShowCombos(true); }}>
                   <span className="dk-palette-l"><InfinityIcon size={18} /> {t('combos.button')}</span>
                 </button>
+                <button type="button" className="coll-more-row" onClick={() => { setPalette(null); setShowSynergy(true); }}>
+                  <span className="dk-palette-l"><Network size={18} /> {t('deck.synergyMap')}</span>
+                </button>
                 <button type="button" className="coll-more-row" onClick={() => setGroupMode(groupMode === 'tags' ? 'type' : 'tags')}>
                   <span className="dk-palette-l">{groupMode === 'tags' ? <Tags size={18} /> : <Shapes size={18} />} {t('deck.groupMode')}</span>
                   <span className="dk-palette-v">{groupMode === 'tags' ? t('deck.groupTags') : t('deck.groupType')}</span>
@@ -2006,6 +2016,12 @@ function DeckBuilder({ showToast, onNavigate }) {
           onHighlight={() => setHlQuery(`otag:${otagOpen.slug}`)}
           onClose={() => setOtagOpen(null)} />
       )}
+      {showSynergy && activeDeck && (
+        <Suspense fallback={null}>
+          <SynergyMap deck={activeDeck} commander={commanderCard} onClose={() => setShowSynergy(false)} onOpenCard={(card) => openCardSheet(card, 'main')} />
+        </Suspense>
+      )}
+
       {showCombos && activeDeck && (
         <CombosModal deckId={activeDeck.id} deckName={activeDeck.name} onClose={() => setShowCombos(false)} />
       )}
