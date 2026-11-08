@@ -83,11 +83,6 @@ function DeckBuilder({ showToast, onNavigate }) {
   // preview for list rows, and prices behind a persisted $ toggle (off).
   const [sheetRef, setSheetRef] = useState(null);
   const [hoverCard, setHoverCard] = useState(null);
-  const [showPrices, setShowPricesState] = useState(() => localStorage.getItem('deckShowPrices') === '1');
-  const setShowPrices = (on) => {
-    setShowPricesState(on);
-    localStorage.setItem('deckShowPrices', on ? '1' : '0');
-  };
   // Same details the Collection shows: open the owned collection entry in the
   // shared CardInspectorModal (read-only fallback when not owned). Deck
   // quantity / remove ride along as extra controls for main-board cards.
@@ -1779,14 +1774,10 @@ function DeckBuilder({ showToast, onNavigate }) {
                     <Tags size={13} /> <span className="dk-seg-label">{t('deck.groupTags')}</span>
                   </button>
                 </div>
-                <button type="button" className={`deck-chip deck-chip-btn${showPrices ? ' on' : ''}`} aria-pressed={showPrices}
-                  title={t('deck.togglePrices')} aria-label={t('deck.togglePrices')} onClick={() => setShowPrices(!showPrices)}>
-                  $
-                </button>
               </div>
 
               {/* Deck Cards Header & Display Mode Toggle */}
-              <div className={`deck-pane-cards dk-cards${showPrices ? ' dk-prices' : ''}${hl.names ? ' dk-hl-on' : ''}`}>
+              <div className={`deck-pane-cards dk-cards dk-prices${hl.names ? ' dk-hl-on' : ''}`}>
                 {!showMaybe && activeDeck.cards.length === 0 ? (
                   <p className="dk-empty">{t('deck.emptyDeck')}</p>
                 ) : (
@@ -1834,7 +1825,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                                     {card.cmc !== null && card.cmc !== undefined && !isLandCard(card) && <span className="dk-row-cmc">{card.cmc}</span>}
                                   </span>
                                   <span className="dk-row-set">{(card.set_id || '').toUpperCase()}</span>
-                                  {showPrices && <span className="dk-row-price">{cardPriceLabel(card)}</span>}
+                                  <span className="dk-row-price">{cardPriceLabel(card)}</span>
                                 </button>
                               );
                             })}
@@ -1853,7 +1844,7 @@ function DeckBuilder({ showToast, onNavigate }) {
                                   {short > 0 && !isBasicLand(card) && (
                                     <span className="dk-tile-missing" title={t('deck.rowMissingTitle', { need: card.quantity, have: card.owned_qty || 0 })}>{t('deck.missingBadge', { count: short })}</span>
                                   )}
-                                  {showPrices && <span className="deck-card-price-chip">{cardPriceLabel(card)}</span>}
+                                  <span className="deck-card-price-chip">{cardPriceLabel(card)}</span>
                                 </button>
                               );
                             })}

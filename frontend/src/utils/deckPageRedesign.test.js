@@ -51,8 +51,8 @@ assert.doesNotMatch(editor, /x\{card\.quantity\}/, 'no x1 badges');
 assert.match(editor, /card\.quantity > 1 &&/, 'quantity badge only above one');
 assert.doesNotMatch(editor, /Trash2 size=\{1[01]\}/, 'no per-card trash buttons');
 assert.equal((editor.match(/className="btn btn-primary"/g) || []).length, 3, 'three mutually exclusive primaries');
-assert.match(deckBuilder, /localStorage\.setItem\('deckShowPrices'/, '$ toggle persists');
-assert.match(deckBuilder, /localStorage\.getItem\('deckShowPrices'\) === '1'/, 'prices default off');
+assert.doesNotMatch(editor, /deckShowPrices|togglePrices/, 'no $ toggle: prices always shown');
+assert.match(editor, /dk-cards dk-prices/, 'deck cards always carry prices');
 assert.equal(en['deck.group.Sorcery'], 'Sorceries');
 for (const k of ['Creature', 'Planeswalker', 'Instant', 'Enchantment', 'Artifact', 'Battle', 'Land', 'Other']) {
   assert.ok(en[`deck.group.${k}`], `missing deck.group.${k}`);
