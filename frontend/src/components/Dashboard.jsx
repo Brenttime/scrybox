@@ -198,7 +198,20 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast, portalOn = f
   const [cotd, setCotd] = useState(null);
   // Coin flip per page load: roughly every other load/reload features the
   // commander (the commander itself is fixed for the day).
-  const [showCotd] = useState(() => Math.random() < 0.5);
+  // Art tile rotation, one pick per page load: top card, commander of the
+  // day, or today's biggest gainer. Unavailable picks fall back to the top card.
+  const [artPick] = useState(() => ['top', 'cotd', 'mover'][Math.floor(Math.random() * 3)]);
+  const showCotd = artPick === 'cotd';
+  const [mover, setMover] = useState(null);
+  useEffect(() => {
+    if (artPick !== 'mover') return undefined;
+    let alive = true;
+    fetch('/api/stats/top-mover')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (alive && d && d.card) setMover(d); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [artPick]);
   useEffect(() => {
     // Only the coin-flip loads that feature the commander need it.
     if (!showCotd) return undefined;
@@ -333,6 +346,16 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast, portalOn = f
               <span className="dash-sub dim">{t('dash.commanderOfDaySub')}</span>
             </span>
           </a>
+        ) : mover && artPick === 'mover' ? (
+          <button type="button" className="dash-tile dash-art" onClick={() => setInspectorCard(mover.card)}>
+            <CardImage card={mover.card} src={artCrop(mover.card.image_url)} fallbackSrc={mover.card.image_url} className="dash-art-img" alt="" />
+            <span className="dash-art-shade" />
+            <span className="dash-art-cap">
+              <span className="dash-k"><TrendingUp size={12} style={{ verticalAlign: '-1px', marginRight: 4 }} />{t('dash.topMover')}</span>
+              <span className="dash-art-name">{name(mover.card)}</span>
+              <span className="dash-art-price">{t('dash.topMoverSub', { price: `$${mover.price.toFixed(2)}`, gain: `+$${mover.gain.toFixed(2)}`, pct: mover.pct })}</span>
+            </span>
+          </button>
         ) : top && (
           <button type="button" className="dash-tile dash-art" onClick={() => setInspectorCard(top)}>
             <CardImage card={top} src={artCrop(top.image_url)} fallbackSrc={top.image_url} className="dash-art-img" alt="" />

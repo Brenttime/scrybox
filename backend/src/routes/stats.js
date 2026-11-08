@@ -809,4 +809,52 @@ router.get('/stats/commander-of-the-day', async (req, res) => {
   }
 });
 
+// Biggest gainer: the owned (non-proxy) card whose per-copy price rose the
+// most versus its last recorded price at least 24 h ago. price_history is
+// written by the daily price sweep, so this is "today's" move.
+router.get('/stats/top-mover', cached(() => 'top-mover', async (req, res) => {
+  try {
+    const row = await db.get(`
+      WITH o AS (
+        SELECT card_id, MIN(id) AS entry_id
+        FROM collection
+        WHERE user_id = ? AND COALESCE(is_proxy, 0) = 0
+        GROUP BY card_id
+      ),
+      p AS (
+        SELECT o.card_id, o.entry_id,
+               (SELECT price FROM price_history ph WHERE ph.card_id = o.card_id
+                ORDER BY ph.recorded_at DESC LIMIT 1) AS cur,
+               (SELECT price FROM price_history ph WHERE ph.card_id = o.card_id
+                  AND ph.recorded_at <= datetime('now', '-24 hours')
+                ORDER BY ph.recorded_at DESC LIMIT 1) AS prev
+        FROM o
+      )
+      SELECT p.cur, p.prev, p.cur - p.prev AS gain,
+             c.id AS entry_id, c.quantity, c.condition, c.printing, c.language, c.purchase_price, c.is_proxy,
+             cc.id AS card_id, cc.name, cc.printed_name, cc.rarity, cc.set_name, cc.set_id, cc.number, cc.image_url,
+             cc.supertype, cc.subtypes, cc.types, cc.cmc, cc.color_identity, cc.price_trend,
+             cc.price_normal, cc.price_holofoil, cc.price_estimated
+      FROM p
+      JOIN collection c ON c.id = p.entry_id
+      JOIN card_cache cc ON cc.id = p.card_id
+      WHERE p.prev > 0 AND p.cur > p.prev
+      ORDER BY gain DESC
+      LIMIT 1
+    `, [req.user.id]);
+    if (!row) return res.json({ card: null });
+    const { cur, prev, gain, ...card } = row;
+    res.json({
+      card: { ...card, price_trend: cur },
+      prev: Math.round(prev * 100) / 100,
+      price: Math.round(cur * 100) / 100,
+      gain: Math.round(gain * 100) / 100,
+      pct: Math.round((gain / prev) * 1000) / 10,
+    });
+  } catch (err) {
+    console.error('top-mover failed:', err.message);
+    res.status(500).json({ error: 'Top mover unavailable' });
+  }
+}));
+
 module.exports = router;
