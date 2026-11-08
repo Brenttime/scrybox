@@ -5,13 +5,13 @@ import { useSwipeBack } from '../utils/useSwipeBack';
 // top. Card details keep their own hook (.ci-overlay is skipped here).
 const LAYERS = '.fs-sheet-backdrop, .modal-overlay:not(.ci-overlay), .quick-add-drawer.open';
 
-export const topLayer = () => {
+const topLayer = () => {
   const all = document.querySelectorAll(LAYERS);
   return all.length ? all[all.length - 1] : null;
 };
 
 // Close it the way a tap would: an explicit close button, else the backdrop.
-export function closeLayer(el) {
+function closeLayer(el) {
   if (!el) return;
   if (el.matches('.quick-add-drawer')) {
     const backdrop = el.previousElementSibling?.matches('.drawer-backdrop') ? el.previousElementSibling : null;
