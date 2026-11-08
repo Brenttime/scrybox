@@ -124,6 +124,8 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   const [showBuy, setShowBuy] = useState(false);
   const [buyText, setBuyText] = useState('');
   const [buyLoading, setBuyLoading] = useState(false);
+  // Buy modal scope: only the copies not owned yet, or the whole list.
+  const [buyMissingOnly, setBuyMissingOnly] = useState(true);
   // false (fine) | 'empty' (list has no cards) | 'failed' (request broke)
   const [buyError, setBuyError] = useState('');
 
@@ -762,13 +764,12 @@ function Lists({ showToast, handoff, onHandoffDone }) {
   // Fetch the plain list when the modal opens (not on header click): an
   // in-flight fetch never races a user activation, so no tab is opened before
   // its payload exists. Cached afterwards; switching lists invalidates it.
-  const openBuy = async () => {
-    setShowBuy(true);
+  const loadBuyText = async (missingOnly) => {
     setBuyError(false);
-    if (buyText) return;
+    setBuyText('');
     setBuyLoading(true);
     try {
-      const res = await fetch(`/api/lists/${activeList.id}/cardlist?style=plain`);
+      const res = await fetch(`/api/lists/${activeList.id}/cardlist?style=plain${missingOnly ? '&missing=1' : ''}`);
       if (!res.ok) throw new Error('export failed');
       const text = await res.text();
       if (text.trim()) setBuyText(text);
@@ -779,6 +780,16 @@ function Lists({ showToast, handoff, onHandoffDone }) {
     } finally {
       setBuyLoading(false);
     }
+  };
+  const openBuy = () => {
+    const anyMissing = (listDetail?.cards || []).some(c => (c.owned_qty || 0) < c.quantity);
+    setBuyMissingOnly(anyMissing);
+    setShowBuy(true);
+    loadBuyText(anyMissing);
+  };
+  const toggleBuyMissing = (on) => {
+    setBuyMissingOnly(on);
+    loadBuyText(on);
   };
 
   const buyLineCount = buyText ? buyText.split('\n').filter(l => l.trim()).length : 0;
@@ -1040,9 +1051,9 @@ function Lists({ showToast, handoff, onHandoffDone }) {
         <div className="list-editor-header-actions" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
           {/* Everyday actions sit in view (one sideways row on a phone); the
               menu keeps only the rare and destructive ones. */}
-          {(listDetail?.cards || []).some(c => (c.owned_qty || 0) < c.quantity) && (
+          {(listDetail?.cards || []).length > 0 && (
             <button className="btn btn-primary" onClick={openBuy} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-              <ShoppingCart size={16} /> {t('lists.buyMissing')}
+              <ShoppingCart size={16} /> {t('lists.buyShort')}
             </button>
           )}
           <button className="btn btn-secondary" onClick={openCopy} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
@@ -1336,7 +1347,13 @@ function Lists({ showToast, handoff, onHandoffDone }) {
               aria-label={t('common.close')} title={t('common.close')}
               style={{ position: 'absolute', top: '0.75rem', right: '0.75rem', zIndex: 1 }}><X size={16} /></button>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-strong)', margin: '0 0 0.35rem', paddingRight: '2.25rem' }}>{t('lists.buyList')}</h3>
-            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{activeList.name}</div>
+            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.75rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{activeList.name}</div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: 'var(--text-primary)', marginBottom: '1rem', cursor: 'pointer' }}>
+              <input type="checkbox" checked={buyMissingOnly} disabled={buyLoading}
+                onChange={e => toggleBuyMissing(e.target.checked)}
+                style={{ width: 18, height: 18, accentColor: 'var(--mb-accent, #ff7a1a)' }} />
+              {t('lists.buyOnlyMissing')}
+            </label>
 
             {/* Provider choices — flat bordered cards, no glass, wrap on narrow screens */}
             <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>

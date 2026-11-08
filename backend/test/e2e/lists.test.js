@@ -139,6 +139,14 @@ async function runTests() {
       '1 Mox Diamond',
     ], 'plain export is name+qty only, sorted by name');
 
+    // missing=1: owned copies subtracted, fully owned cards dropped (Bolt: want 4, own 2)
+    const resM = await fetch(`http://localhost:${port}/api/lists/${listId}/cardlist?missing=1`, { headers: authHeaders });
+    assert.strictEqual(resM.status, 200);
+    const missingLines = (await resM.text()).trim().split('\n');
+    assert.ok(missingLines.includes('2 Lightning Bolt'), 'only the 2 missing Bolts');
+    assert.ok(missingLines.includes("2 Gaea's Cradle"), 'unowned card keeps its full quantity');
+    assert.ok(!missingLines.includes('4 Lightning Bolt'));
+
     const resDP = await fetch(`http://localhost:${port}/api/lists/${listId}/cardlist?style=detailed`, { headers: authHeaders });
     assert.strictEqual(resDP.status, 200);
     const detailed = (await resDP.text()).trim().split('\n');

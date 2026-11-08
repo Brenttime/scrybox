@@ -231,6 +231,7 @@ router.get('/:id', async (req, res) => {
 router.get('/:id/cardlist', async (req, res) => {
   const { id } = req.params;
   const style = req.query.style === 'detailed' ? 'detailed' : 'plain';
+  const missingOnly = req.query.missing === '1';
   try {
     const list = await db.get(`SELECT id FROM card_lists WHERE id = ? AND user_id = ?`, [id, req.user.id]);
     if (!list) {
@@ -251,12 +252,26 @@ router.get('/:id/cardlist', async (req, res) => {
          JOIN card_cache list_cc ON list_cc.id = lc.card_id
          WHERE lc.list_id = ? AND lc.quantity > 0
          GROUP BY ${sqlCardKey('list_cc')}
+       ),
+       owned AS (
+         SELECT
+           ${sqlCardKey('owned_cc')} AS card_key,
+           SUM(collection_row.quantity) AS quantity
+         FROM card_cache owned_cc
+         CROSS JOIN collection collection_row
+         WHERE ? = 1
+           AND collection_row.card_id = owned_cc.id
+           AND collection_row.user_id = ? AND collection_row.quantity > 0
+           AND ${sqlCardKey('owned_cc')} IN (SELECT card_key FROM requested)
+         GROUP BY ${sqlCardKey('owned_cc')}
        )
-       SELECT requested.quantity, cc.name, cc.set_id, cc.number
+       SELECT requested.quantity - COALESCE(owned.quantity, 0) AS quantity, cc.name, cc.set_id, cc.number
        FROM requested
        JOIN card_cache cc ON cc.id = requested.representative_id
+       LEFT JOIN owned ON owned.card_key = requested.card_key
+       WHERE requested.quantity - COALESCE(owned.quantity, 0) > 0
        ORDER BY cc.name ASC`,
-      [id]
+      [id, missingOnly ? 1 : 0, req.user.id]
     );
     res.type('text/plain').send(buildCardListText(rows, style));
   } catch (error) {
