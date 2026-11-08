@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, Suspense } from 'react';
-import { LayoutDashboard, Database, Sparkles, Settings as SettingsIcon, Search, Plus, Swords, ListChecks } from 'lucide-react';
+import { LayoutDashboard, Database, Settings as SettingsIcon, Search, Plus, Swords, ListChecks } from 'lucide-react';
 import Logo from './components/Logo';
 import PullToRefresh from './components/PullToRefresh';
 import SwipeToCloseLayers from './components/SwipeToCloseLayers';
@@ -457,10 +457,6 @@ function App() {
         </nav>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-            <Sparkles size={14} style={{ color: 'var(--accent-yellow)' }} />
-            <span><strong style={{ color: 'var(--text-strong)' }}>{user.username}</strong></span>
-          </div>
           {portalOn && (
             <button
               onClick={() => goTab('scryfall')}
