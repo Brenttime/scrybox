@@ -1920,6 +1920,18 @@ select optgroup,
   .dk-head-actions > .btn-icon-only { padding: 0.45rem 0.2rem !important; }
 }
 
+/* Deck header row on phones: compact (Brent: 60px read too large). */
+@media (max-width: 720px) {
+  .dk-head-actions > .btn {
+    height: 44px !important;
+    gap: 0.15rem !important;
+    padding: 0.3rem 0.2rem;
+    font-size: 0.64rem;
+  }
+  .dk-head-actions > .btn svg { width: 15px; height: 15px; }
+  .dk-head-actions > .btn-icon-only { padding: 0.3rem 0.2rem !important; }
+}
+
 /* Deck editor commander banner: off unless a theme opts in (see theme-manabox.css). */
 .deck-editor-header-art { display: none; }
 
