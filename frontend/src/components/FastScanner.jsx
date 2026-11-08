@@ -297,14 +297,14 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     if (candidates.some(c => c.edge_sides?.length)) {
       const m = 0.015;
       const [[x0, y0], , [x1, y1]] = quadPath({ box: [frame.width * m, frame.height * m, frame.width * (1 - 2 * m), frame.height * (1 - 2 * m)] }, fit);
-      ctx.save(); ctx.setLineDash([8, 6]); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(251,191,36,0.85)';
+      ctx.save(); ctx.setLineDash([8, 6]); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,122,26,0.85)';
       ctx.strokeRect(Math.max(2, x0), Math.max(2, y0), Math.min(W - 4, x1 - x0), Math.min(H - 4, y1 - y0));
       ctx.restore();
     }
     for (const cand of candidates) {
       const r = byNumber.get(cand.number);
       const good = r?.ok;
-      const color = good ? '#34d399' : cand.eligible ? '#fbbf24' : 'rgba(255,255,255,0.45)';
+      const color = good ? '#34d399' : cand.eligible ? '#ff7a1a' : 'rgba(255,255,255,0.45)';
       const pts = quadPath(cand, fit);
       ctx.lineJoin = 'round';
       ctx.lineWidth = 3;
