@@ -1055,9 +1055,6 @@ function Lists({ showToast, handoff, onHandoffDone }) {
             <PackagePlus size={15} /> {t('lists.registerShort')}
           </button>
           <OverflowMenu label={t('lists.moreActions')}>
-            <button role="menuitem" style={menuItem} onClick={openBuy}>
-              <ShoppingCart size={14} /> {t('lists.buyList')}
-            </button>
             <button role="menuitem" style={{ ...menuItem, color: 'var(--accent-red)' }} onClick={pullFromCollection}>
               <PackageMinus size={14} /> {t('lists.pullButton')}
             </button>
