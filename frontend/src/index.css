@@ -1967,12 +1967,12 @@ select optgroup,
 .fs-icon:hover:not(:disabled) { background: rgba(30,38,56,.7); }
 .fs-icon:active:not(:disabled) { transform: scale(.92); }
 .fs-icon:disabled { opacity: .4; cursor: default; }
-.fs-icon.is-on { background: rgba(251,191,36,.22); color: #fde68a; border-color: #fbbf24; }
+.fs-icon.is-on { background: rgba(255,122,26,.22); color: #ffb27a; border-color: #ff7a1a; }
 .fs-empty { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; text-align: center; color: #e5e7eb; }
-.fs-empty-icon { width: 64px; height: 64px; border-radius: 20px; display: grid; place-items: center; background: linear-gradient(145deg, rgba(251,191,36,.22), rgba(251,191,36,.05)); border: 1px solid rgba(251,191,36,.3); color: #fbbf24; }
+.fs-empty-icon { width: 64px; height: 64px; border-radius: 20px; display: grid; place-items: center; background: linear-gradient(145deg, rgba(255,122,26,.22), rgba(255,122,26,.05)); border: 1px solid rgba(255,122,26,.3); color: #ff7a1a; }
 .fs-empty-title { font: 700 20px/1.2 -apple-system, system-ui, sans-serif; letter-spacing: -.01em; }
 .fs-empty-sub { max-width: 320px; font-size: 13.5px; line-height: 1.45; color: #9ca3af; }
-.fs-cta { margin-top: 6px; display: inline-flex; align-items: center; gap: 6px; height: 44px; padding: 0 22px; border: 0; border-radius: 999px; font: 600 15px/1 -apple-system, system-ui, sans-serif; color: #111827; background: linear-gradient(180deg, #fcd34d, #f59e0b); box-shadow: 0 8px 24px -8px rgba(245,158,11,.7); cursor: pointer; transition: transform .15s ease; }
+.fs-cta { margin-top: 6px; display: inline-flex; align-items: center; gap: 6px; height: 44px; padding: 0 22px; border: 0; border-radius: 999px; font: 600 15px/1 -apple-system, system-ui, sans-serif; color: #111827; background: linear-gradient(180deg, #ff9a4d, #ff7a1a); box-shadow: 0 8px 24px -8px rgba(255,122,26,.7); cursor: pointer; transition: transform .15s ease; }
 .fs-cta:active { transform: scale(.97); }
 .fs-cta-sm { height: 34px; padding: 0 14px; font-size: 13px; margin: 0; }
 .fs-hint { position: absolute; left: 50%; bottom: 112px; transform: translateX(-50%); z-index: 3; padding: 8px 14px; border-radius: 999px; font: 500 13px/1.2 -apple-system, system-ui, sans-serif; color: #f9fafb; background: rgba(12,16,26,.6); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); white-space: nowrap; max-width: 90%; overflow: hidden; text-overflow: ellipsis; }
@@ -1990,11 +1990,11 @@ select optgroup,
 .fs-shutter span { position: absolute; inset: 5px; border-radius: 50%; background: #fff; transition: transform .15s ease, background .2s ease; }
 .fs-shutter:active:not(:disabled) span { transform: scale(.88); }
 .fs-shutter:disabled { opacity: .45; cursor: default; }
-.fs-shutter.is-auto-mode { border-color: #fbbf24; }
-.fs-shutter.is-auto-mode span { background: #fbbf24; }
-.fs-shutter.is-auto { border-color: #fbbf24; opacity: 1; }
-.fs-shutter.is-auto span { background: #fbbf24; transform: scale(.42); border-radius: 8px; }
-.fs-shutter.is-busy::after { content: ''; position: absolute; inset: -8px; border-radius: 50%; border: 2px solid transparent; border-top-color: #fbbf24; animation: fs-spin .7s linear infinite; }
+.fs-shutter.is-auto-mode { border-color: #ff7a1a; }
+.fs-shutter.is-auto-mode span { background: #ff7a1a; }
+.fs-shutter.is-auto { border-color: #ff7a1a; opacity: 1; }
+.fs-shutter.is-auto span { background: #ff7a1a; transform: scale(.42); border-radius: 8px; }
+.fs-shutter.is-busy::after { content: ''; position: absolute; inset: -8px; border-radius: 50%; border: 2px solid transparent; border-top-color: #ff7a1a; animation: fs-spin .7s linear infinite; }
 @keyframes fs-spin { to { transform: rotate(360deg); } }
 .fs-tray { border-radius: 22px; padding: 16px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)); border: 1px solid rgba(255,255,255,.07); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
 @media (min-width: 1000px) { .fs-tray { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; } }
@@ -2008,7 +2008,7 @@ select optgroup,
 .fs-switch-track span { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4); transition: transform .2s ease; }
 .fs-switch input:checked + .fs-switch-track { background: #34d399; }
 .fs-switch input:checked + .fs-switch-track span { transform: translateX(14px); }
-.fs-switch input:focus-visible + .fs-switch-track { outline: 2px solid #fbbf24; outline-offset: 2px; }
+.fs-switch input:focus-visible + .fs-switch-track { outline: 2px solid #ff7a1a; outline-offset: 2px; }
 .fs-cards { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px; }
 .fs-card { animation: fs-in .28s cubic-bezier(.2,.8,.2,1); min-width: 0; }
 @keyframes fs-in { from { opacity: 0; transform: translateY(6px) scale(.96); } to { opacity: 1; transform: none; } }
@@ -2016,29 +2016,29 @@ select optgroup,
 .fs-card-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .fs-card.is-added .fs-card-art { box-shadow: 0 0 0 2px #34d399, 0 6px 18px -8px rgba(0,0,0,.8); }
 .fs-card-edit { position: absolute; inset: 0; border: 0; padding: 0; background: transparent; cursor: pointer; }
-.fs-card-edit:focus-visible { outline: 2px solid #fbbf24; outline-offset: -2px; }
+.fs-card-edit:focus-visible { outline: 2px solid #ff7a1a; outline-offset: -2px; }
 .fs-card-art .fs-card-x, .fs-card-art .fs-card-price, .fs-card-art .fs-card-badge { z-index: 1; }
 .fs-card-printing { position: absolute; top: 5px; left: 5px; z-index: 1; display: inline-flex; align-items: center; gap: 3px; height: 22px; padding: 0 7px; border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: rgba(8,10,18,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: var(--text-strong, #f3f4f6); font: 600 10.5px/1 -apple-system, system-ui, sans-serif; cursor: pointer; }
-.fs-card-printing:focus-visible { outline: 2px solid #fbbf24; outline-offset: 1px; }
+.fs-card-printing:focus-visible { outline: 2px solid #ff7a1a; outline-offset: 1px; }
 /* A guessed printing: a subtle amber hint on the art and the chip. */
-.fs-card.is-guessed .fs-card-art { box-shadow: 0 0 0 1.5px rgba(251,191,36,.5), 0 6px 18px -8px rgba(0,0,0,.8); }
-.fs-card.is-guessed.is-added .fs-card-art { box-shadow: 0 0 0 2px #34d399, 0 0 0 4px rgba(251,191,36,.4), 0 6px 18px -8px rgba(0,0,0,.8); }
-.fs-card.is-guessed .fs-card-printing { color: #fde68a; border-color: rgba(251,191,36,.45); }
+.fs-card.is-guessed .fs-card-art { box-shadow: 0 0 0 1.5px rgba(255,122,26,.5), 0 6px 18px -8px rgba(0,0,0,.8); }
+.fs-card.is-guessed.is-added .fs-card-art { box-shadow: 0 0 0 2px #34d399, 0 0 0 4px rgba(255,122,26,.4), 0 6px 18px -8px rgba(0,0,0,.8); }
+.fs-card.is-guessed .fs-card-printing { color: #ffb27a; border-color: rgba(255,122,26,.45); }
 .fs-undo { display: inline-flex; align-items: center; gap: 4px; font-size: .8rem; padding: 6px 10px; border-radius: 999px; }
 .fs-sheet-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,.55); display: flex; align-items: flex-end; justify-content: center; }
 .fs-sheet { width: min(720px, 100%); max-height: 78vh; overflow: auto; border-radius: 22px 22px 0 0; padding: 16px; }
 @media (min-width: 769px) and (pointer: fine), (min-width: 941px) { .fs-sheet-backdrop { align-items: center; } .fs-sheet { border-radius: 22px; } }
 .fs-sheet-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .fs-print { all: unset; display: block; width: 100%; cursor: pointer; }
-.fs-card-choose { position: absolute; left: 6px; right: 6px; bottom: 6px; padding: 3px 6px; border-radius: 999px; background: rgba(251,191,36,.92); color: #111; font-size: 11px; font-weight: 700; text-align: center; pointer-events: none; }
+.fs-card-choose { position: absolute; left: 6px; right: 6px; bottom: 6px; padding: 3px 6px; border-radius: 999px; background: rgba(255,122,26,.92); color: #111; font-size: 11px; font-weight: 700; text-align: center; pointer-events: none; }
 .fs-card.is-choice .fs-card-art img { opacity: .55; }
-.fs-print:focus-visible .fs-card-art { outline: 2px solid #fbbf24; }
-.fs-card.is-current .fs-card-art { box-shadow: 0 0 0 2px #fbbf24, 0 6px 18px -8px rgba(0,0,0,.8); }
+.fs-print:focus-visible .fs-card-art { outline: 2px solid #ff7a1a; }
+.fs-card.is-current .fs-card-art { box-shadow: 0 0 0 2px #ff7a1a, 0 6px 18px -8px rgba(0,0,0,.8); }
 .fs-card-x { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; border-radius: 50%; border: 0; display: grid; place-items: center; color: #fff; background: rgba(0,0,0,.55); cursor: pointer; opacity: 0; transition: opacity .15s ease; }
 .fs-card:hover .fs-card-x, .fs-card:focus-within .fs-card-x { opacity: 1; }
 @media (hover: none) { .fs-card-x { opacity: .85; } }
 .fs-card-add, .fs-card-badge { position: absolute; right: 6px; bottom: 6px; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; border: 0; }
-.fs-card-add { color: #111827; background: #fbbf24; cursor: pointer; box-shadow: 0 4px 12px -4px rgba(0,0,0,.6); transition: transform .15s ease; }
+.fs-card-add { color: #111827; background: #ff7a1a; cursor: pointer; box-shadow: 0 4px 12px -4px rgba(0,0,0,.6); transition: transform .15s ease; }
 .fs-card-add:active { transform: scale(.9); }
 .fs-card-badge { color: #052e1c; background: #34d399; }
 .fs-card-name { margin-top: 6px; font: 600 12px/1.25 -apple-system, system-ui, sans-serif; color: var(--text-strong, #f3f4f6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -2046,16 +2046,16 @@ select optgroup,
 .fs-tray-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 14px; }
 .fs-ghost { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,.1); background: transparent; color: var(--text-secondary); font-size: 13px; cursor: pointer; }
 .fs-ghost:hover { color: var(--text-strong, #fff); }
-.fs-pill-value { color: #fde68a; font-weight: 700; }
-.fs-tray-total { font: 800 26px/1.1 -apple-system, system-ui, sans-serif; letter-spacing: -.02em; color: #fbbf24; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.fs-card-price { position: absolute; left: 6px; bottom: 6px; padding: 3px 7px; border-radius: 999px; font: 700 11px/1 -apple-system, system-ui, sans-serif; color: #fde68a; background: rgba(8,10,18,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-variant-numeric: tabular-nums; }
+.fs-pill-value { color: #ffb27a; font-weight: 700; }
+.fs-tray-total { font: 800 26px/1.1 -apple-system, system-ui, sans-serif; letter-spacing: -.02em; color: #ff7a1a; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.fs-card-price { position: absolute; left: 6px; bottom: 6px; padding: 3px 7px; border-radius: 999px; font: 700 11px/1 -apple-system, system-ui, sans-serif; color: #ffb27a; background: rgba(8,10,18,.78); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-variant-numeric: tabular-nums; }
 .fs-card-quick { display: flex; align-items: center; justify-content: space-between; gap: 4px; margin-top: 5px; }
 .fs-qty { display: inline-flex; align-items: center; height: 24px; border-radius: 999px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); }
 .fs-qty button { width: 24px; height: 22px; border: 0; background: transparent; color: var(--text-strong, #f3f4f6); display: grid; place-items: center; cursor: pointer; border-radius: 999px; }
 .fs-qty button:disabled { opacity: .35; cursor: default; }
 .fs-qty span { min-width: 14px; text-align: center; font: 600 12px/1 -apple-system, system-ui, sans-serif; font-variant-numeric: tabular-nums; }
 .fs-foil { display: inline-flex; align-items: center; gap: 3px; height: 24px; padding: 0 8px; border-radius: 999px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.07); color: var(--text-secondary); font: 600 11px/1 -apple-system, system-ui, sans-serif; cursor: pointer; }
-.fs-foil.is-on { color: #fde68a; background: rgba(251,191,36,.18); border-color: rgba(251,191,36,.45); }
+.fs-foil.is-on { color: #ffb27a; background: rgba(255,122,26,.18); border-color: rgba(255,122,26,.45); }
 .fs-foil:disabled { opacity: .35; cursor: default; }
 .fs-send { display: flex; gap: 8px; margin-top: 14px; }
 .fs-select { flex: 1; min-width: 0; height: 34px; padding: 0 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: var(--text-strong, #f3f4f6); font-size: 13px; }
