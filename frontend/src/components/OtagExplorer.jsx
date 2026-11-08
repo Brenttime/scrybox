@@ -12,7 +12,7 @@ const PAGE = 60;
 const LETTER = { white: 'w', blue: 'u', black: 'b', red: 'r', green: 'g', w: 'w', u: 'u', b: 'b', r: 'r', g: 'g' };
 const PIP = { w: 'W', u: 'U', b: 'B', r: 'R', g: 'G' };
 
-export const identityOf = (commander) => {
+const identityOf = (commander) => {
   const set = new Set((commander?.color_identity || []).map(c => LETTER[String(c).toLowerCase()]).filter(Boolean));
   return ['w', 'u', 'b', 'r', 'g'].filter(l => set.has(l)).join('');
 };
