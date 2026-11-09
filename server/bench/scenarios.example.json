@@ -1,0 +1,10 @@
+{"base":"http://127.0.0.1:3911","scenarios":[
+{"name":"health","path":"/api/health"},
+{"name":"collection_page100","path":"/api/collection?limit=100&offset=0","headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"collection_full_27MB","path":"/api/collection","concurrency":2,"duration":15,"headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"stats","path":"/api/stats","headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"search_coll_t_creature_c_g","path":"/api/search?scope=collection&q=t%3Acreature%20c%3Ag&limit=60&page=1","headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"search_coll_sol_ring","path":"/api/search?scope=collection&q=sol%20ring&limit=60&page=1","headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"search_db_name_sol_ring","path":"/api/search?scope=database&name=Sol%20Ring","headers":{"Authorization":"Bearer <TOKEN><redacted>"}},
+{"name":"login_burst","path":"/api/auth/login","method":"POST","concurrency":4,"body":{"username":"brenttime","password":"benchpass"}}
+]}
