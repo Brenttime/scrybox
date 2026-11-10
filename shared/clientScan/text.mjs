@@ -287,38 +287,26 @@ export function footerNumbers(raws) {
   return numbers;
 }
 
-// Printed language codes beside the set code ('ZNR • EN'); never a set.
-const LANG_TOKENS = new Set(['en', 'de', 'fr', 'it', 'es', 'pt', 'ja', 'jp', 'ko', 'ru', 'cs', 'ct', 'zhs', 'zht', 'ph']);
+// Every set code the footer line can be read as: each set-code substring of
+// the compacted line starting within its first 3 chars (a printed code, plus
+// up to two noise chars). ALL readings are returned, never one picked by
+// rank, offset or token shape: OCR moves spaces ('im afc en' / 'ima fc en'
+// are the same compact string) and adds noise ('ZNR·EN' -> 'znren' also
+// reads 'ren'). resolveFooterGroup then takes a set only when exactly one
+// reading matches the title's printings at the read number; two readings
+// that both match are ambiguity, never an exact proof (reviews R1-B1, R2-B1).
 export function footerCodes(ix, raws) {
   const codes = [];
   for (const raw of raws) {
     const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
-    // A token that IS a set code, on its own between separators, is direct
-    // evidence ('ZNR·EN' -> znr; the substring scan alone picked 'ren' from
-    // 'znren' and every Zendikar Rising footer named the wrong set). Only a
-    // single such token counts; none or several -> the substring scan below,
-    // unchanged (offset + rank), so a noise prefix never creates a new code
-    // (review R1-B1: 'im afc en' stays AFC, never IMA).
-    // Same reach as the scan: the token must start within the first 3 chars.
-    const tokens = [];
-    let at = 0;
-    for (const t of raw.toLowerCase().split(/[^a-z0-9]+/)) {
-      if (at < 3 && ix.setLookup.has(t) && !LANG_TOKENS.has(t)) tokens.push(t);
-      at += t.length;
-    }
-    let best = new Set(tokens).size === 1 ? tokens[0] : null;
-    if (best == null) {
-      for (let pos = 0; pos < Math.min(3, compact.length); pos++) {
-        for (const len of ix.setLengths) {
-          const cand = compact.slice(pos, pos + len);
-          if (cand.length === len && ix.setLookup.has(cand)
-            && (best == null || ix.setRank.get(cand) < ix.setRank.get(best))) best = cand;
-        }
+    for (let pos = 0; pos < Math.min(3, compact.length); pos++) {
+      for (const len of ix.setLengths) {
+        const cand = compact.slice(pos, pos + len);
+        if (cand.length === len && ix.setLookup.has(cand) && !codes.includes(cand)) codes.push(cand);
       }
     }
-    if (best && !codes.includes(best)) codes.push(best);
   }
-  return codes;
+  return codes.sort((a, b) => ix.setRank.get(a) - ix.setRank.get(b));
 }
 
 // The retro copyright line: only a trailing number, never a (c) year.

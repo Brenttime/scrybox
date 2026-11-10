@@ -102,17 +102,46 @@ test('footerCodes reads a set code with up to two noise chars', () => {
   assert.deepEqual(footerCodes(ix, ['0408 R MH2']), []);
 });
 
-test('footerCodes: a set code standing alone as a token beats a better-ranked substring', () => {
-  // 2026-11-10: 'ZNR·EN' compacted to 'znren' and named 'ren' (ranked first)
-  // instead of 'znr', so every Zendikar Rising footer code was wrong.
+test('footerCodes returns every in-window reading, never one picked by rank/offset/token', () => {
   const sx = loadIndex({ names: [], canon: {}, excluded: [], sets: ['ren', 'ima', 'afc', 'tpr', 'znr', 'trk'], printings: [], byTitle: {}, uniqueAlias: {} });
-  assert.deepEqual(footerCodes(sx, ['ZNR·EN']), ['znr']);
-  assert.deepEqual(footerCodes(sx, ['TPR • EN']), ['tpr']);
-  assert.deepEqual(footerCodes(sx, ['• ZNR • EN']), ['znr']);
-  assert.deepEqual(footerCodes(sx, ['TRKEN']), ['trk'], 'no separator: the substring scan, as before');
-  // Review R1-B1: a retained noise prefix must never create another set.
-  assert.deepEqual(footerCodes(sx, ['im afc en']), ['afc']);
-  assert.deepEqual(footerCodes(sx, ['0408 R ZNR']), [], 'a code token must sit where a footer code does');
+  // 'ZNR·EN' compacts to 'znren', which also reads 'ren' at offset 2.
+  assert.deepEqual(footerCodes(sx, ['ZNR·EN']).sort(), ['ren', 'znr']);
+  assert.deepEqual(footerCodes(sx, ['TPR • EN']).sort(), ['ren', 'tpr']);
+  // Review R2-B1: spacing moves; 'im afc en' and 'ima fc en' are one string.
+  assert.deepEqual(footerCodes(sx, ['im afc en']).sort(), ['afc', 'ima']);
+  assert.deepEqual(footerCodes(sx, ['ima fc en']).sort(), ['afc', 'ima']);
+  assert.deepEqual(footerCodes(sx, ['0408 R ZNR']), [], 'a code must sit where a footer code does');
+});
+
+// Review R2-B1: Dimir Aqueduct is #234 in both IMA and AFC. A footer whose
+// compact string reads both codes is ambiguity, whatever the OCR spacing.
+const dx = loadIndex({
+  names: ['dimir aqueduct', 'mine collapse'],
+  canon: {}, excluded: [],
+  sets: ['ren', 'ima', 'afc', 'tpr', 'znr', 'trk', 'mh2'],
+  printings: [
+    ['id-dimir-ima', 'ima', '234'], ['id-dimir-afc', 'afc', '234'], ['id-dimir-znr', 'znr', '90'],
+    ['id-dimir-tpr', 'tpr', '235'], ['id-dimir-ren', 'ren', '90'],
+  ],
+  byTitle: { 'dimir aqueduct': [0, 1, 2, 3], 'mine collapse': [4] },
+  uniqueAlias: {},
+});
+const footer = (raws) => resolveFooter(dx, 'dimir aqueduct', footerCodes(dx, raws), footerNumbers(raws), strongNumbers(raws));
+
+test('R2-B1: competing set readings that both match title+number are ambiguous', () => {
+  for (const text of ['ima fc en', 'im afc en', 'imafc en', 'i maf c en', 'ima f c en', 'im a fc · en']) {
+    assert.equal(footer([text, '234']), null, text);
+  }
+});
+
+test('R2-B1: clean footers still prove their printing', () => {
+  assert.equal(footer(['AFC · EN', '234']), 1);
+  assert.equal(footer(['IMA • EN', '234']), 0);
+  assert.equal(footer(['ZNR·EN', '0090']), 2, 'ren reading has no dimir #90 for this title');
+  assert.equal(footer(['TPR • EN', '235']), 3);
+  // Noise prefix + internal space that leaves only one valid reading.
+  assert.equal(footer(['x zn r en', '90']), 2);
+  assert.equal(footer(['•a fc en', '234']), 1);
 });
 
 test('needsServer: fallback rules', () => {
