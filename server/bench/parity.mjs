@@ -143,6 +143,17 @@ cases.push({ name: 'authr_bootstrap_short_pw', path: '/api/auth/bootstrap', head
 cases.push({ name: 'authr_oidc_login_disabled', path: '/api/auth/oidc/login', headers: {}, method: 'GET' });
 cases.push({ name: 'authr_oidc_callback_disabled', path: '/api/auth/oidc/callback', headers: {}, method: 'GET' });
 cases.push({ name: 'authr_unknown_path_proxy', path: '/api/auth/definitely_not_a_route', headers: {}, method: 'GET' });
+// Mutating auth routes: their write paths touch the shared DB copy (session
+// rows, api_key, settings) and randomised tokens make byte-equality
+// impossible, so live parity here covers the auth-gate contract (no token ->
+// Node's exact 401 body, answered BEFORE any write; proven native on a dead
+// upstream). Mutation paths are compared cargo-vs-fixture (tests/auth.rs
+// logout_and_api_key_round_trip, settings_...); live Rust-write->Node-read
+// round-trips with a disposable probe user are queued for iter 21.
+cases.push({ name: 'authr_logout_no_token', path: '/api/auth/logout', headers: {}, method: 'POST' });
+cases.push({ name: 'authr_apikey_post_no_token', path: '/api/auth/api-key', headers: {}, method: 'POST' });
+cases.push({ name: 'authr_apikey_delete_no_token', path: '/api/auth/api-key', headers: {}, method: 'DELETE' });
+cases.push({ name: 'authr_settings_no_token', path: '/api/auth/settings', headers: AUTH_JSON, method: 'PUT', body: '{}' });
 
 // --- comparison --------------------------------------------------------------
 

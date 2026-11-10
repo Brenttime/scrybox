@@ -1,129 +1,413 @@
 {
- "DELETE /api/admin/users/:id": "pending",
- "DELETE /api/auth/api-key": "verified",
- "DELETE /api/card-art/:cardId": "pending",
- "DELETE /api/collection/:id": "pending",
- "DELETE /api/decks/:id": "pending",
- "DELETE /api/decks/:id/cards/:card_id": "pending",
- "DELETE /api/lists/:id": "pending",
- "DELETE /api/lists/:id/cards/:card_id": "pending",
- "DELETE /api/moxfield/authors/:id": "pending",
- "DELETE /api/search-history": "pending",
- "GET *": "pending",
- "GET /api/admin/backups": "pending",
- "GET /api/admin/backups/:file/download": "pending",
- "GET /api/admin/catalogs": "pending",
- "GET /api/admin/catalogs/languages": "pending",
- "GET /api/admin/catalogs/progress": "pending",
- "GET /api/admin/models": "pending",
- "GET /api/admin/users": "pending",
- "GET /api/auth/config": "verified",
- "GET /api/auth/me": "verified",
- "GET /api/auth/oidc/callback": "verified",
- "GET /api/auth/oidc/login": "verified",
- "GET /api/card-art/:cardId.png": "pending",
- "GET /api/card-art/index": "pending",
- "GET /api/cards/:id/decks": "pending",
- "GET /api/cards/:id/oracle": "pending",
- "GET /api/cards/:id/oracle-tags": "pending",
- "GET /api/cards/:id/price-history": "pending",
- "GET /api/cardscan/status": "pending",
- "GET /api/collection": "verified",
- "GET /api/collection/cardlist": "pending",
- "GET /api/decks": "pending",
- "GET /api/decks/:id": "pending",
- "GET /api/decks/:id/combos": "pending",
- "GET /api/decks/:id/locations": "pending",
- "GET /api/decks/:id/synergy": "pending",
- "GET /api/export": "pending",
- "GET /api/health": "verified",
- "GET /api/lists": "pending",
- "GET /api/lists/:id": "pending",
- "GET /api/lists/:id/cardlist": "pending",
- "GET /api/lists/card-matches": "pending",
- "GET /api/manabox-sync/runs": "pending",
- "GET /api/manabox-sync/runs/:id/report": "pending",
- "GET /api/marketplace/accounts": "pending",
- "GET /api/marketplace/recent/:source": "pending",
- "GET /api/moxfield": "pending",
- "GET /api/precons": "pending",
- "GET /api/rules": "pending",
- "GET /api/rules/keywords": "pending",
- "GET /api/scan-sets": "pending",
- "GET /api/search": "verified",
- "GET /api/search-history": "pending",
- "GET /api/secret-lair": "pending",
- "GET /api/secret-lair/preview": "pending",
- "GET /api/sets": "pending",
- "GET /api/settings": "pending",
- "GET /api/settings/version": "pending",
- "GET /api/shared/:share_token": "pending",
- "GET /api/stats": "verified",
- "GET /api/stats/commander-of-the-day": "pending",
- "GET /api/stats/history": "pending",
- "GET /api/stats/networth": "pending",
- "GET /api/stats/top-mover": "pending",
- "GET /api/suggest": "pending",
- "GET /models/cornelius.onnx": "pending",
- "POST /api/admin/backups": "pending",
- "POST /api/admin/catalogs/build": "pending",
- "POST /api/admin/catalogs/stop": "pending",
- "POST /api/admin/models/download": "pending",
- "POST /api/admin/seed-cards": "pending",
- "POST /api/admin/users": "pending",
- "POST /api/auth/api-key": "verified",
- "POST /api/auth/bootstrap": "verified",
- "POST /api/auth/login": "verified",
- "POST /api/auth/logout": "verified",
- "POST /api/auth/register": "verified",
- "POST /api/card-art/:cardId": "pending",
- "POST /api/cards/highlight": "pending",
- "POST /api/cards/role-tags": "pending",
- "POST /api/cards/tag-stats": "pending",
- "POST /api/cardscan/cards": "pending",
- "POST /api/cardscan/choices": "pending",
- "POST /api/cardscan/detect": "pending",
- "POST /api/cardscan/frame": "pending",
- "POST /api/cardscan/scan": "pending",
- "POST /api/cardscan/telemetry": "pending",
- "POST /api/collection": "pending",
- "POST /api/collection/bulk": "pending",
- "POST /api/collection/bulk-add": "pending",
- "POST /api/decks": "pending",
- "POST /api/decks/:id/cards": "pending",
- "POST /api/decks/:id/register-collection": "pending",
- "POST /api/export": "pending",
- "POST /api/import": "pending",
- "POST /api/limited/analyze": "pending",
- "POST /api/lists": "pending",
- "POST /api/lists/:id/cards": "pending",
- "POST /api/lists/:id/cards/bulk": "pending",
- "POST /api/lists/:id/cards/bulk-remove": "pending",
- "POST /api/lists/:id/remove-from-collection": "pending",
- "POST /api/manabox-sync/apply": "pending",
- "POST /api/manabox-sync/preview": "pending",
- "POST /api/marketplace/add": "pending",
- "POST /api/marketplace/preview": "pending",
- "POST /api/moxfield/authors": "pending",
- "POST /api/moxfield/authors/:id/sync-contents": "pending",
- "POST /api/moxfield/authors/:id/sync-decklist": "pending",
- "POST /api/moxfield/decks/:publicId/sync": "pending",
- "POST /api/precons/import": "pending",
- "POST /api/scan-match": "pending",
- "POST /api/search": "pending",
- "POST /api/search-history": "pending",
- "POST /api/secret-lair/add": "pending",
- "PUT /api/admin/users/:id": "pending",
- "PUT /api/auth/settings": "verified",
- "PUT /api/collection/:id": "pending",
- "PUT /api/decks/:id": "pending",
- "PUT /api/decks/:id/checkout": "pending",
- "PUT /api/decks/:id/return": "pending",
- "PUT /api/lists/:id": "pending",
- "PUT /api/lists/:id/cards/:card_id/printing": "pending",
- "PUT /api/lists/:id/cheapest-printings": "pending",
- "PUT /api/lists/order": "pending",
- "PUT /api/marketplace/accounts": "pending",
- "PUT /api/moxfield/decks/:publicId": "pending",
- "PUT /api/settings": "pending"
+  "DELETE /api/admin/users/:id": {
+    "status": "node"
+  },
+  "DELETE /api/auth/api-key": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_no_token (auth-gate). Key-revoke path cargo-vs-fixture; live write parity iter 21"
+  },
+  "DELETE /api/card-art/:cardId": {
+    "status": "node"
+  },
+  "DELETE /api/collection/:id": {
+    "status": "node"
+  },
+  "DELETE /api/decks/:id": {
+    "status": "node"
+  },
+  "DELETE /api/decks/:id/cards/:card_id": {
+    "status": "node"
+  },
+  "DELETE /api/lists/:id": {
+    "status": "node"
+  },
+  "DELETE /api/lists/:id/cards/:card_id": {
+    "status": "node"
+  },
+  "DELETE /api/moxfield/authors/:id": {
+    "status": "node"
+  },
+  "DELETE /api/search-history": {
+    "status": "node"
+  },
+  "GET *": {
+    "status": "node"
+  },
+  "GET /api/admin/backups": {
+    "status": "node"
+  },
+  "GET /api/admin/backups/:file/download": {
+    "status": "node"
+  },
+  "GET /api/admin/catalogs": {
+    "status": "node"
+  },
+  "GET /api/admin/catalogs/languages": {
+    "status": "node"
+  },
+  "GET /api/admin/catalogs/progress": {
+    "status": "node"
+  },
+  "GET /api/admin/models": {
+    "status": "node"
+  },
+  "GET /api/admin/users": {
+    "status": "node"
+  },
+  "GET /api/auth/config": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::config_reports_flags_with_weak_etag; parity.mjs authr_config"
+  },
+  "GET /api/auth/me": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::me_requires_token_and_serialises_req_user; parity.mjs authr_me_no_token/bad_token/ok"
+  },
+  "GET /api/auth/oidc/callback": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/oidc_e2e.rs::full_oidc_ladder; parity.mjs authr_oidc_callback_disabled"
+  },
+  "GET /api/auth/oidc/login": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/oidc_e2e.rs::full_oidc_ladder (stub HS256 IdP, PKCE/nonce/tamper legs); parity.mjs authr_oidc_login_disabled"
+  },
+  "GET /api/card-art/:cardId.png": {
+    "status": "node"
+  },
+  "GET /api/card-art/index": {
+    "status": "node"
+  },
+  "GET /api/cards/:id/decks": {
+    "status": "node"
+  },
+  "GET /api/cards/:id/oracle": {
+    "status": "node"
+  },
+  "GET /api/cards/:id/oracle-tags": {
+    "status": "node"
+  },
+  "GET /api/cards/:id/price-history": {
+    "status": "node"
+  },
+  "GET /api/cardscan/status": {
+    "status": "node"
+  },
+  "GET /api/collection": {
+    "status": "verified",
+    "module": "scrybox-server::collection (lib.rs GET /api/collection)",
+    "tests": "tests/collection.rs (21); parity.mjs collection_page100 + collection_full_27MB + EXTRA_COLLECTION x10"
+  },
+  "GET /api/collection/cardlist": {
+    "status": "node"
+  },
+  "GET /api/decks": {
+    "status": "node"
+  },
+  "GET /api/decks/:id": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/combos": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/locations": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/synergy": {
+    "status": "node"
+  },
+  "GET /api/export": {
+    "status": "node"
+  },
+  "GET /api/health": {
+    "status": "verified",
+    "module": "scrybox-server::health (lib.rs GET /api/health)",
+    "tests": "tests/health.rs (4); parity.mjs health"
+  },
+  "GET /api/lists": {
+    "status": "node"
+  },
+  "GET /api/lists/:id": {
+    "status": "node"
+  },
+  "GET /api/lists/:id/cardlist": {
+    "status": "node"
+  },
+  "GET /api/lists/card-matches": {
+    "status": "node"
+  },
+  "GET /api/manabox-sync/runs": {
+    "status": "node"
+  },
+  "GET /api/manabox-sync/runs/:id/report": {
+    "status": "node"
+  },
+  "GET /api/marketplace/accounts": {
+    "status": "node"
+  },
+  "GET /api/marketplace/recent/:source": {
+    "status": "node"
+  },
+  "GET /api/moxfield": {
+    "status": "node"
+  },
+  "GET /api/precons": {
+    "status": "node"
+  },
+  "GET /api/rules": {
+    "status": "node"
+  },
+  "GET /api/rules/keywords": {
+    "status": "node"
+  },
+  "GET /api/scan-sets": {
+    "status": "node"
+  },
+  "GET /api/search": {
+    "status": "verified",
+    "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
+    "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
+  },
+  "GET /api/search-history": {
+    "status": "node"
+  },
+  "GET /api/secret-lair": {
+    "status": "node"
+  },
+  "GET /api/secret-lair/preview": {
+    "status": "node"
+  },
+  "GET /api/sets": {
+    "status": "node"
+  },
+  "GET /api/settings": {
+    "status": "node"
+  },
+  "GET /api/settings/version": {
+    "status": "node"
+  },
+  "GET /api/shared/:share_token": {
+    "status": "node"
+  },
+  "GET /api/stats": {
+    "status": "verified",
+    "module": "scrybox-server::stats (+stats_sql; lib.rs GET /api/stats)",
+    "tests": "tests/stats.rs (15); parity.mjs stats + stats_post_write (5 s SWR per owner ruling)"
+  },
+  "GET /api/stats/commander-of-the-day": {
+    "status": "node"
+  },
+  "GET /api/stats/history": {
+    "status": "node"
+  },
+  "GET /api/stats/networth": {
+    "status": "node"
+  },
+  "GET /api/stats/top-mover": {
+    "status": "node"
+  },
+  "GET /api/suggest": {
+    "status": "node"
+  },
+  "GET /models/cornelius.onnx": {
+    "status": "node"
+  },
+  "POST /api/admin/backups": {
+    "status": "node"
+  },
+  "POST /api/admin/catalogs/build": {
+    "status": "node"
+  },
+  "POST /api/admin/catalogs/stop": {
+    "status": "node"
+  },
+  "POST /api/admin/models/download": {
+    "status": "node"
+  },
+  "POST /api/admin/seed-cards": {
+    "status": "node"
+  },
+  "POST /api/admin/users": {
+    "status": "node"
+  },
+  "POST /api/auth/api-key": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_post_no_token (auth-gate). Key-gen path cargo-vs-fixture; live write parity iter 21"
+  },
+  "POST /api/auth/bootstrap": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::bootstrap_creates_owner_and_adopts_orphans; parity.mjs authr_bootstrap_users_exist/short_pw. Owner-create path cargo-vs-fixture; live write parity iter 21"
+  },
+  "POST /api/auth/login": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::login_success_legacy_and_parser_quirks + rate_limit_shared_bucket_per_ip; parity.mjs authr_login_missing_fields/wrong. Session-insert success path compared cargo-vs-fixture; live write parity queued iter 21"
+  },
+  "POST /api/auth/logout": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_logout_no_token (auth-gate). Session-delete path cargo-vs-fixture; live write parity iter 21"
+  },
+  "POST /api/auth/register": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled. Success path cargo-vs-fixture; live write parity iter 21"
+  },
+  "POST /api/card-art/:cardId": {
+    "status": "node"
+  },
+  "POST /api/cards/highlight": {
+    "status": "node"
+  },
+  "POST /api/cards/role-tags": {
+    "status": "node"
+  },
+  "POST /api/cards/tag-stats": {
+    "status": "node"
+  },
+  "POST /api/cardscan/cards": {
+    "status": "node"
+  },
+  "POST /api/cardscan/choices": {
+    "status": "node"
+  },
+  "POST /api/cardscan/detect": {
+    "status": "node"
+  },
+  "POST /api/cardscan/frame": {
+    "status": "node"
+  },
+  "POST /api/cardscan/scan": {
+    "status": "node"
+  },
+  "POST /api/cardscan/telemetry": {
+    "status": "node"
+  },
+  "POST /api/collection": {
+    "status": "node"
+  },
+  "POST /api/collection/bulk": {
+    "status": "node"
+  },
+  "POST /api/collection/bulk-add": {
+    "status": "node"
+  },
+  "POST /api/decks": {
+    "status": "node"
+  },
+  "POST /api/decks/:id/cards": {
+    "status": "node"
+  },
+  "POST /api/decks/:id/register-collection": {
+    "status": "node"
+  },
+  "POST /api/export": {
+    "status": "node"
+  },
+  "POST /api/import": {
+    "status": "node"
+  },
+  "POST /api/limited/analyze": {
+    "status": "node"
+  },
+  "POST /api/lists": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards/bulk": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards/bulk-remove": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/remove-from-collection": {
+    "status": "node"
+  },
+  "POST /api/manabox-sync/apply": {
+    "status": "node"
+  },
+  "POST /api/manabox-sync/preview": {
+    "status": "node"
+  },
+  "POST /api/marketplace/add": {
+    "status": "node"
+  },
+  "POST /api/marketplace/preview": {
+    "status": "node"
+  },
+  "POST /api/moxfield/authors": {
+    "status": "node"
+  },
+  "POST /api/moxfield/authors/:id/sync-contents": {
+    "status": "node"
+  },
+  "POST /api/moxfield/authors/:id/sync-decklist": {
+    "status": "node"
+  },
+  "POST /api/moxfield/decks/:publicId/sync": {
+    "status": "node"
+  },
+  "POST /api/precons/import": {
+    "status": "node"
+  },
+  "POST /api/scan-match": {
+    "status": "node"
+  },
+  "POST /api/search": {
+    "status": "node"
+  },
+  "POST /api/search-history": {
+    "status": "node"
+  },
+  "POST /api/secret-lair/add": {
+    "status": "node"
+  },
+  "PUT /api/admin/users/:id": {
+    "status": "node"
+  },
+  "PUT /api/auth/settings": {
+    "status": "verified",
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "tests": "tests/auth.rs::settings_password_share_and_readonly_gating; parity.mjs authr_settings_no_token (auth-gate). Mutation paths cargo-vs-fixture; live write parity iter 21"
+  },
+  "PUT /api/collection/:id": {
+    "status": "node"
+  },
+  "PUT /api/decks/:id": {
+    "status": "node"
+  },
+  "PUT /api/decks/:id/checkout": {
+    "status": "node"
+  },
+  "PUT /api/decks/:id/return": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id/cards/:card_id/printing": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id/cheapest-printings": {
+    "status": "node"
+  },
+  "PUT /api/lists/order": {
+    "status": "node"
+  },
+  "PUT /api/marketplace/accounts": {
+    "status": "node"
+  },
+  "PUT /api/moxfield/decks/:publicId": {
+    "status": "node"
+  },
+  "PUT /api/settings": {
+    "status": "node"
+  }
 }
