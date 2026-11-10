@@ -114,7 +114,7 @@ pub struct CollectionParams {
 
 /// JS `parseInt(x, 10)`: leading whitespace, optional sign, ASCII digits,
 /// stop at the first non-digit; None for NaN.
-fn js_parse_int(s: &str) -> Option<i64> {
+pub(crate) fn js_parse_int(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r') {

@@ -106,6 +106,36 @@ fn auth() -> Vec<(&'static str, &'static str)> {
     vec![("authorization", "Bearer tok-stats-rich")]
 }
 
+fn auth_json() -> Vec<(&'static str, &'static str)> {
+    vec![("authorization", "Bearer tok-stats-rich"), ("content-type", "application/json")]
+}
+
+/// Request with a body (owner ruling iter 21: revision-bump semantics must be
+/// exercised through the REAL write surface — native Rust routes and proxied
+/// writes — not only through hand-bumped revision tables).
+async fn request_body(
+    r: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::from(body.unwrap_or_default().to_string()))
+        .unwrap();
+    for (k, v) in headers {
+        req.headers_mut().insert(
+            header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    let res = r.clone().oneshot(req).await.unwrap();
+    let (parts, body) = res.into_parts();
+    (parts.status, parts.headers, axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec())
+}
+
 async fn get_json(r: &Router, path: &str) -> (StatusCode, HeaderMap, Value) {
     let (s, h, b) = request(r, "GET", path, &auth()).await;
     (s, h, serde_json::from_slice(&b).unwrap())
@@ -326,6 +356,71 @@ async fn revision_bumps_invalidate_all_three_counters() {
         // …and the fresh body must re-cache — bounded, not instant.
         get_stats_until(&r, "hit", 2000).await;
     }
+
+    // Owner ruling (iter 21, collection_writes port): the hand-bumps above
+    // pin the INVALIDATION side; this phase pins the BUMP side — every
+    // Rust-native write must bump the revision counters ON COMMIT (the db.js
+    // AFTER triggers fire inside the route's write transaction, so the bump
+    // lands with the data), and a native write that never commits must not
+    // bump at all.
+    let r2 = router_for(db_path.clone(), &["stats", "collection_writes"], &format!("http://{upstream}"));
+    let snap = |t: &str| -> i64 {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(&format!("SELECT revision FROM {t} WHERE id = 1"), [], |row| row.get(0))
+            .unwrap()
+    };
+    let counters = || (snap("collection_snapshot"), snap("collection_read_revision"), snap("deck_list_revision"));
+
+    let (_, h, _) = request(&r2, "GET", "/api/stats", &auth()).await;
+    assert_eq!(h["x-stats-cache"], "miss");
+    get_stats_until(&r2, "hit", 2000).await;
+
+    // Native PUT (row 4, c-plains): commit => each collection-driven counter
+    // moves exactly one step and the stats cache drops the old key.
+    let before = counters();
+    let (s, _, _) = request_body(&r2, "PUT", "/api/collection/4", &auth_json(), Some("{\"notes\":\"bump\"}")).await;
+    assert_eq!(s, StatusCode::OK, "native PUT must be served by Rust (group owned)");
+    let after = counters();
+    assert_eq!(after.0, before.0 + 1, "collection_snapshot trigger bump on commit");
+    assert_eq!(after.1, before.1 + 1, "collection_read_revision trigger bump on commit");
+    assert_eq!(after.2, before.2 + 1, "deck_list_revision trigger bump on commit");
+    let (_, h, _) = request(&r2, "GET", "/api/stats", &auth()).await;
+    assert_eq!(h["x-stats-cache"], "miss", "native PUT must invalidate via trigger bump");
+    get_stats_until(&r2, "hit", 2000).await;
+
+    // Native bulk condition (row 3) — same contract through the bulk route.
+    let before = counters();
+    let (s, _, b) = request_body(
+        &r2, "POST", "/api/collection/bulk", &auth_json(),
+        Some("{\"entry_ids\":[3],\"action\":\"condition\",\"value\":\"Heavily Played\"}"),
+    ).await;
+    assert_eq!(s, StatusCode::OK, "bulk body was {}", String::from_utf8_lossy(&b));
+    let after = counters();
+    assert_eq!(after.1, before.1 + 1, "bulk condition must bump collection_read_revision");
+    let (_, h, _) = request(&r2, "GET", "/api/stats", &auth()).await;
+    assert_eq!(h["x-stats-cache"], "miss", "native bulk must invalidate");
+    get_stats_until(&r2, "hit", 2000).await;
+
+    // Native DELETE (row 6, no deck refs) bumps too.
+    let before = counters();
+    let (s, _, _) = request(&r2, "DELETE", "/api/collection/6", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    let after = counters();
+    assert_eq!(after.0, before.0 + 1, "collection_snapshot trigger bump on DELETE");
+    assert_eq!(after.1, before.1 + 1, "collection_read_revision trigger bump on DELETE");
+    let (_, h, _) = request(&r2, "GET", "/api/stats", &auth()).await;
+    assert_eq!(h["x-stats-cache"], "miss", "native DELETE must invalidate");
+    get_stats_until(&r2, "hit", 2000).await;
+
+    // A native write that never commits must NOT bump (on-commit, not
+    // before): the 404 path rolls its transaction back / never enters it.
+    let before = counters();
+    let (s, _, _) = request_body(&r2, "PUT", "/api/collection/99999", &auth_json(), Some("{\"notes\":\"x\"}")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(counters(), before, "uncommitted native write must not bump any counter");
+    let (_, h, _) = request(&r2, "GET", "/api/stats", &auth()).await;
+    assert_eq!(h["x-stats-cache"], "hit", "no bump => the cache key survives");
 }
 
 #[tokio::test]
@@ -343,14 +438,20 @@ async fn price_history_write_bumps_aux_trigger_and_freshens_body() {
     // the live DB), so the cached body must be dropped AND the body must
     // reflect the new history (change7d abs re-computed).
     let conn = Connection::open(&db_path).unwrap();
+    // Owner ruling (iter 21): the bump must land when the write COMMITS —
+    // pin it as an exact delta (one trigger execution per statement), not
+    // merely "> 0".
+    let aux_before: i64 = conn
+        .query_row("SELECT revision FROM stats_aux_revision WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
     conn.execute_batch(
         "INSERT INTO price_history (card_id, price, recorded_at) VALUES ('c-sol', 4.0, '2099-06-01 00:00:00');",
     )
     .unwrap();
-    let aux: i64 = conn
+    let aux_after: i64 = conn
         .query_row("SELECT revision FROM stats_aux_revision WHERE id = 1", [], |r| r.get(0))
         .unwrap();
-    assert!(aux >= 1, "trigger must have bumped stats_aux_revision");
+    assert_eq!(aux_after - aux_before, 1, "one committed write bumps stats_aux_revision exactly once");
     drop(conn);
 
     let (_, h, served) = get_json(&r, "/api/stats").await;
@@ -447,6 +548,24 @@ async fn proxied_write_bumps_user_generation() {
     // Bounded staleness (owner ruling, iter 12): the stale body may serve
     // until the background rebuild lands, but it must land inside the bound.
     get_stats_until(&r, "hit", 2000).await;
+
+    // Owner ruling (iter 21, collection_writes port): EVERY proxied write
+    // bumps, not just the POST case this test was born with. With the
+    // collection_writes group off, PUT/DELETE/bulk ride the proxy too — each
+    // must drop the cache key the same way.
+    for (method, path, body) in [
+        ("PUT", "/api/collection/3", Some("{\"notes\":\"proxied\"}")),
+        ("POST", "/api/collection/bulk", Some("{\"entry_ids\":[4],\"action\":\"condition\",\"value\":\"Damaged\"}")),
+        ("DELETE", "/api/collection/6", None),
+    ] {
+        let (s, h, _) = request_body(&r, method, path, &auth_json(), body).await;
+        assert_eq!(s, StatusCode::OK, "proxied {method} {path} echoes");
+        assert!(h.get("x-node").is_some(), "{method} {path} must ride the proxy");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, h, _) = request(&r, "GET", "/api/stats", &auth()).await;
+        assert_eq!(h["x-stats-cache"], "miss", "proxied {method} {path} must bump");
+        get_stats_until(&r, "hit", 2000).await;
+    }
 
     // HEAD and unauthenticated writes must NOT bump (Node's middleware skips
     // HEAD and never reaches a user for unauth).

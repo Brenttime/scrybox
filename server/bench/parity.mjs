@@ -155,28 +155,236 @@ cases.push({ name: 'authr_apikey_post_no_token', path: '/api/auth/api-key', head
 cases.push({ name: 'authr_apikey_delete_no_token', path: '/api/auth/api-key', headers: {}, method: 'DELETE' });
 cases.push({ name: 'authr_settings_no_token', path: '/api/auth/settings', headers: AUTH_JSON, method: 'PUT', body: '{}' });
 
-// --- comparison --------------------------------------------------------------
+// Collection WRITE group (iter 22 port: GET cardlist, PUT/DELETE :id, POST
+// bulk; RUST_ROUTES=collection_writes). Read/gate/validation cases are plain;
+// success-path WRITE cases use setup()/teardown() so each side answers the
+// identical request from an identical fresh probe row. POST /api/collection
+// does NOT accept `notes` (addCardToCollection destructures a fixed field
+// set), so probes are tracked by the ids the create response returned and
+// deleted again by id through bulk — every bulk body uses `entry_ids`, the
+// field Node's bulk route actually reads (an earlier `ids` typo made every
+// bulk case pass on a 400==400 'entry_ids is required' without ever
+// executing the write). Owner ruling (iter 21): each success case also
+// carries a `readBack` verifying the mutation from the OPPOSITE server
+// (Rust-write → Node-read and vice versa) before teardown cleans up. The
+// add_to_deck full-move path mutates decks + collection rows non-idempotently
+// and stays cargo-fixture-only (tests/collection_writes.rs); its pre-write
+// validation branches (bad value, missing deck, checked-out deck) are covered
+// live here because Node answers them before any deck write.
+const CW_JSON = { ...authHeaders, 'content-type': 'application/json' };
+cases.push({ name: 'cw_cardlist_plain', path: '/api/collection/cardlist', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cw_cardlist_detailed', path: '/api/collection/cardlist?style=detailed', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cw_cardlist_no_token', path: '/api/collection/cardlist', headers: {}, method: 'GET' });
+cases.push({ name: 'cw_put_no_token', path: '/api/collection/99999999', headers: {}, method: 'PUT', body: '{"notes":"x"}' });
+cases.push({ name: 'cw_put_bad_token', path: '/api/collection/99999999', headers: { Authorization: '***' }, method: 'PUT', body: '{"notes":"x"}' });
+cases.push({ name: 'cw_delete_no_token', path: '/api/collection/99999999', headers: {}, method: 'DELETE' });
+cases.push({ name: 'cw_bulk_no_token', path: '/api/collection/bulk', headers: {}, method: 'POST', body: '{"entry_ids":[1],"action":"delete"}' });
+cases.push({ name: 'cw_put_missing_404', path: '/api/collection/99999999', headers: CW_JSON, method: 'PUT', body: '{"notes":"x"}' });
+cases.push({ name: 'cw_delete_missing_404', path: '/api/collection/99999999', headers: authHeaders, method: 'DELETE' });
+cases.push({ name: 'cw_bulk_bad_ids_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"action":"delete"}' });
+cases.push({ name: 'cw_bulk_empty_ids_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"entry_ids":[],"action":"delete"}' });
+cases.push({ name: 'cw_bulk_bad_action_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"entry_ids":[1],"action":"frobnicate"}' });
+cases.push({ name: 'cw_bulk_bad_condition_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"entry_ids":[1],"action":"condition","value":"Bent"}' });
+cases.push({ name: 'cw_bulk_bad_printing_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"entry_ids":[1],"action":"printing","value":"Foil"}' });
+cases.push({ name: 'cw_bulk_split_bad_total_400', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST', body: '{"entry_ids":[1],"action":"purchase_split","value":{}}' });
+// add_to_deck `value` is the deck id itself (Node: parseInt(value,10)).
+cases.push({
+  name: 'cw_bulk_deck_bad_value_400', path: '/api/collection/0', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { path: '/api/collection/bulk', body: JSON.stringify({ entry_ids: p.ids, action: 'add_to_deck', value: { deck_id: 1 } }), ctx: { ids: p.ids } }; },
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_bulk_deck_missing_404', path: '/api/collection/0', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { path: '/api/collection/bulk', body: JSON.stringify({ entry_ids: p.ids, action: 'add_to_deck', value: 99999999 }), ctx: { ids: p.ids } }; },
+  teardown: deleteProbes,
+});
+// Deck 114 ('Urlings' sibling in the bench DB) is owned by the bench token
+// user and checked_out=1 — Node answers 409 before touching any deck row.
+cases.push({
+  name: 'cw_bulk_deck_checked_out_409', path: '/api/collection/0', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { path: '/api/collection/bulk', body: JSON.stringify({ entry_ids: p.ids, action: 'add_to_deck', value: 114 }), ctx: { ids: p.ids } }; },
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_notes_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"notes":"parity-notes"}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && rows[0].notes === 'parity-notes', 'PUT notes must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_condition_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"condition":"Lightly Played"}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && rows[0].condition === 'Lightly Played', 'PUT condition must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_printing_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"printing":"Holofoil"}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && rows[0].printing === 'Holofoil', 'PUT printing must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_bad_printing_400', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"printing":"Foil"}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  teardown: deleteProbes,
+});
+// Node reconciles the physical stack to N single-copy rows (cargo pins the
+// family math); the live read-back verifies the written row is visible from
+// the other server with the reconciled quantity.
+cases.push({
+  name: 'cw_put_qty_grow_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"quantity":3}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && rows[0].quantity === 1, 'grown stack keeps row as single copy'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_qty_zero_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"quantity":0}',
+  setup: async (base) => { const p = await createProbe(base, { quantity: 2 }); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && rows[0].quantity === 1, 'quantity 0 floors at 1 and never deletes'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_put_trade_200', path: '/api/collection/0', headers: CW_JSON, method: 'PUT', body: '{"is_trade":true}',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 1 && Boolean(rows[0].is_trade), 'PUT is_trade must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_delete_200', path: '/api/collection/0', headers: authHeaders, method: 'DELETE',
+  setup: async (base) => { const p = await createProbe(base); return { path: `/api/collection/${p.id}`, ctx: { ids: p.ids, pid: p.id } }; },
+  readBack: expectPersisted((ctx) => [ctx.pid], (rows) => rows.length === 0, 'DELETE must remove the row'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_bulk_delete_200', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { body: JSON.stringify({ entry_ids: p.ids, action: 'delete' }), ctx: { ids: p.ids } }; },
+  readBack: expectPersisted((ctx) => ctx.ids, (rows) => rows.length === 0, 'bulk delete must remove rows'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_bulk_trade_200', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { body: JSON.stringify({ entry_ids: p.ids, action: 'trade' }), ctx: { ids: p.ids } }; },
+  readBack: expectPersisted((ctx) => ctx.ids, (rows) => rows.length >= 1 && rows.every((r) => Boolean(r.is_trade)), 'bulk trade must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_bulk_condition_200', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST',
+  setup: async (base) => { const p = await createProbe(base); return { body: JSON.stringify({ entry_ids: p.ids, action: 'condition', value: 'Near Mint' }), ctx: { ids: p.ids } }; },
+  readBack: expectPersisted((ctx) => ctx.ids, (rows) => rows.length === 1 && rows[0].condition === 'Near Mint', 'bulk condition must persist'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_split_weighted_200', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST',
+  setup: async (base) => {
+    const a = await createProbe(base), b = await createProbe(base);
+    return { body: JSON.stringify({ entry_ids: [a.id, b.id], action: 'purchase_split', value: { total: 1.5, method: 'weighted' } }), ctx: { ids: [a.id, b.id] } };
+  },
+  readBack: expectPersisted((ctx) => ctx.ids, (rows) => rows.length === 2 && Math.abs(rows.reduce((s, r) => s + Number(r.purchase_price), 0) - 1.5) < 1e-9, 'weighted split must persist summing to 1.50'),
+  teardown: deleteProbes,
+});
+cases.push({
+  name: 'cw_split_equal_200', path: '/api/collection/bulk', headers: CW_JSON, method: 'POST',
+  setup: async (base) => {
+    const a = await createProbe(base), b = await createProbe(base);
+    return { body: JSON.stringify({ entry_ids: [a.id, b.id], action: 'purchase_split', value: { total: 1, method: 'equal' } }), ctx: { ids: [a.id, b.id] } };
+  },
+  readBack: expectPersisted((ctx) => ctx.ids, (rows) => rows.length === 2 && rows.every((r) => Math.abs(Number(r.purchase_price) - 0.5) < 1e-9), 'equal split must persist 0.50 per row'),
+  teardown: deleteProbes,
+});
 
+// --- write-parity helpers (iter 22: collection_writes group) -----------------
+// A write case is only honest if BOTH sides answer the identical request from
+// the identical starting state. `setup(base)` runs immediately before each
+// side's request (per attempt — a retry gets a fresh probe) and can rewrite
+// path/body/headers and hand state to `teardown(base, ctx)`, which always
+// cleans up through the API so the shared DB copy is left as found. Probes
+// are tagged with a unique marker in `notes`; teardown deletes ONLY rows
+// whose notes match, never pre-existing user data.
 let ipSeq = 1;
 function xff() { const n = ipSeq++; return `10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}`; }
 
+const CW_CARD = 'mtg-dda6f965-cbdf-4dbc-b0b1-00c27e32f5f2'; // parity fixture card (in card_cache + owned)
+async function apiReq(base, method, path, headers, body) {
+  const res = await fetch(base + path, {
+    method, headers: { ...headers, 'x-forwarded-for': xff() }, body, redirect: 'manual',
+  });
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { /* non-JSON */ }
+  return { status: res.status, json, text };
+}
+async function createProbe(base, body = {}) {
+  // POST /api/collection ignores `notes` (addCardToCollection takes a fixed
+  // field set), so probes are identified by the ids the create response
+  // returned — teardown deletes exactly those rows, never pre-existing data.
+  const r = await apiReq(base, 'POST', '/api/collection',
+    { ...authHeaders, 'content-type': 'application/json' },
+    JSON.stringify({ card_id: CW_CARD, quantity: 1, ...body }));
+  if (r.status !== 200 || !r.json || !Array.isArray(r.json.ids) || r.json.ids.length === 0) {
+    throw new Error(`parity probe create failed: ${r.status} ${r.text.slice(0, 120)}`);
+  }
+  return { id: r.json.id, ids: r.json.ids };
+}
+async function deleteProbes(base, ctx) {
+  const ids = ctx && Array.isArray(ctx.ids) ? ctx.ids : [];
+  if (!ids.length) return;
+  await apiReq(base, 'POST', '/api/collection/bulk',
+    { ...authHeaders, 'content-type': 'application/json' },
+    JSON.stringify({ entry_ids: ids, action: 'delete' }));
+}
+async function rowsByIdsVia(base, ids) {
+  const g = await apiReq(base, 'GET', `/api/collection?card_id=${CW_CARD}&limit=1000`, authHeaders);
+  const rows = Array.isArray(g.json) ? g.json : (Array.isArray(g.json?.data) ? g.json.data : []);
+  const want = new Set(ids.map((n) => Number(n)));
+  return rows.filter((row) => want.has(Number(row.entry_id)));
+}
+const persistView = (rows) => rows
+  .map((r) => ({ quantity: r.quantity, condition: r.condition, printing: r.printing, is_trade: r.is_trade, purchase_price: r.purchase_price, notes: r.notes }))
+  .sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+/// Owner ruling (iter 21): write success cases must be VERIFIED by a read
+/// through the opposite server. Returns (otherBase, ctx) => {ok, why, seen}:
+/// `ok` false fails the case outright; `seen` (normalized persisted fields of
+/// the probe rows) is deep-compared across the two sides, so a Rust write
+/// that persists differently from a Node write cannot hide behind matching
+/// write-response bodies.
+function expectPersisted(idsOf, pred, why) {
+  return async (other, ctx) => {
+    const rows = await rowsByIdsVia(other, idsOf(ctx));
+    const detail = rows.map((r) => ({ id: r.entry_id, q: r.quantity, c: r.condition, p: r.printing, t: r.is_trade, pp: r.purchase_price, n: r.notes }));
+    return { ok: pred(rows), why: `${why} -> ${JSON.stringify(detail)}`, seen: persistView(rows) };
+  };
+}
+
 async function fetchSide(base, c) {
   const t0 = Date.now();
-  const res = await fetch(base + c.path, {
+  let path = c.path, body = c.body, headers = c.headers, ctx = null;
+  if (c.setup) {
+    const s = await c.setup(base, c);
+    if (s) { path = s.path ?? path; body = s.body ?? body; headers = s.headers ?? headers; ctx = s.ctx ?? null; }
+  }
+  const res = await fetch(base + path, {
     method: c.method,
-    headers: { ...c.headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
-    body: c.body,
+    headers: { ...headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
+    body,
     redirect: 'manual',
   });
-  const body = res.status === 304 ? '' : await res.text();
+  const resBody = res.status === 304 ? '' : await res.text();
+  // Cross-side write verification BEFORE teardown (the probe must still exist).
+  let readback;
+  if (c.readBack) {
+    const other = base === RUST ? NODE : RUST;
+    try { readback = await c.readBack(other, ctx); }
+    catch (e) { readback = { ok: false, why: `readBack threw ${e}`, seen: null }; }
+  }
+  if (c.teardown) { try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
   return {
     status: res.status,
-    body,
-    json: body && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(body) : undefined,
+    body: resBody,
+    json: resBody && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(resBody) : undefined,
     total: res.headers.get('x-total-count'),
     source: res.headers.get('x-source'),
     etag: res.headers.get('etag'),
     ctype: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
+    readback,
     ms: Date.now() - t0,
   };
 }
@@ -222,6 +430,17 @@ function compareCase(c, r, n) {
   } else if (r.body !== n.body) {
     diffs.push(`body ${fmt(r.body)} vs ${fmt(n.body)}`);
   }
+  // Owner ruling (iter 21): write success cases verified through the OTHER
+  // server's read path. A failed read-back is an absolute failure (it cannot
+  // cancel out across sides), and the persisted views must be identical.
+  if (r.readback || n.readback) {
+    if (!r.readback || !n.readback) diffs.push('readback missing on one side');
+    else {
+      if (!r.readback.ok) diffs.push(`rust-write not verified by Node read: ${r.readback.why}`);
+      if (!n.readback.ok) diffs.push(`node-write not verified by Rust read: ${n.readback.why}`);
+      deepDiff(r.readback.seen, n.readback.seen, '$persisted', diffs);
+    }
+  }
   return diffs;
 }
 
@@ -262,6 +481,9 @@ function rawGet(base, path, headers) {
 ///     are byte-identical the tags must be identical, which cross-checks the
 ///     Rust serializer against Node's at byte level.
 async function etagParity(c) {
+  // Replay only makes sense for idempotent GETs; write cases are compared by
+  // response alone (their ETag is Express's default body tag, not a contract).
+  if ((c.method || 'GET') !== 'GET') return [];
   if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats')) return [];
   const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
   if (r.status !== 200 || n.status !== 200) return [];
@@ -297,7 +519,15 @@ const MAX_TRIES = 3;
 for (const c of cases) {
   let lastDiffs = null, tries = 0, etagDiffs = [];
   for (; tries < MAX_TRIES; tries++) {
-    const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
+    // Write cases run RUST then NODE serially: probes for one case share a
+    // physical stack (card/user/condition/printing/language), and Node's
+    // setStackQuantity trim deletes by stack key — a concurrent other-side
+    // probe could be trimmed out from under its own flow. Sequential keeps
+    // the "identical request from identical fresh state" property and makes
+    // the trim deterministic. Pure reads stay parallel.
+    const [r, n] = c.setup
+      ? [await fetchSide(RUST, c), await fetchSide(NODE, c)]
+      : await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
     lastDiffs = compareCase(c, r, n);
     if (lastDiffs.length === 0) { etagDiffs = await etagParity(c); if (etagDiffs.length === 0) break; }
   }

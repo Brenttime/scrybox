@@ -31,6 +31,7 @@ pub mod collq;
 pub mod ip_limit;
 pub mod oidc;
 pub mod collection;
+pub mod collection_writes;
 pub mod db;
 pub mod health;
 pub mod name_index;
@@ -253,6 +254,18 @@ pub fn app(state: AppState) -> Router {
     };
     let router = if state.owns("search") {
         router.route("/api/search", any(search::handle))
+    } else {
+        router
+    };
+    // Collection WRITE group (cardlist / bulk / PUT+DELETE :id). The
+    // handlers dispatch internally: methods the port does not own, and the
+    // PUT card_id branch whose target printing is not in card_cache (Node
+    // would hydrate it from Scryfall), are proxied to Node untouched.
+    let router = if state.owns("collection_writes") {
+        router
+            .route("/api/collection/cardlist", any(collection_writes::handle_cardlist))
+            .route("/api/collection/bulk", any(collection_writes::handle_bulk))
+            .route("/api/collection/{id}", any(collection_writes::handle_entry))
     } else {
         router
     };
