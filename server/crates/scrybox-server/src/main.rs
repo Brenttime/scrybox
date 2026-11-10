@@ -24,6 +24,19 @@ async fn main() {
         }
     };
     tracing::info!(bind = %cfg.bind, upstream = %cfg.node_upstream, static_dir = ?cfg.static_dir, rust_routes = ?cfg.rust_routes, "scrybox-server P0 starting");
+    // Lane B background jobs (BRIEF-B): RUST_JOBS=scryfall takes the
+    // weekly set-sync / hourly price-sweep timers from Node's server.js
+    // (which the test container disables via SCRYBOX_DISABLE_SETS_REFRESH /
+    // SCRYBOX_DISABLE_PRICE_SWEEP when this is on). Off unless set.
+    if std::env::var("RUST_JOBS").unwrap_or_default().split(',').any(|s| s.trim() == "scryfall") {
+        match cfg.db_path.clone() {
+            Some(path) => {
+                tracing::info!(db = %path.display(), "Rust Scryfall jobs enabled (RUST_JOBS=scryfall)");
+                scrybox_server::scry_jobs::start_job_timers(path);
+            }
+            None => tracing::warn!("RUST_JOBS=scryfall set but SCRYBOX_DB_PATH missing; jobs not started"),
+        }
+    }
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");
     let router = app(AppState::new(cfg));
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())

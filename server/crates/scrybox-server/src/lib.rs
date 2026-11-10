@@ -27,6 +27,8 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
+pub mod card_cache;
+pub mod card_norm;
 pub mod collq;
 pub mod ip_limit;
 pub mod oidc;
@@ -35,7 +37,10 @@ pub mod collection_writes;
 pub mod db;
 pub mod health;
 pub mod name_index;
+pub mod scryfall;
+pub mod scry_jobs;
 pub mod search;
+pub mod sets;
 pub mod sidecar;
 pub mod stats;
 mod stats_sql;
@@ -119,6 +124,11 @@ pub struct AppState {
     /// Tests set this directly; `new` parses the same env Node's server.js
     /// reads, with the same ladder.
     pub trust_proxy: ip_limit::Trust,
+    /// Shared Scryfall client (Lane B): rate-limited queue + 404 breaker.
+    /// One per process so the queue is global, like Node's module state.
+    pub scry: Arc<scryfall::Scry>,
+    /// cardSets.js getScryfallSets memo (tree=1 folds, 6 h TTL).
+    pub scryfall_sets: sets::ScryfallSetsMemo,
     /// authLimiter twin (middleware/auth.js): one fixed window per client IP
     /// shared by login/register/bootstrap/api-key/settings.
     pub auth_limiter: Arc<ip_limit::FixedWindowLimiter>,
@@ -145,7 +155,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -286,6 +296,12 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/auth", any(auth_routes::handle))
             .route("/api/auth/{*rest}", any(auth_routes::handle))
+    } else {
+        router
+    };
+    // Sets route group (Lane B unit 1): native GET /api/sets (flat + tree).
+    let router = if state.owns("sets") {
+        router.route("/api/sets", any(sets::handle))
     } else {
         router
     };

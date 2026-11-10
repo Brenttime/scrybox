@@ -185,7 +185,9 @@
     "status": "node"
   },
   "GET /api/sets": {
-    "status": "node"
+    "module": "scrybox-server::sets (lib.rs GET /api/sets)",
+    "status": "verified",
+    "tests": "tests/sets_route.rs (3); parity.mjs sets_flat/sets_tree/sets_lang_de/sets_empty_query/sets_no_token/sets_bad_token"
   },
   "GET /api/settings": {
     "status": "node"
