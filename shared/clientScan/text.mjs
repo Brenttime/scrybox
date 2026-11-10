@@ -287,20 +287,33 @@ export function footerNumbers(raws) {
   return numbers;
 }
 
+// Printed language codes beside the set code ('ZNR • EN'); never a set.
+const LANG_TOKENS = new Set(['en', 'de', 'fr', 'it', 'es', 'pt', 'ja', 'jp', 'ko', 'ru', 'cs', 'ct', 'zhs', 'zht', 'ph']);
 export function footerCodes(ix, raws) {
   const codes = [];
   for (const raw of raws) {
     const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
-    // The earliest position wins, then rank: 'ZNR·EN' compacts to 'znren',
-    // where 'ren' (pos 2) outranked 'znr' (pos 0) and every Zendikar Rising
-    // footer named the wrong set (also 'TPR·EN' -> 'ren'). A noise glyph in
-    // front still reaches pos 1-2 when nothing matches earlier.
-    let best = null;
-    for (let pos = 0; pos < Math.min(3, compact.length) && best == null; pos++) {
-      for (const len of ix.setLengths) {
-        const cand = compact.slice(pos, pos + len);
-        if (cand.length === len && ix.setLookup.has(cand)
-          && (best == null || ix.setRank.get(cand) < ix.setRank.get(best))) best = cand;
+    // A token that IS a set code, on its own between separators, is direct
+    // evidence ('ZNR·EN' -> znr; the substring scan alone picked 'ren' from
+    // 'znren' and every Zendikar Rising footer named the wrong set). Only a
+    // single such token counts; none or several -> the substring scan below,
+    // unchanged (offset + rank), so a noise prefix never creates a new code
+    // (review R1-B1: 'im afc en' stays AFC, never IMA).
+    // Same reach as the scan: the token must start within the first 3 chars.
+    const tokens = [];
+    let at = 0;
+    for (const t of raw.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (at < 3 && ix.setLookup.has(t) && !LANG_TOKENS.has(t)) tokens.push(t);
+      at += t.length;
+    }
+    let best = new Set(tokens).size === 1 ? tokens[0] : null;
+    if (best == null) {
+      for (let pos = 0; pos < Math.min(3, compact.length); pos++) {
+        for (const len of ix.setLengths) {
+          const cand = compact.slice(pos, pos + len);
+          if (cand.length === len && ix.setLookup.has(cand)
+            && (best == null || ix.setRank.get(cand) < ix.setRank.get(best))) best = cand;
+        }
       }
     }
     if (best && !codes.includes(best)) codes.push(best);

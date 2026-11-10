@@ -5,7 +5,7 @@ import { priceText, cardPriceText, estPrefix, isEstimated } from '../utils/forma
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
 import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, updatePresence, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
-import { loadClientScan, checkClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
+import { loadClientScan, checkClientScan, requestPersistentStorage, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
@@ -235,8 +235,10 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       scanTelemetry.device({ ok: r.ok, loadMs: r.loadMs, error: r.error, ...(r.info || {}) });
       if (r.ok) {
         // Same card index as the server? (content hash; one tiny request)
+        requestPersistentStorage().then(p => { if (live) scanTelemetry.device({ ok: true, loadMs: r.loadMs, ...(r.info || {}), persisted: p }); });
         checkClientScan().then(c => {
-          if (live && c.updated) scanTelemetry.device({ ok: true, loadMs: c.loadMs, updatedFrom: c.from, ...(c.info || {}) });
+          // Fresh or updated: telemetry names the bundle that will read.
+          if (live && c.info) scanTelemetry.device({ ok: true, loadMs: c.updated ? c.loadMs : r.loadMs, updatedFrom: c.updated ? c.from : undefined, ...c.info });
         });
       } else {
         console.info('[fastscan] on-device reader unavailable:', r.error);
@@ -284,10 +286,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const video = { width: { ideal: size[0] }, height: { ideal: size[1] }, frameRate: { ideal: 30 } };
     if (id) video.deviceId = { exact: id }; else video.facingMode = { ideal: 'environment' };
     try {
-      let stream;
+      let stream, fallback = false;
       try { stream = await navigator.mediaDevices.getUserMedia({ video, audio: false }); }
       catch (e) {
         if (!id) throw e;
+        fallback = true;
         // A stale saved camera id (iOS rotates them): keep the resolution ask.
         const rest = { ...video, facingMode: { ideal: 'environment' } };
         delete rest.deviceId;
@@ -302,7 +305,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       setTorchOk(!!caps.torch);
       await raiseResolution(track, size);
       const st = track.getSettings?.() || {};
-      scanTelemetry.camera({ w: st.width, h: st.height, fps: st.frameRate, asked: size, max: [caps.width?.max, caps.height?.max], stale: !!id && st.deviceId !== id });
+      scanTelemetry.camera({ w: st.width, h: st.height, fps: st.frameRate, asked: size, max: [caps.width?.max, caps.height?.max], fallback });
       if (caps.focusMode?.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
       setCameraOn(true);
       const all = await navigator.mediaDevices.enumerateDevices();

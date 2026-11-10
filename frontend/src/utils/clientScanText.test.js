@@ -102,15 +102,17 @@ test('footerCodes reads a set code with up to two noise chars', () => {
   assert.deepEqual(footerCodes(ix, ['0408 R MH2']), []);
 });
 
-test('footerCodes: the earliest set code wins over a better-ranked one inside it', () => {
+test('footerCodes: a set code standing alone as a token beats a better-ranked substring', () => {
   // 2026-11-10: 'ZNR·EN' compacted to 'znren' and named 'ren' (ranked first)
   // instead of 'znr', so every Zendikar Rising footer code was wrong.
-  const sx = loadIndex({ names: [], canon: {}, excluded: [], sets: ['ren', 'tpr', 'znr', 'trk'], printings: [], byTitle: {}, uniqueAlias: {} });
+  const sx = loadIndex({ names: [], canon: {}, excluded: [], sets: ['ren', 'ima', 'afc', 'tpr', 'znr', 'trk'], printings: [], byTitle: {}, uniqueAlias: {} });
   assert.deepEqual(footerCodes(sx, ['ZNR·EN']), ['znr']);
   assert.deepEqual(footerCodes(sx, ['TPR • EN']), ['tpr']);
-  assert.deepEqual(footerCodes(sx, ['TRKEN']), ['trk']);
-  assert.deepEqual(footerCodes(sx, ['• ZNR • EN']), ['znr'], 'noise glyph in front');
-  assert.deepEqual(footerCodes(sx, ['REN EN']), ['ren']);
+  assert.deepEqual(footerCodes(sx, ['• ZNR • EN']), ['znr']);
+  assert.deepEqual(footerCodes(sx, ['TRKEN']), ['trk'], 'no separator: the substring scan, as before');
+  // Review R1-B1: a retained noise prefix must never create another set.
+  assert.deepEqual(footerCodes(sx, ['im afc en']), ['afc']);
+  assert.deepEqual(footerCodes(sx, ['0408 R ZNR']), [], 'a code token must sit where a footer code does');
 });
 
 test('needsServer: fallback rules', () => {

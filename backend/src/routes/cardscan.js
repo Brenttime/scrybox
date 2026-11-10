@@ -145,6 +145,14 @@ const fs = require('fs');
 const path = require('path');
 const TELEMETRY_DIR = process.env.SCAN_TELEMETRY_DIR || path.join(__dirname, '..', '..', '..', 'database', 'scan-telemetry');
 const TELEMETRY_DAY_MAX = 50 * 1024 * 1024;
+// What getUserMedia actually delivered, for scan telemetry: numbers only.
+function cameraMeta(c) {
+  if (!c || typeof c !== 'object') return undefined;
+  const n = (v) => (Number.isFinite(v) ? Math.round(v) : undefined);
+  const pair = (v) => (Array.isArray(v) ? v.slice(0, 2).map(n) : undefined);
+  return { w: n(c.w), h: n(c.h), fps: n(c.fps), asked: pair(c.asked), max: pair(c.max), fallback: c.fallback === true || undefined };
+}
+
 router.post('/telemetry', express.json({ limit: '512kb', type: ['application/json', 'text/plain'] }), (req, res) => {
   if (process.env.SCAN_TELEMETRY === '0') return res.status(204).end();
   const b = req.body || {};
@@ -152,7 +160,7 @@ router.post('/telemetry', express.json({ limit: '512kb', type: ['application/jso
   if (!records.length) return res.status(400).json({ ok: false, error: 'No records' });
   const day = new Date().toISOString().slice(0, 10);
   const file = path.join(TELEMETRY_DIR, `${day}.jsonl`);
-  const meta = { user: req.user?.id ?? null, session: String(b.session || '').slice(0, 20), platform: b.platform, device: b.device, ua: String(req.get('user-agent') || '').slice(0, 200) };
+  const meta = { user: req.user?.id ?? null, session: String(b.session || '').slice(0, 20), platform: b.platform, device: b.device, camera: cameraMeta(b.camera), ua: String(req.get('user-agent') || '').slice(0, 200) };
   const lines = records.map(r => JSON.stringify({ ...meta, ...r, recv: new Date().toISOString() })).join('\n') + '\n';
   fs.promises.mkdir(TELEMETRY_DIR, { recursive: true })
     .then(() => fs.promises.stat(file).then(s => s.size).catch(() => 0))

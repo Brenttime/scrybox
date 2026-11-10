@@ -21,6 +21,7 @@ import { startLoad } from './scanLoad.js';
 const LOAD_TIMEOUT_MS = 120000;   // first download of ~40 MB on a slow phone
 const READ_TIMEOUT_MS = 8000;     // a normal read is well under 2 s
 const LOAD_RETRY_MS = 30000;      // after a failed load, try again this much later
+const CHECK_TIMEOUT_MS = 100000;  // > the worker's own refresh bound (UPDATE_MS 90 s)
 
 let worker = null;
 let loading = false;        // a load (incl. its 1-thread fallback) is in flight
@@ -63,7 +64,7 @@ function ensureWorker() {
 function call(msg, transfer = [], timeoutMs = READ_TIMEOUT_MS, onTimeout = killWorker) {
   const id = nextId++;
   return new Promise((resolve) => {
-    const timer = setTimeout(() => onTimeout('scan worker timed out'), timeoutMs);
+    const timer = setTimeout(() => onTimeout('scan worker timed out', id), timeoutMs);
     waiting.set(id, { resolve, timer });
     ensureWorker().postMessage({ ...msg, id }, transfer);
   });
@@ -124,11 +125,22 @@ export function loadClientScan() {
 export async function checkClientScan() {
   const r = ready ? await ready : null;
   if (!r?.ok || !worker) return { skipped: true };
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ error: 'check timed out' }), LOAD_TIMEOUT_MS);
-    call({ type: 'check' }, [], LOAD_TIMEOUT_MS + 1000, () => {})
-      .then((x) => { clearTimeout(timer); resolve(x); });
-  });
+  // On its deadline only THIS call is answered and forgotten; the worker
+  // bounds and supersedes the refresh itself (review R1-B2).
+  const expire = (reason, id) => {
+    const w = waiting.get(id);
+    if (w) { waiting.delete(id); w.resolve({ error: reason }); }
+  };
+  return call({ type: 'check' }, [], CHECK_TIMEOUT_MS, expire);
+}
+
+// Ask the browser to keep the scanner's cached models and index under storage
+// pressure. persist() exists on the window only (not in workers); refusal is
+// harmless. Once per page.
+let persistAsked = null;
+export function requestPersistentStorage() {
+  persistAsked ||= (navigator.storage?.persist?.() ?? Promise.resolve(null)).catch(() => null);
+  return persistAsked;
 }
 
 let frameCanvas = null, smallCanvas = null;

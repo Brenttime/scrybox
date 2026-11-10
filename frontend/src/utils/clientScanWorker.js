@@ -12,6 +12,7 @@
 import * as ort from 'onnxruntime-web/wasm';
 import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
+import { createBundles } from './scanBundles.js';
 
 ort.env.wasm.wasmPaths = '/ort/';
 // Threads need cross-origin isolation (COOP + COEP, backend coep.js). Replay
@@ -40,15 +41,15 @@ ort.env.wasm.numThreads = 1;
 let ORIGIN = '';
 const BASE = '/scan-assets/';
 const CACHE = 'scrybox-scan-assets';
-let readerPromise = null;
+let readerPromise = null;     // the first load (shared by every 'load' call)
 let pendingReset = false;
 let FLAGS = {};
 let THREAD_OVERRIDE = null;
 
-async function cachedBytes(cache, url) {
+async function cachedBytes(cache, url, signal) {
   let res = cache ? await cache.match(url) : null;
   if (!res) {
-    res = await fetch(ORIGIN + url);
+    res = await fetch(ORIGIN + url, { signal });
     const type = res.headers.get('content-type') || '';
     if (!res.ok || type.includes('text/html')) throw new Error(`${url} not served (${res.status})`);
     if (cache) await cache.put(url, res.clone()).catch(() => {});
@@ -62,27 +63,24 @@ async function gunzip(bytes) {
   return new Response(stream).text();
 }
 
-async function fetchManifest() {
+async function fetchManifest(signal) {
   // Tiny and no-cache: the content hashes in it are the whole version check.
-  const res = await fetch(`${ORIGIN}${BASE}manifest.json`, { cache: 'no-cache' });
+  const res = await fetch(`${ORIGIN}${BASE}manifest.json`, { cache: 'no-cache', signal });
   if (!res.ok) throw new Error(`manifest not served (${res.status})`);
   return res.json();
 }
 
-// Same assets (content-hashed names) = same reader.
-const sameAssets = (a, b) => !!a && !!b && a.index === b.index && a.rec === b.rec && a.dict === b.dict;
-
 // cornelius has a fixed URL (shared with the server route), so it is kept in
-// the Cache API like the hashed assets and revalidated in the background
-// (one conditional request); a changed model is picked up by the next load.
+// the Cache API like the hashed assets; each load serves the cached copy and
+// stores a revalidated one for the next load (no identity guessing from
+// headers; review R1-S2).
 const CORN_URL = '/models/cornelius.onnx';
-async function cornBytes(cache) {
+async function cornBytes(cache, signal) {
   const hit = cache ? await cache.match(CORN_URL) : null;
-  if (!hit) return cachedBytes(cache, CORN_URL);
-  fetch(ORIGIN + CORN_URL, { cache: 'no-cache' }).then(res => {
+  if (!hit) return cachedBytes(cache, CORN_URL, signal);
+  fetch(ORIGIN + CORN_URL, { cache: 'no-cache' }).then(async (res) => {
     const type = res.headers.get('content-type') || '';
-    if (res.ok && !type.includes('text/html')
-      && res.headers.get('content-length') !== hit.headers.get('content-length')) cache.put(CORN_URL, res);
+    if (res.ok && !type.includes('text/html')) await cache.put(CORN_URL, res);
   }).catch(() => {});
   return new Uint8Array(await hit.arrayBuffer());
 }
@@ -93,33 +91,41 @@ async function warmUp(rec, cornelius) {
   await rec.run({ [rec.inputNames[0]]: zeros([1, 3, 48, 320]) });
 }
 
-async function load(manifest = null) {
+// Drop cached assets no current bundle names. Only after a bundle is ACTIVE,
+// so a failed refresh never costs the last good copy (review R1-S1).
+const releaseSessions = (...ss) => { for (const x of ss) x?.release?.()?.catch?.(() => {}); };
+async function pruneCache() {
+  const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
+  if (!cache) return;
+  const keep = new Set([bundles.active, bundles.pending].filter(Boolean)
+    .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
+  keep.add(CORN_URL);
+  for (const req of await cache.keys()) {
+    if (!keep.has(new URL(req.url).pathname)) await cache.delete(req).catch(() => {});
+  }
+}
+
+async function load(manifest = null, signal = undefined) {
   const t0 = performance.now();
-  // Ask the browser not to evict the ~25 MB of models and index under storage
-  // pressure (granted silently to installed PWAs; harmless when refused).
-  self.navigator?.storage?.persist?.().catch(() => {});
-  manifest ||= await fetchManifest();
+  manifest ||= await fetchManifest(signal);
   const urls = [manifest.index, manifest.rec, manifest.dict].map(n => BASE + n);
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
-  if (cache) {
-    // Drop assets a newer manifest no longer names.
-    for (const req of await cache.keys()) {
-      const path = new URL(req.url).pathname;
-      if (path !== CORN_URL && !urls.includes(path)) cache.delete(req);
-    }
-  }
   const tFetch = performance.now();
   const [indexGz, recBytes, dictBytes, corn] = await Promise.all([
-    cachedBytes(cache, urls[0]), cachedBytes(cache, urls[1]), cachedBytes(cache, urls[2]), cornBytes(cache),
+    cachedBytes(cache, urls[0], signal), cachedBytes(cache, urls[1], signal), cachedBytes(cache, urls[2], signal), cornBytes(cache, signal),
   ]);
   const fetchMs = Math.round(performance.now() - tFetch);
   const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
-  // Index decode runs while ORT compiles the two sessions.
-  const [rec, cornelius, index] = await Promise.all([
+  // Index decode runs while ORT compiles the two sessions; a failure frees
+  // whatever was created (review R1-S1).
+  const parts = await Promise.allSettled([
     ort.InferenceSession.create(recBytes, opts),
     ort.InferenceSession.create(corn, opts),
     gunzip(indexGz).then(text => loadIndex(JSON.parse(text))),
   ]);
+  const failed = parts.find(p => p.status === 'rejected');
+  const [rec, cornelius, index] = parts.map(p => p.value);
+  if (failed || signal?.aborted) { releaseSessions(rec, cornelius); throw failed?.reason || new Error('refresh aborted'); }
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
   // Warm-up: the first run of each session allocates and plans its kernels
   // (hundreds of ms on a phone); pay that here, not on the first card.
@@ -129,35 +135,24 @@ async function load(manifest = null) {
   const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate, retroFirst: FLAGS.retroFirst ?? ort.env.wasm.numThreads >= 4 });
   // Which assets this worker actually runs, for scan telemetry: rules out a
   // stale cached index/model when live and replay disagree.
-  const info = { index: manifest.index, rec: manifest.rec, cornBytes: corn.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false, fetchMs, warmMs };
-  return { reader, info, manifest, loadMs: Math.round(performance.now() - t0) };
+  const info = { index: manifest.index, rec: manifest.rec, cornBytes: corn.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false, assetMs: fetchMs, warmMs };
+  return { reader, info, manifest, rec, cornelius, busy: 0, retired: false, loadMs: Math.round(performance.now() - t0) };
 }
 
-// Camera start: compare the device's loaded card index with the server's by
-// content hash. Same -> nothing to do (one tiny request). Different -> build
-// the new reader in the background from the Cache API / network while the
-// current one keeps reading, then swap it in between reads. A failed update
-// keeps the current reader.
-let updating = null;
-async function checkAssets() {
-  if (!readerPromise) return { loaded: false };
-  const current = await readerPromise;
-  const manifest = await fetchManifest();
-  if (sameAssets(current.manifest, manifest)) return { fresh: true, info: current.info };
-  updating ||= load(manifest).then(next => {
-    readerPromise = Promise.resolve(next);
-    return next;
-  }).finally(() => { updating = null; });
-  const next = await updating;
-  return { updated: true, from: current.info.index, info: next.info, loadMs: next.loadMs };
-}
+// Reader bundles: first load, camera-start freshness check, swap (scanBundles.js).
+const bundles = createBundles({
+  loadBundle: (manifest, signal) => load(manifest, signal),
+  fetchManifest: () => fetchManifest(),
+  release: (b) => releaseSessions(b.rec, b.cornelius),
+  prune: () => { pruneCache().catch(() => {}); },
+});
 
 self.onmessage = async (e) => {
   const { type, id } = e.data;
   if (type === 'load') {
     ORIGIN = e.data.base || '';
     if (!readerPromise) { ort.env.wasm.numThreads = pickThreads(e.data.threads); THREAD_OVERRIDE = e.data.threads || null; FLAGS = e.data.flags || {}; }
-    readerPromise ||= load();
+    readerPromise ||= load().then(b => bundles.install(b));
     try {
       const { loadMs, info } = await readerPromise;
       self.postMessage({ id, ready: true, loadMs, info });
@@ -168,7 +163,7 @@ self.onmessage = async (e) => {
     return;
   }
   if (type === 'check') {
-    try { self.postMessage({ id, ...(await checkAssets()) }); }
+    try { if (readerPromise) await readerPromise; self.postMessage({ id, ...(await bundles.check()) }); }
     catch (err) { self.postMessage({ id, error: err?.message || String(err) }); }
     return;
   }
@@ -181,9 +176,11 @@ self.onmessage = async (e) => {
     const { small, w, h } = e.data;
     try {
       if (!readerPromise) throw new Error('reader not loaded');
-      const { reader } = await readerPromise;
-      if (pendingReset) { pendingReset = false; reader.reset(); }
-      const quad = await reader.probe(new Uint8ClampedArray(small), 4, w, h);
+      await readerPromise;
+      const bundle = bundles.begin();
+      // A reset is for whatever bundle reads next; a fresh one starts clean.
+      if (pendingReset) { pendingReset = false; bundle.reader.reset(); }
+      const quad = await bundles.use(bundle, r => r.probe(new Uint8ClampedArray(small), 4, w, h));
       const out = quad ? null : { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
       self.postMessage({ id, quad, out, small }, [small]);
     } catch (err) {
@@ -196,10 +193,13 @@ self.onmessage = async (e) => {
     const { frame, w, h, quad, requireStill, frameId = null, guess = null } = e.data;
     try {
       if (!readerPromise) throw new Error('reader not loaded');
-      const { reader } = await readerPromise;
-      const out = await reader.read(
+      await readerPromise;
+      const bundle = bundles.current();
+      const out = await bundles.use(bundle, r => r.read(
         { data: new Uint8ClampedArray(frame), width: w, height: h },
-        null, { requireStill, quad, frameId, guess });
+        null, { requireStill, quad, frameId, guess }));
+      // The index this answer came from, per read (telemetry, review R1-S3).
+      if (out) out.index = bundle.info.index;
       self.postMessage({ id, out, frame }, [frame]);
     } catch (err) {
       self.postMessage({ id, error: err?.message || String(err), frame }, [frame]);

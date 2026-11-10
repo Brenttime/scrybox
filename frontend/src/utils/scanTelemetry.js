@@ -87,6 +87,7 @@ export const scanTelemetry = {
         const c = out.candidates?.[0];
         const r = out.results?.[0];
         rec.local = {
+          index: out.index,
           frame: out.frame ? [out.frame.width, out.frame.height] : undefined,
           status: c ? c.status : 'no card',
           sharp: c?.sharpness,
