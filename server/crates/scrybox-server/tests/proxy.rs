@@ -56,6 +56,7 @@ async fn spawn_rust(upstream: String, static_dir: Option<std::path::PathBuf>) ->
         node_upstream: upstream,
         static_dir,
         rust_routes: BTreeSet::new(),
+        db_path: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

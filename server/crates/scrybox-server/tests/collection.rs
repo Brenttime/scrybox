@@ -1,0 +1,480 @@
+//! Ported `GET /api/collection` tests. These encode the Node parity contract
+//! (status, exact bodies, key order, ETag/304, X-Total-Count, auth errors)
+//! against a temp DB built from the prod schema fixture.
+
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf};
+
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header, HeaderMap, StatusCode},
+    routing::any,
+    Router,
+};
+use rusqlite::Connection;
+use scrybox_server::{app, AppState, Config};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+const TOKEN: &str = "tok-session";
+const API_KEY: &str = "tok-api";
+
+/// The 32 selected columns in Node's order, plus the appended keys.
+fn base_keys() -> Vec<&'static str> {
+    vec![
+        "entry_id", "card_id", "quantity", "condition", "printing", "language", "purchase_price",
+        "added_at", "is_trade", "notes", "is_proxy", "name", "printed_name", "supertype", "subtypes",
+        "types", "cmc", "color_identity", "rarity", "set_id", "set_name", "number", "image_url",
+        "price_trend", "price_normal", "price_holofoil", "price_currency", "price_source",
+        "price_estimated", "tcgplayer_url", "cardmarket_url", "tcgplayer_product_id", "base_rarity",
+    ]
+}
+
+fn seeded_db(dir: &std::path::Path) -> PathBuf {
+    seeded_db_named(dir, "bindarr-test.db")
+}
+
+fn seeded_db_named(dir: &std::path::Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let conn = Connection::open(&path).unwrap();
+    // Trigger bodies in the prod schema also touch tables this port does not
+    // model; stub them so the revision triggers stay live and writes do not
+    // throw.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS collection_snapshot (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE IF NOT EXISTS deck_list_revision (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0);
+         INSERT OR IGNORE INTO collection_snapshot (id, revision) VALUES (1, 0);
+         INSERT OR IGNORE INTO deck_list_revision (id, revision) VALUES (1, 0);",
+    )
+    .unwrap();
+    conn.execute_batch(include_str!("schema_fixture.sql")).unwrap();
+    conn.execute_batch(
+        "
+        INSERT INTO users (id, username, password_hash, role, share_token, api_key)
+          VALUES (1, 'u1', 'x', 'admin', 'share1', 'tok-api'),
+                 (2, 'u2', 'x', 'member', 'share2', NULL);
+        INSERT INTO sessions (token, user_id, expires_at)
+          VALUES ('tok-session', 1, '2099-01-01 00:00:00'),
+                 ('tok-expired', 1, '2000-01-01 00:00:00');
+        INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name, number,
+                                price_trend, price_normal, price_holofoil, cmc, color_identity, tcgplayer_product_id)
+          VALUES ('cc1', 'Sol Ring', 'Card', '[]', '[\"Artifact\"]', 'Common', '3ed', 'The Dark', '1',
+                  2.5, 3.0, 4.5, 1, '[]', 123),
+                 ('cc2', 'Plains', 'Basic', '[\"Land\"]', '[\"Land\"]', 'Common', '3ed', 'The Dark', '2',
+                  NULL, NULL, NULL, 0, NULL, NULL),
+                 ('cc3', 'Proxy Card', 'Card', '[\"Human\"]', '[\"Creature\"]', 'Uncommon', '3ed', 'The Dark', '3',
+                  9.0, 0, 0, 2, '[\"W\"]', NULL),
+                 ('cc4', 'Holo Only', 'Card', '', '[]', 'Rare', '3ed', 'The Dark', '4',
+                  NULL, NULL, 7.5, 3, '[]', NULL),
+                 ('cc5', 'Tundra', 'Card', '[\"Plains\",\"Island\"]', '[\"Land\"]', 'Rare', '3ed', 'The Dark', '5',
+                  1.25, 1.25, NULL, 0, '[\"W\",\"U\"]', NULL);
+        INSERT INTO collection (id, card_id, quantity, condition, printing, language, purchase_price,
+                                added_at, notes, is_trade, user_id, is_proxy)
+          VALUES (1, 'cc1', 2, 'Near Mint', 'Normal', 'English', 0.0, '2024-01-05 00:00:00', '', 0, 1, 0),
+                 (2, 'cc2', 4, 'Near Mint', 'Normal', 'English', NULL, '2024-01-04 00:00:00', '', 0, 1, 0),
+                 (3, 'cc3', 1, 'Near Mint', 'Normal', 'English', NULL, '2024-01-03 00:00:00', '', 0, 1, 1),
+                 (4, 'cc4', 1, 'Near Mint', 'Holofoil', 'English', NULL, '2024-01-02 00:00:00', '', 0, 1, 0),
+                 (5, 'cc5', 1, 'Near Mint', 'Normal', 'English', NULL, '2024-01-01 00:00:00', '', 1, 1, 0),
+                 (6, 'cc1', 1, 'Near Mint', 'Normal', 'English', NULL, '2024-01-06 00:00:00', '', 0, 2, 0);
+        INSERT INTO collection_read_revision (id, revision) VALUES (1, 1);
+        INSERT INTO decks (id, user_id, name, checked_out) VALUES (1, 1, 'd1', 1);
+        INSERT INTO deck_cards (deck_id, card_id, quantity)
+          VALUES (1, 'cc1', 2), (1, 'cc2', 99), (1, 'cc5', 1);
+        ",
+    )
+    .unwrap();
+    path
+}
+
+fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+        db_path: Some(db_path),
+    };
+    app(AppState::new(cfg))
+}
+
+async fn get(r: &Router, path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+    for (k, v) in headers {
+        req.headers_mut().insert(
+            header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    let res = r.clone().oneshot(req).await.unwrap();
+    let (parts, body) = res.into_parts();
+    (parts.status, parts.headers, axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec())
+}
+
+fn auth() -> Vec<(&'static str, &'static str)> {
+    vec![("authorization", "Bearer tok-session")]
+}
+
+async fn get_json(r: &Router, path: &str) -> (StatusCode, HeaderMap, Value) {
+    let (s, h, b) = get(r, path, &auth()).await;
+    (s, h, serde_json::from_slice(&b).unwrap())
+}
+
+/// A stand-in Node that just answers "NODE" — used to prove the proxy fallback.
+async fn fake_node() -> String {
+    let r = Router::new().fallback(any(|| async { (StatusCode::OK, "NODE") }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, r).await.unwrap() });
+    format!("http://{addr}")
+}
+
+// --- auth parity -------------------------------------------------------------
+
+#[tokio::test]
+async fn no_token_401_exact_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, b) = get(&r, "/api/collection", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap(),
+        json!({ "error": "Access denied. No token provided." })
+    );
+    assert!(h[header::CONTENT_TYPE].to_str().unwrap().starts_with("application/json"));
+}
+
+#[tokio::test]
+async fn expired_and_unknown_token_401() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    for tok in ["tok-expired", "nope"] {
+        let (s, _, b) = get(&r, "/api/collection", &[("authorization", &format!("Bearer {tok}"))]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{tok}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            json!({ "error": "Invalid or expired session token." })
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_key_get_is_authorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, _, _) = get(&r, "/api/collection?limit=10", &[("authorization", "Bearer tok-api")]).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+// --- response shape parity ----------------------------------------------------
+
+#[tokio::test]
+async fn paginated_shape_headers_and_key_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, v) = get_json(&r, "/api/collection?limit=100&offset=0").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-total-count"], "5"); // user 1 only
+    assert_eq!(h["access-control-expose-headers"], "X-Total-Count");
+    let etag = h[header::ETAG].to_str().unwrap().to_string();
+    assert!(etag.starts_with("W/\"col-") && etag.ends_with('"'), "etag: {etag}");
+    assert_eq!(h[header::CACHE_CONTROL], "private, no-cache");
+    assert_eq!(h[header::CONTENT_TYPE], "application/json; charset=utf-8");
+
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    // Newest first by added_at DESC, id DESC.
+    let ids: Vec<i64> = rows.iter().map(|r| r["entry_id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    // Key order: 32 SELECT keys then appended base_rarity; no checked_out_qty.
+    let keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    assert_eq!(keys, base_keys());
+}
+
+#[tokio::test]
+async fn row_semantics_proxy_rarity_prices_and_arrays() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (_, _, v) = get_json(&r, "/api/collection?limit=100").await;
+    let rows = v.as_array().unwrap();
+    let by_id = |id: i64| rows.iter().find(|r| r["entry_id"] == json!(id)).unwrap().clone();
+
+    let e1 = by_id(1); // Normal printing, price_normal 3.0 > 0
+    assert_eq!(e1["price_trend"], json!(3));
+    assert_eq!(e1["rarity"], json!("Common"));
+    assert_eq!(e1["base_rarity"], json!("Common"));
+    assert_eq!(e1["is_proxy"], json!(0));
+    assert_eq!(e1["types"], json!(["Artifact"]));
+    assert_eq!(e1["subtypes"], json!([]));
+    assert_eq!(e1["color_identity"], json!([]));
+    assert_eq!(e1["name"], json!("Sol Ring"));
+    assert_eq!(e1["quantity"], json!(2));
+
+    let e2 = by_id(2); // NULL color_identity -> []
+    assert_eq!(e2["color_identity"], json!([]));
+    assert_eq!(e2["types"], json!(["Land"]));
+
+    let e3 = by_id(3); // is_proxy row: proxy price/rarity rules
+    assert_eq!(e3["price_trend"], json!(0));
+    assert_eq!(e3["rarity"], json!("Proxy"));
+    assert_eq!(e3["base_rarity"], json!("Uncommon"));
+    assert_eq!(e3["is_proxy"], json!(1));
+
+    let e4 = by_id(4); // Holofoil with only price_holofoil set
+    assert_eq!(e4["price_trend"], json!(7.5));
+    assert_eq!(e4["subtypes"], json!([])); // stored '' -> []
+
+    let e5 = by_id(5); // price_trend 1.25 pass-through (Normal, price_normal 1.25)
+    assert_eq!(e5["price_trend"], json!(1.25));
+}
+
+#[tokio::test]
+async fn full_response_appends_checked_out_qty() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, v) = get_json(&r, "/api/collection").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-total-count").is_none(), "no total header when unpaginated");
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let last = keys.pop().unwrap();
+        assert_eq!(last, "checked_out_qty");
+        keys.pop().unwrap();
+        assert_eq!(keys, base_keys()[..32]);
+    }
+    let qty = |id: i64| rows.iter().find(|r| r["entry_id"] == json!(id)).unwrap()["checked_out_qty"].clone();
+    assert_eq!(qty(1), json!(2)); // greedy: deck needs 2x cc1, newest entry takes all
+    assert_eq!(qty(5), json!(1)); // dual land is not basic -> allocated
+    assert_eq!(qty(2), json!(0)); // Plains excluded via basic-land rule
+    assert_eq!(qty(3), json!(0));
+    assert_eq!(qty(4), json!(0));
+}
+
+#[tokio::test]
+async fn include_allocation_on_paginated() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, v) = get_json(&r, "/api/collection?include_allocation=1&limit=10").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-total-count"], "5");
+    // Node skips the *route* ETag branch exactly when include_allocation === '1'
+    // (routes/collection.js:389), but Express's res.json() still stamps its
+    // default body tag — so the tag here must be the body form, not `col-`.
+    let etag = h[header::ETAG].to_str().unwrap().to_string();
+    assert!(!etag.starts_with("W/\"col-"), "alloc read must not carry the route tag: {etag}");
+    assert!(etag.starts_with("W/\"") && etag.len() > 4, "expected Express body tag: {etag}");
+    assert!(h.get(header::CACHE_CONTROL).is_none());
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows[0]["checked_out_qty"], json!(2));
+}
+
+#[tokio::test]
+async fn count_zero_suppresses_total_and_pagination_clamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, v) = get_json(&r, "/api/collection?count=0&limit=10").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-total-count").is_none());
+    assert_eq!(v.as_array().unwrap().len(), 5);
+
+    // limit=-5 -> Math.max(1, -5) = 1; limit=99999 -> 2000.
+    let (_, _, v) = get_json(&r, "/api/collection?limit=-5").await;
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    let (_, _, v) = get_json(&r, "/api/collection?limit=99999").await;
+    assert_eq!(v.as_array().unwrap().len(), 5);
+    // limit=0 / limit=abc -> 100.
+    let (_, _, v) = get_json(&r, "/api/collection?limit=abc").await;
+    assert_eq!(v.as_array().unwrap().len(), 5);
+    // offset beyond the end -> empty; negative -> 0.
+    let (_, _, v) = get_json(&r, "/api/collection?limit=10&offset=9").await;
+    assert_eq!(v.as_array().unwrap().len(), 0);
+    let (_, _, v) = get_json(&r, "/api/collection?limit=10&offset=-2").await;
+    assert_eq!(v.as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn is_trade_and_card_id_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, v) = get_json(&r, "/api/collection?is_trade=true&limit=10").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-total-count"], "1");
+    assert_eq!(v.as_array().unwrap()[0]["entry_id"], json!(5));
+
+    let (_, h, v) = get_json(&r, "/api/collection?is_trade=0&limit=10").await;
+    assert_eq!(h["x-total-count"], "4");
+    assert_eq!(v.as_array().unwrap().len(), 4);
+
+    // Non-'true'/'1' values coerce to 0.
+    let (_, h, _) = get_json(&r, "/api/collection?is_trade=maybe&limit=10").await;
+    assert_eq!(h["x-total-count"], "4");
+
+    let (_, h, v) = get_json(&r, "/api/collection?card_id=cc1&limit=10").await;
+    assert_eq!(h["x-total-count"], "1");
+    assert_eq!(v.as_array().unwrap()[0]["entry_id"], json!(1));
+
+    // card_id='' is falsy in Node -> no filter.
+    let (_, h, _) = get_json(&r, "/api/collection?card_id=&limit=10").await;
+    assert_eq!(h["x-total-count"], "5");
+}
+
+// --- ETag / cache invalidation -------------------------------------------------
+
+#[tokio::test]
+async fn etag_304_and_revision_invalidates_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let r = router_for(path.clone(), &["collection"], "http://127.0.0.1:1");
+
+    let (s, h, _) = get_json(&r, "/api/collection?limit=2&offset=0").await;
+    assert_eq!(s, StatusCode::OK);
+    let etag = h[header::ETAG].to_str().unwrap().to_string();
+
+    // Replay -> 304 with empty body.
+    let (s, _, b) = get(&r, "/api/collection?limit=2&offset=0", &[("authorization", &format!("Bearer {TOKEN}")), ("if-none-match", &etag)]).await;
+    assert_eq!(s, StatusCode::NOT_MODIFIED);
+    assert!(b.is_empty());
+
+    // Node-side write (via trigger-bumped revision) must invalidate both the
+    // ETag and the cached bytes.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE collection SET notes = 'sold copy' WHERE id = 1", []).unwrap();
+    }
+    let (s, h2, v) = get_json(&r, "/api/collection?limit=2&offset=0").await;
+    assert_eq!(s, StatusCode::OK);
+    let etag2 = h2[header::ETAG].to_str().unwrap().to_string();
+    assert_ne!(etag, etag2, "etag must follow the revision counter");
+    assert_eq!(v.as_array().unwrap()[0]["notes"], json!("sold copy"));
+
+    // Old tag no longer matches.
+    let (s, _, _) = get(&r, "/api/collection?limit=2&offset=0", &[("authorization", &format!("Bearer {TOKEN}")), ("if-none-match", &etag)]).await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn card_cache_price_update_invalidates_full_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let r = router_for(path.clone(), &["collection"], "http://127.0.0.1:1");
+
+    let (_, _, v) = get_json(&r, "/api/collection").await;
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows[0]["price_trend"], json!(3));
+
+    {
+        let conn = Connection::open(&path).unwrap();
+        // Holofoil price movement through card_cache (trigger bumps revision).
+        conn.execute("UPDATE card_cache SET price_holofoil = 10.0 WHERE id = 'cc1'", []).unwrap();
+        conn.execute("UPDATE collection SET printing = 'Holofoil' WHERE id = 1", []).unwrap();
+    }
+    let (_, _, v) = get_json(&r, "/api/collection").await;
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows[0]["price_trend"], json!(10));
+}
+
+// --- compression ---------------------------------------------------------------
+
+#[tokio::test]
+async fn gzip_served_when_accepted_and_above_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    // Push one row's notes past the 1 KB compression threshold.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE collection SET notes = ?1 WHERE id = 1", [ "z".repeat(1500) ]).unwrap();
+    }
+    let r = router_for(path, &["collection"], "http://127.0.0.1:1");
+
+    let (s, h, gz) = get(&r, "/api/collection?limit=100", &[("authorization", &format!("Bearer {TOKEN}")), ("accept-encoding", "gzip, deflate, br")]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h[header::CONTENT_ENCODING], "gzip");
+    let mut dec = flate2::read::GzDecoder::new(&gz[..]);
+    let mut plain = Vec::new();
+    std::io::Read::read_to_end(&mut dec, &mut plain).unwrap();
+
+    let (_, _, raw) = get(&r, "/api/collection?limit=100", &auth()).await;
+    assert_eq!(plain, raw);
+
+    // Small bodies stay identity even when gzip is offered.
+    let (_, h, _) = get(&r, "/api/collection?limit=1&offset=1", &[("authorization", &format!("Bearer {TOKEN}")), ("accept-encoding", "gzip")]).await;
+    assert!(h.get(header::CONTENT_ENCODING).is_none());
+}
+
+// --- Express-default body ETag (untagged paths) --------------------------------
+
+/// Vectors from the `etag` npm package that Express's `res.json()` uses
+/// (`base64(sha1(body))` truncated to 27 chars, byte length in hex), verified
+/// against openssl and the copy installed in backend/node_modules/etag.
+#[test]
+fn body_etag_matches_the_etag_package() {
+    assert_eq!(scrybox_server::collection::body_etag(b""), "W/\"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk\"");
+    assert_eq!(scrybox_server::collection::body_etag(b"abc"), "W/\"3-qZk+NkcGgWq6PiVxeFDCbJzQ2J0\"");
+    assert_eq!(scrybox_server::collection::body_etag(b"hello"), "W/\"5-qvTGHdzF6KLavt4PO0gs2a6pQ00\"");
+    // Multi-byte characters hash as UTF-8 bytes (2 bytes for "é"), matching
+    // Buffer.byteLength(entity, 'utf8').
+    assert_eq!(scrybox_server::collection::body_etag("é".as_bytes()), "W/\"2-vxW+cXrBsIC08cRWaSgliR/1Bz0\"");
+}
+
+/// Unpaginated and allocation-carrying reads get no route tag, so they must
+/// fall back to the body tag and answer a conditional GET with an empty 304.
+#[tokio::test]
+async fn untagged_paths_get_body_etag_and_answer_304() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    for path in ["/api/collection", "/api/collection?include_allocation=1&limit=50"] {
+        let (s, h, body) = get(&r, path, &auth()).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        assert!(h.get(header::CACHE_CONTROL).is_none(), "{path}: body tag carries no Cache-Control");
+        let etag = h[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(etag, scrybox_server::collection::body_etag(&body), "{path}");
+
+        let (s, h2, b2) = get(&r, path, &[("authorization", "Bearer tok-session"), ("if-none-match", &etag)]).await;
+        assert_eq!(s, StatusCode::NOT_MODIFIED, "{path}");
+        assert!(b2.is_empty(), "{path}: 304 carried a body");
+        assert_eq!(h2[header::ETAG].to_str().unwrap(), etag);
+
+        // A stale tag must not short-circuit the read.
+        let (s, _, b3) = get(&r, path, &[("authorization", "Bearer tok-session"), ("if-none-match", "\"dead-beef\"")]).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        assert_eq!(b3, body);
+    }
+}
+
+/// The route's revision tag wins where Node emits it; the body tag must not
+/// shadow it (a body tag would force a full read before any 304).
+#[tokio::test]
+async fn route_etag_is_not_shadowed_by_body_etag() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_for(seeded_db(dir.path()), &["collection"], "http://127.0.0.1:1");
+    let (s, h, body) = get(&r, "/api/collection?limit=100&offset=0", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    let etag = h[header::ETAG].to_str().unwrap().to_string();
+    assert!(etag.starts_with("W/\"col-"), "etag: {etag}");
+    assert_ne!(etag, scrybox_server::collection::body_etag(&body));
+    assert_eq!(h[header::CACHE_CONTROL], "private, no-cache");
+}
+
+// --- kill switch ---------------------------------------------------------------
+
+#[tokio::test]
+async fn unowned_routes_and_non_get_still_proxy_to_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = fake_node().await;
+    // Route disabled -> everything on the path proxies.
+    let r = router_for(seeded_db(dir.path()), &[], &upstream);
+    let (s, _, b) = get(&r, "/api/collection", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(&b, b"NODE");
+
+    // Route enabled but method POST -> still Node's.
+    let r = router_for(seeded_db_named(dir.path(), "bindarr-post.db"), &["collection"], &upstream);
+    let req = Request::builder().method("POST").uri("/api/collection")
+        .header("authorization", "Bearer tok-session")
+        .body(Body::empty()).unwrap();
+    let res = r.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let b = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&b[..], b"NODE");
+}

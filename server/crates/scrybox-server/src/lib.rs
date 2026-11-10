@@ -1,18 +1,20 @@
-//! Scrybox front server (strangler fig, phase P0).
+//! Scrybox front server (strangler fig).
 //!
-//! P0 ports nothing but `/api/health`. Every other request is reverse-proxied
-//! to the Node backend unchanged, so behaviour (headers, status codes, bodies)
-//! stays exactly what Node produces. Static frontend serving from Rust is
-//! opt-in (`SCRYBOX_STATIC_DIR`); misses fall through to Node.
+//! `/api/health` is answered natively (backed by a Node health ping). Routes
+//! listed in `RUST_ROUTES` are served by their ported Rust handlers; every
+//! other request is reverse-proxied to the Node backend unchanged, so
+//! behaviour (headers, status codes, bodies) stays exactly what Node
+//! produces. Static frontend serving from Rust is opt-in
+//! (`SCRYBOX_STATIC_DIR`); misses fall through to Node.
 
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
     Router,
 };
 use hyper_util::{
@@ -20,6 +22,10 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use tower_http::services::ServeDir;
+
+pub mod auth;
+pub mod collection;
+pub mod db;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -32,6 +38,9 @@ pub struct Config {
     pub static_dir: Option<PathBuf>,
     /// Routes Rust owns (per-route kill switch, plan section 3). Empty in P0.
     pub rust_routes: BTreeSet<String>,
+    /// The SQLite copy shared with Node (`SCRYBOX_DB_PATH`). Ported routes
+    /// read through it; without it they stay disabled and everything proxies.
+    pub db_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -54,7 +63,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        Ok(Self { bind, node_upstream, static_dir, rust_routes })
+        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from) })
     }
 }
 
@@ -64,6 +73,9 @@ type HttpClient = Client<HttpConnector, Body>;
 pub struct AppState {
     pub cfg: Config,
     client: HttpClient,
+    /// Read pool over the shared DB copy; `None` when SCRYBOX_DB_PATH unset.
+    pub db: Option<Arc<db::DbPool>>,
+    pub collection_cache: Arc<collection::CollectionCache>,
 }
 
 impl AppState {
@@ -73,7 +85,21 @@ impl AppState {
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(30))
             .build(conn);
-        Self { cfg, client }
+        let db = cfg.db_path.as_ref().and_then(|path| {
+            match db::DbPool::open(path, 16) {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(e) => {
+                    tracing::error!(error = %e, path = %path.display(), "cannot open DB copy; Rust routes disabled");
+                    None
+                }
+            }
+        });
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()) }
+    }
+
+    /// Kill-switch decision for a route name (`collection`, `stats`, ...).
+    pub fn owns(&self, route: &str) -> bool {
+        self.db.is_some() && (self.cfg.rust_routes.contains("*") || self.cfg.rust_routes.contains(route))
     }
 }
 
@@ -181,6 +207,13 @@ pub async fn health(State(st): State<AppState>) -> Response {
 /// falls back to Node (optionally after a static-file lookup).
 pub fn app(state: AppState) -> Router {
     let router = Router::new().route("/api/health", get(health));
+    // Ported API routes behind the per-route kill switch. Non-GET methods on
+    // an owned path still proxy to Node (the handler dispatches internally).
+    let router = if state.owns("collection") {
+        router.route("/api/collection", any(collection::handle))
+    } else {
+        router
+    };
     let router = match state.cfg.static_dir.clone() {
         Some(dir) => {
             // Static hits are served by Rust; misses (API, SPA deep links,
