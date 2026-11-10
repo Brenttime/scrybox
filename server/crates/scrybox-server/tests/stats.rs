@@ -111,6 +111,26 @@ async fn get_json(r: &Router, path: &str) -> (StatusCode, HeaderMap, Value) {
     (s, h, serde_json::from_slice(&b).unwrap())
 }
 
+/// Owner ruling (iter 12): after a write, the stats handler may serve the
+/// previous body while the replacement rebuilds in the background, bounded at
+/// 5 s. Freshness tests therefore poll for the fresh state instead of
+/// asserting it on the very next request; the bound makes a hang impossible
+/// to mistake for success.
+async fn get_stats_until(r: &Router, want_cache: &str, within_ms: u64) -> (HeaderMap, Value) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(within_ms);
+    loop {
+        let (_, h, b) = request(r, "GET", "/api/stats", &auth()).await;
+        if h["x-stats-cache"] == want_cache {
+            return (h, serde_json::from_slice(&b).unwrap());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "x-stats-cache never became \"{want_cache}\" within {within_ms} ms (bounded-staleness violation)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // --- native path: byte parity against the Node oracle ---------------------
 
 #[tokio::test]
@@ -297,10 +317,14 @@ async fn revision_bumps_invalidate_all_three_counters() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(&format!("UPDATE {table} SET revision = revision + 1 WHERE id = 1;")).unwrap();
         drop(conn);
+        // The very next request must not get a fresh store hit on the old
+        // key: the header still matches Node (Node had no entry at this
+        // instant either). Under SWR it is served the previous body while
+        // the replacement rebuilds in the background (owner ruling, iter 12).
         let (_, h, _) = request(&r, "GET", "/api/stats", &auth()).await;
         assert_eq!(h["x-stats-cache"], "miss", "{table} bump must invalidate");
-        let (_, h, _) = request(&r, "GET", "/api/stats", &auth()).await;
-        assert_eq!(h["x-stats-cache"], "hit", "and the fresh body re-caches");
+        // …and the fresh body must re-cache — bounded, not instant.
+        get_stats_until(&r, "hit", 2000).await;
     }
 }
 
@@ -329,10 +353,16 @@ async fn price_history_write_bumps_aux_trigger_and_freshens_body() {
     assert!(aux >= 1, "trigger must have bumped stats_aux_revision");
     drop(conn);
 
-    let (_, h, _) = request(&r, "GET", "/api/stats", &auth()).await;
+    let (_, h, served) = get_json(&r, "/api/stats").await;
     assert_eq!(h["x-stats-cache"], "miss", "trigger-bumped revision invalidates");
-    let (_, _, fresh) = get_json(&r, "/api/stats").await;
-    assert_ne!(fresh, old, "body must reflect the new price point");
+    // Owner ruling (iter 12): inside the 5 s grace the previous body may be
+    // served while the replacement rebuilds in the background — and on this
+    // single-threaded path it deterministically is (the miss above is what
+    // starts the background build).
+    assert_eq!(served, old, "within the grace the SWR path serves the last computed body");
+
+    let (_, fresh) = get_stats_until(&r, "hit", 2000).await;
+    assert_ne!(fresh, old, "body must eventually reflect the new price point");
     assert_eq!(fresh["summary"]["change7d"]["abs"], json!(4.5), "9.0→12.0 on qty 3");
 }
 
@@ -356,6 +386,9 @@ async fn proxied_write_bumps_user_generation() {
 
     let (_, h, _) = request(&r, "GET", "/api/stats", &auth()).await;
     assert_eq!(h["x-stats-cache"], "miss", "proxied write must invalidate the user's cache");
+    // Bounded staleness (owner ruling, iter 12): the stale body may serve
+    // until the background rebuild lands, but it must land inside the bound.
+    get_stats_until(&r, "hit", 2000).await;
 
     // HEAD and unauthenticated writes must NOT bump (Node's middleware skips
     // HEAD and never reaches a user for unauth).

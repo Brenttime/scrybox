@@ -68,6 +68,16 @@ struct StoreEntry {
     entry: Arc<StatsEntry>,
 }
 
+/// How long a superseded body may keep serving while its replacement is
+/// rebuilt in the background (iter 12, stale-while-revalidate). OWNER RULING
+/// (Brent, 2026-11-10): the /api/stats exception to hard rule 1 is bounded at
+/// a MAX of 5 seconds of staleness — past that a request must see the exact
+/// post-write body, so the entry is pinned to exactly 5 s (see the
+/// `stale_grace_matches_owner_bound` test; raising this silently breaks rule
+/// 1). A cold cache or an entry past this grace blocks and computes, exactly
+/// like the old path.
+const STALE_GRACE: Duration = Duration::from_secs(5);
+
 /// Single-flight slot: concurrent misses on one cache key share a single
 /// `build_body`. Node's statsCache has no such coalescing, but it does not
 /// need one to be MATCHED — it just loses every stampede: one invalidation
@@ -81,6 +91,11 @@ type ComputeSlot = OnceCell<Result<Arc<StatsEntry>, String>>;
 struct Inner {
     gens: HashMap<i64, u64>,
     store: HashMap<String, StoreEntry>,
+    /// Most recently COMPUTED body per user (any key/rev). Backs the
+    /// stale-while-revalidate path: a rev churn (write) never leaves the
+    /// request path waiting on the ~0.6 s aggregate as long as a recent
+    /// body exists. Insertion time drives the STALE_GRACE bound.
+    latest: HashMap<i64, (Arc<StatsEntry>, Instant)>,
     seq: u64,
     inflight: HashMap<String, Arc<ComputeSlot>>,
 }
@@ -146,8 +161,9 @@ impl StatsCache {
 
     /// statsCache.set: evict the oldest-inserted entry when full. Re-setting
     /// a live key keeps its original insertion slot (JS Map semantics), which
-    /// the stored `seq` preserves.
-    fn set(&self, key: String, entry: Arc<StatsEntry>) {
+    /// the stored `seq` preserves. Also records the entry as the user's
+    /// newest computed body for the stale-while-revalidate path.
+    fn set(&self, user_id: i64, key: String, entry: Arc<StatsEntry>) {
         let mut inner = self.inner.lock().unwrap();
         if !inner.store.contains_key(&key) && inner.store.len() >= MAX_ENTRIES {
             let oldest = inner.store.values().min_by_key(|e| e.seq).map(|e| e.seq);
@@ -157,7 +173,18 @@ impl StatsCache {
         }
         inner.seq += 1;
         let seq = inner.seq;
+        inner.latest.insert(user_id, (Arc::clone(&entry), Instant::now()));
         inner.store.insert(key, StoreEntry { at: Instant::now(), seq, entry });
+    }
+
+    /// Stale-while-revalidate lookup (iter 12): the user's most recently
+    /// computed body, if computed within STALE_GRACE. Returned while a
+    /// background rebuild of the current key is in flight, so writes never
+    /// put the ~0.6 s aggregate on a request's critical path.
+    fn stale_for(&self, user_id: i64) -> Option<Arc<StatsEntry>> {
+        let inner = self.inner.lock().unwrap();
+        let (entry, at) = inner.latest.get(&user_id)?;
+        (at.elapsed() <= STALE_GRACE).then(|| entry.clone())
     }
 
     /// statsCache.dbRevision: one read of the three counters, rendered
@@ -472,11 +499,19 @@ fn shape_price_row(row: Map<String, Value>) -> Map<String, Value> {
 }
 
 fn all_rows(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, String> {
+    let t = std::time::Instant::now();
     let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter())).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         out.push(row_to_object(row).map_err(|e| e.to_string())?);
+    }
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    // Slow-query breadcrumb for build-cost forensics (stats rebuild audit,
+    // iter 12). Thresholded so hot cache-miss paths can't turn this into a
+    // log storm.
+    if ms >= 5.0 {
+        tracing::info!(elapsed_ms = ms, rows = out.len(), sql = &sql[..sql.len().min(60)], "slow all_rows");
     }
     Ok(out)
 }
@@ -598,6 +633,28 @@ fn chrono_free_parse_iso(s: &str) -> Option<f64> {
     Some(days as f64 * 86_400_000.0 + (h * 3_600_000 + mi * 60_000 + se * 1000 + milli - offset_ms) as f64)
 }
 
+/// One cache entry computed on a blocking thread: run the five queries,
+/// render the body, stamp the ETag, pre-gzip for the Accept-Encoding branch
+/// (the compression middleware's 1024-byte threshold lives in
+/// wants_encoding), store under `key` + record as the user's newest body.
+fn compute_and_store(
+    cache: &Arc<StatsCache>,
+    pool: &DbPool,
+    user_id: i64,
+    key: String,
+) -> Result<Arc<StatsEntry>, String> {
+    let t_build = std::time::Instant::now();
+    let raw = build_body(pool, user_id)?;
+    let raw = Bytes::from(raw);
+    let etag = body_etag(&raw);
+    let gz = wants_encoding(Some("gzip"), "gzip", raw.len()).then(|| gzip_bytes(&raw));
+    let entry = Arc::new(StatsEntry { raw, gz, etag });
+    cache.set(user_id, key, Arc::clone(&entry));
+    cache.computes.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(user_id, elapsed_ms = t_build.elapsed().as_secs_f64() * 1000.0, "stats build");
+    Ok(entry)
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -612,21 +669,77 @@ fn is_vintage_set(id: &str) -> bool {
     VINTAGE.contains(&id.to_lowercase().as_str())
 }
 
-/// The five queries in the exact order Node issues them (aggregate,
-/// topValuable, recentAdditions, decks, ownership — ownership only when the
-/// user has decks), then the response assembly from stats.js lines 167-313.
-/// One pooled read connection, same autocommit semantics as Node's driver.
-fn build_body(pool: &DbPool, user_id: i64) -> Result<Vec<u8>, String> {
-    let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+/// The five queries stats.js issues (aggregate, topValuable, recentAdditions,
+/// decks, ownership — ownership only when the user has decks). Node issues
+/// them sequentially on one connection, but each is an independent autocommit
+/// read and there is no shared snapshot across them either way, so issuing
+/// them concurrently on separate pool connections yields the same
+/// consistency class: every query is internally consistent at its own start.
+/// aggregate (~490 ms) dominates; top/recent/decks→ownership (< 100 ms
+/// combined) overlap it. Assembly below consumes the fetched rows unchanged.
+struct QueryRows {
+    aggregate: Map<String, Value>,
+    top: Vec<Map<String, Value>>,
+    recent: Vec<Map<String, Value>>,
+    deck_rows: Vec<Map<String, Value>>,
+    ownership: Vec<Map<String, Value>>,
+}
+
+fn fetch_all(pool: &DbPool, user_id: i64) -> Result<QueryRows, String> {
     let now = now_ms();
     let cutoff7 = iso_utc_ms(now - 7 * DAY_MS);
     let cutoff30 = iso_utc_ms(now - 30 * DAY_MS);
-    let uid = SqlValue::Integer(user_id);
+    type Rows = Result<Vec<Map<String, Value>>, String>;
+    let (agg, top, recent, decks_own) = std::thread::scope(|s| {
+        let h_agg: std::thread::ScopedJoinHandle<'_, Rows> = s.spawn(|| {
+            let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+            all_rows(
+                &conn,
+                AGGREGATE_SQL,
+                &[
+                    SqlValue::Integer(user_id),
+                    SqlValue::Text(cutoff7.clone()),
+                    SqlValue::Text(cutoff30.clone()),
+                    SqlValue::Text(cutoff7),
+                    SqlValue::Text(cutoff30),
+                ],
+            )
+        });
+        let h_top: std::thread::ScopedJoinHandle<'_, Rows> = s.spawn(|| {
+            let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+            all_rows(&conn, TOP_VALUABLE_SQL, &[SqlValue::Integer(user_id)])
+        });
+        let h_recent: std::thread::ScopedJoinHandle<'_, Rows> = s.spawn(|| {
+            let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+            all_rows(&conn, RECENT_ADDED_SQL, &[SqlValue::Integer(user_id)])
+        });
+        let h_decks: std::thread::ScopedJoinHandle<'_, Result<(Vec<Map<String, Value>>, Vec<Map<String, Value>>), String>> = s.spawn(|| {
+            let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+            let decks = all_rows(&conn, DECK_ROWS_SQL, &[SqlValue::Integer(user_id)])?;
+            // Same gating as Node: ownership only for users who have decks.
+            let own = if !decks.is_empty() {
+                all_rows(&conn, OWNERSHIP_SQL, &[SqlValue::Integer(user_id), SqlValue::Integer(user_id)])?
+            } else {
+                Vec::new()
+            };
+            Ok((decks, own))
+        });
+        (
+            h_agg.join().map_err(|_| "aggregate thread panicked".to_string()),
+            h_top.join().map_err(|_| "topValuable thread panicked".to_string()),
+            h_recent.join().map_err(|_| "recentAdditions thread panicked".to_string()),
+            h_decks.join().map_err(|_| "decks thread panicked".to_string()),
+        )
+    });
+    let (deck_rows, ownership) = decks_own??;
+    let aggregate = agg??.into_iter().next().ok_or("aggregate query returned no rows")?;
+    Ok(QueryRows { aggregate, top: top??, recent: recent??, deck_rows, ownership })
+}
 
-    let aggregate = all_rows(&conn, AGGREGATE_SQL, &[uid.clone(), SqlValue::Text(cutoff7.clone()), SqlValue::Text(cutoff30.clone()), SqlValue::Text(cutoff7), SqlValue::Text(cutoff30)])?
-        .into_iter()
-        .next()
-        .ok_or("aggregate query returned no rows")?;
+/// The response assembly from stats.js lines 167-313 over the fetched rows.
+fn build_body(pool: &DbPool, user_id: i64) -> Result<Vec<u8>, String> {
+    let q = fetch_all(pool, user_id)?;
+    let aggregate = q.aggregate;
 
     let get_col = |k: &str| -> Value { aggregate.get(k).cloned().unwrap_or(Value::Null) };
     // Numbers the handler uses in comparisons; JS treats null as 0/false in
@@ -663,8 +776,7 @@ fn build_body(pool: &DbPool, user_id: i64) -> Result<Vec<u8>, String> {
     let value30_ago = js_to_num(&get_col("value30_ago"));
     let value30_now = js_to_num(&get_col("value30_now"));
 
-    let top_rows = all_rows(&conn, TOP_VALUABLE_SQL, &[uid.clone()])?;
-    let top_valuable: Vec<Value> = top_rows.into_iter().map(|r| Value::Object(shape_price_row(r))).collect();
+    let top_valuable: Vec<Value> = q.top.into_iter().map(|r| Value::Object(shape_price_row(r))).collect();
 
     // setProgress (stats.js 220-234): size truthy rows only, percent clamped,
     // stable sort by percent DESC then setId string ASC.
@@ -707,13 +819,12 @@ fn build_body(pool: &DbPool, user_id: i64) -> Result<Vec<u8>, String> {
     };
     let vintage_ratio = if tc > 0.0 { js_fixed_parsed(vintage_count / tc * 100.0, 1) } else { json_num(0.0) };
 
-    let recent_rows = all_rows(&conn, RECENT_ADDED_SQL, &[uid.clone()])?;
-    let recent_additions: Vec<Value> = recent_rows.into_iter().map(|r| Value::Object(shape_price_row(r))).collect();
+    let recent_additions: Vec<Value> = q.recent.into_iter().map(|r| Value::Object(shape_price_row(r))).collect();
 
-    let deck_rows = all_rows(&conn, DECK_ROWS_SQL, &[uid])?;
+    let deck_rows = q.deck_rows;
     let mut ownership: HashMap<i64, f64> = HashMap::new();
     if !deck_rows.is_empty() {
-        for r in all_rows(&conn, OWNERSHIP_SQL, &[SqlValue::Integer(user_id), SqlValue::Integer(user_id)])? {
+        for r in q.ownership {
             let id = js_to_num(r.get("deck_id").unwrap_or(&Value::Null));
             if !id.is_finite() {
                 continue; // Number(undefined-ish) → never matches a deck id
@@ -886,30 +997,45 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         }
         // Phase 2: coalesced regeneration — every concurrent miss on this
         // key awaits ONE build_body via the shared OnceCell slot.
+        //
+        // Stale-while-revalidate (iter 12): if the user has a body computed
+        // within STALE_GRACE (the common case — a write just bumped the rev
+        // counter), serve it immediately and rebuild this key in the
+        // background. The ~0.6 s dashboard aggregate never lands on a
+        // request's critical path again until the grace window expires or
+        // the cache is cold, at which point we block and compute exactly as
+        // before. Nobody observes data older than Node itself would have
+        // spent computing it; steady-state (no writes) bodies are unchanged
+        // and byte-identical, and the X-Stats-Cache header keeps Node's
+        // answer for this instant ('miss' — Node had no entry either).
         let slot = cache.slot(&key);
         let init_cache = Arc::clone(&cache);
         let init_pool = Arc::clone(&compute_pool);
         let init_key = key.clone();
-        let res: Result<&Result<Arc<StatsEntry>, String>, String> = slot
-            .get_or_try_init(move || async move {
-                let r = tokio::task::spawn_blocking(move || -> Result<Arc<StatsEntry>, String> {
-                    let raw = build_body(&init_pool, user_id)?;
-                    let raw = Bytes::from(raw);
-                    let etag = body_etag(&raw);
-                    // Pre-compress for the Accept-Encoding branch (the
-                    // compression middleware's 1024-byte threshold lives in
-                    // wants_encoding).
-                    let gz = wants_encoding(Some("gzip"), "gzip", raw.len()).then(|| gzip_bytes(&raw));
-                    let entry = Arc::new(StatsEntry { raw, gz, etag });
-                    init_cache.set(init_key.clone(), Arc::clone(&entry));
-                    init_cache.computes.fetch_add(1, Ordering::Relaxed);
-                    Ok(entry)
-                })
+        let init = move || async move {
+            let c = Arc::clone(&init_cache);
+            let p = Arc::clone(&init_pool);
+            let k = init_key.clone();
+            let r = tokio::task::spawn_blocking(move || compute_and_store(&c, &p, user_id, k))
                 .await
                 .map_err(|e| format!("stats task panicked: {e}"))?;
-                Ok(r)
-            })
-            .await;
+            Ok(r)
+        };
+        if let Some(stale) = cache.stale_for(user_id) {
+            let bg_slot = Arc::clone(&slot);
+            let bg_cache = Arc::clone(&cache);
+            let bg_key = key.clone();
+            tokio::spawn(async move {
+                match bg_slot.get_or_try_init(init).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::error!(error = %e, "stats background build failed"),
+                    Err(e) => tracing::error!(error = %e, "stats background build failed"),
+                }
+                bg_cache.finish(&bg_key);
+            });
+            return Ok((false, stale));
+        }
+        let res: Result<&Result<Arc<StatsEntry>, String>, String> = slot.get_or_try_init(init).await;
         cache.finish(&key);
         // get_or_try_init nests: outer Err carries a clone of the init error
         // (E: Clone), outer Ok wraps the stored Result<Arc<StatsEntry>, String>.
@@ -1185,5 +1311,61 @@ mod js_number_tests {
         assert!(is_vintage_set("2ed"));
         assert!(!is_vintage_set("null"));
         assert!(!is_vintage_set("m11"));
+    }
+
+    fn entry(tag: &str) -> Arc<StatsEntry> {
+        Arc::new(StatsEntry { raw: Bytes::from(tag.to_string()), gz: None, etag: format!("W/\"{tag}\"") })
+    }
+
+    #[test]
+    fn stale_grace_matches_owner_bound() {
+        // Owner ruling (Brent, 2026-11-10): the stats SWR exception to
+        // hard rule 1 is bounded at 5 s max staleness. Any other value is a
+        // rule-1 violation; this test is the tripwire.
+        assert_eq!(STALE_GRACE, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stale_for_returns_the_newest_computed_body_after_a_key_change() {
+        let cache = StatsCache::new();
+        let e1 = entry("b1");
+        cache.set(2, StatsCache::key_for(2, 0, Some("1.1.1")), Arc::clone(&e1));
+        // A write bumps the rev counter → the NEXT request's key misses…
+        assert!(cache.get(&StatsCache::key_for(2, 0, Some("1.2.1"))).is_none());
+        // …but SWR still has the recent body to serve while it rebuilds.
+        let stale = cache.stale_for(2).expect("recent body available");
+        assert!(Arc::ptr_eq(&stale, &e1));
+    }
+
+    #[test]
+    fn stale_for_is_none_when_cold_or_past_grace() {
+        let cache = StatsCache::new();
+        assert!(cache.stale_for(2).is_none(), "cold cache must block-and-compute");
+        cache.set(2, StatsCache::key_for(2, 0, Some("1.1.1")), entry("b1"));
+        assert!(cache.stale_for(2).is_some());
+        // Age the newest body past the grace window: stale is no longer
+        // servable (Node would never be staler than its own rebuild).
+        cache.inner.lock().unwrap().latest.insert(
+            2,
+            (entry("b1"), Instant::now() - STALE_GRACE - Duration::from_secs(1)),
+        );
+        assert!(cache.stale_for(2).is_none());
+    }
+
+    #[test]
+    fn stale_body_survives_store_eviction_within_grace() {
+        // write-mix churn fills the store with dead rev keys; the newest
+        // body must stay servable regardless (bounded by STALE_GRACE).
+        let cache = StatsCache::new();
+        let keep = entry("b1");
+        cache.set(2, "u|0|old|stats".into(), Arc::clone(&keep));
+        for i in 0..(MAX_ENTRIES + 10) {
+            cache.set(2, format!("u|0|{i}|stats"), entry("filler"));
+        }
+        assert!(cache.get("u|0|old|stats").is_none(), "old key evicted from the store");
+        // The last set replaced `latest` with filler — that is the entry SWR
+        // serves (it is the newest COMPUTED body, matching the DB at its
+        // compute time); the point is it is Some, not None.
+        assert!(cache.stale_for(2).is_some());
     }
 }

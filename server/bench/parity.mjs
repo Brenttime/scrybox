@@ -281,5 +281,44 @@ for (const c of cases) {
   }
 }
 
-console.log(`\nparity: ${cases.length - failed}/${cases.length} cases pass (${flaky} needed retries) rust=${RUST} node=${NODE}`);
+// --- bounded staleness: the stats SWR exception (owner ruling, 2026-11-10) ---
+// Hard rule 1 excepts ONLY GET /api/stats: after a write, Rust may serve the
+// pre-write body while it rebuilds in the background, for at most 5 s
+// (STALE_GRACE). Past the bound it must match Node exactly. Write a
+// collection edit through Node (:3312 — same shape as the bench write-mix),
+// wait > 5 s, require an exact rust==node match, then revert the edit so the
+// DB copy is left as found.
+const pw = { name: 'stats_post_write', path: '/api/stats', headers: authHeaders, method: 'GET' };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function putTrade(v) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ is_trade: v });
+    const req = http.request(new URL('/api/collection/4', NODE), {
+      method: 'PUT',
+      headers: { ...authHeaders, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), 'x-forwarded-for': xff() },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', () => resolve(0));
+    req.write(body); req.end();
+  });
+}
+{
+  await fetchSide(RUST, pw); // warm Rust's stats slot so the write lands in a live grace window
+  const a = await putTrade(1);
+  await sleep(6500); // > STALE_GRACE (5 s) + rebuild margin
+  let diffs = ['comparison not run'];
+  for (let t = 0; t < MAX_TRIES; t++) {
+    const [r, n] = await Promise.all([fetchSide(RUST, pw), fetchSide(NODE, pw)]);
+    diffs = compareCase(pw, r, n);
+    if (!diffs.length) break;
+  }
+  const b = await putTrade(0);
+  if (a !== 200 || b !== 200) { failed++; console.log(`FAIL stats_post_write  PUTs answered ${a}/${b} (expected 200/200)`); }
+  else if (diffs.length) {
+    failed++;
+    console.log(`FAIL stats_post_write  ${pw.method} ${pw.path} past the 5 s staleness bound`);
+    for (const d of diffs) console.log(`     · ${d}`);
+  } else console.log('PASS stats_post_write (write -> >5 s -> rust==node exact; edit reverted)');
+}
+
+console.log(`\nparity: ${cases.length + 1 - failed}/${cases.length + 1} cases pass (${flaky} needed retries) rust=${RUST} node=${NODE}`);
 process.exit(failed === 0 ? 0 : 1);
