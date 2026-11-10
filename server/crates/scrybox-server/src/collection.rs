@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::{OnceCell, Semaphore};
@@ -653,6 +653,29 @@ fn shape_row(raw: Vec<Value>, alloc: Option<&HashMap<i64, f64>>) -> Result<Value
 // Cache
 // ---------------------------------------------------------------------------
 
+/// Background pre-warm (iter 14, owner hint "collection_full write-mix
+/// rebuild could be incremental/pre-warmed"): poll the revision counter and
+/// pre-build the post-bump body for recently-requested shapes, so the first
+/// request after an invalidation never rides the ~400 ms full-body compute
+/// path. Purely an optimization: the request-path miss build is untouched
+/// and the refresher produces the identical body through the same code, so
+/// strict parity (BRIEF rule 1) is unaffected.
+const REFRESH_TICK: Duration = Duration::from_millis(250);
+/// Only shapes requested within this window are pre-built; a shape nobody
+/// asks for must not cost background query work (Node does no unrequested
+/// work either).
+const REFRESH_ACTIVE: Duration = Duration::from_secs(30);
+/// Debounce: the revision must be observed stable across two consecutive
+/// ticks before the fan-out — keeps in-flight edit+revert write pairs from
+/// spawning builds for the intermediate state.
+const REFRESH_DEBOUNCE_TICKS: u8 = 2;
+/// After a failed pre-build, back off per key instead of retrying every tick.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+/// Soft cap on the recently-requested-shape map (params variety × users).
+const RECENT_MAX: usize = 256;
+/// Recent entries older than this are dropped when the reaper runs.
+const RECENT_WINDOW: Duration = Duration::from_secs(120);
+
 pub struct CacheEntry {
     rev: i64,
     raw: Bytes,
@@ -675,6 +698,11 @@ type ComputeSlot = OnceCell<Result<Arc<CacheEntry>, String>>;
 struct Inner {
     entries: HashMap<String, Arc<CacheEntry>>,
     inflight: HashMap<String, Arc<ComputeSlot>>,
+    /// Shapes requested recently, with their parsed params — the candidate
+    /// set for the background refresher (see `spawn_refresher`).
+    recent: HashMap<String, (CollectionParams, Instant)>,
+    /// Per-key backoff after a failed pre-build (refresher only).
+    cooldown: HashMap<String, Instant>,
 }
 
 /// Serialized responses keyed by (params, collection_read_revision).
@@ -729,6 +757,50 @@ impl CollectionCache {
     fn finish(&self, key: &str) {
         self.inner.lock().unwrap().inflight.remove(key);
     }
+    /// Record a request for this params shape (refresher candidate).
+    fn touch(&self, p: &CollectionParams) {
+        let key = p.cache_key();
+        let mut e = self.inner.lock().unwrap();
+        if e.recent.len() > RECENT_MAX && !e.recent.contains_key(&key) {
+            e.recent.retain(|_, (_, seen)| seen.elapsed() < RECENT_WINDOW);
+            e.cooldown.retain(|_, t| t.elapsed() < REFRESH_COOLDOWN);
+        }
+        e.recent.insert(key, (p.clone(), Instant::now()));
+    }
+    /// Params shapes requested within `window` — the refresher's fan-out set,
+    /// most-recently-requested first (the round-robin's next victim rebuilds
+    /// at the head of the build-semaphore queue, not the tail).
+    fn active_keys(&self, window: Duration) -> Vec<(String, CollectionParams)> {
+        let e = self.inner.lock().unwrap();
+        let mut v: Vec<_> = e
+            .recent
+            .iter()
+            .filter(|(_, (_, seen))| seen.elapsed() < window)
+            .map(|(k, (p, seen))| (k.clone(), p.clone(), *seen))
+            .collect();
+        v.sort_by_key(|(_, _, seen)| std::cmp::Reverse(*seen));
+        v.into_iter().map(|(k, p, _)| (k, p)).collect()
+    }
+    /// True when the stored entry for `key` already carries the current rev.
+    fn is_current(&self, key: &str, rev: i64) -> bool {
+        let e = self.inner.lock().unwrap();
+        e.entries.get(key).map_or(false, |e| e.rev == rev)
+    }
+    /// A build already in flight for this key (request-path or refresher) —
+    /// the poller skips it this tick; the slot's owner will land the body.
+    fn inflight_contains(&self, key: &str) -> bool {
+        self.inner.lock().unwrap().inflight.contains_key(key)
+    }
+    fn on_cooldown(&self, key: &str) -> bool {
+        let e = self.inner.lock().unwrap();
+        match e.cooldown.get(key) {
+            Some(t) => t.elapsed() < REFRESH_COOLDOWN,
+            None => false,
+        }
+    }
+    fn refresh_failed(&self, key: &str) {
+        self.inner.lock().unwrap().cooldown.insert(key.to_string(), Instant::now());
+    }
     /// Observability for the single-flight test and ops dashboards.
     pub fn computes(&self) -> u64 {
         self.computes.load(Ordering::Relaxed)
@@ -737,6 +809,119 @@ impl CollectionCache {
         // acquire() only fails on close(), which never happens here.
         Arc::clone(&self.builds).acquire_owned().await.expect("build semaphore")
     }
+}
+
+/// Background pre-warm (iter 14, owner hint): poll the `collection_read_revision`
+/// counter and, after a bump settles, pre-build the current body for every
+/// recently-requested shape through the SAME single-flight slot and build
+/// semaphore as the request path. Requests landing after an invalidation are
+/// then answered from the cache instead of waiting on a ~400 ms (full shape)
+/// blocking build. Bodies are produced by the identical `build_body_parallel`
+/// path, so this cannot change any response — strict parity is preserved
+/// (unlike the stats route's bounded-SWR exception, this route needs none).
+///
+/// Costs are bounded: only shapes requested within REFRESH_ACTIVE, only after
+/// the revision has been observed stable for REFRESH_DEBOUNCE_TICKS ticks
+/// (edit+revert write-mix pairs must not fan out builds for intermediate
+/// states), a failed pre-build backs off per key for REFRESH_COOLDOWN, and
+/// concurrent builds never exceed the cross-key semaphore the request path
+/// already enforces.
+pub fn spawn_refresher(state: &AppState) {
+    let Some(pool) = state.db.clone() else { return };
+    let cache = Arc::clone(&state.collection_cache);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REFRESH_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_observed: Option<i64> = None;
+        let mut stable_ticks: u8 = 0;
+        let mut built_rev: Option<i64> = None;
+        loop {
+            tick.tick().await;
+            let active = cache.active_keys(REFRESH_ACTIVE);
+            if active.is_empty() {
+                continue;
+            }
+            // One revision read per tick, kept off the runtime workers.
+            let pool2 = Arc::clone(&pool);
+            let rev = match tokio::task::spawn_blocking(move || {
+                pool2.get().ok().and_then(|c| crate::db::current_revision(&c).ok().flatten())
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => return, // runtime shutting down
+            };
+            let Some(rev) = rev else {
+                last_observed = None;
+                stable_ticks = 0;
+                continue;
+            };
+            if built_rev == Some(rev) {
+                continue;
+            }
+            if last_observed == Some(rev) {
+                stable_ticks = stable_ticks.saturating_add(1);
+            } else {
+                last_observed = Some(rev);
+                stable_ticks = 1;
+            }
+            if stable_ticks < REFRESH_DEBOUNCE_TICKS {
+                continue;
+            }
+            let mut retry_next_tick = false;
+            for (key, p) in active {
+                if cache.is_current(&key, rev) || cache.on_cooldown(&key) {
+                    continue;
+                }
+                if cache.inflight_contains(&key) {
+                    // An older build owns the slot; it lands shortly and the
+                    // is_current check skips it next tick (or we fire then).
+                    retry_next_tick = true;
+                    continue;
+                }
+                let slot = cache.slot(&key);
+                let cache2 = Arc::clone(&cache);
+                let pool3 = Arc::clone(&pool);
+                let key2 = key.clone();
+                tokio::spawn(async move {
+                    let init_cache = Arc::clone(&cache2);
+                    let init_pool = Arc::clone(&pool3);
+                    let init_key = key2.clone();
+                    let init = move || async move {
+                        let _permit = init_cache.build_permit().await;
+                        let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
+                            let (body, total) = build_body_parallel(&init_pool, &p)?;
+                            Ok(init_cache.put(init_key, rev, body, total))
+                        })
+                        .await
+                        .map_err(|e| format!("collection refresh join: {e}"))?;
+                        Ok(r)
+                    };
+                    // Shared with any concurrent request-path miss on the
+                    // same key: whoever gets here first computes, everyone
+                    // else awaits the same OnceCell. (Type annotation pins
+                    // the nested Result like the request-path call below.)
+                    let res: Result<&Result<Arc<CacheEntry>, String>, String> =
+                        slot.get_or_try_init(init).await;
+                    match res {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "collection refresher build failed");
+                            cache2.refresh_failed(&key2);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "collection refresher build failed");
+                            cache2.refresh_failed(&key2);
+                        }
+                    }
+                    cache2.finish(&key2);
+                });
+            }
+            if !retry_next_tick {
+                built_rev = Some(rev);
+            }
+        }
+    });
 }
 
 pub(crate) fn gzip_bytes(raw: &[u8]) -> Bytes {
@@ -857,6 +1042,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     }
 
     let key = p.cache_key();
+    // Refresher candidate bookkeeping (see `spawn_refresher`).
+    st.collection_cache.touch(&p);
     let rev_i = rev.unwrap_or(-1);
     let entry: Arc<CacheEntry> = match st.collection_cache.get(&key, rev_i) {
         Some(e) => e,

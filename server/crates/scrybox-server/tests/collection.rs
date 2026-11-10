@@ -631,3 +631,91 @@ async fn concurrent_misses_coalesce_into_one_computation() {
     }
     assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
 }
+
+// --- background pre-warm refresher (iter 14) ---------------------------------
+
+/// Fire N writes the way the write-mix does, then poll until the refresher
+/// has had ≥2 settled ticks (500 ms) plus build time.
+async fn wait_refresher_window(ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+#[tokio::test]
+async fn refresher_prebuilds_post_bump_body_without_requests() {
+    // Owner hint "collection_full pre-warm after invalidation": after a
+    // revision bump, the poller must land the current body on its own — a
+    // request arriving afterwards is served from the store (computes does
+    // not grow).
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "refresher.db", 4500);
+    let upstream = fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.clone(),
+        static_dir: None,
+        rust_routes: ["collection".to_string()].into_iter().collect(),
+        db_path: Some(path.clone()),
+        sidecar_url: None,
+    };
+    let state = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&state.collection_cache);
+    let r = app(state);
+
+    let (s, _, first) = get_json(&r, "/api/collection").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(cache.computes(), 1, "cold request computes once");
+
+    // Node-side write: bump the counter exactly like the schema trigger does.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1;")
+            .unwrap();
+    }
+
+    // No requests in flight: poll for the refresher's own compute.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cache.computes() < 2 && std::time::Instant::now() < deadline {
+        wait_refresher_window(50).await;
+    }
+    assert_eq!(cache.computes(), 2, "refresher must pre-build the post-bump body with no requests in flight");
+
+    // The next request is served from the store — no new compute — and the
+    // body is byte-identical (data unchanged; only the counter moved).
+    let (s, _, second) = get_json(&r, "/api/collection").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(second, first, "post-bump body must equal the pre-bump body (data unchanged)");
+    assert_eq!(cache.computes(), 2, "request after the pre-build must be a store hit");
+}
+
+#[tokio::test]
+async fn refresher_does_no_unrequested_work_or_spurious_builds() {
+    // Costs are bounded like Node's: a shape nobody requests is never built,
+    // and a current entry is never rebuilt while the revision is stable
+    // (protects the burst computes()==1 contract and idle-server cost).
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "refresher-idle.db", 4500);
+    let upstream = fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.clone(),
+        static_dir: None,
+        rust_routes: ["collection".to_string()].into_iter().collect(),
+        db_path: Some(path.clone()),
+        sidecar_url: None,
+    };
+    let state = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&state.collection_cache);
+    let r = app(state);
+
+    // Idle server: many ticks, zero requests → zero builds.
+    wait_refresher_window(1200).await;
+    assert_eq!(cache.computes(), 0, "no requests must mean no background builds");
+
+    let (s, _, _) = get_json(&r, "/api/collection?limit=50&offset=100").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(cache.computes(), 1);
+
+    // Revision stable: the poller must skip (is_current) — no spurious compute.
+    wait_refresher_window(1500).await;
+    assert_eq!(cache.computes(), 1, "a current entry at a stable revision must not be rebuilt");
+}

@@ -245,6 +245,15 @@ pub fn app(state: AppState) -> Router {
     // Ported API routes behind the per-route kill switch. Non-GET methods on
     // an owned path still proxy to Node (the handler dispatches internally).
     let router = if state.owns("collection") {
+        // Background pre-warm (iter 14, owner hint): pre-builds post-bump
+        // bodies for recently-requested shapes through the shared
+        // single-flight slot, so the first request after a write never
+        // rides the blocking build. Bodies come from the identical
+        // build path — strict parity untouched. Ops kill switch:
+        // SCRYBOX_COLLECTION_PREWARM=0 restores iter-12 behavior exactly.
+        if std::env::var("SCRYBOX_COLLECTION_PREWARM").map(|v| v != "0").unwrap_or(true) {
+            collection::spawn_refresher(&state);
+        }
         router.route("/api/collection", any(collection::handle))
     } else {
         router
