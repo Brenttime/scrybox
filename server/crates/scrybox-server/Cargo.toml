@@ -23,6 +23,8 @@ flate2.workspace = true
 bytes.workspace = true
 form_urlencoded.workspace = true
 libc.workspace = true
+getrandom = "0.4"
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "rustls-native-certs"] }
 
 [dev-dependencies]
 tempfile = "3"

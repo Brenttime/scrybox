@@ -124,6 +124,26 @@ cases.push({ name: 'auth_apikey_post', path: '/api/collection', headers: { Autho
 cases.push({ name: 'auth_no_token_stats', path: '/api/stats', headers: {}, method: 'GET' });
 cases.push({ name: 'auth_bad_token_stats', path: '/api/stats', headers: { Authorization: '***' }, method: 'GET' });
 
+// Auth route group (iter 20 port): the non-mutating surface, compared
+// Rust-vs-Node. Deliberately excludes anything that would write the shared
+// DB copy (valid login/register/bootstrap-success/api-key mutations) —
+// those are covered by the cargo auth suites against fixture DBs instead;
+// write-side live parity is iter-21 work. All POST bodies here are
+// validation-error or disabled paths, which Node answers before any write.
+const AUTH_JSON = { 'content-type': 'application/json' };
+cases.push({ name: 'authr_config', path: '/api/auth/config', headers: {}, method: 'GET' });
+cases.push({ name: 'authr_me_no_token', path: '/api/auth/me', headers: {}, method: 'GET' });
+cases.push({ name: 'authr_me_bad_token', path: '/api/auth/me', headers: { Authorization: '***' }, method: 'GET' });
+cases.push({ name: 'authr_me_ok', path: '/api/auth/me', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'authr_login_missing_fields', path: '/api/auth/login', headers: AUTH_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'authr_login_wrong', path: '/api/auth/login', headers: AUTH_JSON, method: 'POST', body: '{"username":"no_such_user_xyz","password":"whatever123"}' });
+cases.push({ name: 'authr_register_disabled', path: '/api/auth/register', headers: AUTH_JSON, method: 'POST', body: '{"username":"parityprobe","password":"goodpass123"}' });
+cases.push({ name: 'authr_bootstrap_users_exist', path: '/api/auth/bootstrap', headers: AUTH_JSON, method: 'POST', body: '{"password":"paritypass123"}' });
+cases.push({ name: 'authr_bootstrap_short_pw', path: '/api/auth/bootstrap', headers: AUTH_JSON, method: 'POST', body: '{"password":"short"}' });
+cases.push({ name: 'authr_oidc_login_disabled', path: '/api/auth/oidc/login', headers: {}, method: 'GET' });
+cases.push({ name: 'authr_oidc_callback_disabled', path: '/api/auth/oidc/callback', headers: {}, method: 'GET' });
+cases.push({ name: 'authr_unknown_path_proxy', path: '/api/auth/definitely_not_a_route', headers: {}, method: 'GET' });
+
 // --- comparison --------------------------------------------------------------
 
 let ipSeq = 1;
@@ -134,6 +154,7 @@ async function fetchSide(base, c) {
   const res = await fetch(base + c.path, {
     method: c.method,
     headers: { ...c.headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
+    body: c.body,
     redirect: 'manual',
   });
   const body = res.status === 304 ? '' : await res.text();

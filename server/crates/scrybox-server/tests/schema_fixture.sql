@@ -132,6 +132,11 @@ CREATE INDEX idx_collection_user_added
 CREATE INDEX idx_card_cache_oracle_id ON card_cache(oracle_id);
 CREATE UNIQUE INDEX idx_users_oidc_sub ON users(oidc_sub) WHERE oidc_sub IS NOT NULL;
 CREATE INDEX idx_collection_card_user ON collection(card_id, user_id);
+-- The snapshot triggers below (live schema, backend/src/db.js) need this
+-- table; other suites create it per-file, the fixture owns it so every
+-- consumer (auth harness included) gets a self-contained DB.
+CREATE TABLE IF NOT EXISTS collection_snapshot (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO collection_snapshot (id, revision) VALUES (1, 0);
 CREATE TRIGGER collection_snapshot_after_insert
       AFTER INSERT ON collection
       BEGIN

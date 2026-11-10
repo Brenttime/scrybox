@@ -15,13 +15,25 @@ pub struct AuthUser {
     pub id: i64,
     pub role: Option<String>,
     pub via_api_key: bool,
+    /// middleware/auth.js builds req.user from the full column list; /me
+    /// serialises exactly that. Ported GET routes only consume id/role, so
+    /// these stay None on hot paths that pass `full=false`… actually the
+    /// middleware always reads all columns (same single row fetch), so we
+    /// always populate — the extra columns cost one row-copy.
+    pub username: Option<String>,
+    pub share_token: Option<String>,
+    pub share_enabled: Option<i64>,
+    pub api_key: Option<String>,
+    pub oidc_sub: Option<String>,
 }
 
 /// Extract the Bearer token exactly like Node: only an `Authorization`
 /// header starting with `Bearer ` qualifies.
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    // Node: `req.headers.authorization?.split(' ')[1]` — index 1 of a
+    // space-split, no prefix check, empty ⇒ falsy (no token).
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    raw.strip_prefix("Bearer ").map(|t| t.trim())
+    raw.split(' ').nth(1).filter(|s| !s.is_empty())
 }
 
 fn json_error(status: StatusCode, msg: &str) -> Response {
@@ -64,35 +76,43 @@ pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<
         }
     };
 
-    // Node's exact two queries, in order. Only user_id/role are consumed by
-    // ported routes, but the FROM/WHERE clauses are what must match.
-    let lookup = (|| -> rusqlite::Result<Option<(i64, Option<String>, bool)>> {
+    // Node's exact two queries, in order. All seven columns come back
+    // (middleware/auth.js selects them for req.user); the tuple maps
+    // (user_id, username, role, share_token, share_enabled, api_key, oidc_sub).
+    type Row = (i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>, Option<String>);
+    let lookup = (|| -> rusqlite::Result<Option<(Row, bool)>> {
+        let map = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        };
         let mut stmt = conn.prepare_cached(SESSION_SQL)?;
-        if let Some(row) = stmt
-            .query_row([token], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(2)?)))
-            .optional()?
-        {
-            return Ok(Some((row.0, row.1, false)));
+        if let Some(row) = stmt.query_row([token], map).optional()? {
+            return Ok(Some((row, false)));
         }
         let mut stmt = conn.prepare_cached(API_KEY_SQL)?;
-        if let Some(row) = stmt
-            .query_row([token], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(2)?)))
-            .optional()?
-        {
-            return Ok(Some((row.0, row.1, true)));
+        if let Some(row) = stmt.query_row([token], map).optional()? {
+            return Ok(Some((row, true)));
         }
         Ok(None)
     })();
 
     match lookup {
-        Ok(Some((id, role, via_api_key))) => {
+        Ok(Some(((id, username, role, share_token, share_enabled, api_key, oidc_sub), via_api_key))) => {
             if via_api_key && !is_get {
                 return Err(json_error(
                     StatusCode::FORBIDDEN,
                     "API keys are read-only. Use a login session for this request.",
                 ));
             }
-            Ok(AuthUser { id, role, via_api_key })
+            Ok(AuthUser {
+                id,
+                role,
+                via_api_key,
+                username,
+                share_token,
+                share_enabled,
+                api_key,
+                oidc_sub,
+            })
         }
         Ok(None) => Err(json_error(StatusCode::UNAUTHORIZED, "Invalid or expired session token.")),
         Err(e) => {

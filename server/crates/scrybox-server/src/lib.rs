@@ -25,7 +25,11 @@ use hyper_util::{
 use tower_http::services::ServeDir;
 
 pub mod auth;
+pub mod auth_routes;
+pub mod auth_support;
 pub mod collq;
+pub mod ip_limit;
+pub mod oidc;
 pub mod collection;
 pub mod db;
 pub mod health;
@@ -110,6 +114,13 @@ pub struct AppState {
     pub prewarm_min_cost_ms: u64,
     /// `/api/health` response cache + prober (iter 17). Read from env.
     pub health_cache: Arc<health::HealthCache>,
+    /// TRUST_PROXY twin for the auth limiter's client-IP decision (iter 20).
+    /// Tests set this directly; `new` parses the same env Node's server.js
+    /// reads, with the same ladder.
+    pub trust_proxy: ip_limit::Trust,
+    /// authLimiter twin (middleware/auth.js): one fixed window per client IP
+    /// shared by login/register/bootstrap/api-key/settings.
+    pub auth_limiter: Arc<ip_limit::FixedWindowLimiter>,
 }
 
 impl AppState {
@@ -133,7 +144,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -252,6 +263,16 @@ pub fn app(state: AppState) -> Router {
         // which is the point — the bounded-staleness tests exercise it.
         stats::spawn_refresher(&state);
         router.route("/api/stats", any(stats::handle))
+    } else {
+        router
+    };
+    // Auth route group (iter 20, FULL PORT P1): everything under /api/auth
+    // not in the known-route table is proxied by the handler itself, so
+    // Express keeps authoring the 404 pages.
+    let router = if state.owns("auth") {
+        router
+            .route("/api/auth", any(auth_routes::handle))
+            .route("/api/auth/{*rest}", any(auth_routes::handle))
     } else {
         router
     };
