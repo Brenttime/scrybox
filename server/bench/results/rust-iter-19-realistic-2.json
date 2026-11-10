@@ -1,0 +1,103 @@
+{
+  "at": "2026-11-10T15:09:11.537Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": {
+    "every_ms": 2000,
+    "ticks": 33,
+    "errors": 0,
+    "target": "http://127.0.0.1:3312/api/collection/4"
+  },
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 263899,
+      "variants": 1,
+      "rps": 26389.9,
+      "p50_ms": 0.53,
+      "p99_ms": 1.58,
+      "p999_ms": 4.13,
+      "max_ms": 13.56,
+      "peak_rss_mb": 999.2,
+      "codes": {
+        "200": 263899
+      }
+    },
+    {
+      "name": "collection_page_varied",
+      "conc": 16,
+      "n": 47801,
+      "variants": 52,
+      "rps": 4709.5,
+      "p50_ms": 1.64,
+      "p99_ms": 10.48,
+      "p999_ms": 230.49,
+      "max_ms": 328.48,
+      "peak_rss_mb": 792.9,
+      "codes": {
+        "200": 47801
+      }
+    },
+    {
+      "name": "collection_full_varied",
+      "conc": 2,
+      "n": 315,
+      "variants": 6,
+      "rps": 21,
+      "p50_ms": 50.9,
+      "p99_ms": 561.17,
+      "p999_ms": 836.97,
+      "max_ms": 836.97,
+      "peak_rss_mb": 1144.5,
+      "codes": {
+        "200": 315
+      }
+    },
+    {
+      "name": "stats_varied",
+      "conc": 16,
+      "n": 132877,
+      "variants": 52,
+      "rps": 13281.1,
+      "p50_ms": 0.83,
+      "p99_ms": 7.9,
+      "p999_ms": 17.38,
+      "max_ms": 45.59,
+      "peak_rss_mb": 944.9,
+      "codes": {
+        "200": 132877
+      }
+    },
+    {
+      "name": "search_db_varied",
+      "conc": 16,
+      "n": 18408,
+      "variants": 52,
+      "rps": 1757.7,
+      "p50_ms": 0.73,
+      "p99_ms": 324.59,
+      "p999_ms": 1147.64,
+      "max_ms": 1659.97,
+      "peak_rss_mb": 1531.2,
+      "codes": {
+        "200": 18408
+      }
+    },
+    {
+      "name": "search_coll_varied",
+      "conc": 16,
+      "n": 151858,
+      "variants": 52,
+      "rps": 15185.8,
+      "p50_ms": 0.73,
+      "p99_ms": 5.73,
+      "p999_ms": 22.88,
+      "max_ms": 89.93,
+      "peak_rss_mb": 1272.7,
+      "codes": {
+        "200": 151858
+      }
+    }
+  ]
+}
