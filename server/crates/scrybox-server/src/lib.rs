@@ -26,6 +26,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod collection;
 pub mod db;
+pub mod name_index;
 pub mod search;
 pub mod stats;
 mod stats_sql;
@@ -82,6 +83,12 @@ pub struct AppState {
     /// Response cache for the ported search route, keyed by
     /// (params, user, collection_read_revision).
     pub search_cache: Arc<search::SearchCache>,
+    /// In-memory name index speeding the search route's LIKE filter
+    /// (name_index.rs). Process-wide so invalidation rebuilds once.
+    pub name_index: Arc<name_index::NameIndex>,
+    /// Per-user owned-qty snapshots (name_index::OwnedCache) replacing the
+    /// per-request owned CTE re-materialization in the search route.
+    pub owned_index: Arc<name_index::OwnedCache>,
     /// Response cache for the native /stats route (stats.rs mirrors
     /// backend/src/utils/statsCache.js); disabled without a DB, same rule.
     pub stats_cache: Arc<stats::StatsCache>,
@@ -103,7 +110,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), stats_cache: Arc::new(stats::StatsCache::new()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).

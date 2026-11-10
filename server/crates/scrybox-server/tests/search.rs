@@ -4,7 +4,12 @@
 //! default body ETag, and proxy fallback for every request Node would answer
 //! from Scryfall/the sidecar instead.
 
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use axum::{
     body::Body,
@@ -378,4 +383,239 @@ async fn auth_matches_node() {
     // API keys may read searches (GET).
     let (s, _, _) = get(&r, "/api/search?name=Sol%20Ring", &[("authorization", "Bearer tok-api")]).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+// --- name index (name_index.rs) -------------------------------------------
+
+use scrybox_server::{db::DbPool, name_index, name_index::{NameIndex, OwnedCache}};
+
+/// Add distinctive rows to the seeded DB and bump the revision past every
+/// earlier entry so both caches and the name index treat it as a fresh state.
+fn seed_extra(path: &std::path::Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "
+        INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name,
+                                number, language, printed_name, price_estimated)
+          VALUES ('cc8',  'Zz Zorv',           'Artifact', '[]', '[]', 'Rare', 'brc', 'Extra', '9',
+                  'English', 'Sol Ring', 0),
+                 ('cc9',  'Sol Ringg Variant', 'Artifact', '[]', '[]', 'Rare', 'brc', 'Extra', '8',
+                  'English', NULL,       0),
+                 ('cc10', 'Plainville',        'Land',     '[]', '[]', 'Rare', 'brc', 'Extra', '7',
+                  'English', 'the PLAINS of paper', 0),
+                 ('cc11', '100_Card',          'Land',     '[]', '[]', 'Rare', 'brc', 'Extra', '6',
+                  'English', NULL,       0),
+                 ('cc12', '100XCard',          'Land',     '[]', '[]', 'Rare', 'brc', 'Extra', '5',
+                  'English', NULL,       0),
+                 ('cc13', 'ソールテスト',      'Artifact', '[]', '[]', 'Rare', 'brc', 'Extra', '4',
+                  'English', NULL,       0);
+        UPDATE collection_read_revision SET revision = 10 WHERE id = 1;
+        ",
+    )
+    .unwrap();
+}
+
+fn router_for_idx(db_path: PathBuf, routes: &[&str], upstream: &str, idx: NameIndex) -> Router {
+    router_for_idx_owned(db_path, routes, upstream, idx, OwnedCache::new())
+}
+
+fn router_for_idx_owned(
+    db_path: PathBuf,
+    routes: &[&str],
+    upstream: &str,
+    idx: NameIndex,
+    owned: OwnedCache,
+) -> Router {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+        db_path: Some(db_path),
+    };
+    let mut st = AppState::new(cfg);
+    st.name_index = Arc::new(idx);
+    st.owned_index = Arc::new(owned);
+    app(st)
+}
+
+/// The candidate set must equal — rowid-order and all — what SQLite's
+/// ASCII-case-insensitive LIKE matches, for every indexable pattern shape.
+#[test]
+fn index_candidates_equal_like_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_extra(&path);
+    let pool = DbPool::open(&path, 2).unwrap();
+    let idx = NameIndex::new();
+    idx.ensure_fresh(&pool, 10);
+    let snap = idx.snapshot_for(10).expect("snapshot at seeded rev");
+    let other = Connection::open(&path).unwrap();
+
+    for raw in [
+        "sol ring", "SOL RING", "Sol Rin", "l ring", "plains", "PLAINS", "the PLAINS of paper",
+        "ソール", "100", "zzz missing", "Zz Zorv", "ringg",
+    ] {
+        let pat = name_index::indexable_pattern(raw).unwrap();
+        let like = format!("%{raw}%");
+        let want: Vec<i64> = other
+            .prepare_cached("SELECT rowid FROM card_cache WHERE name LIKE ? OR printed_name LIKE ? ORDER BY rowid")
+            .unwrap()
+            .query_map(rusqlite::params![like.clone(), like], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(snap.candidate_rowids(&pat), want, "pattern {raw:?}");
+    }
+    // Metacharacters and empty patterns never take the index.
+    assert!(name_index::indexable_pattern("").is_none());
+    assert!(name_index::indexable_pattern("100_card").is_none());
+    assert!(name_index::indexable_pattern("a%b").is_none());
+}
+
+/// Byte-for-byte: the index path must serialize exactly what the plain scan
+/// serializes — same rows, same rowid order, same owned_qty, same ETag.
+#[tokio::test]
+async fn index_path_body_bytes_equal_plain_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_extra(&path);
+    let upstream = format!("http://{}", spawn_fake_node().await);
+
+    let plain = router_for_idx_owned(path.clone(), &["search"], &upstream, NameIndex::disabled(), OwnedCache::disabled());
+    let indexed = router_for_idx(path.clone(), &["search"], &upstream, NameIndex::new());
+
+    for url in [
+        "/api/search?scope=database&name=Sol%20Ring",
+        "/api/search?scope=database&name=Sol&page=2&limit=1",
+        "/api/search?scope=database&name=plains&page=1&limit=1",
+        "/api/search?scope=database&name=100",
+        "/api/search?name=the%20plains%20of%20paper",
+        "/api/search?scope=database&name=ソール",
+    ] {
+        let (s1, h1, b1) = get(&plain, url, &auth()).await;
+        let (s2, h2, b2) = get(&indexed, url, &auth()).await;
+        assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK), "{url}");
+        assert_eq!(h1.get("x-node"), None, "{url} plain hit Node");
+        assert_eq!(h2.get("x-node"), None, "{url} indexed hit Node");
+        assert_eq!(b1, b2, "body mismatch for {url}");
+        assert_eq!(
+            h1.get(header::ETAG).unwrap(),
+            h2.get(header::ETAG).unwrap(),
+            "etag mismatch for {url}"
+        );
+        assert!(!b1.is_empty());
+    }
+}
+
+/// A row written after the index exists must be visible once the revision
+/// bumps — i.e. the rebuild actually sees new rows (the DB-copy write-mix
+/// pattern of the honest bench).
+#[tokio::test]
+async fn index_serves_rows_written_after_invalidations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let r = router_for_idx(path.clone(), &["search"], &upstream, NameIndex::new());
+
+    // Cold: zero rows → proxy, exactly like the plain path.
+    let (s, h, _) = get(&r, "/api/search?name=Newthing", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "zero rows must proxy");
+
+    // Node-style write + trigger bump, then the entry must go native.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id,
+                                     set_name, number, language, price_estimated)
+             VALUES ('cc13', 'Newthing', 'Land', '[]', '[]', 'Rare', 'brc', 'Extra', '3', 'English', 0);
+             UPDATE collection_read_revision SET revision = 11 WHERE id = 1;",
+        )
+        .unwrap();
+    }
+    let (s, h, b) = get(&r, "/api/search?name=Newthing", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None, "must be answered natively after invalidation");
+    let cards = serde_json::from_slice::<Value>(&b).unwrap();
+    assert_eq!(cards.as_array().unwrap().len(), 1);
+    assert_eq!(cards[0]["id"], json!("cc13"));
+
+    // …and a deletion is equally visible (the trigger bumps the same counter).
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DELETE FROM card_cache WHERE id = 'cc13';
+             UPDATE collection_read_revision SET revision = 12 WHERE id = 1;",
+        )
+        .unwrap();
+    }
+    let (s, h, _) = get(&r, "/api/search?name=Newthing", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "deleted row must fall back to proxy");
+}
+
+/// `_` is LIKE's single-char wildcard — patterns containing it must keep the
+/// plain-scan semantics (both literal `_` and wildcard hits come back).
+#[tokio::test]
+async fn underscore_pattern_keeps_plain_scan_like_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_extra(&path);
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let r = router_for_idx(path, &["search"], &upstream, NameIndex::new());
+
+    let (s, h, b) = get(&r, "/api/search?name=100_card", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None);
+    let cards = serde_json::from_slice::<Value>(&b).unwrap();
+    let ids: Vec<&str> = cards
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["cc11", "cc12"], "LIKE '_' wildcard must still match cc12 via plain scan");
+}
+
+/// Repeated same-revision builds must not be re-scanned; and stale snapshots
+/// (wrong rev) must never serve.
+#[test]
+fn index_snapshot_is_rev_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_extra(&path);
+    let pool = DbPool::open(&path, 2).unwrap();
+    let idx = NameIndex::new();
+    assert!(idx.snapshot_for(10).is_none(), "cold index serves nothing");
+    idx.ensure_fresh(&pool, 10);
+    assert!(idx.snapshot_for(10).is_some());
+    assert!(idx.snapshot_for(11).is_none(), "rev mismatch must fall back to plain scan");
+    assert!(idx.snapshot_for(9).is_none());
+}
+
+/// SQLite TRIM strips spaces only and LOWER folds ASCII only — the Rust
+/// attach must agree (tab-prefixed names are NOT trimmed by either).
+#[test]
+fn owned_snapshot_attach_mirrors_sql_trim_lower() {
+    use scrybox_server::name_index::attach_owned_from_snapshot;
+    let mut map = std::collections::HashMap::new();
+    map.insert("sol ring".to_string(), 7i64);
+    map.insert("\tx".to_string(), 3i64);
+    let mut cards = vec![
+        json!({"id": "a", "name": "  SOL Ring  "}), // spaces trimmed by both
+        json!({"id": "b", "name": "\tX"}),           // tab kept by both (key "\tx")
+        json!({"id": "c", "name": "\u{a0}X"}),       // NBSP kept by both (no match)
+        json!({"id": "d", "name": "   "}),           // trims to empty → 0
+        json!({"id": "e", "name": null}),            // NULL name → empty key → 0
+    ];
+    assert!(attach_owned_from_snapshot(&mut cards, &map));
+    let qty: Vec<i64> = cards.iter().map(|c| c["owned_qty"].as_i64().unwrap()).collect();
+    assert_eq!(qty, vec![7, 3, 0, 0, 0]);
+    // Key order preserved (owned_qty still appended last).
+    let keys: Vec<&String> = cards[0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, vec!["id", "name", "owned_qty"]);
+    // A foreign card_id (not the row's own id) must bounce to the SQL path.
+    let mut odd = vec![json!({"id": "a", "card_id": "zz", "name": "Sol Ring"})];
+    assert!(!attach_owned_from_snapshot(&mut odd, &map));
 }

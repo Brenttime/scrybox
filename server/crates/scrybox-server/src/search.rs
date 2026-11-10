@@ -40,6 +40,7 @@ use crate::{
     auth,
     collection::{body_etag, etag_matches, gzip_bytes, parse_array_col, sqlite_value, truthy, wants_encoding},
     db::DbPool,
+    name_index::{self, NameIndex, OwnedCache, Txn},
     AppState,
 };
 
@@ -205,7 +206,12 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
 // ---------------------------------------------------------------------------
 
 /// `cardSearchSql.localCacheQuery` — same SQL text, same parameter order.
-fn local_cache_query(p: &SearchQuery) -> (String, Vec<rusqlite::types::Value>) {
+/// `candidates_json` (from the name index, when honoured) is a JSON array of
+/// rowids: the predicate only *narrows the scan* — the LIKE clause stays, so
+/// results are identical for a correct candidate set — and `ORDER BY rowid`
+/// pins the output to the rowid-ascending order the plain full scan (the
+/// proven plan: `SCAN card_cache`, no usable index) returns rows in.
+fn local_cache_query(p: &SearchQuery, candidates_json: Option<&str>) -> (String, Vec<rusqlite::types::Value>) {
     use rusqlite::types::Value as Sql;
     let mut sql = String::from("SELECT * FROM card_cache WHERE language = ?");
     let mut params = vec![Sql::Text(p.lang_name.clone())];
@@ -229,6 +235,11 @@ fn local_cache_query(p: &SearchQuery) -> (String, Vec<rusqlite::types::Value>) {
             params.push(Sql::Text(format!("%{s}%")));
             params.push(Sql::Text(s.clone()));
         }
+    }
+    if let Some(cj) = candidates_json {
+        sql.push_str(" AND rowid IN (SELECT value FROM json_each(?))");
+        params.push(Sql::Text(cj.to_string()));
+        sql.push_str(" ORDER BY rowid");
     }
     // offset = (page-1)*limit, saturating: JS computes it as a float and the
     // driver clamps; i64 saturating math keeps the same "past the end"
@@ -348,15 +359,58 @@ fn attach_owned_qty(conn: &Connection, cards: &mut [Value], user_id: i64) -> Res
 /// to `Ok(None)` because `runSearch` swallows it into an empty result and
 /// falls through to the live path; only post-cache (attachOwnedQty/serialize)
 /// errors mirror Node's 500, surfaced as `Err`.
-fn build_body(pool: &DbPool, p: &SearchQuery) -> Result<Option<(Vec<u8>, Option<u64>)>, String> {
+fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuery) -> Result<Option<(Vec<u8>, Option<u64>)>, String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
-    let (sql, params) = local_cache_query(p);
+    // Pin one read transaction over probe + card query + owned attach: WAL
+    // fixes every statement's view at the probe, so the revision we compare
+    // snapshot revs against is the state the response is built from
+    // (name_index.rs documents why that equality is sufficient). BEGIN
+    // failure proxies (same as a query error).
+    let txn = match Txn::begin(&conn) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(error = %e, "search build: BEGIN failed → proxy");
+            return Ok(None);
+        }
+    };
+    let now = crate::db::current_revision(&conn).ok().flatten();
+    // Name-index fast path: any miss (cold index, metacharacter pattern,
+    // revision moved mid-build) falls through to today's plain scan.
+    let mut candidates_json: Option<String> = None;
+    if !p.name.is_empty() {
+        if let Some(pat) = name_index::indexable_pattern(&p.name) {
+            if let Some(r) = now {
+                idx.ensure_fresh(pool, r);
+                if let Some(snap) = idx.snapshot_for(r) {
+                    let ids = snap.candidate_rowids(&pat);
+                    tracing::debug!(name = %p.name, candidates = ids.len(), "search build: name index");
+                    if ids.is_empty() {
+                        return Ok(None); // LIKE finds nothing either → Node's live path
+                    }
+                    let mut cj = String::with_capacity(ids.len() * 8 + 2);
+                    cj.push('[');
+                    for (i, id) in ids.iter().enumerate() {
+                        if i > 0 {
+                            cj.push(',');
+                        }
+                        cj.push_str(&id.to_string());
+                    }
+                    cj.push(']');
+                    candidates_json = Some(cj);
+                }
+            }
+        }
+    }
+    let (sql, params) = local_cache_query(p, candidates_json.as_deref());
     let mut cards: Vec<Value> = {
         let mut stmt = conn.prepare_cached(&sql).map_err(|e| format!("prepare: {e}"))?;
         let mut rows = match stmt.query(rusqlite::params_from_iter(params.iter())) {
             Ok(r) => r,
             // runSearch: `catch (e) { localResults = []; }` → live path.
-            Err(_) => return Ok(None),
+            Err(e) => {
+                tracing::debug!(error = %e, sql = %sql, "search build: cache query failed → proxy");
+                return Ok(None);
+            }
         };
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|_| "cache scan failed".to_string())? {
@@ -367,7 +421,18 @@ fn build_body(pool: &DbPool, p: &SearchQuery) -> Result<Option<(Vec<u8>, Option<
     if cards.is_empty() {
         return Ok(None); // Node keeps going: specific/broad Scryfall query.
     }
-    attach_owned_qty(&conn, &mut cards[..], p.user_id)?;
+    // Owned quantities from the per-rev snapshot when it holds; any
+    // deviation (row shape, non-integer SUM, build race) → original SQL.
+    let mut attached = false;
+    if let Some(r) = now {
+        if let Some(map) = owned.owned_map(pool, p.user_id, r) {
+            attached = name_index::attach_owned_from_snapshot(&mut cards, &map);
+        }
+    }
+    if !attached {
+        attach_owned_qty(&conn, &mut cards[..], p.user_id)?;
+    }
+    txn.commit().map_err(|e| e.to_string())?;
     let body = serde_json::to_vec(&cards).map_err(|e| e.to_string())?;
     // This path never sets meta.total (only the live paths do) → no
     // X-Total-Count header on the native response.
@@ -469,9 +534,11 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         Some(e) => e,
         None => {
             let build_pool = Arc::clone(&pool);
+            let build_idx = Arc::clone(&st.name_index);
+            let build_owned = Arc::clone(&st.owned_index);
             let p2 = p.clone();
             let built = tokio::task::spawn_blocking(move || {
-                let Some((body, _total)) = build_body(&build_pool, &p2)? else {
+                let Some((body, _total)) = build_body(&build_pool, &build_idx, &build_owned, &p2)? else {
                     return Ok::<_, String>(None);
                 };
                 let etag = body_etag(&body);
