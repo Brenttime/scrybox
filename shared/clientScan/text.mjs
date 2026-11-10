@@ -291,8 +291,12 @@ export function footerCodes(ix, raws) {
   const codes = [];
   for (const raw of raws) {
     const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+    // The earliest position wins, then rank: 'ZNR·EN' compacts to 'znren',
+    // where 'ren' (pos 2) outranked 'znr' (pos 0) and every Zendikar Rising
+    // footer named the wrong set (also 'TPR·EN' -> 'ren'). A noise glyph in
+    // front still reaches pos 1-2 when nothing matches earlier.
     let best = null;
-    for (let pos = 0; pos < Math.min(3, compact.length); pos++) {
+    for (let pos = 0; pos < Math.min(3, compact.length) && best == null; pos++) {
       for (const len of ix.setLengths) {
         const cand = compact.slice(pos, pos + len);
         if (cand.length === len && ix.setLookup.has(cand)

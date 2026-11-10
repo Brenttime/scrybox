@@ -116,6 +116,21 @@ export function loadClientScan() {
 }
 
 
+// Camera start: is the card index (and models) on this device the server's
+// current one? Compared by the manifest's content hashes inside the worker;
+// a newer index is built in the background and swapped in between reads, so
+// new sets scan on-device without a page reload. Never throws; a timeout or
+// failure keeps the current reader.
+export async function checkClientScan() {
+  const r = ready ? await ready : null;
+  if (!r?.ok || !worker) return { skipped: true };
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ error: 'check timed out' }), LOAD_TIMEOUT_MS);
+    call({ type: 'check' }, [], LOAD_TIMEOUT_MS + 1000, () => {})
+      .then((x) => { clearTimeout(timer); resolve(x); });
+  });
+}
+
 let frameCanvas = null, smallCanvas = null;
 function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }
 function canvas(w, h) {

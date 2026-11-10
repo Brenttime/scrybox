@@ -102,6 +102,17 @@ test('footerCodes reads a set code with up to two noise chars', () => {
   assert.deepEqual(footerCodes(ix, ['0408 R MH2']), []);
 });
 
+test('footerCodes: the earliest set code wins over a better-ranked one inside it', () => {
+  // 2026-11-10: 'ZNR·EN' compacted to 'znren' and named 'ren' (ranked first)
+  // instead of 'znr', so every Zendikar Rising footer code was wrong.
+  const sx = loadIndex({ names: [], canon: {}, excluded: [], sets: ['ren', 'tpr', 'znr', 'trk'], printings: [], byTitle: {}, uniqueAlias: {} });
+  assert.deepEqual(footerCodes(sx, ['ZNR·EN']), ['znr']);
+  assert.deepEqual(footerCodes(sx, ['TPR • EN']), ['tpr']);
+  assert.deepEqual(footerCodes(sx, ['TRKEN']), ['trk']);
+  assert.deepEqual(footerCodes(sx, ['• ZNR • EN']), ['znr'], 'noise glyph in front');
+  assert.deepEqual(footerCodes(sx, ['REN EN']), ['ren']);
+});
+
 test('needsServer: fallback rules', () => {
   const card = (ok) => ({ candidates: [{ eligible: true }], results: [{ ok }] });
   assert.equal(needsServer(null, { autoPass: true }), true);

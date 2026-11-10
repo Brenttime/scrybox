@@ -5,7 +5,7 @@ import { priceText, cardPriceText, estPrefix, isEstimated } from '../utils/forma
 import { displayName } from '../utils/languages';
 import { useT } from '../utils/i18n';
 import { FRAME_MAX, fitContain, quadPath, zoomPlan, nextFailStreak, serverAllowed, nextEdgeRun, isEdgePartial, nextPresentation, presentationInput, dedupeFresh, notePresence, edgeDirection, choiceHits, choiceLabel, SHEET_ESCAPE, recentSets, guessChoiceHit, presenceDecision, notePresenceCommit, updatePresence, hitCentre, canChangePrinting, sentEntryIds } from '../utils/fastScan';
-import { loadClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
+import { loadClientScan, checkClientScan, readOnDevice, resetOnDevice, lastFrameJpeg, hydrateResults, needsServer, takeHydrateMs, isHydrated, frameClock, newFrameAfter, lastCapturedFrame, fetchChoices } from '../utils/clientScan';
 import { scanTelemetry } from '../utils/scanTelemetry';
 
 // Fast scan. One request per scan: the frame goes up once, the cardscan
@@ -44,7 +44,29 @@ const HYDRATE_RETRY_MS = [1000, 3000, 10000, 30000];
 const REPOINT_TIMEOUT_MS = 8000;
 const FIX_RETRY_MS = 3000;
 const AUTO_FRAME_MAX_EXTRA_MS = 40;
-const FAST_DEVICE = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 8);
+// Phones (coarse pointer) ask for 1080p, desktops 1440p (see startCamera).
+function cameraSize() {
+  const phone = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
+  return phone ? [1920, 1080] : [2560, 1440];
+}
+// Some browsers still hand back VGA for an 'ideal' they could have met (seen
+// on iOS); ask again once, explicitly, before scanning starts.
+async function raiseResolution(track, [w, h]) {
+  const st = track.getSettings?.() || {};
+  if (Math.max(st.width || 0, st.height || 0) >= 1280) return;
+  for (const [cw, ch] of [[w, h], [1280, 720]]) {
+    try {
+      await track.applyConstraints({ width: { ideal: cw }, height: { ideal: ch }, frameRate: { ideal: 30 } });
+      const now = track.getSettings?.() || {};
+      if (Math.max(now.width || 0, now.height || 0) >= 1280) return;
+    } catch { /* keep what we have */ }
+  }
+}
+// The fresh-frame path (8 ms yield, then the next decoded frame) for every
+// device with >= 4 cores. 2026-11-10: iPhones report 4 cores and sat out a
+// fixed 60 ms between failed passes (median gap 61.5 ms, Astra); the pipeline
+// already ignores repeated frames, so this only removes idle time.
+const FAST_DEVICE = (typeof navigator !== 'undefined' && (navigator.hardwareConcurrency || 0) >= 4);
 const AUTO_BUSY_MS = 1000;   // sidecar said 429: back off instead of re-asking in 60 ms
 // The tray is capped for render cost, but unsent scans are never dropped to
 // make room: at the cap, auto pauses and asks for a Send instead.
@@ -205,7 +227,12 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       if (!live) return;
       onDeviceRef.current = r.ok; setOnDevice(r.ok);
       scanTelemetry.device({ ok: r.ok, loadMs: r.loadMs, error: r.error, ...(r.info || {}) });
-      if (!r.ok) {
+      if (r.ok) {
+        // Same card index as the server? (content hash; one tiny request)
+        checkClientScan().then(c => {
+          if (live && c.updated) scanTelemetry.device({ ok: true, loadMs: c.loadMs, updatedFrom: c.from, ...(c.info || {}) });
+        });
+      } else {
         console.info('[fastscan] on-device reader unavailable:', r.error);
         if (r.error !== 'unsupported browser') timer = setTimeout(attempt, 31000);
       }
@@ -242,12 +269,24 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       setError(t('fastscan.insecure', { origin: window.location.origin })); return;
     }
     stopCamera();
-    const video = { width: { ideal: 2560 }, height: { ideal: 1440 }, frameRate: { ideal: 30 } };
+    // Resolution is what reads the footer: at iOS's default 640x480 a
+    // collector number is ~11 px tall (2026-11-10 telemetry, every iPhone
+    // session). Phones ask for 1920x1080, a preset every iPhone/Android rear
+    // camera has (frames are grabbed at FRAME_MAX 1920 anyway); desktop
+    // webcams keep 2560x1440, which the Windows sessions were validated at.
+    const size = cameraSize();
+    const video = { width: { ideal: size[0] }, height: { ideal: size[1] }, frameRate: { ideal: 30 } };
     if (id) video.deviceId = { exact: id }; else video.facingMode = { ideal: 'environment' };
     try {
       let stream;
       try { stream = await navigator.mediaDevices.getUserMedia({ video, audio: false }); }
-      catch (e) { if (!id) throw e; stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }); }
+      catch (e) {
+        if (!id) throw e;
+        // A stale saved camera id (iOS rotates them): keep the resolution ask.
+        const rest = { ...video, facingMode: { ideal: 'environment' } };
+        delete rest.deviceId;
+        stream = await navigator.mediaDevices.getUserMedia({ video: rest, audio: false });
+      }
       streamRef.current = stream;
       const v = videoRef.current;
       v.srcObject = stream;
@@ -255,6 +294,9 @@ export default function FastScanner({ onAddSuccess, showToast }) {
       const track = stream.getVideoTracks()[0];
       const caps = track.getCapabilities?.() || {};
       setTorchOk(!!caps.torch);
+      await raiseResolution(track, size);
+      const st = track.getSettings?.() || {};
+      scanTelemetry.camera({ w: st.width, h: st.height, fps: st.frameRate, asked: size, max: [caps.width?.max, caps.height?.max], stale: !!id && st.deviceId !== id });
       if (caps.focusMode?.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
       setCameraOn(true);
       const all = await navigator.mediaDevices.enumerateDevices();
@@ -737,7 +779,7 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const gen = ++runRef.current;
     if (!next) { scanAbortRef.current?.abort(); return; }
     // A new run proves every card afresh; nothing tracked in the last one carries over.
-    seenIdsRef.current.clear(); committedRef.current = []; failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; presRef.current = null; resetOnDevice();
+    seenIdsRef.current.clear(); committedRef.current = []; failStreakRef.current = null; edgeRunRef.current = null; noTitleRunRef.current = 0; sheetRunRef.current = 0; titledRunRef.current = 0; presRef.current = null; firstSeenRef.current = null; resetOnDevice();
     sessionRef.current = Math.random().toString(36).slice(2, 12);   // fresh sidecar cache too
     autoLoop(gen);
   };

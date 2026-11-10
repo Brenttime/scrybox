@@ -18,6 +18,7 @@ const MAX_QUEUE = 200;
 let queue = [];
 let timer = null;
 let deviceInfo = null;
+let cameraInfo = null;   // what getUserMedia actually delivered (track settings)
 let seq = 0;
 const session = Math.random().toString(36).slice(2, 10);
 // Which bundle produced a record (R2 measurement fix): version + build stamp.
@@ -38,7 +39,7 @@ function flush(useBeacon = false) {
   clearTimeout(timer); timer = null;
   if (!queue.length) return;
   const batch = queue; queue = [];
-  const body = JSON.stringify({ session, platform: platform(), device: deviceInfo, records: batch });
+  const body = JSON.stringify({ session, platform: platform(), device: deviceInfo, camera: cameraInfo, records: batch });
   try {
     if (useBeacon && navigator.sendBeacon) {
       navigator.sendBeacon('/api/cardscan/telemetry', new Blob([body], { type: 'application/json' }));
@@ -70,6 +71,7 @@ let emptyCount = 0;
 
 export const scanTelemetry = {
   device(info) { deviceInfo = info; },
+  camera(info) { cameraInfo = info; },
   begin({ mode, sw, sh }) {
     const rec = { id: `${session}-${++seq}`, t: new Date().toISOString(), mode, video: [sw, sh], ms: {}, build: BUILD };
     let done = false;
