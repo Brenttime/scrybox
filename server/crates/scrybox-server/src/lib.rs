@@ -1,6 +1,7 @@
 //! Scrybox front server (strangler fig).
 //!
-//! `/api/health` is answered natively (backed by a Node health ping). Routes
+//! `/api/health` is answered natively (backed by a cached Node health ping,
+//! health.rs). Routes
 //! listed in `RUST_ROUTES` are served by their ported Rust handlers; every
 //! other request is reverse-proxied to the Node backend unchanged, so
 //! behaviour (headers, status codes, bodies) stays exactly what Node
@@ -27,6 +28,7 @@ pub mod auth;
 pub mod collq;
 pub mod collection;
 pub mod db;
+pub mod health;
 pub mod name_index;
 pub mod search;
 pub mod sidecar;
@@ -106,6 +108,8 @@ pub struct AppState {
     /// was cheaper than this never fan out. `SCRYBOX_PREWARM_MIN_COST_MS`
     /// overrides; tests set the field directly.
     pub prewarm_min_cost_ms: u64,
+    /// `/api/health` response cache + prober (iter 17). Read from env.
+    pub health_cache: Arc<health::HealthCache>,
 }
 
 impl AppState {
@@ -129,7 +133,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -212,40 +216,14 @@ pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
     }
 }
 
-/// `/api/health`: healthy only when the Node upstream (and therefore its DB
-/// ping) is healthy. Body shape matches Node's `{ "status": "ok" }`.
-pub async fn health(State(st): State<AppState>) -> Response {
-    let uri: Uri = match format!("{}/api/health", st.cfg.node_upstream).parse() {
-        Ok(u) => u,
-        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "bad upstream"),
-    };
-    let req = Request::get(uri).body(Body::empty()).expect("static request");
-    let res = tokio::time::timeout(Duration::from_secs(3), st.client.request(req)).await;
-    match res {
-        // Healthy: hand back Node's own response so security headers
-        // (helmet/COEP) stay byte-identical to Node's.
-        Ok(Ok(r)) if r.status().is_success() => {
-            let (mut parts, body) = r.into_parts();
-            strip_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, Body::new(body))
-        }
-        Ok(Ok(r)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "status": "error", "upstream": "node", "upstream_status": r.status().as_u16() })),
-        )
-            .into_response(),
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "status": "error", "upstream": "node", "error": "unreachable" })),
-        )
-            .into_response(),
-    }
-}
-
 /// Build the router. Ported routes are mounted explicitly; everything else
 /// falls back to Node (optionally after a static-file lookup).
 pub fn app(state: AppState) -> Router {
-    let router = Router::new().route("/api/health", get(health));
+    // Health cache prober (iter 17): keeps the last healthy Node response
+    // warm so the handler answers from memory while fresh. SCRYBOX_HEALTH_CACHE=0
+    // disables both the prober and the cache lookup (iter-16 live proxy).
+    health::spawn_prober(&state);
+    let router = Router::new().route("/api/health", get(health::handle));
     // Ported API routes behind the per-route kill switch. Non-GET methods on
     // an owned path still proxy to Node (the handler dispatches internally).
     let router = if state.owns("collection") {
