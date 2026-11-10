@@ -46,26 +46,37 @@ let pendingReset = false;
 let FLAGS = {};
 let THREAD_OVERRIDE = null;
 
-// Each load owns its Cache API writes (review R3-S2): once the load fails it
-// writes nothing more, and its cleanup waits for the writes already started,
-// so a late put can never resurrect a failed candidate's bytes. URLs being
-// cleaned up are read from the network and not written meanwhile.
-const tainted = new Set();
-async function cachedBytes(cache, url, signal, own = null) {
-  const useCache = cache && !tainted.has(url);
-  let res = useCache ? await cache.match(url) : null;
+// Cache API writes happen only after a load has validated its bytes (index
+// gunzipped + parsed, both ORT sessions created and warmed, dictionary
+// decoded) and has not been aborted (review R4-S1). Asset names carry the
+// sha256 prefix of their bytes (cardscan build_client_index.py), so an entry
+// for a URL is always the right bytes: a late write from an abandoned load can
+// only store the same valid content, and no write needs owning or undoing.
+// A failed load deletes only copies it READ from the cache (they may be bad),
+// never one the active/pending bundle names.
+const HASHED = /\.([0-9a-f]{12})\.[a-z.]+$/;
+async function hashOk(url, bytes) {
+  const want = HASHED.exec(url)?.[1];
+  const subtle = self.crypto?.subtle;          // secure contexts only (not LAN http)
+  if (!want || !subtle) return true;
+  const d = new Uint8Array(await subtle.digest('SHA-256', bytes));
+  return [...d.slice(0, 6)].map(b => b.toString(16).padStart(2, '0')).join('') === want;
+}
+async function cachedBytes(cache, url, signal, got = []) {
+  const hit = cache ? await cache.match(url) : null;
   if (signal?.aborted) throw new Error('refresh aborted');
-  if (!res) {
-    res = await fetch(ORIGIN + url, { signal });
-    const type = res.headers.get('content-type') || '';
-    if (!res.ok || type.includes('text/html')) throw new Error(`${url} not served (${res.status})`);
-    if (useCache && !own?.dead && !tainted.has(url)) {
-      const put = cache.put(url, res.clone()).catch(() => {});
-      own?.puts.push(put);
-      await put;
-    }
+  if (hit) {
+    const bytes = new Uint8Array(await hit.arrayBuffer());
+    if (await hashOk(url, bytes)) { got.push({ url, bytes, cached: true }); return bytes; }
+    await cache.delete(url).catch(() => {});
   }
-  return new Uint8Array(await res.arrayBuffer());
+  const res = await fetch(ORIGIN + url, { signal });
+  const type = res.headers.get('content-type') || '';
+  if (!res.ok || type.includes('text/html')) throw new Error(`${url} not served (${res.status})`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (!(await hashOk(url, bytes))) throw new Error(`${url} content hash mismatch`);
+  got.push({ url, bytes, cached: false });
+  return bytes;
 }
 
 async function gunzip(bytes) {
@@ -86,9 +97,9 @@ async function fetchManifest(signal) {
 // stores a revalidated one for the next load (no identity guessing from
 // headers; review R1-S2).
 const CORN_URL = '/models/cornelius.onnx';
-async function cornBytes(cache, signal) {
+async function cornBytes(cache, signal, got) {
   const hit = cache ? await cache.match(CORN_URL) : null;
-  if (!hit) return cachedBytes(cache, CORN_URL, signal);
+  if (!hit) return cachedBytes(null, CORN_URL, signal, got);
   fetch(ORIGIN + CORN_URL, { cache: 'no-cache' }).then(async (res) => {
     const type = res.headers.get('content-type') || '';
     if (res.ok && !type.includes('text/html')) await cache.put(CORN_URL, res);
@@ -104,56 +115,58 @@ async function warmUp(rec, cornelius) {
 
 // Drop cached assets no current bundle names. Only after a bundle is ACTIVE,
 // so a failed refresh never costs the last good copy (review R1-S1).
-const releaseSessions = (...ss) => { for (const x of ss) x?.release?.()?.catch?.(() => {}); };
+// Exactly once per session, whichever owner gets there first (review R4-S2).
+const released = new WeakSet();
+const releaseSessions = (...ss) => {
+  for (const x of ss) {
+    if (!x || released.has(x)) continue;
+    released.add(x);
+    x.release?.()?.catch?.(() => {});
+  }
+};
 async function pruneCache() {
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
   if (!cache) return;
-  const keep = new Set([bundles.active, bundles.pending].filter(Boolean)
-    .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
+  const keep = keptUrls();
   keep.add(CORN_URL);
   for (const req of await cache.keys()) {
     if (!keep.has(new URL(req.url).pathname)) await cache.delete(req).catch(() => {});
   }
 }
 
-// A candidate that failed to load must not leave its bytes in the Cache API,
-// or every retry would read the same bad copy (review R2-S2). Files that the
-// active/pending bundle also names (shared rec/dict, last-known-good A) stay.
-async function dropCandidate(cache, urls, own) {
-  if (!cache) return;
-  own.dead = true;
-  const keep = new Set([bundles.active, bundles.pending].filter(Boolean)
-    .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
-  const drop = urls.filter(u => !keep.has(u));
-  for (const u of drop) tainted.add(u);
-  try {
-    await Promise.allSettled(own.puts);
-    for (const u of drop) await cache.delete(u).catch(() => {});
-  } finally { for (const u of drop) tainted.delete(u); }
-}
+const keptUrls = () => new Set([bundles.active, bundles.pending].filter(Boolean)
+  .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
 
 async function load(manifest = null, signal = undefined) {
   manifest ||= await fetchManifest(signal);
   const urls = [manifest.index, manifest.rec, manifest.dict].map(n => BASE + n);
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
-  const own = { dead: false, puts: [] };
-  try { return await loadFrom(manifest, urls, cache, signal, own); } catch (err) {
-    // Cleanup runs in the background so a hung write cannot hold the error;
-    // its URLs bypass the cache until it is done.
-    dropCandidate(cache, urls, own).catch(() => {});
+  const got = [];
+  let bundle;
+  try { bundle = await loadFrom(manifest, urls, cache, signal, got); } catch (err) {
+    // A failed candidate must not leave a bad copy for the retry to read
+    // (review R2-S2): drop what it read from the cache, unless the
+    // active/pending bundle (shared rec/dict, last-known-good A) names it.
+    const keep = keptUrls();
+    for (const f of got) if (cache && f.cached && f.url !== CORN_URL && !keep.has(f.url)) cache.delete(f.url).catch(() => {});
     throw err;
   }
+  // Validated and not aborted: now, and only now, store what was fetched.
+  for (const f of got) if (cache && !f.cached) cache.put(f.url, new Response(f.bytes)).catch(() => {});
+  return bundle;
 }
 
-// Sessions this load created, owned until the bundle is returned: on abort,
+// Sessions this load created, owned until handoff() passes them to the
+// returned bundle (the controller retires it from then on; R4-S2). On abort,
 // every completed one is released now and a late one when it completes, so a
 // hung sibling cannot pin them (review R2-B2). A session still running its
 // warm-up is not released under it; the bundle is retired when it returns.
 function sessionOwner(signal) {
   const made = [];
-  let disowned = false, warming = false;
-  const drop = () => { disowned = true; releaseSessions(...made.splice(0)); };
-  signal?.addEventListener?.('abort', () => { if (!warming) drop(); }, { once: true });
+  let disowned = false, warming = false, handed = false;
+  const drop = () => { if (handed) return; disowned = true; releaseSessions(...made.splice(0)); };
+  const onAbort = () => { if (!warming) drop(); };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   // Abort listeners do not fire for a signal that is already aborted
   // (review R3-S1): such an owner is disowned from the start.
   if (signal?.aborted) drop();
@@ -165,14 +178,15 @@ function sessionOwner(signal) {
     }),
     warming: (v) => { warming = v; if (!v && signal?.aborted) drop(); },
     drop,
+    handoff: () => { handed = true; made.length = 0; signal?.removeEventListener?.('abort', onAbort); },
   };
 }
 
-async function loadFrom(manifest, urls, cache, signal, ownCache = null) {
+async function loadFrom(manifest, urls, cache, signal, got = []) {
   const t0 = performance.now();
   const tFetch = performance.now();
   const [indexGz, recBytes, dictBytes, corn] = await Promise.all([
-    cachedBytes(cache, urls[0], signal, ownCache), cachedBytes(cache, urls[1], signal, ownCache), cachedBytes(cache, urls[2], signal, ownCache), cornBytes(cache, signal),
+    cachedBytes(cache, urls[0], signal, got), cachedBytes(cache, urls[1], signal, got), cachedBytes(cache, urls[2], signal, got), cornBytes(cache, signal, got),
   ]);
   // The Cache API waits above are not abortable: an abort that landed during
   // them stops here, before any session is created (review R3-S1).
@@ -203,6 +217,7 @@ async function loadFrom(manifest, urls, cache, signal, ownCache = null) {
   await warmUp(rec, cornelius).catch(() => {});
   own.warming(false);
   if (signal?.aborted) throw new Error('refresh aborted');
+  own.handoff();
   const warmMs = Math.round(performance.now() - tWarm);
   const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate, retroFirst: FLAGS.retroFirst ?? ort.env.wasm.numThreads >= 4 });
   // Which assets this worker actually runs, for scan telemetry: rules out a

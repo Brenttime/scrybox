@@ -130,8 +130,8 @@ export function createBundles({ loadBundle, fetchManifest, release, prune = () =
       deciding = my;
       const from = (pending || active).info?.index;
       const ctrl = new AbortController();
-      const dl = deadline(() => ctrl.abort());
-      let ok = false;
+      let ok = false, expired = false;
+      const dl = deadline(() => { expired = true; ctrl.abort(); });
       try {
         // fetchManifest bounds the body (res.json) with the same signal; the
         // race bounds it even if it does not.
@@ -158,10 +158,11 @@ export function createBundles({ loadBundle, fetchManifest, release, prune = () =
       } finally {
         dl.settle();
         // Only the newest check governs the build; on its expiry or failure
-        // the build it owns goes with it (R3-B1).
+        // the build it owns goes with it (R3-B1). Older waiters hear why:
+        // timed out only when this deadline fired, else superseded (R4-N1).
         if (my === gen) {
           deciding = 0;
-          if (!ok) cancel(update, timeoutError());
+          if (!ok) cancel(update, expired ? timeoutError() : supersededError());
         }
       }
     },
