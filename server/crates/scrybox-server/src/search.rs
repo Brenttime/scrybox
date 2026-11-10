@@ -497,20 +497,15 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
     };
-    let headers = req.headers().clone();
+    let headers = req.headers();
     let uri = req.uri().clone();
 
     // authenticateToken runs before the route in Node; same 401/403 bodies.
-    let auth_pool = Arc::clone(&pool);
-    let auth_headers = headers.clone();
-    let authed = tokio::task::spawn_blocking(move || auth::authenticate(&auth_pool, &auth_headers, true)).await;
-    let user = match authed {
-        Ok(Ok(u)) => u,
-        Ok(Err(res)) => return res,
-        Err(e) => {
-            tracing::error!(error = %e, "auth task panicked");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error");
-        }
+    // µs-cached SQLite, inline on the worker (iter 6).
+    let token = auth::bearer_token(headers).map(|s| s.to_string());
+    let user = match auth::authenticate(&pool, token.as_deref(), true) {
+        Ok(u) => u,
+        Err(res) => return res,
     };
 
     let raw_query = uri.query().map(|s| s.to_string());
@@ -522,11 +517,10 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
-    let probe_pool = Arc::clone(&pool);
-    let rev = tokio::task::spawn_blocking(move || crate::db::current_revision(&probe_pool.get().unwrap()))
-        .await
-        .unwrap_or(Ok(None))
-        .unwrap_or(None);
+    let rev = pool
+        .get()
+        .ok()
+        .and_then(|c| crate::db::current_revision(&c).ok().flatten());
     let rev_i = rev.unwrap_or(-1);
 
     let key = p.cache_key();

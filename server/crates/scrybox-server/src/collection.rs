@@ -807,20 +807,15 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
     };
-    let headers = req.headers().clone();
+    let headers = req.headers();
     let uri = req.uri().clone();
 
-    // authenticate (blocking DB call offlined from the runtime)
-    let auth_pool = Arc::clone(&pool);
-    let auth_headers = headers.clone();
-    let authed = tokio::task::spawn_blocking(move || auth::authenticate(&auth_pool, &auth_headers, true)).await;
-    let user = match authed {
-        Ok(Ok(u)) => u,
-        Ok(Err(res)) => return res,
-        Err(e) => {
-            tracing::error!(error = %e, "auth task panicked");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error");
-        }
+    // authenticate (µs-cached SQLite; inline on the worker, no blocking-pool
+    // hop — iter 6).
+    let token = auth::bearer_token(headers).map(|s| s.to_string());
+    let user = match auth::authenticate(&pool, token.as_deref(), true) {
+        Ok(u) => u,
+        Err(res) => return res,
     };
 
     let raw_query = uri.query().map(|s| s.to_string());
@@ -829,11 +824,10 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
     // Revision probe: single indexed read; also the cache invalidator.
-    let probe_pool = Arc::clone(&pool);
-    let rev = tokio::task::spawn_blocking(move || crate::db::current_revision(&probe_pool.get().unwrap()))
-        .await
-        .unwrap_or(Ok(None))
-        .unwrap_or(None);
+    let rev = pool
+        .get()
+        .ok()
+        .and_then(|c| crate::db::current_revision(&c).ok().flatten());
 
     let mut extra_headers: Vec<(header::HeaderName, HeaderValue)> = Vec::new();
     // True when the route's own revision tag was emitted; Express's default

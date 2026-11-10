@@ -6,7 +6,15 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        // App-target default, NOT bare "info": the bare default also enables
+        // tower_http's per-request INFO span events, which meant every API
+        // request paid a fmt+write to journald on a runtime worker (~9k
+        // lines/s during the hot bench — iter 6). Route errors still log
+        // (they are scrybox_server:: events at warn/error).
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "scrybox_server=info".into()),
+        )
         .init();
     let cfg = match Config::from_env() {
         Ok(c) => c,

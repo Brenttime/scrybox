@@ -195,14 +195,18 @@ pub fn on_proxied_write(st: &AppState, method: &Method, path: &str, headers: &He
         return;
     }
     let Some(pool) = st.db.clone() else { return };
-    let headers = headers.clone();
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
     let cache = Arc::clone(&st.stats_cache);
     // Fire-and-forget: the proxied response must not wait on our bookkeeping.
     tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || crate::auth::authenticate(&pool, &headers, false)).await {
-            Ok(Ok(user)) => cache.bump(user.id),
-            Ok(Err(_)) => {} // unauth / API-key write: Node never bumps either
-            Err(_) => {}
+        // ~5 us sync lookup; no need for a blocking hop (see auth.rs).
+        match crate::auth::authenticate(&pool, token.as_deref(), false) {
+            Ok(user) => cache.bump(user.id),
+            Err(_) => {} // unauth / API-key write: Node never bumps either
         }
     });
 }
@@ -846,20 +850,16 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
     };
-    let headers = req.headers().clone();
+    let headers = req.headers();
 
     // authenticateToken runs before the route in Node (Bearer session token;
-    // API keys are GET-only, which this path is). Same 401/403 bodies.
-    let auth_pool = Arc::clone(&pool);
-    let auth_headers = headers.clone();
-    let authed = tokio::task::spawn_blocking(move || crate::auth::authenticate(&auth_pool, &auth_headers, true)).await;
-    let user = match authed {
-        Ok(Ok(u)) => u,
-        Ok(Err(res)) => return res,
-        Err(e) => {
-            tracing::error!(error = %e, "stats auth task panicked");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error");
-        }
+    // API keys are GET-only, which this path is). Same 401/403 bodies. The
+    // lookup is ~5 us of cached SQLite — run inline on the worker, no
+    // blocking-pool hop (iter 6: that hop, not the SQL, was the hot-path cost).
+    let token = crate::auth::bearer_token(headers).map(|s| s.to_string());
+    let user = match crate::auth::authenticate(&pool, token.as_deref(), true) {
+        Ok(u) => u,
+        Err(res) => return res,
     };
 
     let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
@@ -871,20 +871,16 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     // Phase 1: resolve the cache key and probe. Node computes (gen, rev) at
     // request start; a bump racing the computation lands on the NEXT
     // request's key, exactly like Node's cached() wrapper.
-    let probe_pool = Arc::clone(&pool);
-    let probe_cache = Arc::clone(&cache);
     let outcome = async move {
-        let probe = tokio::task::spawn_blocking(move || -> Result<(Option<Arc<StatsEntry>>, String), String> {
-            let conn = probe_pool.get().map_err(|e| format!("read pool: {e}"))?;
-            let gen = probe_cache.gen(user_id);
+        let (hit, key) = {
+            let conn = pool
+                .get()
+                .map_err(|e| format!("read pool: {e}"))?;
+            let gen = cache.gen(user_id);
             let rev = StatsCache::db_revision(&conn);
             let key = StatsCache::key_for(user_id, gen, rev.as_deref());
-            let hit = probe_cache.get(&key);
-            Ok((hit, key))
-        })
-        .await
-        .map_err(|e| format!("stats probe panicked: {e}"))??;
-        let (hit, key) = probe;
+            (cache.get(&key), key)
+        };
         if let Some(entry) = hit {
             return Ok((true, entry));
         }

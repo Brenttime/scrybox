@@ -59,6 +59,19 @@ impl DbPool {
         Ok(PooledConn { pool: self, conn: Some(conn) })
     }
 
+    /// Pre-create idle connections so steady-state `get()` never pays the
+    /// SQLite open+PRAGMA cost on a runtime worker (the hit path checks out
+    /// connections inline since iter 6). Only fills up to `max`.
+    pub fn warm(&self, n: usize) {
+        let want = n.min(self.max);
+        let have = self.idle.lock().unwrap().len();
+        for _ in have..want {
+            if let Ok(conn) = Self::connect(&self.path) {
+                self.put(conn);
+            }
+        }
+    }
+
     fn put(&self, conn: Connection) {
         let mut idle = self.idle.lock().unwrap();
         if idle.len() < self.max {

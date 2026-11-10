@@ -103,7 +103,12 @@ impl AppState {
             .build(conn);
         let db = cfg.db_path.as_ref().and_then(|path| {
             match db::DbPool::open(path, 16) {
-                Ok(pool) => Some(Arc::new(pool)),
+                Ok(pool) => {
+                    // Hit-path checkouts (auth + revision) run inline on
+                    // runtime workers; pre-fill so they never pay connect().
+                    pool.warm(16);
+                    Some(Arc::new(pool))
+                }
                 Err(e) => {
                     tracing::error!(error = %e, path = %path.display(), "cannot open DB copy; Rust routes disabled");
                     None

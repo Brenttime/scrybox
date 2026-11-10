@@ -33,13 +33,27 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
         .into_response()
 }
 
-const SESSION_COLUMNS: &str = "u.username, u.role, u.share_token, u.share_enabled, u.api_key, u.oidc_sub";
+// Built once (concat! of consts): the handlers call this on the hot request
+// path and prepare_cached hashes the SQL text on every call.
+const SESSION_SQL: &str = concat!(
+    "SELECT s.user_id, u.username, u.role, u.share_token, u.share_enabled, u.api_key, u.oidc_sub ",
+    "FROM sessions s JOIN users u ON s.user_id = u.id ",
+    "WHERE s.token = ?1 AND s.expires_at > DATETIME('now')"
+);
+const API_KEY_SQL: &str = concat!(
+    "SELECT u.id AS user_id, u.username, u.role, u.share_token, u.share_enabled, u.api_key, u.oidc_sub ",
+    "FROM users u WHERE u.api_key = ?1"
+);
 
 /// Run the two Node lookups (session, then API key) on a pooled connection.
 /// `is_get` mirrors the `req.method !== 'GET'` API-key rejection; ported
 /// routes are GET-only so it never fires there, kept for exactness.
-pub fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> Result<AuthUser, Response> {
-    let Some(token) = bearer_token(headers) else {
+///
+/// Takes the extracted bearer token (not the HeaderMap) so the hot path can
+/// run this synchronously on a runtime worker: the whole lookup measured
+/// ~5 us on the seeded fixture, cheaper than a spawn_blocking hop.
+pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<AuthUser, Response> {
+    let Some(token) = token else {
         return Err(json_error(StatusCode::UNAUTHORIZED, "Access denied. No token provided."));
     };
     let conn = match pool.get() {
@@ -53,21 +67,14 @@ pub fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> Result<
     // Node's exact two queries, in order. Only user_id/role are consumed by
     // ported routes, but the FROM/WHERE clauses are what must match.
     let lookup = (|| -> rusqlite::Result<Option<(i64, Option<String>, bool)>> {
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT s.user_id, {SESSION_COLUMNS}
-             FROM sessions s
-             JOIN users u ON s.user_id = u.id
-             WHERE s.token = ?1 AND s.expires_at > DATETIME('now')"
-        ))?;
+        let mut stmt = conn.prepare_cached(SESSION_SQL)?;
         if let Some(row) = stmt
             .query_row([token], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(2)?)))
             .optional()?
         {
             return Ok(Some((row.0, row.1, false)));
         }
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT u.id AS user_id, {SESSION_COLUMNS} FROM users u WHERE u.api_key = ?1"
-        ))?;
+        let mut stmt = conn.prepare_cached(API_KEY_SQL)?;
         if let Some(row) = stmt
             .query_row([token], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(2)?)))
             .optional()?
