@@ -247,9 +247,10 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
 
 /// Gate + normalization for the collection-scope q leg
 /// (`searchCards`' `scope === 'collection' && q.trim()` branch). Returns
-/// None (→ proxy) whenever anything outside the ported name-only subset is
-/// involved, including the `snapshot` parameter (expectedSnapshot mismatch
-/// is Node's 409 contract) and duplicate `count` keys (qs array semantics).
+/// None (→ proxy) whenever anything outside the ported name + operator-
+/// conjunction subset is involved, including the `snapshot` parameter
+/// (expectedSnapshot mismatch is Node's 409 contract) and duplicate `count`
+/// keys (qs array semantics).
 fn plan_collection_q(
     user_id: i64,
     pairs: &[(String, String)],
@@ -262,7 +263,7 @@ fn plan_collection_q(
     if pairs.iter().filter(|(k, _)| k == "count").count() > 1 {
         return None;
     }
-    let walk_base = collq::free_text_walk_base(qraw)?;
+    let walk_base = collq::walk_base(qraw)?;
     let (lang_code, scry_code) = lang_codes(first("lang").as_deref());
     // Route-level parsing, collection+q variant: maxLimit is 2000 here.
     let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);

@@ -49,11 +49,20 @@ for (let i = 0; i < 52; i++) {
   const page = (i % 3) + 1, limit = [20, 60, 100][i % 3];
   searchDb.push(`/api/search?scope=database&name=${enc(name)}&page=${page}&limit=${limit}`);
 }
-// collection-scope search: 52 owned names through the Node sidecar walk.
+// collection-scope search: 39 owned names + 13 operator conjunctions
+// (iter 10's native gate) through the shared sidecar walk. The name picks
+// consume rnd() on EVERY slot, so widening the shapes never shifts the
+// names of the untouched slots.
+const OPERATORS = ['t:creature c:g', 'c:wu t:instant', 't:enchantment c:b', 't:instant c:r', 'type:creature colour:green', 't:artifact c:w'];
 const searchColl = [];
 for (let i = 0; i < 52; i++) {
   const name = collNames[rnd(collNames.length)];
-  searchColl.push(`/api/search?scope=collection&q=${enc(name)}&limit=${[20, 60][i % 2]}&page=1`);
+  const limit = [20, 60][i % 2];
+  if (i % 4 === 0) {
+    searchColl.push(`/api/search?scope=collection&q=${enc(OPERATORS[(i / 4 | 0) % OPERATORS.length])}&limit=${limit}&page=${(i % 3) + 1}`);
+  } else {
+    searchColl.push(`/api/search?scope=collection&q=${enc(name)}&limit=${limit}&page=1`);
+  }
 }
 // stats: 52 variants. The query is ignored by both handlers (cache name is
 // the constant 'stats'), so this exercises per-request routing/parse cost

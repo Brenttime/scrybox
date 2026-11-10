@@ -688,6 +688,8 @@ async fn spawn_fake_sidecar() -> (String, Arc<Mutex<Vec<(String, i64)>>>) {
                 (200, 75)
             } else if q.starts_with("sol ring") {
                 (4, 4) // collection walk: 4 unique:cards printings, one name
+            } else if q.starts_with("t:creature c:g") || q.starts_with("t:Creature c:G") {
+                (4, 4) // operator-conjunction walk: green printings of an owned name
             } else if q.starts_with("fire // ice") {
                 (1, 1) // one DFC — the walk must add full + both faces
             } else if q.starts_with("dfcwalk") {
@@ -708,7 +710,10 @@ async fn spawn_fake_sidecar() -> (String, Arc<Mutex<Vec<(String, i64)>>>) {
             let data: Vec<Value> = (0..n)
                 .map(|i| {
                     let idx = start + i;
-                    let card_name = if q.starts_with("sol ring") {
+                    let card_name = if q.starts_with("sol ring")
+                        || q.starts_with("t:Creature c:G")
+                        || q.starts_with("t:creature c:g")
+                    {
                         "Sol Ring".to_string()
                     } else if q.starts_with("fire // ice") || q.starts_with("dfcwalk") {
                         "Fire // Ice".to_string()
@@ -1129,12 +1134,17 @@ async fn collq_structured_queries_and_params_proxy() {
     let upstream = spawn_fake_node().await;
     let r = router_for(path.clone(), &["search", "search_sidecar"], &format!("http://{upstream}"));
     for url in [
-        "/api/search?scope=collection&q=t%3Acreature%20c%3Ag&limit=60", // operator
+        "/api/search?scope=collection&q=t%3Acreature%20and%20and%20c%3Ag&limit=60", // doubled 'and' → Node throws → raw-passthrough key
+        "/api/search?scope=collection&q=colorless",                                  // Node rewrites bare colorless to c:c
+        "/api/search?scope=collection&q=t%3Acreature%20c%3Axyz&limit=60",            // invalid color → Node throws → raw-passthrough key
         "/api/search?scope=collection&q=%21sol%20ring",                  // exact name
         "/api/search?scope=collection&q=sol%20ring%20or%20plains",       // keyword token
         "/api/search?scope=collection&q=sol%20ring%20not",               // keyword token
         "/api/search?scope=collection&q=sol%20%28ring%29",               // grouping
         "/api/search?scope=collection&q=%22sol%20ring%22",               // quoted
+        "/api/search?scope=collection&q=t%3A%22big%20creature%22",       // quoted operator value
+        "/api/search?scope=collection&q=t%3Dcreature",                   // '=' comparator
+        "/api/search?scope=collection&q=unique%3Acards",                 // smuggled sidecar param
         "/api/search?scope=collection&q=sol%20ring&snapshot=x",          // expectedSnapshot contract
         "/api/search?scope=collection&q=sol%20ring&count=0&count=1",     // qs array
         "/api/search?scope=database&q=sol%20ring",                       // other scope
@@ -1186,6 +1196,158 @@ async fn collq_walk_resolves_persists_and_joins_single_flight() {
     let walked2: Vec<_> = g2.iter().filter(|(q, _)| q == "sol ring unique:cards").collect();
     assert_eq!(walked2.len(), 1, "warm entries must not re-walk");
     drop(g2);
+}
+
+// --- iter 10: operator-conjunction subset of the q leg ---------------------
+
+/// Pure gate battery. Every ACCEPT expectation is pinned against the real
+/// `shared/scryfallQuery.js` (`analyze` → `toScryfall(stripDirectives(…))`),
+/// run as ground truth — if the grammar's re-serialization changes, this
+/// test must change with it, and it should.
+#[test]
+fn collq_walk_base_operator_battery() {
+    const ACCEPT: &[(&str, &str)] = &[
+        // The bench route's query — byte-identical echo.
+        ("t:creature c:g", "t:creature c:g"),
+        // Keyword lowercased (tokenizer toLowerCase), value verbatim.
+        ("T:Creature C:G", "t:Creature c:G"),
+        ("C:WU", "c:WU"),
+        // Whitespace collapses; JS trim drops edges.
+        ("  t:creature   c:g ", "t:creature c:g"),
+        ("t:creature\tand c:g", "t:creature c:g"),
+        // 'and' strictly between terms is consumed by parseAnd.
+        ("t:creature and c:g", "t:creature c:g"),
+        ("rust and gold", "rust gold"),
+        // Name + operator mixtures (all game-card terms → ownedByNames leg).
+        ("sol ring t:creature", "sol ring t:creature"),
+        ("t:cre aure", "t:cre aure"),
+        // Keyword spellings ride through as typed (raw preserved).
+        ("type:creature colour:green", "type:creature colour:green"),
+        ("c:colorless", "c:colorless"),
+        ("c:m t:creature", "c:m t:creature"),
+        ("c:multicolor t:instant", "c:multicolor t:instant"),
+        // Digit counts and letter runs pass the color classifier.
+        ("c:5", "c:5"),
+        // Values keep any interior punctuation Node's readBare keeps.
+        ("t:a-b", "t:a-b"),
+        ("t:>x", "t:>x"),
+        ("t:creaturec:g", "t:creaturec:g"),
+        // Unicode names keep iter-9 semantics.
+        ("t:creature naïve", "t:creature naïve"),
+        // Plain name-only queries keep the exact iter-9 output.
+        ("Sol Ring", "sol ring"),
+    ];
+    const REJECT: &[&str] = &[
+        // Node's parser THROWS on these → sidecar mode walks the raw string
+        // verbatim: a different durable key, so the gate must not accept.
+        "c:xyz",
+        "t:creature c:mono-b",
+        "t:",
+        "and",
+        "and t:creature",
+        "t:creature and",
+        "t:a and and t:c", // Node elides both — proxy is the safe subset
+        // Grammar structures outside the subset.
+        "or",
+        "sol ring or plains",
+        "sol ring not",
+        "is:land",
+        "unique:cards",
+        "oracle:fire",
+        "t=creature",
+        "c!=g",
+        "t:creature|instant",
+        "\"sol ring\"",
+        "sol (ring)",
+        "!sol ring",
+        "-t:artifact",
+        "t:\"big creature\"",
+        "t:/gob/",
+        "/gob/",
+        // The iter-9 parity hole: makeLeaf rewrites bare `colorless` to the
+        // color leaf c:c — echoing it would walk a query Node never sends.
+        "colorless",
+        "COLORLESS goblin",
+        "t:creature colorless",
+    ];
+    for (q, want) in ACCEPT {
+        assert_eq!(scrybox_server::collq::walk_base(q).as_deref(), Some(*want), "accept {q:?}");
+    }
+    for q in REJECT {
+        assert_eq!(scrybox_server::collq::walk_base(q), None, "reject {q:?}");
+    }
+}
+
+#[tokio::test]
+async fn collq_operator_conjunction_walks_persists_and_serves_natively() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let st = sidecar_state(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let r = app(st.clone());
+
+    // Cold burst on the operator query: served NATIVELY (no x-node hop), one
+    // single-flight walk, on the byte-exact toScryfall spelling Node uses —
+    // keyword lowercased, value verbatim, ' unique:cards' scope appended.
+    let hits = burst(&r, "/api/search?scope=collection&q=T%3ACreature%20c%3AG&limit=60&page=1").await;
+    for (s, h, b) in &hits {
+        assert_eq!(*s, StatusCode::OK);
+        assert!(h.get("x-node").is_none(), "operator conjunction must not proxy");
+        assert_eq!(h["x-catalog-cache"], "resolved");
+        assert_eq!(h["x-source"], "sidecar");
+        assert_eq!(h["x-total-count"], "3");
+        let v: Value = serde_json::from_slice(b).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], "Sol Ring");
+        assert_eq!(
+            rows[0].as_object().unwrap().keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+            q_row_keys()
+        );
+    }
+    let g = seen.lock().unwrap();
+    assert_eq!(
+        g.iter().filter(|(q, _)| q == "t:Creature c:G unique:cards").count(),
+        1,
+        "burst pays exactly ONE walk, on the Node-identical query"
+    );
+    drop(g);
+    // Durable row lands under Node's own key (same bytes → shared answer).
+    let (names, total, complete) = cqc_row(&path, "t:Creature c:G", "en").expect("row persisted");
+    assert_eq!(names, r#"["sol ring"]"#);
+    assert_eq!(total, Some(4));
+    assert_eq!(complete, 1);
+    assert_eq!(st.collq_cache.walks(), 1);
+
+    // Warm burst: memory hit, zero new sidecar traffic.
+    let hits2 = burst(&r, "/api/search?scope=collection&q=T%3ACreature%20c%3AG&limit=60&page=1").await;
+    assert_eq!(hits2[0].1["x-catalog-cache"], "fresh");
+    assert_eq!(hits2[0].1["x-source"], "sidecar");
+    let g2 = seen.lock().unwrap();
+    assert_eq!(g2.iter().filter(|(q, _)| q == "t:Creature c:G unique:cards").count(), 1);
+    drop(g2);
+
+    // The 'and'-elision spelling normalizes the keyword away; values keep
+    // their typed case (Node's leafToScryfall is verbatim on values), so
+    // this lowercase spelling is a SEPARATE durable key that pays its own
+    // single walk — and the walked string proves 'and' never reaches the
+    // sidecar.
+    let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=t%3Acreature%20and%20c%3Ag&limit=60&page=1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+    assert_eq!(h["x-catalog-cache"], "resolved");
+    assert_eq!(h["x-total-count"], "3");
+    assert_eq!(b.as_array().unwrap().len(), 3);
+    let g3 = seen.lock().unwrap();
+    assert_eq!(g3.iter().filter(|(q, _)| q.starts_with("t:creature and")).count(), 0);
+    assert_eq!(g3.iter().filter(|(q, _)| q == "t:creature c:g unique:cards").count(), 1);
+    drop(g3);
+    // And it lands its own Node-shaped durable row under that key.
+    let (names, total, complete) = cqc_row(&path, "t:creature c:g", "en").expect("row persisted");
+    assert_eq!(names, r#"["sol ring"]"#);
+    assert_eq!(total, Some(4));
+    assert_eq!(complete, 1);
 }
 
 #[tokio::test]

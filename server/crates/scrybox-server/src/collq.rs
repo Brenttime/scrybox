@@ -126,45 +126,95 @@ fn is_js_ws(c: char) -> bool {
         | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
 }
 
-/// True when `head` starts with the tokenizer's keyword-operator shape
-/// `^([a-z_]+)(!=|<=|>=|:|=|<|>)` (case-insensitive). A token that matches
-/// takes the operator path in Node's tokenizer; the gate refuses those, so
-/// Rust only ever reproduces the plain name-leaf serialization.
-fn operator_prefixed(tok: &str) -> bool {
+/// The tokenizer's operator regex `^([a-z_]+)(!=|<=|>=|:|=|<|>)` (case-
+/// insensitive), mirrored as `(keyword_len, comparator_len)`: the ASCII
+/// `[a-z_]` run followed by the FIRST comparator the alternation accepts
+/// (the two-char `!=`/`<=`/`>=` are tried before the one-char `:`/`=`/`<`/
+/// `>`). `(0, 0)` when the token takes the bare-name path instead.
+fn op_shape(tok: &str) -> (usize, usize) {
     let b = tok.as_bytes();
     let mut i = 0;
     while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
         i += 1;
     }
     if i == 0 {
-        return false; // regex needs at least one [a-z_] before the comparator
+        return (0, 0); // regex needs at least one [a-z_] before the comparator
     }
     let rest = &tok[i..];
-    rest.starts_with("!=")
-        || rest.starts_with("<=")
-        || rest.starts_with(">=")
-        || rest.starts_with(':')
-        || rest.starts_with('=')
-        || rest.starts_with('<')
-        || rest.starts_with('>')
+    let cmp = if rest.starts_with("!=") || rest.starts_with("<=") || rest.starts_with(">=") {
+        2
+    } else if rest.starts_with([':', '=', '<', '>']) {
+        1
+    } else {
+        0
+    };
+    (i, cmp)
 }
 
-/// The name-only free-text gate + `toScryfall` normalization. Returns the
-/// canonical walk base (`fmtValue(name)` per token, AND-joined by ' ') when
-/// Node's tokenizer/parser would produce a pure AND of bare name leaves and
-/// the serializer would emit exactly `tokens.join(" ")`. Everything else —
-/// quotes, negation, exact `!`, bare regex `/`, grouping, `|`, keyword
-/// tokens, any operator-prefixed token — is refused (caller proxies).
-pub fn free_text_walk_base(raw: &str) -> Option<String> {
-    let mut toks: Vec<String> = Vec::new();
-    for tok in raw.split(is_js_ws) {
-        if tok.is_empty() {
-            continue;
-        }
+/// `cardSearchSql.parseColorValue`'s accept verdict: digit count, the m/c
+/// family, (mono-)color words, or a `[wubrg]` letter run. Node THROWS on
+/// anything else (→ parsed=null → the sidecar gets the query VERBATIM,
+/// un-normalized), so the gate must reject too rather than walk a
+/// re-serialized string Node never sends.
+fn color_value_ok(value: &str) -> bool {
+    let v = value.trim_matches(is_js_ws).to_lowercase();
+    if v.is_empty() {
+        return false;
+    }
+    if v.bytes().all(|b| b.is_ascii_digit()) {
+        return true; // /^[0-9]+$/
+    }
+    if matches!(v.as_str(), "m" | "multicolor" | "multicolored" | "c" | "colorless") {
+        return true;
+    }
+    const WORDS: [&str; 5] = ["white", "blue", "black", "red", "green"];
+    let lw = v.replace('-', " ");
+    let parts: Vec<&str> = lw.trim_matches(is_js_ws).split(is_js_ws).filter(|s| !s.is_empty()).collect();
+    // JS keeps [''] for an empty trim result — mirror by requiring non-empty.
+    if !parts.is_empty() && parts.iter().all(|w| WORDS.contains(w)) {
+        return true;
+    }
+    v.chars().all(|c| matches!(c, 'w' | 'u' | 'b' | 'r' | 'g')) // /^[wubrg]+$/
+}
+
+/// The accepted operator keywords, by lowercased spelling. `is:` is excluded
+/// (makeLeaf rewrites it to `t:` with hyphen→space quoting), `oracle:`/
+/// `name:`/… stay proxied — only the two data operators the bench and UI
+/// conjunctions need are proven here.
+fn allowed_operator_kw(kw_lower: &str) -> bool {
+    matches!(kw_lower, "t" | "type" | "c" | "color" | "colour")
+}
+
+/// The free-text + operator-conjunction gate + `toScryfall` normalization.
+/// Returns the canonical walk base when Node's parser would produce an AND
+/// of bare name leaves and/or simple `t:`/`c:` operator leaves and the
+/// serializer would emit exactly the mirror's join. Acceptance rules
+/// (everything else → caller proxies, Node answers verbatim):
+///
+///  * bare name tokens — lowercased (makeLeaf lowercases name values;
+///    fmtValue only quotes on `[(\s"]`, excluded here by construction);
+///  * `t:`/`type:`/`c:`/`color:`/`colour:` leaves with the `:` comparator
+///    and a bare, non-empty, unquoted, non-regex value — re-serialized
+///    from the LOWERCASED keyword with the value verbatim (leafToScryfall
+///    uses `raw`+`cmp`+`fmtValue(value,false)`; color values pass through
+///    the `parseColorValue` accept-verdict first);
+///  * `and` keyword tokens strictly BETWEEN two terms — parseAnd consumes
+///    them; at a boundary (or doubled) it THROWS, which under sidecar mode
+///    hands the sidecar the raw query verbatim, a different walk key.
+///
+/// Refused outright: quotes, negation, exact `!`, bare regex `/`, grouping,
+/// `|`, `or`/`not`, any other keyword/comparator, empty values, and the
+/// bare word `colorless` — makeLeaf rewrites THAT to a `c:c` color leaf, so
+/// echoing it would walk a query Node never sends (iter-9 parity hole,
+/// fixed here).
+pub fn walk_base(raw: &str) -> Option<String> {
+    let toks: Vec<&str> = raw.split(is_js_ws).filter(|t| !t.is_empty()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (idx, tok) in toks.iter().enumerate() {
         let first = tok.chars().next().unwrap();
         // '"' starts a quoted token; '!' an exact name; '-' negation;
-        // '/' the bare-regex form. None of them are name leaves.
-        if matches!(first, '"' | '!' | '-' | '/') {
+        // '/' the bare-regex form. None of them serialize as-is.
+        if matches!(first, '"' | '!' | '-' | '/' | '(' | ')') {
             return None;
         }
         // '(' ')' are tokenizer structure; '|' and '"' inside a token would
@@ -172,21 +222,60 @@ pub fn free_text_walk_base(raw: &str) -> Option<String> {
         if tok.contains(['"', '(', ')', '|']) {
             return None;
         }
-        if operator_prefixed(tok) {
-            return None;
-        }
         let lower = tok.to_lowercase();
-        if lower == "and" || lower == "or" || lower == "not" {
+        if lower == "or" || lower == "not" {
             return None;
         }
-        toks.push(lower);
+        if lower == "and" {
+            // parseAnd consumes the keyword only between two terms. A
+            // neighbouring 'and' (double keyword) or a boundary position
+            // throws → Node walks the RAW string instead. Proxy.
+            let term_ok = |t: &str| {
+                let l = t.to_lowercase();
+                l != "and" && l != "or" && l != "not"
+            };
+            let prev_ok = idx > 0 && term_ok(toks[idx - 1]);
+            let next_ok = toks.get(idx + 1).is_some_and(|n| term_ok(n));
+            if !prev_ok || !next_ok {
+                return None;
+            }
+            continue;
+        }
+        let (kw_len, cmp_len) = op_shape(tok);
+        if cmp_len == 0 {
+            // Bare name leaf. makeLeaf's one word-special case: a bare
+            // `colorless` becomes the color leaf `c:c`, NOT a name.
+            if lower == "colorless" {
+                return None;
+            }
+            out.push(lower);
+            continue;
+        }
+        // Operator leaf: only the `:` comparator of an allowed keyword on a
+        // bare value survives the byte-exactness proof.
+        if cmp_len != 1 || tok.as_bytes()[kw_len] != b':' {
+            return None;
+        }
+        let kw_lower = tok[..kw_len].to_ascii_lowercase();
+        let value = &tok[kw_len + 1..];
+        if value.is_empty() || value.starts_with('"') || value.starts_with('/') {
+            return None; // Node throws (needs a value) or enters quoted/regex mode
+        }
+        if !allowed_operator_kw(&kw_lower) {
+            return None;
+        }
+        if matches!(kw_lower.as_str(), "c" | "color" | "colour") && !color_value_ok(value) {
+            return None;
+        }
+        // leafToScryfall: `${raw}${cmp}${fmtValue(value, false)}` — raw is
+        // the lowercased keyword, cmp the verbatim ':', value untouched
+        // (fmtValue only quotes on [(\s"], all excluded above).
+        out.push(format!("{kw_lower}:{value}"));
     }
-    if toks.is_empty() {
+    if out.is_empty() {
         return None;
     }
-    // fmtValue(value, false): quoted only when /[()\s"]/ matches or empty —
-    // tokens are non-empty and free of all three by construction above.
-    Some(toks.join(" "))
+    Some(out.join(" "))
 }
 
 // ---------------------------------------------------------------------------

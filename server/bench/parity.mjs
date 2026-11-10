@@ -69,6 +69,19 @@ const EXTRA_SEARCH = [
   "/api/search?scope=collection&q=G'raha%20Tia&limit=60&page=1",
   '/api/search?scope=collection&q=Neerdiv%2C%20Devious%20Diver&limit=60&page=1',
   '/api/search?scope=collection&q=definitely%20no%20such%20card%20xyz&limit=20&page=1',
+  // Operator-conjunction leg (iter 10): t:/c: conjunctions share the same
+  // match-list walk + ownedByNames intersect. The durable rows ride the
+  // shared collection_query_cache under the byte-exact toScryfall spelling,
+  // so a divergence in the Rust gate shows up as a body diff, not a
+  // silent cache-key mismatch. `colorless` and `c:xyz` sit OUTSIDE the gate
+  // (Node rewrites/throws) and must stay byte-equal through the proxy path.
+  '/api/search?scope=collection&q=t%3Acreature%20c%3Ag&limit=60&page=1',
+  '/api/search?scope=collection&q=T%3ACreature%20C%3AG&limit=20&page=2',
+  '/api/search?scope=collection&q=t%3Acreature%20and%20c%3Ag&limit=60&page=1',
+  '/api/search?scope=collection&q=c%3Awu&limit=60&page=1',
+  '/api/search?scope=collection&q=sol%20ring%20t%3Acreature&limit=20&page=1',
+  '/api/search?scope=collection&q=colorless&limit=60&page=1',
+  '/api/search?scope=collection&q=c%3Axyz&limit=20&page=1',
 ];
 
 // Stats coverage for the ported /api/stats (iter 3): the bench scenario URL
