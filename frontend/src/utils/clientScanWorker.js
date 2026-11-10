@@ -46,13 +46,24 @@ let pendingReset = false;
 let FLAGS = {};
 let THREAD_OVERRIDE = null;
 
-async function cachedBytes(cache, url, signal) {
-  let res = cache ? await cache.match(url) : null;
+// Each load owns its Cache API writes (review R3-S2): once the load fails it
+// writes nothing more, and its cleanup waits for the writes already started,
+// so a late put can never resurrect a failed candidate's bytes. URLs being
+// cleaned up are read from the network and not written meanwhile.
+const tainted = new Set();
+async function cachedBytes(cache, url, signal, own = null) {
+  const useCache = cache && !tainted.has(url);
+  let res = useCache ? await cache.match(url) : null;
+  if (signal?.aborted) throw new Error('refresh aborted');
   if (!res) {
     res = await fetch(ORIGIN + url, { signal });
     const type = res.headers.get('content-type') || '';
     if (!res.ok || type.includes('text/html')) throw new Error(`${url} not served (${res.status})`);
-    if (cache) await cache.put(url, res.clone()).catch(() => {});
+    if (useCache && !own?.dead && !tainted.has(url)) {
+      const put = cache.put(url, res.clone()).catch(() => {});
+      own?.puts.push(put);
+      await put;
+    }
   }
   return new Uint8Array(await res.arrayBuffer());
 }
@@ -108,19 +119,28 @@ async function pruneCache() {
 // A candidate that failed to load must not leave its bytes in the Cache API,
 // or every retry would read the same bad copy (review R2-S2). Files that the
 // active/pending bundle also names (shared rec/dict, last-known-good A) stay.
-async function dropCandidate(cache, urls) {
+async function dropCandidate(cache, urls, own) {
   if (!cache) return;
+  own.dead = true;
   const keep = new Set([bundles.active, bundles.pending].filter(Boolean)
     .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
-  for (const u of urls) if (!keep.has(u)) await cache.delete(u).catch(() => {});
+  const drop = urls.filter(u => !keep.has(u));
+  for (const u of drop) tainted.add(u);
+  try {
+    await Promise.allSettled(own.puts);
+    for (const u of drop) await cache.delete(u).catch(() => {});
+  } finally { for (const u of drop) tainted.delete(u); }
 }
 
 async function load(manifest = null, signal = undefined) {
   manifest ||= await fetchManifest(signal);
   const urls = [manifest.index, manifest.rec, manifest.dict].map(n => BASE + n);
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
-  try { return await loadFrom(manifest, urls, cache, signal); } catch (err) {
-    await dropCandidate(cache, urls);
+  const own = { dead: false, puts: [] };
+  try { return await loadFrom(manifest, urls, cache, signal, own); } catch (err) {
+    // Cleanup runs in the background so a hung write cannot hold the error;
+    // its URLs bypass the cache until it is done.
+    dropCandidate(cache, urls, own).catch(() => {});
     throw err;
   }
 }
@@ -134,6 +154,9 @@ function sessionOwner(signal) {
   let disowned = false, warming = false;
   const drop = () => { disowned = true; releaseSessions(...made.splice(0)); };
   signal?.addEventListener?.('abort', () => { if (!warming) drop(); }, { once: true });
+  // Abort listeners do not fire for a signal that is already aborted
+  // (review R3-S1): such an owner is disowned from the start.
+  if (signal?.aborted) drop();
   return {
     create: (bytes, opts) => ort.InferenceSession.create(bytes, opts).then((x) => {
       if (disowned) { releaseSessions(x); throw new Error('refresh aborted'); }
@@ -145,18 +168,24 @@ function sessionOwner(signal) {
   };
 }
 
-async function loadFrom(manifest, urls, cache, signal) {
+async function loadFrom(manifest, urls, cache, signal, ownCache = null) {
   const t0 = performance.now();
   const tFetch = performance.now();
   const [indexGz, recBytes, dictBytes, corn] = await Promise.all([
-    cachedBytes(cache, urls[0], signal), cachedBytes(cache, urls[1], signal), cachedBytes(cache, urls[2], signal), cornBytes(cache, signal),
+    cachedBytes(cache, urls[0], signal, ownCache), cachedBytes(cache, urls[1], signal, ownCache), cachedBytes(cache, urls[2], signal, ownCache), cornBytes(cache, signal),
   ]);
+  // The Cache API waits above are not abortable: an abort that landed during
+  // them stops here, before any session is created (review R3-S1).
+  if (signal?.aborted) throw new Error('refresh aborted');
   const fetchMs = Math.round(performance.now() - tFetch);
   const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
   // Index decode runs while ORT compiles the two sessions; a failure frees
   // whatever was created (review R1-S1).
   const own = sessionOwner(signal);
-  const abortWait = new Promise((_, rej) => signal?.addEventListener?.('abort', () => rej(new Error('refresh aborted')), { once: true }));
+  const abortWait = new Promise((_, rej) => {
+    if (signal?.aborted) rej(new Error('refresh aborted'));
+    else signal?.addEventListener?.('abort', () => rej(new Error('refresh aborted')), { once: true });
+  });
   abortWait.catch(() => {});
   const parts = await Promise.race([Promise.allSettled([
     own.create(recBytes, opts),

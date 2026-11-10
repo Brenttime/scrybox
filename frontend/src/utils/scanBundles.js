@@ -17,19 +17,25 @@
 // current bundle and its cached files (pruning runs only after a swap).
 export const assetsKey = (m) => (m ? `${m.index}|${m.rec}|${m.dict}` : '');
 
-// Review R2: every check gets a generation BEFORE its manifest request, and
-// only the newest check may select a target (B3). The manifest fetch, its
-// body and the wait for a build are raced against a logical deadline, so a
-// check settles even if work ignores its AbortSignal; a build that misses its
-// deadline is detached from the refresh slot (a same-key retry starts its own
-// build) and, should it ever complete, the bundle it produced is released by
-// that build, never installed (B2). A swap waits (boundedly) while the active
+// Review R2/R3: every check gets a generation BEFORE its manifest request,
+// and only the newest check may select a target (B3). Each check has ONE
+// end-to-end deadline, started before its manifest request and covering the
+// build it waits for; the build has no deadline of its own (R3-B1). A build
+// is owned by the newest check that selected it: when that check expires,
+// fails or selects something else, the build is cancelled (its signal
+// aborted) and, should its work ever complete, the bundle is released by the
+// build, never installed. An older check that expires does not cancel a build
+// a newer live check still needs. A build that completes while a newer check
+// is still waiting for its manifest is held until that manifest decides
+// (same target -> installed, otherwise released). A same-target retry after
+// an expiry starts a fresh build. A swap waits (boundedly) while the active
 // reader owes the verification of a first-look guess (S3).
 const timeoutError = () => new Error('refresh timed out');
 const supersededError = () => new Error('refresh superseded');
 
 export function createBundles({ loadBundle, fetchManifest, release, prune = () => {}, now = () => Date.now(), updateMs = 90000, freshMs = 15000, maxVerifyDefer = 2, setTimer = setTimeout, clearTimer = clearTimeout }) {
   let active = null, pending = null, tx = null, checkedAt = -Infinity, update = null, gen = 0;
+  let deciding = 0;   // generation of the newest check while it awaits its manifest
 
   function retire(b) {
     if (!b || b.retired) return;
@@ -46,37 +52,37 @@ export function createBundles({ loadBundle, fetchManifest, release, prune = () =
     return { promise, settle: () => clearTimer(timer) };
   }
 
-  // Abandon a build: abort its work, free the slot. Its bundle, if it ever
-  // arrives, is released by the build itself (it owns it until adopted).
-  function cancel(u) {
-    if (!u || u.cancelled) return;
+  // Abandon a build: abort its work, free the slot, release a held result.
+  function cancel(u, err = supersededError()) {
+    if (!u || u.cancelled || u.adopted) return;
     u.cancelled = true;
     u.ctrl.abort();
-    u.dl.settle();
-    u.fail(supersededError());
+    if (u.result) retire(u.result);
+    u.reject(err);
     if (update === u) update = null;
   }
 
-  function build(manifest, key) {
+  // Install a finished build, only while its owner is the newest live check.
+  function adopt(u) {
+    if (!u || !u.result || u.cancelled || u.adopted || u.owner !== gen || deciding) return;
+    u.adopted = true;
+    if (update === u) update = null;
+    retire(pending);
+    pending = u.result;
+    checkedAt = now();
+    u.resolve(u.result);
+  }
+
+  function build(manifest, key, owner) {
     const ctrl = new AbortController();
-    const u = { key, ctrl, cancelled: false };
-    let fail;
-    const detached = new Promise((_, rej) => { fail = rej; });
-    detached.catch(() => {});
-    u.fail = fail;
-    u.dl = deadline(() => { if (!u.cancelled) { u.cancelled = true; ctrl.abort(); fail(timeoutError()); if (update === u) update = null; } });
-    const work = Promise.resolve().then(() => loadBundle(manifest, ctrl.signal)).then((next) => {
-      u.dl.settle();
-      if (u.cancelled || ctrl.signal.aborted) { retire(next); throw supersededError(); }
-      if (update === u) update = null;
-      retire(pending);
-      pending = next;
-      checkedAt = now();
-      return next;
-    }, (err) => { u.dl.settle(); if (update === u) update = null; throw err; });
-    work.catch(() => {});
-    u.promise = Promise.race([work, detached]);
+    const u = { key, ctrl, owner, cancelled: false, adopted: false, result: null };
+    u.promise = new Promise((res, rej) => { u.resolve = res; u.reject = rej; });
     u.promise.catch(() => {});
+    Promise.resolve().then(() => loadBundle(manifest, ctrl.signal)).then((next) => {
+      if (u.cancelled || ctrl.signal.aborted) { retire(next); return; }
+      u.result = next;
+      adopt(u);
+    }, (err) => { if (!u.cancelled) { u.cancelled = true; if (update === u) update = null; u.reject(err); } });
     return u;
   }
 
@@ -98,10 +104,15 @@ export function createBundles({ loadBundle, fetchManifest, release, prune = () =
     },
     // The bundle the current transaction's read must use.
     current() { return tx || this.begin(); },
-    // Reader outcomes the swap boundary depends on (R2-S3).
+    // Reader outcomes the swap boundary depends on (R2-S3, R3-S3). The
+    // obligation is the reader's own verify state (out.verify_pending), not
+    // the absence of a guess in this output: a title miss or a duplicate
+    // frame verifies nothing and keeps it. It clears once verified, on a
+    // different card or no card, or at the maxVerifyDefer cap; the deferral
+    // count is not reset while the same obligation persists.
     noteRead(b, out) {
       if (!b) return;
-      b.verifyPending = !!out?.results?.some(r => r?.guess_first);
+      b.verifyPending = !!out?.verify_pending || !!out?.results?.some(r => r?.guess_first);
       if (!b.verifyPending) b.verifyDefers = 0;
     },
     noteProbe(b, quad) { if (b && !quad) { b.verifyPending = false; b.verifyDefers = 0; } },
@@ -116,28 +127,43 @@ export function createBundles({ loadBundle, fetchManifest, release, prune = () =
       if (!(pending || active)) return { loaded: false };
       if (now() - checkedAt < freshMs) return { fresh: true, info: (pending || active).info };
       const my = ++gen;
+      deciding = my;
       const from = (pending || active).info?.index;
       const ctrl = new AbortController();
       const dl = deadline(() => ctrl.abort());
+      let ok = false;
       try {
         // fetchManifest bounds the body (res.json) with the same signal; the
         // race bounds it even if it does not.
         const manifest = await Promise.race([Promise.resolve().then(() => fetchManifest(ctrl.signal)), dl.promise]);
         if (my !== gen) throw supersededError();
+        deciding = 0;
         const key = assetsKey(manifest);
         // Live state, re-read after the await.
         if (active && assetsKey(active.manifest) === key) {
           cancel(update);
           if (pending) { retire(pending); pending = null; }
+          ok = true;
           return fresh(active);
         }
-        if (pending && assetsKey(pending.manifest) === key) { cancel(update); return fresh(pending); }
-        if (!update || update.key !== key) { cancel(update); update = build(manifest, key); }
+        if (pending && assetsKey(pending.manifest) === key) { cancel(update); ok = true; return fresh(pending); }
+        if (update && update.key === key) update.owner = my;
+        else { cancel(update); update = build(manifest, key, my); }
         const u = update;
+        adopt(u);                       // a result held for this decision
         const next = await Promise.race([u.promise, dl.promise]);
-        if (my !== gen || next.retired) throw supersededError();
+        if (next.retired || (next !== pending && next !== active)) throw supersededError();
+        ok = true;
         return { updated: true, from, info: next.info, loadMs: next.loadMs };
-      } finally { dl.settle(); }
+      } finally {
+        dl.settle();
+        // Only the newest check governs the build; on its expiry or failure
+        // the build it owns goes with it (R3-B1).
+        if (my === gen) {
+          deciding = 0;
+          if (!ok) cancel(update, timeoutError());
+        }
+      }
     },
   };
 }

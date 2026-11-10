@@ -107,9 +107,13 @@ export const scanTelemetry = {
     current = { ...diag, ...(id || {}), updatedFrom, ...(loadMs != null ? { bundleLoadMs: loadMs } : {}) };
   },
   device: deviceInfo,
-  // Bounded track settings for a new stream. Records snapshot it at pass
-  // start (review R2-S4); a batch spanning two streams is flushed first so the
-  // batch-level camera never describes a different stream than its rows.
+  // Bounded track settings for a new stream. Each record snapshots it at pass
+  // start (review R2-S4), and that ROW camera is authoritative. Flushing here
+  // only separates rows already queued: a pass that began on the old stream
+  // and ends after this call can still share a batch with new-stream rows,
+  // so the batch-level camera is just the latest stream (review R3-N1). Same
+  // for the batch `device`: it is last-check metadata; attribute a row to its
+  // reader by its own local.index / local.rec.
   camera(info) {
     if (queue.length) flush();
     cameraGen++;

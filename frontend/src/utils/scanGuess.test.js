@@ -293,3 +293,20 @@ test('tray: presence records are per card place and survive the first candidate 
   assert.equal(updatePresence(updatePresence(m, rightOnly), shaky).length, 1, 'a still pass resets the count');
   assert.equal(updatePresence(m, shaky).length, 0);
 });
+
+test('pipeline: a pending verify is reported on every read until verified; a title miss or duplicate frame keeps it (review R3-S3)', async () => {
+  const opts = (frameId) => ({ requireStill: true, frameId, guess: { sets: ['som', 'som', 'som'] } });
+  const { r } = reader((c) => (c === 1 || c === 3 ? 'twisted image' : c === 5 ? 'a25 075/249' : 'zz'));
+  const first = await r.read(sharpFrame(), small, opts(1));
+  assert.equal(first.results[0].guess_first, true); assert.equal(first.verify_pending, true);
+  const dup = await r.read(sharpFrame(), small, opts(1));                // same decoded frame
+  assert.equal(dup.verify_pending, true, 'a duplicate frame verifies nothing');
+  const verified = await r.read(sharpFrame(), small, opts(2));
+  assert.equal(verified.results[0].scryfallId, 'ti-a25'); assert.ok(!verified.verify_pending, 'verified');
+  const { r: m } = reader((c) => (c === 1 ? 'twisted image' : 'zz'));
+  await m.read(sharpFrame(), small, opts(1));
+  const miss = await m.read(sharpFrame(), small, opts(2));               // title miss
+  assert.ok(!miss.results[0]?.ok); assert.equal(miss.verify_pending, true, 'a title miss keeps the obligation');
+  m.reset();                                                            // a new presentation
+  assert.ok(!(await m.read(sharpFrame(), small, opts(3))).verify_pending, 'reset clears it');
+});

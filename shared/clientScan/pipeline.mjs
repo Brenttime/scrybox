@@ -1016,7 +1016,16 @@ export function createReader(env) {
     return quad;
   }
 
-  return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
+  // Every read output says whether a first-look guess still owes its verify
+  // read (review R3-S3): the worker holds a bundle swap on this, not on the
+  // absence of guess_first (a title miss or duplicate frame verifies nothing).
+  async function readOut(...args) {
+    const out = await read(...args);
+    if (out && guessed && !guessed.verified) out.verify_pending = true;
+    return out;
+  }
+
+  return { read: readOut, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
     reset() { lastQuad = null; stillRun = 0; lastDeferred = null; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, // A pending verify survives (it IS a real read); a verified guess is a
     // cached answer and goes, like tracked.
