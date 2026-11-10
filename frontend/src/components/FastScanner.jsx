@@ -44,19 +44,23 @@ const HYDRATE_RETRY_MS = [1000, 3000, 10000, 30000];
 const REPOINT_TIMEOUT_MS = 8000;
 const FIX_RETRY_MS = 3000;
 const AUTO_FRAME_MAX_EXTRA_MS = 40;
-// Phones (coarse pointer) ask for 1080p, desktops 1440p (see startCamera).
-// localStorage 'scan.res' = 720 / 1080 / 1440 overrides it for A/B rounds:
+// A coarse-pointer preference picks the requested ideal resolution: 1080p for
+// coarse pointers, 1440p otherwise (see startCamera). It is only an 'ideal';
+// the browser may deliver less. localStorage 'scan.res' = 720 / 1080 / 1440
+// overrides the request for A/B rounds; any other value (including inherited
+// Object keys such as '__proto__') falls back to the default:
 // more pixels read the footer better but cost the on-device re-detect
 // (Lanczos to 384 px) ~4x VGA's time at 1080p.
-const RES = { 720: [1280, 720], 1080: [1920, 1080], 1440: [2560, 1440] };
+const RES = new Map([['720', [1280, 720]], ['1080', [1920, 1080]], ['1440', [2560, 1440]]]);
 function cameraSize() {
   let pick = null;
-  try { pick = RES[localStorage.getItem('scan.res')]; } catch { /* default */ }
-  const phone = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
-  return pick || (phone ? RES[1080] : RES[1440]);
+  try { pick = RES.get(String(localStorage.getItem('scan.res'))) || null; } catch { /* default */ }
+  const coarse = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
+  return pick || (coarse ? RES.get('1080') : RES.get('1440'));
 }
-// Some browsers still hand back VGA for an 'ideal' they could have met (seen
-// on iOS); ask again once, explicitly, before scanning starts.
+// Some browsers still hand back VGA for a requested ideal they could have
+// met (seen on iOS); ask again once, explicitly, before scanning starts. The
+// browser may still keep VGA; scanning proceeds at whatever was delivered.
 async function raiseResolution(track, [w, h]) {
   const st = track.getSettings?.() || {};
   if (Math.max(st.width || 0, st.height || 0) >= 1280) return;
@@ -232,13 +236,16 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     const attempt = () => loadClientScan().then(r => {
       if (!live) return;
       onDeviceRef.current = r.ok; setOnDevice(r.ok);
-      scanTelemetry.device({ ok: r.ok, loadMs: r.loadMs, error: r.error, ...(r.info || {}) });
+      // Each completion writes only its own slice of the device metadata, so
+      // no order of these callbacks can drop persistence/fallback fields or
+      // put the shared load's (possibly superseded) bundle back (R2-S1).
+      scanTelemetry.loaded(r);
       if (r.ok) {
+        requestPersistentStorage().then(p => { if (live) scanTelemetry.persisted(p); });
         // Same card index as the server? (content hash; one tiny request)
-        requestPersistentStorage().then(p => { if (live) scanTelemetry.device({ ok: true, loadMs: r.loadMs, ...(r.info || {}), persisted: p }); });
         checkClientScan().then(c => {
           // Fresh or updated: telemetry names the bundle that will read.
-          if (live && c.info) scanTelemetry.device({ ok: true, loadMs: c.updated ? c.loadMs : r.loadMs, updatedFrom: c.updated ? c.from : undefined, ...c.info });
+          if (live && c.info) scanTelemetry.bundle(c.info, { loadMs: c.updated ? c.loadMs : undefined, updatedFrom: c.updated ? c.from : undefined });
         });
       } else {
         console.info('[fastscan] on-device reader unavailable:', r.error);
@@ -279,9 +286,11 @@ export default function FastScanner({ onAddSuccess, showToast }) {
     stopCamera();
     // Resolution is what reads the footer: at iOS's default 640x480 a
     // collector number is ~11 px tall (2026-11-10 telemetry, every iPhone
-    // session). Phones ask for 1920x1080, a preset every iPhone/Android rear
-    // camera has (frames are grabbed at FRAME_MAX 1920 anyway); desktop
-    // webcams keep 2560x1440, which the Windows sessions were validated at.
+    // session). A coarse-pointer preference requests an ideal 1920x1080
+    // (frames are grabbed at FRAME_MAX 1920 anyway), otherwise an ideal
+    // 2560x1440, which the Windows sessions were validated at. These are
+    // requested ideal resolutions, not guarantees; telemetry records what
+    // the track actually delivered.
     const size = cameraSize();
     const video = { width: { ideal: size[0] }, height: { ideal: size[1] }, frameRate: { ideal: 30 } };
     if (id) video.deviceId = { exact: id }; else video.facingMode = { ideal: 'environment' };

@@ -225,7 +225,8 @@ self.onmessage = async (e) => {
       if (pendingReset) { pendingReset = false; bundle.reader.reset(); bundles.noteReset(bundle); }
       const quad = await bundles.use(bundle, r => r.probe(new Uint8ClampedArray(small), 4, w, h));
       bundles.noteProbe(bundle, quad);
-      const out = quad ? null : { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
+      // Bundle identity on the empty result too (review R2-S1).
+      const out = quad ? null : { ok: true, engine: 'client', index: bundle.info.index, rec: bundle.info.rec, frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
       self.postMessage({ id, quad, out, small }, [small]);
     } catch (err) {
       self.postMessage({ id, error: err?.message || String(err), small }, [small]);

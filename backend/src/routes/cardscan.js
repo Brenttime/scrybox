@@ -150,7 +150,7 @@ function cameraMeta(c) {
   if (!c || typeof c !== 'object') return undefined;
   const n = (v) => (Number.isFinite(v) ? Math.round(v) : undefined);
   const pair = (v) => (Array.isArray(v) ? v.slice(0, 2).map(n) : undefined);
-  return { w: n(c.w), h: n(c.h), fps: n(c.fps), asked: pair(c.asked), max: pair(c.max), fallback: c.fallback === true || undefined };
+  return { w: n(c.w), h: n(c.h), fps: n(c.fps), asked: pair(c.asked), max: pair(c.max), fallback: c.fallback === true || undefined, gen: n(c.gen) };
 }
 
 router.post('/telemetry', express.json({ limit: '512kb', type: ['application/json', 'text/plain'] }), (req, res) => {
@@ -161,7 +161,9 @@ router.post('/telemetry', express.json({ limit: '512kb', type: ['application/jso
   const day = new Date().toISOString().slice(0, 10);
   const file = path.join(TELEMETRY_DIR, `${day}.jsonl`);
   const meta = { user: req.user?.id ?? null, session: String(b.session || '').slice(0, 20), platform: b.platform, device: b.device, camera: cameraMeta(b.camera), ua: String(req.get('user-agent') || '').slice(0, 200) };
-  const lines = records.map(r => JSON.stringify({ ...meta, ...r, recv: new Date().toISOString() })).join('\n') + '\n';
+  // A record's own camera snapshot (its stream at pass start, R2-S4) wins over
+  // the batch's, and goes through the same numbers-only sanitizer.
+  const lines = records.map(r => JSON.stringify({ ...meta, ...r, camera: cameraMeta(r?.camera) || meta.camera, recv: new Date().toISOString() })).join('\n') + '\n';
   fs.promises.mkdir(TELEMETRY_DIR, { recursive: true })
     .then(() => fs.promises.stat(file).then(s => s.size).catch(() => 0))
     .then(size => (size + lines.length > TELEMETRY_DAY_MAX ? null : fs.promises.appendFile(file, lines)))

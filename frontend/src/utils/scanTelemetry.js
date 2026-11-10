@@ -17,8 +17,19 @@ const MAX_QUEUE = 200;
 
 let queue = [];
 let timer = null;
-let deviceInfo = null;
+// Device metadata comes from independent async completions (load, persist(),
+// bundle check) that may resolve in any order and repeat on remount, so each
+// writer owns its own slice and the batch's `device` is merged field-wise
+// (review R2-S1); no writer can drop another's fields.
+//   load:    stable load diagnostics (ok, loadMs, error, threads, threadFallback)
+//   initial: identity of the bundle the shared load produced. Only a fallback:
+//            the shared `ready` keeps returning it after a swap.
+//   current: the bundle the last check reported (wins over `initial`)
+//   persist: navigator.storage.persist() outcome
+const IDENTITY = ['index', 'rec', 'dict'];
+let load = null, initial = null, current = null, persist;
 let cameraInfo = null;   // what getUserMedia actually delivered (track settings)
+let cameraGen = 0;       // bumps per stream; each record snapshots its stream
 let seq = 0;
 const session = Math.random().toString(36).slice(2, 10);
 // Which bundle produced a record (R2 measurement fix): version + build stamp.
@@ -35,11 +46,24 @@ function platform() {
   return { os, browser: br, cores: navigator?.hardwareConcurrency || null, mem: navigator?.deviceMemory || null };
 }
 
+function deviceInfo() {
+  if (!load && !initial && !current && persist === undefined) return null;
+  const out = { ...(load || {}), ...(current || initial || {}) };
+  if (load?.threadFallback) out.threadFallback = load.threadFallback;
+  if (persist !== undefined) out.persisted = persist;
+  return out;
+}
+function split(info) {
+  const diag = {}, id = {};
+  for (const [k, v] of Object.entries(info || {})) (IDENTITY.includes(k) ? id : diag)[k] = v;
+  return [diag, Object.keys(id).length ? id : null];
+}
+
 function flush(useBeacon = false) {
   clearTimeout(timer); timer = null;
   if (!queue.length) return;
   const batch = queue; queue = [];
-  const body = JSON.stringify({ session, platform: platform(), device: deviceInfo, camera: cameraInfo, records: batch });
+  const body = JSON.stringify({ session, platform: platform(), device: deviceInfo(), camera: cameraInfo, records: batch });
   try {
     if (useBeacon && navigator.sendBeacon) {
       navigator.sendBeacon('/api/cardscan/telemetry', new Blob([body], { type: 'application/json' }));
@@ -70,10 +94,29 @@ const clip = (arr, n = 12, len = 60) => (Array.isArray(arr) ? arr.slice(0, n).ma
 let emptyCount = 0;
 
 export const scanTelemetry = {
-  device(info) { deviceInfo = info; },
-  camera(info) { cameraInfo = info; },
+  // Result of the shared load (FastScanner effect, may repeat on remount).
+  loaded(r) {
+    const [diag, id] = split(r?.info);
+    load = { ...diag, ok: !!r?.ok, loadMs: r?.loadMs, error: r?.error || undefined };
+    if (id && !initial) initial = id;
+  },
+  persisted(p) { persist = p; },
+  // The bundle a check found current (fresh or freshly swapped in).
+  bundle(info, { loadMs, updatedFrom } = {}) {
+    const [diag, id] = split(info);
+    current = { ...diag, ...(id || {}), updatedFrom, ...(loadMs != null ? { bundleLoadMs: loadMs } : {}) };
+  },
+  device: deviceInfo,
+  // Bounded track settings for a new stream. Records snapshot it at pass
+  // start (review R2-S4); a batch spanning two streams is flushed first so the
+  // batch-level camera never describes a different stream than its rows.
+  camera(info) {
+    if (queue.length) flush();
+    cameraGen++;
+    cameraInfo = info ? { w: info.w, h: info.h, fps: info.fps, asked: info.asked, max: info.max, fallback: info.fallback, gen: cameraGen } : null;
+  },
   begin({ mode, sw, sh }) {
-    const rec = { id: `${session}-${++seq}`, t: new Date().toISOString(), mode, video: [sw, sh], ms: {}, build: BUILD };
+    const rec = { id: `${session}-${++seq}`, t: new Date().toISOString(), mode, video: [sw, sh], camera: cameraInfo || undefined, ms: {}, build: BUILD };
     let done = false;
     return {
       id: rec.id,
@@ -87,7 +130,9 @@ export const scanTelemetry = {
         const c = out.candidates?.[0];
         const r = out.results?.[0];
         rec.local = {
+          // Bundle identity of THIS result, empty probes included (R2-S1).
           index: out.index,
+          rec: out.rec,
           frame: out.frame ? [out.frame.width, out.frame.height] : undefined,
           status: c ? c.status : 'no card',
           sharp: c?.sharpness,
