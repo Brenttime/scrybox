@@ -257,7 +257,7 @@ pub(crate) fn truthy(v: &Value) -> bool {
 }
 
 /// JS `Number(x) > 0` style comparison used by resolveCardPrice.
-fn gt_zero(v: &Value) -> bool {
+pub(crate) fn gt_zero(v: &Value) -> bool {
     match v {
         Value::Number(n) => n.as_f64().map(|f| f > 0.0 && !f.is_nan()).unwrap_or(true),
         Value::String(s) => !s.trim().is_empty() && s.trim().parse::<f64>().map(|f| f > 0.0).unwrap_or(false),
@@ -266,7 +266,7 @@ fn gt_zero(v: &Value) -> bool {
 }
 
 /// resolveCardPrice(row) from utils/priceHelpers.js, over raw row values.
-fn resolve_card_price(is_proxy: &Value, printing: &Value, pt: &Value, pn: &Value, ph: &Value) -> Value {
+pub(crate) fn resolve_card_price(is_proxy: &Value, printing: &Value, pt: &Value, pn: &Value, ph: &Value) -> Value {
     if truthy(is_proxy) {
         return Value::from(0);
     }

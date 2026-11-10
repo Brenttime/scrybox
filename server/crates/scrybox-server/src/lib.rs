@@ -27,6 +27,8 @@ pub mod auth;
 pub mod collection;
 pub mod db;
 pub mod search;
+pub mod stats;
+mod stats_sql;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -80,6 +82,9 @@ pub struct AppState {
     /// Response cache for the ported search route, keyed by
     /// (params, user, collection_read_revision).
     pub search_cache: Arc<search::SearchCache>,
+    /// Response cache for the native /stats route (stats.rs mirrors
+    /// backend/src/utils/statsCache.js); disabled without a DB, same rule.
+    pub stats_cache: Arc<stats::StatsCache>,
 }
 
 impl AppState {
@@ -98,7 +103,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), stats_cache: Arc::new(stats::StatsCache::new()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -143,6 +148,10 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 
 /// Reverse-proxy one request to Node, streaming both bodies.
 pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
+    // statsCache.invalidateOnWrite twin: an authenticated non-GET /api write
+    // bumps that user's stats generation so their cached /stats body is
+    // dropped (best-effort; never delays or fails the proxied request).
+    stats::on_proxied_write(&st, req.method(), req.uri().path(), req.headers());
     let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let uri: Uri = match format!("{}{}", st.cfg.node_upstream, pq).parse() {
         Ok(u) => u,
@@ -220,6 +229,11 @@ pub fn app(state: AppState) -> Router {
     };
     let router = if state.owns("search") {
         router.route("/api/search", any(search::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("stats") {
+        router.route("/api/stats", any(stats::handle))
     } else {
         router
     };

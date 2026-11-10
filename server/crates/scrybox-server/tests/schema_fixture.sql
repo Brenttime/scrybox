@@ -70,10 +70,57 @@ CREATE TABLE "collection" (
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, source TEXT, is_proxy INTEGER DEFAULT 0,
             FOREIGN KEY(card_id) REFERENCES card_cache(id)
           );
-CREATE TABLE collection_read_revision (
-      id INTEGER PRIMARY KEY CHECK(id = 1),
-      revision INTEGER NOT NULL DEFAULT 0
-    );
+-- /stats auxiliary tables (backend/src/db.js): price_history backs the
+-- 7d/30d value-change subqueries, sets supplies set sizes for setProgress.
+CREATE TABLE IF NOT EXISTS price_history (
+  card_id TEXT NOT NULL,
+  price REAL NOT NULL,
+  recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(card_id, recorded_at)
+);
+
+CREATE TABLE IF NOT EXISTS sets (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  series TEXT,
+  printed_total INTEGER,
+  total INTEGER,
+  release_date TEXT,
+  set_code TEXT,
+  symbol_url TEXT,
+  logo_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS collection_read_revision (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  revision INTEGER NOT NULL DEFAULT 0
+);
+
+-- statsCache.dbRevision's third counter; db.js attaches stats_aux_* triggers
+-- on every write to price_history/sets — mirrored so a Rust-side or test-side
+-- write invalidates the stats cache the same way a live one would.
+CREATE TABLE IF NOT EXISTS deck_list_revision (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  revision INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS stats_aux_revision (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  revision INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_price_history_insert AFTER INSERT ON price_history
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_price_history_update AFTER UPDATE ON price_history
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_price_history_delete AFTER DELETE ON price_history
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_sets_insert AFTER INSERT ON sets
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_sets_update AFTER UPDATE ON sets
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS stats_aux_rev_sets_delete AFTER DELETE ON sets
+BEGIN UPDATE stats_aux_revision SET revision = revision + 1; END;
 CREATE UNIQUE INDEX idx_users_api_key ON users(api_key) WHERE api_key IS NOT NULL;
 CREATE INDEX idx_card_cache_set_num ON card_cache(set_id, number);
 CREATE INDEX idx_deck_cards_checkout ON deck_cards(deck_id, checked_out);

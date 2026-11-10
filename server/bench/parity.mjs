@@ -55,6 +55,21 @@ const EXTRA_SEARCH = [
   '/api/search?name=__definitely_no_such_card__',
 ];
 
+// Stats coverage for the ported /api/stats (iter 3): the bench scenario URL
+// plus parameter-insensitivity (the handler reads no query — cache name is
+// the constant 'stats'), the per-user contract (admin session inserted into
+// the DB copy by scripts/seed-parity-user1-session.sh), the sub-route the
+// port must NOT swallow (/api/stats/history stays on Node), and the two
+// ETag/304 surfaces. Bodies are compared with deepDiff including key order,
+// so the insertion-ordered Map assembly is asserted against Node, not
+// eyeballed.
+const USER1_TOKEN = '39381d59b2d9874a99c9dfe050a40942ff8bf2fe2338346d7c539def20e5c353';
+const EXTRA_STATS = [
+  '/api/stats?foo=1&bar=baz',
+  '/api/stats/',
+  '/api/stats/history?period=30d',
+];
+
 const cases = [];
 for (const s of scen.scenarios) {
   cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET' });
@@ -66,10 +81,19 @@ for (const [i, p] of EXTRA_COLLECTION.entries()) {
 for (const [i, p] of EXTRA_SEARCH.entries()) {
   cases.push({ name: `search${i + 1}_${p.slice('/api/search'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
+for (const [i, p] of EXTRA_STATS.entries()) {
+  cases.push({ name: `stats${i + 1}_${p.slice('/api/stats'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
+}
+// Second user: the stats body is per-user (owned/valued aggregates of user 1),
+// so parity must run a user the bench token is NOT. Session lives in the DB
+// copy only (scripts/seed-parity-user1-session.sh).
+cases.push({ name: 'stats_user1', path: '/api/stats', headers: { Authorization: `Bearer ${USER1_TOKEN}` }, method: 'GET' });
 // Auth-surface cases (BRIEF rule 2): exact 401/403 bodies.
 cases.push({ name: 'auth_no_token', path: '/api/collection?limit=10', headers: {}, method: 'GET' });
 cases.push({ name: 'auth_bad_token', path: '/api/collection?limit=10', headers: { Authorization: 'Bearer de...def' }, method: 'GET' });
 cases.push({ name: 'auth_apikey_post', path: '/api/collection', headers: { Authorization: '***' + 'x'.repeat(59) }, method: 'POST' });
+cases.push({ name: 'auth_no_token_stats', path: '/api/stats', headers: {}, method: 'GET' });
+cases.push({ name: 'auth_bad_token_stats', path: '/api/stats', headers: { Authorization: '***' }, method: 'GET' });
 
 // --- comparison --------------------------------------------------------------
 
@@ -177,7 +201,7 @@ function rawGet(base, path, headers) {
 ///     are byte-identical the tags must be identical, which cross-checks the
 ///     Rust serializer against Node's at byte level.
 async function etagParity(c) {
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search')) return [];
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats')) return [];
   const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
   if (r.status !== 200 || n.status !== 200) return [];
   const diffs = [];
