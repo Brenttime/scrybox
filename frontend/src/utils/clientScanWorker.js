@@ -105,11 +105,48 @@ async function pruneCache() {
   }
 }
 
+// A candidate that failed to load must not leave its bytes in the Cache API,
+// or every retry would read the same bad copy (review R2-S2). Files that the
+// active/pending bundle also names (shared rec/dict, last-known-good A) stay.
+async function dropCandidate(cache, urls) {
+  if (!cache) return;
+  const keep = new Set([bundles.active, bundles.pending].filter(Boolean)
+    .flatMap(b => [b.manifest.index, b.manifest.rec, b.manifest.dict].map(n => BASE + n)));
+  for (const u of urls) if (!keep.has(u)) await cache.delete(u).catch(() => {});
+}
+
 async function load(manifest = null, signal = undefined) {
-  const t0 = performance.now();
   manifest ||= await fetchManifest(signal);
   const urls = [manifest.index, manifest.rec, manifest.dict].map(n => BASE + n);
   const cache = typeof caches !== 'undefined' ? await caches.open(CACHE).catch(() => null) : null;
+  try { return await loadFrom(manifest, urls, cache, signal); } catch (err) {
+    await dropCandidate(cache, urls);
+    throw err;
+  }
+}
+
+// Sessions this load created, owned until the bundle is returned: on abort,
+// every completed one is released now and a late one when it completes, so a
+// hung sibling cannot pin them (review R2-B2). A session still running its
+// warm-up is not released under it; the bundle is retired when it returns.
+function sessionOwner(signal) {
+  const made = [];
+  let disowned = false, warming = false;
+  const drop = () => { disowned = true; releaseSessions(...made.splice(0)); };
+  signal?.addEventListener?.('abort', () => { if (!warming) drop(); }, { once: true });
+  return {
+    create: (bytes, opts) => ort.InferenceSession.create(bytes, opts).then((x) => {
+      if (disowned) { releaseSessions(x); throw new Error('refresh aborted'); }
+      made.push(x);
+      return x;
+    }),
+    warming: (v) => { warming = v; if (!v && signal?.aborted) drop(); },
+    drop,
+  };
+}
+
+async function loadFrom(manifest, urls, cache, signal) {
+  const t0 = performance.now();
   const tFetch = performance.now();
   const [indexGz, recBytes, dictBytes, corn] = await Promise.all([
     cachedBytes(cache, urls[0], signal), cachedBytes(cache, urls[1], signal), cachedBytes(cache, urls[2], signal), cornBytes(cache, signal),
@@ -118,19 +155,25 @@ async function load(manifest = null, signal = undefined) {
   const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'all' };
   // Index decode runs while ORT compiles the two sessions; a failure frees
   // whatever was created (review R1-S1).
-  const parts = await Promise.allSettled([
-    ort.InferenceSession.create(recBytes, opts),
-    ort.InferenceSession.create(corn, opts),
+  const own = sessionOwner(signal);
+  const abortWait = new Promise((_, rej) => signal?.addEventListener?.('abort', () => rej(new Error('refresh aborted')), { once: true }));
+  abortWait.catch(() => {});
+  const parts = await Promise.race([Promise.allSettled([
+    own.create(recBytes, opts),
+    own.create(corn, opts),
     gunzip(indexGz).then(text => loadIndex(JSON.parse(text))),
-  ]);
+  ]), abortWait]).catch((err) => { own.drop(); throw err; });
   const failed = parts.find(p => p.status === 'rejected');
   const [rec, cornelius, index] = parts.map(p => p.value);
-  if (failed || signal?.aborted) { releaseSessions(rec, cornelius); throw failed?.reason || new Error('refresh aborted'); }
+  if (failed || signal?.aborted) { own.drop(); throw failed?.reason || new Error('refresh aborted'); }
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
   // Warm-up: the first run of each session allocates and plans its kernels
   // (hundreds of ms on a phone); pay that here, not on the first card.
   const tWarm = performance.now();
+  own.warming(true);
   await warmUp(rec, cornelius).catch(() => {});
+  own.warming(false);
+  if (signal?.aborted) throw new Error('refresh aborted');
   const warmMs = Math.round(performance.now() - tWarm);
   const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate, retroFirst: FLAGS.retroFirst ?? ort.env.wasm.numThreads >= 4 });
   // Which assets this worker actually runs, for scan telemetry: rules out a
@@ -142,7 +185,7 @@ async function load(manifest = null, signal = undefined) {
 // Reader bundles: first load, camera-start freshness check, swap (scanBundles.js).
 const bundles = createBundles({
   loadBundle: (manifest, signal) => load(manifest, signal),
-  fetchManifest: () => fetchManifest(),
+  fetchManifest: (signal) => fetchManifest(signal),
   release: (b) => releaseSessions(b.rec, b.cornelius),
   prune: () => { pruneCache().catch(() => {}); },
 });
@@ -179,8 +222,9 @@ self.onmessage = async (e) => {
       await readerPromise;
       const bundle = bundles.begin();
       // A reset is for whatever bundle reads next; a fresh one starts clean.
-      if (pendingReset) { pendingReset = false; bundle.reader.reset(); }
+      if (pendingReset) { pendingReset = false; bundle.reader.reset(); bundles.noteReset(bundle); }
       const quad = await bundles.use(bundle, r => r.probe(new Uint8ClampedArray(small), 4, w, h));
+      bundles.noteProbe(bundle, quad);
       const out = quad ? null : { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings: {} };
       self.postMessage({ id, quad, out, small }, [small]);
     } catch (err) {
@@ -200,6 +244,8 @@ self.onmessage = async (e) => {
         null, { requireStill, quad, frameId, guess }));
       // The index this answer came from, per read (telemetry, review R1-S3).
       if (out) out.index = bundle.info.index;
+      // A first-look guess holds the swap until it is verified (R2-S3).
+      bundles.noteRead(bundle, out);
       self.postMessage({ id, out, frame }, [frame]);
     } catch (err) {
       self.postMessage({ id, error: err?.message || String(err), frame }, [frame]);
