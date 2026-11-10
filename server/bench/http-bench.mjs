@@ -250,6 +250,10 @@ async function runScenarios(list, tag) {
     const row = {
       name: s.name, conc: c, n: lat.length, variants: paths ? paths.length : 1, rps: +(lat.length / secs).toFixed(1),
       p50_ms: +pct(lat, 50).toFixed(2), p99_ms: +pct(lat, 99).toFixed(2),
+      // Tail visibility (iter 13): the SWR grace-expiry blocks land past
+      // p99 at these rps, so p99 alone cannot tell "tail blocks" from
+      // "flat scheduling noise". max_ms ~500 every 2 s = block signature.
+      p999_ms: +pct(lat, 99.9).toFixed(2), max_ms: lat.length ? +lat[lat.length - 1].toFixed(2) : 0,
       peak_rss_mb: peak ? +(peak / 1024).toFixed(1) : null, codes,
     };
     results.push({ row, lat, secs, t0, t1: Date.now() });
@@ -307,6 +311,7 @@ if (workers > 1 && !isChild) {
       name, conc: m.conc * workers, n: m.n, variants: m.variants,
       rps: +(m.n / secs).toFixed(1),
       p50_ms: +pct(m.lat, 50).toFixed(2), p99_ms: +pct(m.lat, 99).toFixed(2),
+      p999_ms: +pct(m.lat, 99.9).toFixed(2), max_ms: m.lat.length ? +m.lat[m.lat.length - 1].toFixed(2) : 0,
       peak_rss_mb: m.peak ? +(m.peak / 1024).toFixed(1) : null, codes: m.codes,
     };
     merged.push(row);

@@ -255,6 +255,11 @@ pub fn app(state: AppState) -> Router {
         router
     };
     let router = if state.owns("stats") {
+        // Background refresher (iter 13): polls the revision counter and
+        // pre-builds post-bump bodies for recently-active users. Lives with
+        // the router (same runtime); tests that build a Router get it too,
+        // which is the point — the bounded-staleness tests exercise it.
+        stats::spawn_refresher(&state);
         router.route("/api/stats", any(stats::handle))
     } else {
         router

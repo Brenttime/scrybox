@@ -367,6 +367,64 @@ async fn price_history_write_bumps_aux_trigger_and_freshens_body() {
 }
 
 #[tokio::test]
+async fn background_refresher_prebuilds_post_bump_body() {
+    // Owner ruling (iter 12 note #1, implemented iter 13): the background
+    // refresher may pre-build the post-write body so requests never pay the
+    // blocking compute after a bump — but only while keeping the 5 s bound.
+    // This pins both halves: the pre-build happens with NO request in
+    // flight (computes grows while the endpoint is idle), and the result is
+    // a store `hit` carrying the NEW data. The immediate post-write request
+    // staying `miss` is pinned by the two bump tests above, which now run
+    // with the refresher active (app() spawns it) — the debounce makes that
+    // deterministic.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded_stats_db(dir.path(), "refresher.db");
+    let upstream = spawn_fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: format!("http://{upstream}"),
+        static_dir: None,
+        rust_routes: ["stats".to_string()].into_iter().collect(),
+        db_path: Some(db_path.clone()),
+        sidecar_url: None,
+    };
+    let state = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&state.stats_cache);
+    let r = app(state);
+
+    // Prime: the user becomes active for the refresher; store + SWR slot
+    // hold the rev-A body.
+    let (_, h, _) = get_json(&r, "/api/stats").await;
+    assert_eq!(h["x-stats-cache"], "miss");
+    let base_computes = cache.computes();
+    assert_eq!(base_computes, 1);
+
+    // Node-side write: a new price point fires the stats_aux trigger.
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO price_history (card_id, price, recorded_at) VALUES ('c-sol', 4.0, '2099-06-01 00:00:00');",
+    )
+    .unwrap();
+    drop(conn);
+
+    // NO stats requests at all — the refresher must notice and build.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4000);
+    while cache.computes() == base_computes {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background refresher never computed the post-bump body (bounded-staleness violation)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The fresh body must already be in the store: one request, `hit`,
+    // already reflecting the new price point.
+    let (_, h, fresh) = get_json(&r, "/api/stats").await;
+    assert_eq!(h["x-stats-cache"], "hit", "post-bump body must be pre-built, not request-computed");
+    assert_eq!(fresh["summary"]["change7d"]["abs"], json!(4.5), "9.0→12.0 on qty 3");
+}
+
+#[tokio::test]
 async fn proxied_write_bumps_user_generation() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = seeded_stats_db(dir.path(), "gen.db");

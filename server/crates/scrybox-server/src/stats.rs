@@ -48,6 +48,24 @@ use crate::AppState;
 
 const TTL: Duration = Duration::from_secs(5 * 60); // statsCache.js TTL_MS
 const MAX_ENTRIES: usize = 500; // statsCache.js MAX_ENTRIES
+/// Background refresher (iter 13, owner ruling #1): poll the revision
+/// counter and pre-build the post-bump body for recently-active users so a
+/// request never rides the blocking compute path after an invalidation.
+/// Pre-building only ever makes the served body FRESHER — the 5 s SWR bound
+/// and the request-path semantics are untouched.
+const REFRESH_TICK: Duration = Duration::from_millis(250);
+/// Only users who requested stats within this window are pre-built; a user
+/// who stopped asking must not cost background query work (Node does no
+/// unrequested work either).
+const REFRESH_ACTIVE: Duration = Duration::from_secs(30);
+/// Debounce: a (gen, rev) must be observed stable across two consecutive
+/// ticks before it is pre-built. Keeps the write itself in flight (edit +
+/// revert pairs bump twice) out of the build fan-out, and keeps the
+/// post-write first-request still a deterministic `miss` — the same window
+/// Node's own cache would answer `miss` in.
+const REFRESH_DEBOUNCE_TICKS: u8 = 2;
+/// After a failed pre-build, back off per user instead of retrying per tick.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -98,6 +116,18 @@ struct Inner {
     latest: HashMap<i64, (Arc<StatsEntry>, Instant)>,
     seq: u64,
     inflight: HashMap<String, Arc<ComputeSlot>>,
+    /// Background refresher bookkeeping (iter 13): last stats request per
+    /// user — gates which users get a post-bump body pre-built.
+    seen: HashMap<i64, Instant>,
+    /// The (gen, rev) the current `latest` body was computed for; compared
+    /// against the live counters to decide whether the SWR slot still
+    /// represents the current DB state.
+    latest_key: HashMap<i64, (u64, Option<String>)>,
+    /// Debounce state: (gen, rev) under observation per user and the number
+    /// of consecutive ticks it has been seen stable.
+    observed: HashMap<i64, (u64, Option<String>, u8)>,
+    /// Per-user backoff instant after a failed background pre-build.
+    cooldown: HashMap<i64, Instant>,
 }
 
 pub struct StatsCache {
@@ -139,13 +169,91 @@ impl StatsCache {
         *inner.gens.entry(user_id).or_insert(0) += 1;
     }
 
-    fn gen(&self, user_id: i64) -> u64 {
-        self.inner.lock().unwrap().gens.get(&user_id).copied().unwrap_or(0)
-    }
-
     /// statsCache.keyFor: `${userId}|${gen || 0}|${rev ?? ''}|${name}`.
     fn key_for(user_id: i64, gen: u64, rev: Option<&str>) -> String {
         format!("{user_id}|{gen}|{}|stats", rev.unwrap_or(""))
+    }
+
+    // --- background refresher support (iter 13) -----------------------------
+
+    /// Record a stats request for `user_id` and return its current gen.
+    /// (The request path's key resolution is the only thing that marks a
+    /// user "active" for the refresher — mirrors Node doing work only for
+    /// users who asked.)
+    fn touch(&self, user_id: i64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seen.insert(user_id, Instant::now());
+        inner.gens.get(&user_id).copied().unwrap_or(0)
+    }
+
+    /// Users whose last stats request is within `window`.
+    fn active_users(&self, window: Duration) -> Vec<i64> {
+        let now = Instant::now();
+        self.inner
+            .lock()
+            .unwrap()
+            .seen
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) <= window)
+            .map(|(u, _)| *u)
+            .collect()
+    }
+
+    /// Decide whether `user_id` needs a background pre-build for the CURRENT
+    /// (gen, rev), applying the stability debounce. Returns the cache key to
+    /// build when it is due. The debounce requires the same (gen, rev) on
+    /// REFRESH_DEBOUNCE_TICKS consecutive observations, so a request that
+    /// follows a write immediately still sees `miss` (Node answers `miss`
+    /// in that window too) and edit+revert pairs do not fan out builds.
+    fn refresh_due(&self, user_id: i64, rev: Option<&str>) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .cooldown
+            .get(&user_id)
+            .is_some_and(|at| Instant::now().duration_since(*at) < REFRESH_COOLDOWN)
+        {
+            return None;
+        }
+        let gen = inner.gens.get(&user_id).copied().unwrap_or(0);
+        let key = StatsCache::key_for(user_id, gen, rev);
+        if inner
+            .store
+            .get(&key)
+            .is_some_and(|e| Instant::now().duration_since(e.at) <= TTL)
+        {
+            inner.observed.remove(&user_id);
+            return None;
+        }
+        let cur = (gen, rev.map(|s| s.to_string()));
+        // The SWR slot already holds the CURRENT body and is inside the
+        // grace: request-path SWR (with its slot-shared background build)
+        // covers this case; pre-building would duplicate the work.
+        let swr_covers = inner
+            .latest_key
+            .get(&user_id)
+            .zip(inner.latest.get(&user_id).map(|(_, at)| *at))
+            .is_some_and(|((g, r), at)| *g == cur.0 && *r == cur.1 && Instant::now().duration_since(at) <= STALE_GRACE);
+        if swr_covers {
+            inner.observed.remove(&user_id);
+            return None;
+        }
+        let mut due = false;
+        let prev_n = match inner.observed.get(&user_id) {
+            Some((g, r, n)) if *g == cur.0 && *r == cur.1 => {
+                due = *n + 1 >= REFRESH_DEBOUNCE_TICKS;
+                *n
+            }
+            _ => 0,
+        };
+        inner.observed.insert(user_id, (cur.0, cur.1, prev_n + 1));
+        if !due || inner.inflight.contains_key(&key) {
+            return None;
+        }
+        Some(key)
+    }
+
+    fn refresh_failed(&self, user_id: i64) {
+        self.inner.lock().unwrap().cooldown.insert(user_id, Instant::now());
     }
 
     /// statsCache.get: TTL-bound hit, expired entries dropped on probe.
@@ -174,6 +282,9 @@ impl StatsCache {
         inner.seq += 1;
         let seq = inner.seq;
         inner.latest.insert(user_id, (Arc::clone(&entry), Instant::now()));
+        inner
+            .latest_key
+            .insert(user_id, parse_key_parts(&key));
         inner.store.insert(key, StoreEntry { at: Instant::now(), seq, entry });
     }
 
@@ -655,6 +766,102 @@ fn compute_and_store(
     Ok(entry)
 }
 
+/// Inverse of key_for: the (gen, rev) encoded in a cache key. The rev
+/// itself contains '|' (it is the `c|d|a` triple), so only the leading
+/// fields and the trailing route name are fixed-position.
+fn parse_key_parts(key: &str) -> (u64, Option<String>) {
+    let mut it = key.split('|');
+    let _uid = it.next();
+    let gen = it.next().and_then(|g| g.parse().ok()).unwrap_or(0);
+    let mut rev_parts: Vec<&str> = it.collect();
+    rev_parts.pop(); // trailing "stats"
+    let rev = rev_parts.join("|");
+    (gen, if rev.is_empty() { None } else { Some(rev) })
+}
+
+/// Background refresher (owner ruling, iter 12 note #1 / iter 13): poll the
+/// revision counter and pre-build the current body for recently-active
+/// users after a bump, so requests landing in the post-write window are
+/// either answered from the store or from a fresh SWR slot — never from the
+/// blocking compute path. This only ever makes served bodies FRESHER: the
+/// store receives an exact-for-current-rev entry earlier than the
+/// request-path build would; the 5 s stale-while-revalidate bound is
+/// untouched, staleness is never widened.
+///
+/// Costs are bounded the way Node's own work is: only users who requested
+/// stats within REFRESH_ACTIVE get a build, only after the (gen, rev) has
+/// been observed stable for REFRESH_DEBOUNCE_TICKS ticks (so in-flight edit
+/// +revert pairs do not fan out builds and the immediate post-write request
+/// stays a deterministic `miss`, matching what Node answers in that window),
+/// and a failed pre-build backs off for REFRESH_COOLDOWN. The build runs
+/// through the SAME single-flight slot as the request path, so a bump that
+/// is already being rebuilt by a request never double-computes.
+pub fn spawn_refresher(state: &AppState) {
+    let Some(pool) = state.db.clone() else { return };
+    let cache = Arc::clone(&state.stats_cache);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REFRESH_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let users = cache.active_users(REFRESH_ACTIVE);
+            if users.is_empty() {
+                continue;
+            }
+            // One revision read per tick, kept off the runtime workers.
+            let pool2 = Arc::clone(&pool);
+            let rev = match tokio::task::spawn_blocking(move || {
+                pool2.get().ok().and_then(|c| StatsCache::db_revision(&c))
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => continue, // runtime shutting down
+            };
+            for user_id in users {
+                let Some(key) = cache.refresh_due(user_id, rev.as_deref()) else { continue };
+                let slot = cache.slot(&key);
+                let cache2 = Arc::clone(&cache);
+                let pool3 = Arc::clone(&pool);
+                let key2 = key.clone();
+                tokio::spawn(async move {
+                    let init_key = key2.clone();
+                    let init_cache = Arc::clone(&cache2);
+                    let init_pool = Arc::clone(&pool3);
+                    let init = move || async move {
+                        let c = Arc::clone(&init_cache);
+                        let p = Arc::clone(&init_pool);
+                        let k = init_key.clone();
+                        // get_or_try_init nests: the stored value is the
+                        // compute Result; the outer Err carries a JoinError
+                        // (same shape as the request-path init below).
+                        tokio::task::spawn_blocking(move || {
+                            compute_and_store(&c, &p, user_id, k)
+                        })
+                        .await
+                        .map_err(|e| format!("refresh join: {e}"))
+                    };
+                    // A compute failure lands as Ok(Err(..)) (the error is
+                    // the stored value) or Err(JoinError); both must engage
+                    // the backoff or the poller retries every tick.
+                    match slot.get_or_try_init(init).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(user_id, error = %e, "stats refresher build failed");
+                            cache2.refresh_failed(user_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(user_id, error = %e, "stats refresher build failed");
+                            cache2.refresh_failed(user_id);
+                        }
+                    }
+                    cache2.finish(&key2);
+                });
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -987,7 +1194,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             let conn = pool
                 .get()
                 .map_err(|e| format!("read pool: {e}"))?;
-            let gen = cache.gen(user_id);
+            let gen = cache.touch(user_id);
             let rev = StatsCache::db_revision(&conn);
             let key = StatsCache::key_for(user_id, gen, rev.as_deref());
             (cache.get(&key), key)
