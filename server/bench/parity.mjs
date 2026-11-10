@@ -10,6 +10,8 @@
 // retried as a fresh pair (up to 3 attempts) before it counts as a failure.
 import fs from 'node:fs';
 import http from 'node:http';
+import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
@@ -154,6 +156,222 @@ cases.push({ name: 'authr_logout_no_token', path: '/api/auth/logout', headers: {
 cases.push({ name: 'authr_apikey_post_no_token', path: '/api/auth/api-key', headers: {}, method: 'POST' });
 cases.push({ name: 'authr_apikey_delete_no_token', path: '/api/auth/api-key', headers: {}, method: 'DELETE' });
 cases.push({ name: 'authr_settings_no_token', path: '/api/auth/settings', headers: AUTH_JSON, method: 'PUT', body: '{}' });
+
+// Auth WRITER success-path parity (iter 23; orchestrator audit ruling
+// 2026-11-10 #1: "verified auth routes need success-path parity ... the
+// current 15 'verified' entries include login/register/bootstrap/api-key/
+// settings, none of which has a verified write round-trip"). A dedicated
+// test user `rusttest_parity` lives in the DB COPY only (never prod; the
+// same direct-SQL channel scripts/seed-parity-user1-session.sh uses). Every
+// case: resetParityUser() puts the row at a deterministic baseline, setup
+// seeds what the case needs, readBack verifies the WRITE THROUGH THE OPPOSITE
+// SERVER (cross-side per the iter-21 owner ruling), teardown restores the
+// baseline — sessions wiped, password/share/api_key back to seed — so the DB
+// is left as found even if a case fails. Random values (session tokens,
+// issued api keys, rotated share tokens) are stripped from body equality
+// (c.strip) and instead asserted by SHAPE plus persistence-visibility, so a
+// Rust write that does not land where Node can read it fails outright.
+// register/bootstrap success cannot run here (users table non-empty; this
+// deployment runs ALLOW_REGISTRATION=false) — those two are covered by the
+// throwaway-instance ladder bench/parity-auth-ephemeral.mjs + cargo fixture
+// tests, and stay `rust` in the manifest until that ladder passes.
+const AUTH_DB = new URL('../../../data/bindarr.db', import.meta.url).pathname;
+const PW_OLD = 'OldPass!2345';
+const PW_NEW = 'NewPass!2345';
+const PARITY_USER = 'rusttest_parity';
+const SALT0 = '5273745061726974792d30303030'; // fixed 16-byte salt (hex)
+const PBKDF2_ITER = 210000; // db.js PBKDF2_ITERATIONS
+const SHARE_T0 = '52737450617269747900000000000054'; // baseline share_token
+const FIXED_KEY = 'bnd_' + 'f'.repeat(48);
+const SESSION_EXP = '2030-01-01 00:00:00';
+const hashPw = (pw, salt) => `${PBKDF2_ITER}:${salt}:${crypto.pbkdf2Sync(pw, salt, PBKDF2_ITER, 64, 'sha512').toString('hex')}`;
+const PW_HASH0 = hashPw(PW_OLD, SALT0);
+function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { fn(d); } finally { d.close(); } }
+function resetParityUser() {
+  dbWrite((d) => {
+    const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+    if (row) d.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+    d.prepare('DELETE FROM users WHERE username = ?').run(PARITY_USER);
+    d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, api_key) VALUES (?, ?, ?, ?, ?, NULL)')
+      .run(PARITY_USER, PW_HASH0, 'member', SHARE_T0, 0);
+  });
+}
+function seedSession(token) {
+  dbWrite((d) => {
+    d.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+    if (!row) throw new Error('parity user missing');
+    d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(token, row.id, SESSION_EXP);
+  });
+}
+const sideTag = (base) => (base === RUST ? 'r' : 'n');
+if (fs.existsSync(AUTH_DB)) {
+cases.push({
+  // Login success: token shape asserted here, and the freshly ISSUED session
+  // must authenticate on the opposite server (Rust-written session row read
+  // by Node and vice versa). token stripped: random by design.
+  name: 'authr_login_ok', path: '/api/auth/login', headers: AUTH_JSON, method: 'POST',
+  body: JSON.stringify({ username: PARITY_USER, password: PW_OLD }),
+  strip: ['$.token'],
+  setup: async () => { resetParityUser(); },
+  readBack: async (other, ctx, res) => {
+    const tok = res?.json?.token;
+    if (typeof tok !== 'string' || !/^[0-9a-f]{64}$/.test(tok)) return { ok: false, why: `login token shape ${fmt(tok)}`, seen: null };
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${tok}` });
+    const u = me.json?.user || {};
+    // `id` excluded from the compared view: resetParityUser recreates the
+    // row, so AUTOINCREMENT ids legitimately differ between the two runs.
+    const view = { username: u.username, role: u.role, share_token: u.share_token, share_enabled: u.share_enabled, api_key: u.api_key ?? '' };
+    return me.status === 200 && u.username === PARITY_USER && u.role === 'member'
+      ? { ok: true, why: 'fresh session authenticates on the other server', seen: view }
+      : { ok: false, why: `fresh session rejected across sides: ${me.status} ${fmt(me.text)}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // Logout success: deterministic seeded session; after the write the token
+  // must 401 on the opposite server (row actually deleted, not just answered).
+  name: 'authr_logout_ok', path: '/api/auth/logout', headers: {}, method: 'POST',
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-logout-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}` }, ctx: { tok } };
+  },
+  readBack: async (other, ctx) => {
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${ctx.tok}` });
+    return me.status === 401
+      ? { ok: true, why: 'revoked session 401s on the other server', seen: { revoked: true } }
+      : { ok: false, why: `revoked session still answers ${me.status}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // API-key issue: bnd_ + 48 hex; the fresh key must authenticate a GET on
+  // the opposite server AND match what /api/auth/me persists there (rule 2:
+  // API key is GET-only — exercised live here, not just in cargo).
+  name: 'authr_apikey_post_ok', path: '/api/auth/api-key', headers: {}, method: 'POST',
+  strip: ['$.api_key'],
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-keypost-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}` }, ctx: { tok } };
+  },
+  readBack: async (other, ctx, res) => {
+    const key = res?.json?.api_key;
+    if (typeof key !== 'string' || !/^bnd_[0-9a-f]{48}$/.test(key)) return { ok: false, why: `api-key shape ${fmt(key)}`, seen: null };
+    const col = await apiReq(other, 'GET', '/api/collection?limit=1', { Authorization: `Bearer ${key}` });
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${key}` });
+    const post = await apiReq(other, 'POST', '/api/collection', { Authorization: `Bearer ${key}`, 'content-type': 'application/json' }, '{}');
+    return col.status === 200 && post.status === 403 && me.json?.user?.api_key === key
+      ? { ok: true, why: 'key usable GET-only and persisted on the other server', seen: { get_ok: true, post_forbidden: true } }
+      : { ok: false, why: `get=${col.status} post=${post.status} persisted=${me.json?.user?.api_key === key}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // API-key revoke: known key seeded, DELETE must make it 401 on the other
+  // server (UPDATE users SET api_key=NULL actually landed).
+  name: 'authr_apikey_delete_ok', path: '/api/auth/api-key', headers: {}, method: 'DELETE',
+  setup: async (base) => {
+    resetParityUser();
+    dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run(FIXED_KEY, PARITY_USER));
+    const tok = `rusttest-keydel-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}` }, ctx: { tok } };
+  },
+  readBack: async (other) => {
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${FIXED_KEY}` });
+    return me.status === 401
+      ? { ok: true, why: 'revoked key 401s on the other server', seen: { revoked: true } }
+      : { ok: false, why: `revoked key still answers ${me.status}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // Settings write: share_enabled flag; response body is fully deterministic
+  // for the seeded user (no strip) and must be visible from the other server.
+  name: 'authr_settings_share_toggle', path: '/api/auth/settings', headers: {}, method: 'PUT',
+  body: '{"share_enabled":1}',
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-share-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, ctx: { tok } };
+  },
+  readBack: async (other, ctx) => {
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${ctx.tok}` });
+    return me.status === 200 && me.json?.user?.share_enabled === 1
+      ? { ok: true, why: 'share flag visible on the other server', seen: { share_enabled: 1 } }
+      : { ok: false, why: `share flag not visible: ${me.status} ${fmt(me.json)}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // Share-token rotation: new token is random (stripped) but must be a fresh
+  // hex32, equal to what the opposite server reads back AND to what the
+  // response body carried.
+  name: 'authr_settings_share_regen', path: '/api/auth/settings', headers: {}, method: 'PUT',
+  body: '{"regenerate_share_token":true}',
+  strip: ['$.user.share_token'],
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-regen-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, ctx: { tok } };
+  },
+  readBack: async (other, ctx, res) => {
+    const me = await apiReq(other, 'GET', '/api/auth/me', { Authorization: `Bearer ${ctx.tok}` });
+    const tok = me.json?.user?.share_token;
+    const ok = me.status === 200 && typeof tok === 'string' && /^[0-9a-f]{32}$/.test(tok) && tok !== SHARE_T0 && tok === res?.json?.user?.share_token;
+    return ok
+      ? { ok: true, why: 'rotated token persisted and matches the response', seen: { rotated_shape_ok: true } }
+      : { ok: false, why: `rotation not visible: ${me.status} stored=${fmt(tok)} resp=${fmt(res?.json?.user?.share_token)}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // Password change: the CURRENT-password check plus the new hash must be
+  // verifiable by the OPPOSITE server's pbkdf2 path (cross-implementation
+  // crypto parity on a live write), and the old password must stop working.
+  name: 'authr_settings_password_change', path: '/api/auth/settings', headers: {}, method: 'PUT',
+  body: JSON.stringify({ current_password: PW_OLD, password: PW_NEW }),
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-pwchange-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, ctx: { tok } };
+  },
+  readBack: async (other) => {
+    const okNew = await apiReq(other, 'POST', '/api/auth/login', { 'content-type': 'application/json' }, JSON.stringify({ username: PARITY_USER, password: PW_NEW }));
+    const badOld = await apiReq(other, 'POST', '/api/auth/login', { 'content-type': 'application/json' }, JSON.stringify({ username: PARITY_USER, password: PW_OLD }));
+    return okNew.status === 200 && typeof okNew.json?.token === 'string' && badOld.status === 401
+      ? { ok: true, why: 'new password verifies on the other server; old rejected', seen: { new_pw_verified: true, old_pw_rejected: true } }
+      : { ok: false, why: `new=${okNew.status} old=${badOld.status}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+cases.push({
+  // Negative twin of the writer block: current_password wrong must 401 AND
+  // leave the old password working on the other server (no partial write).
+  name: 'authr_settings_pwchange_wrong_401', path: '/api/auth/settings', headers: {}, method: 'PUT',
+  body: JSON.stringify({ current_password: 'WrongPass!9999', password: PW_NEW }),
+  setup: async (base) => {
+    resetParityUser();
+    const tok = `rusttest-pwwrong-${sideTag(base)}`;
+    seedSession(tok);
+    return { headers: { Authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, ctx: { tok } };
+  },
+  readBack: async (other) => {
+    const ok = await apiReq(other, 'POST', '/api/auth/login', { 'content-type': 'application/json' }, JSON.stringify({ username: PARITY_USER, password: PW_OLD }));
+    return ok.status === 200 ? { ok: true, why: 'old password still works — 401 wrote nothing', seen: { unchanged: true } }
+      : { ok: false, why: `rejected change still altered state: login ${ok.status}`, seen: null };
+  },
+  teardown: async () => { resetParityUser(); },
+});
+} // auth writers (gated on the local DB copy)
+
 
 // Collection WRITE group (iter 22 port: GET cardlist, PUT/DELETE :id, POST
 // bulk; RUST_ROUTES=collection_writes). Read/gate/validation cases are plain;
@@ -314,7 +532,14 @@ cases.push({ name: 'sets_bad_token', path: '/api/sets', headers: { Authorization
 // are tagged with a unique marker in `notes`; teardown deletes ONLY rows
 // whose notes match, never pre-existing user data.
 let ipSeq = 1;
-function xff() { const n = ipSeq++; return `10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}`; }
+// RFC 2544 benchmark space 198.18.0.0/15: NOT private, so proxy-addr / the
+// Rust Trust rules treat it as the real client (unlike 10.x — under
+// TRUST_PROXY=loopback,uniquelocal a trusted XFF collapses to the socket
+// bucket, which is production-correct but made every harness request share
+// one authLimiter window and the auth-writer password cases 429 once Rust
+// restarted mid-iteration). /15 gives 65k unique keys; key_for() uses the
+// full v4 string, so every request gets its own limiter bucket.
+function xff() { const n = ipSeq++; return `198.18.${(n >> 8) & 255}.${n & 255}`; }
 
 const CW_CARD = 'mtg-dda6f965-cbdf-4dbc-b0b1-00c27e32f5f2'; // parity fixture card (in card_cache + owned)
 async function apiReq(base, method, path, headers, body) {
@@ -381,18 +606,22 @@ async function fetchSide(base, c) {
     redirect: 'manual',
   });
   const resBody = res.status === 304 ? '' : await res.text();
+  const parsed = resBody && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(resBody) : undefined;
   // Cross-side write verification BEFORE teardown (the probe must still exist).
+  // `parsed` lets auth-writer readBacks assert the SHAPE of freshly issued
+  // random values (tokens, api keys) — readBacks that don't need it (cw_*)
+  // ignore the extra argument.
   let readback;
   if (c.readBack) {
     const other = base === RUST ? NODE : RUST;
-    try { readback = await c.readBack(other, ctx); }
+    try { readback = await c.readBack(other, ctx, { json: parsed, status: res.status }); }
     catch (e) { readback = { ok: false, why: `readBack threw ${e}`, seen: null }; }
   }
   if (c.teardown) { try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
   return {
     status: res.status,
     body: resBody,
-    json: resBody && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(resBody) : undefined,
+    json: parsed,
     total: res.headers.get('x-total-count'),
     source: res.headers.get('x-source'),
     etag: res.headers.get('etag'),
@@ -431,6 +660,21 @@ function deepDiff(a, b, path, diffs) {
   if (!(a === b || (Number.isNaN(a) && Number.isNaN(b)))) diffs.push(`${path}: ${fmt(a)} vs ${fmt(b)}`);
 }
 
+/// Remove `$.a.b`-style paths from a parsed body before comparison (the
+/// auth-writer cases strip values that are random by design — session
+/// tokens, issued keys — whose SHAPE and PERSISTENCE the readBack asserts).
+function stripPaths(obj, paths) {
+  if (!paths || !obj || typeof obj !== 'object') return obj;
+  const clone = structuredClone(obj);
+  for (const p of paths) {
+    const parts = p.replace(/^\$\.?/, '').split('.');
+    let cur = clone;
+    for (let i = 0; i < parts.length - 1 && cur; i++) cur = cur[parts[i]];
+    if (cur && typeof cur === 'object') delete cur[parts[parts.length - 1]];
+  }
+  return clone;
+}
+
 function compareCase(c, r, n) {
   const diffs = [];
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
@@ -439,7 +683,7 @@ function compareCase(c, r, n) {
   if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
     if (r.json === undefined || n.json === undefined) diffs.push('one side non-JSON body');
-    else deepDiff(r.json, n.json, '$', diffs);
+    else deepDiff(stripPaths(r.json, c.strip), stripPaths(n.json, c.strip), '$', diffs);
   } else if (r.body !== n.body) {
     diffs.push(`body ${fmt(r.body)} vs ${fmt(n.body)}`);
   }
@@ -524,6 +768,88 @@ async function etagParity(c) {
   }
   return diffs;
 }
+
+  // --- add-group cases (iter 24: POST /api/collection, POST
+  // /api/collection/bulk-add; RUST_ROUTES=collection_adds). Adds CREATE
+  // rows, so the request response carries the ids: readBack stashes them
+  // for teardown AND reads them back through the OPPOSITE server (owner
+  // ruling iter 21 — a write is only verified when the other server sees
+  // it), so a Rust write that Node's reads can't confirm fails the case.
+  // ids/id/entries are autoincrement-random and stripped from the
+  // cross-side diff; the persisted-view JSON carries the real values. ---
+  const addCtx = async () => ({ ctx: {} });
+  const collectAddIds = (json) => [
+    ...(Array.isArray(json?.ids) ? json.ids : []),
+    ...(Array.isArray(json?.entries) ? json.entries.flatMap((e) => e?.ids || []) : []),
+  ];
+  function addReadBack(why, pred) {
+    return async (other, ctx, resp) => {
+      const ids = collectAddIds(resp?.json);
+      if (ctx) ctx.ids = ids;
+      if (!ids.length) return { ok: false, why: `${why}: response carried no ids` };
+      const rows = await rowsByIdsVia(other, ids);
+      if (rows.length !== ids.length) {
+        return { ok: false, why: `${why}: ${ids.length} ids -> ${rows.length} rows via ${other}` };
+      }
+      return { ok: pred(rows, resp), why: `${why} -> ${JSON.stringify(rows)}`, seen: persistView(rows) };
+    };
+  }
+
+  cases.push(
+    { name: 'ca_add_401', path: '/api/collection', headers: {}, method: 'POST', body: JSON.stringify({ card_id: CW_CARD }) },
+    { name: 'ca_add_missing_400', path: '/api/collection', headers: CW_JSON, method: 'POST', body: '{}' },
+    { name: 'ca_add_null_card_400', path: '/api/collection', headers: CW_JSON, method: 'POST', body: '{"card_id":null}' },
+    { name: 'ca_add_bad_printing_400', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, printing: 'Foil' }) },
+    { name: 'ca_add_bool_printing_400', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, printing: true }) },
+    { name: 'ca_add_success_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 2, condition: 'Lightly Played', printing: 'Normal',
+        language: 'English', purchase_price: '2.5', is_trade: 1 }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('add rows', (rows) =>
+        rows.length === 2 && rows.every((r) => r.condition === 'Lightly Played' && r.quantity === 1
+          && r.is_trade === 1 && r.purchase_price === 2.5)) },
+    { name: 'ca_add_stack_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 3, stackable: true }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('stacked row', (rows) =>
+        rows.length === 1 && rows[0].quantity === 3) },
+    { name: 'ca_add_zero_qty_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 0 }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('floored row', (rows) =>
+        rows.length === 1 && rows[0].quantity === 1) },
+    // Unknown card: Node fetches Scryfall and 404s on the miss; Rust must
+    // forward (both sides end on the identical Node-shaped 404).
+    { name: 'ca_add_unknown_404', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: 'mtg-00000000-0000-4000-8000-000000000000' }) },
+    // condition is not validated up front (only printing is): the collection
+    // CHECK rejects it inside the add, surfacing as the generic 500 shape.
+    { name: 'ca_add_bad_condition_500', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, condition: 'Played' }) },
+
+    { name: 'ca_bulk_add_missing_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST', body: '{}' },
+    { name: 'ca_bulk_add_empty_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: '{"card_ids":[]}' },
+    { name: 'ca_bulk_add_badids_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: '{"card_ids":"x"}' },
+    { name: 'ca_bulk_add_over_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: Array.from({ length: 251 }, () => CW_CARD) }) },
+    { name: 'ca_bulk_add_success_200', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [CW_CARD, CW_CARD], condition: 'Damaged', quantity: '2' }),
+      strip: ['$.entries'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('bulk rows', (rows) =>
+        rows.length === 4 && rows.every((r) => r.condition === 'Damaged' && r.quantity === 1)) },
+    { name: 'ca_bulk_add_mixed_200', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [CW_CARD, {}] }),
+      strip: ['$.entries'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('bulk partial', (rows, resp) =>
+        rows.length === 1 && resp.json.message === 'Added 1 of 2 cards; 1 failed.'
+        && resp.json.failed[0].error === 'card_id is required' && resp.json.failed[0].index === 1) },
+    { name: 'ca_bulk_add_all_fail_500', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [{}, {}] }) },
+  );
 
 // --- run ---------------------------------------------------------------------
 
