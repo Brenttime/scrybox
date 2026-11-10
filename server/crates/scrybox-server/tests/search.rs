@@ -12,6 +12,7 @@ use std::{
 };
 
 use axum::{
+    extract::Query,
     body::Body,
     extract::Request,
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -125,6 +126,7 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db_path),
+        sidecar_url: None,
     };
     app(AppState::new(cfg))
 }
@@ -426,12 +428,24 @@ fn router_for_idx_owned(
     idx: NameIndex,
     owned: OwnedCache,
 ) -> Router {
+    router_for_idx_owned_sidecar(db_path, routes, upstream, idx, owned, None)
+}
+
+fn router_for_idx_owned_sidecar(
+    db_path: PathBuf,
+    routes: &[&str],
+    upstream: &str,
+    idx: NameIndex,
+    owned: OwnedCache,
+    sidecar_url: Option<String>,
+) -> Router {
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         node_upstream: upstream.to_string(),
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db_path),
+        sidecar_url,
     };
     let mut st = AppState::new(cfg);
     st.name_index = Arc::new(idx);
@@ -618,4 +632,254 @@ fn owned_snapshot_attach_mirrors_sql_trim_lower() {
     // A foreign card_id (not the row's own id) must bounce to the SQL path.
     let mut odd = vec![json!({"id": "a", "card_id": "zz", "name": "Sol Ring"})];
     assert!(!attach_owned_from_snapshot(&mut odd, &map));
+}
+
+// --- sidecar walk (iter 7) --------------------------------------------------
+//
+// The live leg port: zero-row field-filter searches page the scryfall-local
+// sidecar exactly like Node's runSearch (broad query, first-word fallback,
+// 175-window math, normalizeCard shaping, X-Source: scryfall / cache with
+// the broad query's total). A 500 on the sidecar must proxy to Node verbatim.
+
+use std::sync::Mutex;
+
+/// Scryfall-shaped raw card (what the sidecar serves: no `prices`, no `lang`,
+/// no `supertype` — the normalizeCard null-paths are the point).
+fn raw_card(id: &str, name: &str, collector: &str, n: i64) -> Value {
+    json!({
+        "object": "card", "id": id, "oracle_id": format!("or-{id}"), "layout": "normal",
+        "name": name, "manaid": null, "cmc": n, "colors": ["G"], "color_identity": ["G"],
+        "keywords": ["Reach"], "type_line": "Legendary Creature — Spirit",
+        "oracle_text": "Reach\nModified creatures you control have trample.",
+        "power": "3", "toughness": "3", "mana_cost": "{2}{G}", "collector_number": collector,
+        "released_at": "2022-02-18", "rarity": "mythic", "set": "neo", "set_name": "Kamigawa: Neon Dynasty",
+        "image_uris": {"small": "https://x/small.jpg", "normal": "https://x/normal.jpg", "large": "https://x/large.jpg"},
+        "scryfall_uri": "https://scryfall/card",
+    })
+}
+
+/// Fake scryfall-local. Pages at 75 like the real sidecar (the walk's
+/// 175-window math must ride whatever the sidecar does). Every received
+/// (q, page) pair is recorded for the pagination assertions.
+async fn spawn_fake_sidecar() -> (String, Arc<Mutex<Vec<(String, i64)>>>) {
+    let seen: Arc<Mutex<Vec<(String, i64)>>> = Arc::new(Mutex::new(vec![]));
+    let seen2 = seen.clone();
+    let search = axum::routing::get(move |Query(params): Query<std::collections::HashMap<String, String>>| {
+        let seen = seen2.clone();
+        async move {
+            let q = params.get("q").cloned().unwrap_or_default();
+            let page: i64 = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+            seen.lock().unwrap().push((q.clone(), page));
+            let (total, size): (u64, u64) = if q.starts_with("Kodama of the West Tree") {
+                (7, 7)
+            } else if q.starts_with("Kodama unique") {
+                (41, 41) // the real sidecar's total for the first-word fallback
+            } else if q.starts_with("Elvish Mystic") {
+                (200, 75)
+            } else if q.contains("boom") {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+            } else if q.contains("nomatch") {
+                // Scryfall "no cards found" family — tryQuery's 404/422 catch.
+                return (StatusCode::NOT_FOUND, "").into_response();
+            } else {
+                (0, 0)
+            };
+            let start = (page as u64 - 1) * size;
+            let n = total.saturating_sub(start).min(size);
+            let data: Vec<Value> = (0..n)
+                .map(|i| {
+                    let idx = start + i;
+                    raw_card(
+                        &format!("sid-{q}-p{page}-{i}"),
+                        q.split_whitespace().next().unwrap_or("Card"),
+                        &format!("{}", idx + 1),
+                        (idx % 8) as i64,
+                    )
+                })
+                .collect();
+            let has_more = start + n < total;
+            axum::Json(json!({
+                "object": "list", "type": "card", "context": "search",
+                "data": data, "cards": data, "total_cards": total, "total": total,
+                "page": page, "page_size": size, "per_page": size, "offset": start,
+                "has_more": has_more,
+            }))
+            .into_response()
+        }
+    });
+    let r = Router::new().route("/cards/search", search);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, r).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+fn sidecar_router(path: PathBuf, upstream: &str, sidecar: &str) -> Router {
+    router_for_idx_owned_sidecar(
+        path,
+        &["search", "search_sidecar"],
+        upstream,
+        NameIndex::new(),
+        OwnedCache::new(),
+        Some(sidecar.to_string()),
+    )
+}
+
+/// Zero local rows → native walk: X-Source: scryfall, X-Total-Count from the
+/// broad query, and Node's normalizeCard shape (key order included) with
+/// owned_qty appended last.
+#[tokio::test]
+async fn sidecar_walk_serves_zero_row_name_with_node_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path, &upstream, &sidecar);
+
+    let (s, h, b) = get(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-source").unwrap(), "scryfall");
+    assert_eq!(h.get("x-total-count").unwrap(), "7");
+    assert_eq!(h.get("access-control-expose-headers").unwrap(), "X-Total-Count, X-Source");
+    let cards: Vec<Value> = serde_json::from_slice(&b).unwrap();
+    assert_eq!(cards.len(), 7);
+    assert_eq!(
+        cards[0].as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "id", "oracle_id", "scryfall_search_eligible", "name", "supertype", "subtypes",
+            "types", "rarity", "set_id", "set_name", "number", "image_url", "price_trend",
+            "price_normal", "price_holofoil", "price_etched", "cmc", "color_identity",
+            "language", "printed_name", "tcgplayer_url", "cardmarket_url",
+            "tcgplayer_product_id", "price_source", "price_currency", "released_at",
+            "oracle_text", "oracle_faces", "owned_qty",
+        ],
+        "normalized key order must match the Node object literal (finishes omitted)"
+    );
+    assert_eq!(cards[0]["types"], json!(["Green"]));
+    assert_eq!(cards[0]["subtypes"], json!(["Legendary", "Creature", "Spirit"]));
+    assert_eq!(cards[0]["rarity"], "Mythic");
+    assert_eq!(cards[0]["price_normal"], Value::Null, "no prices object → all-null money");
+    assert_eq!(cards[0]["price_source"], Value::Null);
+    assert_eq!(cards[0]["price_currency"], "USD");
+    assert_eq!(cards[0]["language"], "English");
+    assert_eq!(cards[0]["scryfall_search_eligible"], 1);
+    assert_eq!(cards[0]["oracle_faces"], Value::Null);
+    assert_eq!(cards[0]["image_url"], "https://x/normal.jpg");
+    assert_eq!(cards[0]["released_at"], "2022-02-18");
+    assert_eq!(cards[0]["owned_qty"], 0);
+    // Only the broad query ran (it produced cards → no fallback).
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got, vec![("Kodama of the West Tree unique:prints -is:digital".to_string(), 1)]);
+}
+
+/// offset 200 past a 7-result broad query: empty window → the first-word
+/// fallback (also empty there) → Node's `[] + X-Source: cache` WITH the
+/// broad query's X-Total-Count, and no upsert side effects.
+#[tokio::test]
+async fn sidecar_walk_empty_returns_cache_source_with_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path, &upstream, &sidecar);
+
+    let (s, h, b) = get(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=3&limit=100", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-source").unwrap(), "cache", "empty merge → Node labels it cache");
+    assert_eq!(h.get("x-total-count").unwrap(), "7", "broad query's total survives");
+    assert_eq!(b, b"[]");
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![
+            ("Kodama of the West Tree unique:prints -is:digital".to_string(), 2),
+            ("Kodama unique:prints -is:digital".to_string(), 2),
+        ],
+        "offset 200 → window page 2 (skip 25) of the 175 math; fallback runs only after empty broad"
+    );
+}
+
+/// Multi-page window math: offset 200, limit 100 → fetch page 2 (skip 25),
+/// then page 3 while short of the limit; stable sort by printed number.
+#[tokio::test]
+async fn sidecar_walk_multi_page_window_math() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path, &upstream, &sidecar);
+
+    let (s, h, b) = get(&r, "/api/search?scope=database&name=Elvish%20Mystic&page=3&limit=100", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-source").unwrap(), "scryfall");
+    assert_eq!(h.get("x-total-count").unwrap(), "200");
+    let cards: Vec<Value> = serde_json::from_slice(&b).unwrap();
+    assert_eq!(cards.len(), 100);
+    let nums: Vec<i64> = cards.iter().map(|c| c["number"].as_str().unwrap().parse().unwrap()).collect();
+    let mut sorted = nums.clone();
+    sorted.sort();
+    assert_eq!(nums, sorted, "stable parseInt(number)||0 ascending sort");
+    assert_eq!(nums.first().copied(), Some(101), "window page 2 (sidecar pages at 75) skip 25 → item 101");
+    let pages: Vec<i64> = seen.lock().unwrap().iter().map(|(_, p)| *p).collect();
+    assert_eq!(pages, vec![2, 3], "175-window pagination, continues while short of limit");
+}
+
+/// A sidecar 500 must not 500 or fabricate: the request proxies and Node
+/// answers verbatim (its own retries/503/upsert semantics preserved).
+#[tokio::test]
+async fn sidecar_failure_proxies_to_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, _seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path, &upstream, &sidecar);
+
+    let (s, h, _b) = get(&r, "/api/search?scope=database&name=boom%20card&page=1&limit=20", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap(), "1", "must have gone through Node");
+}
+
+/// With search_sidecar off the kill switch, zero-row requests still proxy.
+#[tokio::test]
+async fn sidecar_kill_switch_proxies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = router_for_idx_owned_sidecar(
+        path,
+        &["search"], // no search_sidecar
+        &upstream,
+        NameIndex::new(),
+        OwnedCache::new(),
+        Some(sidecar.clone()),
+    );
+    let (s, h, _b) = get(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap(), "1");
+    assert!(seen.lock().unwrap().is_empty(), "sidecar must not be touched");
+}
+
+/// Walked entries are cached per (params, rev) like cache-path entries:
+/// repeat hits must not re-page the sidecar, and a revision bump must.
+#[tokio::test]
+async fn sidecar_walk_entry_caches_and_invalidates_with_rev() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path.clone(), &upstream, &sidecar);
+    let url = "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20";
+
+    let (_, _, b1) = get(&r, url, &auth()).await;
+    let (_, _, b2) = get(&r, url, &auth()).await;
+    assert_eq!(b1, b2);
+    assert_eq!(seen.lock().unwrap().len(), 1, "second request served from cache");
+
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1;").unwrap();
+    drop(conn);
+    let (_, _, b3) = get(&r, url, &auth()).await;
+    assert_eq!(b3, b1, "same body after rebuild");
+    assert_eq!(seen.lock().unwrap().len(), 2, "rev bump forced a re-walk");
 }

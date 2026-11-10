@@ -28,6 +28,7 @@ pub mod collection;
 pub mod db;
 pub mod name_index;
 pub mod search;
+pub mod sidecar;
 pub mod stats;
 mod stats_sql;
 
@@ -45,6 +46,11 @@ pub struct Config {
     /// The SQLite copy shared with Node (`SCRYBOX_DB_PATH`). Ported routes
     /// read through it; without it they stay disabled and everything proxies.
     pub db_path: Option<PathBuf>,
+    /// scryfall-local sidecar base URL (`SCRYBOX_SIDECAR_URL`, e.g.
+    /// `http://172.29.0.2:8420`). The `search_sidecar` leg pages it directly
+    /// (same base the Node container uses via LOCAL_SCRYFALL_URL); unset
+    /// disables that leg — those requests keep proxying to Node.
+    pub sidecar_url: Option<String>,
 }
 
 impl Config {
@@ -67,7 +73,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from) })
+        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from), sidecar_url: std::env::var("SCRYBOX_SIDECAR_URL").ok().map(|s| s.trim_end_matches('/').to_string()).filter(|s| !s.is_empty()) })
     }
 }
 
@@ -76,7 +82,7 @@ type HttpClient = Client<HttpConnector, Body>;
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Config,
-    client: HttpClient,
+    pub(crate) client: HttpClient,
     /// Read pool over the shared DB copy; `None` when SCRYBOX_DB_PATH unset.
     pub db: Option<Arc<db::DbPool>>,
     pub collection_cache: Arc<collection::CollectionCache>,

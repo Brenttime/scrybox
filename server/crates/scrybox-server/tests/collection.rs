@@ -93,6 +93,7 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db_path),
+        sidecar_url: None,
     };
     app(AppState::new(cfg))
 }
@@ -599,6 +600,7 @@ async fn concurrent_misses_coalesce_into_one_computation() {
         static_dir: None,
         rust_routes: ["collection".to_string()].into_iter().collect(),
         db_path: Some(path),
+        sidecar_url: None,
     };
     let state = AppState::new(cfg);
     let cache = std::sync::Arc::clone(&state.collection_cache);

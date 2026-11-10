@@ -53,6 +53,14 @@ const EXTRA_SEARCH = [
   '/api/search',
   '/api/search?scope=collection&name=Sol%20Ring',
   '/api/search?name=__definitely_no_such_card__',
+  // Sidecar-walk leg (iter 7): zero-row offsets force the live walk. These
+  // names are in the shared card_cache at shallow pages but not at these
+  // offsets, so Node answers them by paging scryfall-local — the exact leg
+  // Rust now serves natively (X-Source scryfall/cache, X-Total-Count).
+  '/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=3&limit=100',
+  '/api/search?scope=database&name=Elvish%20Mystic&page=2&limit=60',
+  '/api/search?scope=database&name=Lightning%20Bolt&page=4&limit=60',
+  '/api/search?scope=database&name=Shalai%2C%20Voice%20of%20Plenty&page=3&limit=100',
 ];
 
 // Stats coverage for the ported /api/stats (iter 3): the bench scenario URL

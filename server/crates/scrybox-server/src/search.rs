@@ -41,7 +41,7 @@ use crate::{
     collection::{body_etag, etag_matches, gzip_bytes, parse_array_col, sqlite_value, truthy, wants_encoding},
     db::DbPool,
     name_index::{self, NameIndex, OwnedCache, Txn},
-    AppState,
+    sidecar, AppState,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ fn langs() -> &'static Vec<(String, String, String)> {
 
 /// `languages.toName(input)` — display name ('English'). `None`/empty is the
 /// JS falsy path → DEFAULT (LANGUAGES[0], English).
-fn to_name(input: Option<&str>) -> String {
+pub(crate) fn to_name(input: Option<&str>) -> String {
     let default = || langs()[0].1.clone();
     let Some(input) = input.filter(|s| !s.is_empty()) else { return default() };
     let lower = input.trim().to_lowercase();
@@ -98,6 +98,10 @@ pub struct SearchQuery {
     lang_name: String,
     page: i64,
     limit: i64,
+    /// Zero-row local results may be answered by the sidecar leg instead of
+    /// proxying: the name-only English field-filter branch (no number/set —
+    /// the specific-query and set-browse legs stay on Node).
+    walkable: bool,
 }
 
 impl SearchQuery {
@@ -110,7 +114,7 @@ impl SearchQuery {
 }
 
 /// JS `parseInt(x, 10)` (same port as collection.rs).
-fn js_parse_int(s: &str) -> Option<i64> {
+pub(crate) fn js_parse_int(s: &str) -> Option<i64> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r') {
@@ -198,6 +202,13 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
         lang_name: to_name(first("lang").as_deref()),
         page,
         limit,
+        // The walked leg exists only for the name-only English branch; an
+        // empty name has no query to walk (Node answers [] from the cache
+        // path with no sidecar call — the build path's proxy covers it).
+        walkable: !first("name").unwrap_or_default().trim().is_empty()
+            && clean_number(first("number").as_deref().unwrap_or("")).is_empty()
+            && first("set").unwrap_or_default().is_empty()
+            && to_name(first("lang").as_deref()) == "English",
     })
 }
 
@@ -448,6 +459,10 @@ pub struct SearchEntry {
     raw: Bytes,
     gz: Bytes,
     etag: String,
+    /// Walked entries carry the broad query's total (X-Total-Count) and the
+    /// Node source label; cache-path entries are (None, "cache").
+    total: Option<u64>,
+    source: &'static str,
 }
 
 /// Serialized native search responses keyed by (params, revision). Bounded
@@ -535,35 +550,99 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                 let Some((body, _total)) = build_body(&build_pool, &build_idx, &build_owned, &p2)? else {
                     return Ok::<_, String>(None);
                 };
+                let body = bytes::Bytes::from(body);
                 let etag = body_etag(&body);
                 let gz = gzip_bytes(&body);
-                Ok(Some((body, gz, etag)))
+                Ok(Some((body, gz, etag, None, "cache")))
             })
             .await
             .unwrap_or_else(|e| Err(format!("build task panicked: {e}")));
-            match built {
-                // Node would not answer this from the cache — let it.
-                Ok(None) => return crate::proxy(State(st.clone()), req).await,
-                Ok(Some((body, gz, etag))) => st.search_cache.insert(
-                    key,
-                    SearchEntry { rev: rev_i, raw: Bytes::from(body), gz, etag },
-                ),
+            let (body, gz, etag, total, source) = match built {
+                // The local cache had nothing. Node's next leg is the
+                // sidecar walk; for the branch we port, run it ourselves —
+                // anything else (or any sidecar failure) proxies and Node
+                // answers verbatim, upserts/503s and all.
+                Ok(None) => {
+                    let Some(base) = st
+                        .cfg
+                        .sidecar_url
+                        .as_deref()
+                        .filter(|_| p.walkable && st.owns("search_sidecar"))
+                    else {
+                        return crate::proxy(State(st.clone()), req).await;
+                    };
+                    let offset = (p.page - 1).saturating_mul(p.limit);
+                    let outcome = match sidecar::walk_name(&st, base, &p.name, &p.lang_name, offset, p.limit).await {
+                        Ok(o) => o,
+                        Err(_) => {
+                            tracing::debug!(name = %p.name, "sidecar walk failed → proxy");
+                            return crate::proxy(State(st.clone()), req).await;
+                        }
+                    };
+                    let walk_pool = Arc::clone(&pool);
+                    let walk_owned = Arc::clone(&st.owned_index);
+                    let p3 = p.clone();
+                    let walked = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                        let mut cards = outcome.cards;
+                        let conn = walk_pool.get().map_err(|e| e.to_string())?;
+                        let mut attached = false;
+                        if rev_i >= 0 {
+                            if let Some(map) = walk_owned.owned_map(&walk_pool, p3.user_id, rev_i) {
+                                attached = name_index::attach_owned_from_snapshot(&mut cards, &map);
+                            }
+                        }
+                        if !attached {
+                            attach_owned_qty(&conn, &mut cards[..], p3.user_id)?;
+                        }
+                        let body = Bytes::from(serde_json::to_vec(&cards).map_err(|e| e.to_string())?);
+                        Ok::<_, String>((body, outcome.total, outcome.source))
+                    })
+                    .await;
+                    let walked = match walked {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(error = %e, "sidecar walk task panicked");
+                            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+                        }
+                    };
+                    let (body, total, source) = match walked {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(error = %e, "sidecar walk build failed");
+                            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+                        }
+                    };
+                    let etag = body_etag(&body);
+                    let gz = gzip_bytes(&body);
+                    (body, gz, etag, total, source)
+                }
+                Ok(Some(v)) => v,
                 Err(err) => {
                     tracing::error!(error = %err, "search build failed");
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
                 }
-            }
+            };
+            st.search_cache.insert(
+                key,
+                SearchEntry { rev: rev_i, raw: body, gz, etag, total, source },
+            )
         }
     };
 
     // Express's default body ETag on res.json(cards): a matching conditional
     // GET replays as an empty 304, with the headers set before send().
     let tag = entry.etag.clone();
+    let src = HeaderValue::from_str(entry.source).unwrap();
+    let total_hdr = entry.total.map(|t| (header::HeaderName::from_static("x-total-count"), HeaderValue::from_str(&t.to_string()).unwrap()));
     if etag_matches(inm.as_deref(), &tag) {
-        return Response::builder()
+        let mut b = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, HeaderValue::from_str(&tag).unwrap())
-            .header("x-source", HeaderValue::from_static("cache"))
+            .header("x-source", src);
+        if let Some((k, v)) = total_hdr {
+            b = b.header(k, v);
+        }
+        return b
             .header("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"))
             .body(Body::empty())
             .unwrap();
@@ -582,7 +661,11 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     }
     b = b
         .header(header::ETAG, HeaderValue::from_str(&tag).unwrap())
-        .header("x-source", HeaderValue::from_static("cache"))
-        .header("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"));
-    b.body(Body::from(body)).unwrap()
+        .header("x-source", src);
+    if let Some((k, v)) = total_hdr {
+        b = b.header(k, v);
+    }
+    b.header("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"))
+        .body(Body::from(body))
+        .unwrap()
 }
