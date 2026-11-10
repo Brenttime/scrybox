@@ -105,8 +105,13 @@ test('footerCodes reads a set code with up to two noise chars', () => {
 test('footerCodes returns every in-window reading, never one picked by rank/offset/token', () => {
   const sx = loadIndex({ names: [], canon: {}, excluded: [], sets: ['ren', 'ima', 'afc', 'tpr', 'znr', 'trk'], printings: [], byTitle: {}, uniqueAlias: {} });
   // 'ZNR·EN' compacts to 'znren', which also reads 'ren' at offset 2.
-  assert.deepEqual(footerCodes(sx, ['ZNR·EN']).sort(), ['ren', 'znr']);
-  assert.deepEqual(footerCodes(sx, ['TPR • EN']).sort(), ['ren', 'tpr']);
+  // A reading never spans a hard separator (OCR emits '·', '-', '.', '★', '+'
+  // between set and language but does not invent one); whitespace it may.
+  for (const sep of ['·', ' • ', '-', '.', '★', '+', '、', '*', '|', '/'])
+    assert.deepEqual(footerCodes(sx, [`ZNR${sep}EN`]), ['znr'], `ZNR${sep}EN`);
+  assert.deepEqual(footerCodes(sx, ['TPR • EN']), ['tpr']);
+  assert.deepEqual(footerCodes(sx, ['ZNR EN']).sort(), ['ren', 'znr'], 'plain space stays crossable');
+  assert.deepEqual(footerCodes(sx, ['.ZNR·EN']), ['znr'], 'a leading separator only shifts the window');
   // Review R2-B1: spacing moves; 'im afc en' and 'ima fc en' are one string.
   assert.deepEqual(footerCodes(sx, ['im afc en']).sort(), ['afc', 'ima']);
   assert.deepEqual(footerCodes(sx, ['ima fc en']).sort(), ['afc', 'ima']);

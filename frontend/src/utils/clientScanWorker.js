@@ -244,7 +244,7 @@ self.onmessage = async (e) => {
         { data: new Uint8ClampedArray(frame), width: w, height: h },
         null, { requireStill, quad, frameId, guess }));
       // The index this answer came from, per read (telemetry, review R1-S3).
-      if (out) out.index = bundle.info.index;
+      if (out) { out.index = bundle.info.index; out.rec = bundle.info.rec; }
       // A first-look guess holds the swap until it is verified (R2-S3).
       bundles.noteRead(bundle, out);
       self.postMessage({ id, out, frame }, [frame]);

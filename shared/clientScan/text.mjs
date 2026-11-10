@@ -291,19 +291,28 @@ export function footerNumbers(raws) {
 // the compacted line starting within its first 3 chars (a printed code, plus
 // up to two noise chars). ALL readings are returned, never one picked by
 // rank, offset or token shape: OCR moves spaces ('im afc en' / 'ima fc en'
-// are the same compact string) and adds noise ('ZNR·EN' -> 'znren' also
-// reads 'ren'). resolveFooterGroup then takes a set only when exactly one
+// are the same compact string), so only whitespace may be crossed; a hard
+// separator ('ZNR·EN', 'MH2-EN', 'FRA.EN') bounds a reading. resolveFooterGroup then takes a set only when exactly one
 // reading matches the title's printings at the read number; two readings
 // that both match are ambiguity, never an exact proof (reviews R1-B1, R2-B1).
 export function footerCodes(ix, raws) {
   const codes = [];
   for (const raw of raws) {
-    const compact = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
-    for (let pos = 0; pos < Math.min(3, compact.length); pos++) {
-      for (const len of ix.setLengths) {
-        const cand = compact.slice(pos, pos + len);
-        if (cand.length === len && ix.setLookup.has(cand) && !codes.includes(cand)) codes.push(cand);
+    // A reading never spans a hard separator: OCR reads the printed
+    // set/language mark as '·', '-', '.', '★', '+', '、' ... but does not
+    // invent one, while whitespace it adds and drops freely. Each segment
+    // between hard separators is compacted on its own; offsets stay global.
+    let offset = 0;
+    for (const seg of raw.toLowerCase().split(/[^a-z0-9\s]+/)) {
+      if (offset >= 3) break;
+      const compact = seg.replace(/[^a-z0-9]/g, '');
+      for (let pos = 0; pos < compact.length && offset + pos < 3; pos++) {
+        for (const len of ix.setLengths) {
+          const cand = compact.slice(pos, pos + len);
+          if (cand.length === len && ix.setLookup.has(cand) && !codes.includes(cand)) codes.push(cand);
+        }
       }
+      offset += compact.length;
     }
   }
   return codes.sort((a, b) => ix.setRank.get(a) - ix.setRank.get(b));
