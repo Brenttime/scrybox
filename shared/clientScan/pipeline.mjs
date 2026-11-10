@@ -392,7 +392,11 @@ export function createReader(env) {
   let stillRun = 0, lastAt = 0;   // consecutive low-drift observations
   let stillSince = 0;             // real time the current still window began
   let readSince = false;          // OCR ran since the last observation
-  let lastDeferred = false;       // previous read deferred its deep footer stages
+  // Title whose first look deferred its deep footer stages on the previous
+  // read: only THAT title's next read runs the full cascade. A new card is
+  // never forced deep by the last card's deferral (2026-11-10 Duras after
+  // L'Rell: +2.5 s, Astra).
+  let lastDeferred = null;
   let lastFrameId = null;         // decoded-frame id of the last counted observation
   let fastRun = true;             // every observation of this window qualifies for fast settle
   // Identity is carried only for the card being CONTINUOUSLY tracked. Artwork
@@ -453,7 +457,7 @@ export function createReader(env) {
     const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; return base; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = null; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; return base; }
     const xs = quad.map(p => p.x), ys = quad.map(p => p.y);
     const box = [Math.round(Math.min(...xs)), Math.round(Math.min(...ys)),
       Math.round(Math.max(...xs) - Math.min(...xs)), Math.round(Math.max(...ys) - Math.min(...ys))];
@@ -586,8 +590,8 @@ export function createReader(env) {
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
     const verifying = !!guessed && !nearEdge;
     if (verifying) timings.guess_verify = 1;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
-    lastDeferred = !!result.deferred;
+    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying, lastDeferred);
+    lastDeferred = result.deferred ? result.title : null;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
     readSince = timings.rec_calls > 0;
@@ -620,7 +624,7 @@ export function createReader(env) {
     return base;
   }
 
-  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto, verify = false) {
+  async function readCard(rgba, w, h, m, timings, prior = null, auto = false, nearEdge = false, quad = null, autoMode = auto, verify = false, deferredTitle = null) {
     const tA = now();
     // Near the frame edge, a strip that reaches off-frame would be read from
     // clamped, repeated edge pixels. The stage is re-projected with the
@@ -971,7 +975,7 @@ export function createReader(env) {
         const gp = guessed(cands, 'title', pooled ? [...pooled.flat(), ...raws] : raws, si, true);
         if (gp) return gp;
       }
-      if (auto && !pooled && si === 0) {
+      if (auto && name !== deferredTitle && !pooled && si === 0) {
         // env.retroFirst (default on at >= 4 ORT threads, see the worker): a
         // title with an own-numbered (mb2) printing reads its copyright line on
         // the first look. Not List-only titles: 2026-10-09 hand-held runs, it
@@ -1008,13 +1012,13 @@ export function createReader(env) {
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
     const quad = await detect(small, smallChannels, w, h);
-    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }
+    if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = null; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }
     return quad;
   }
 
   return { read, probe, stats: env.stats, // A new presentation / run: nothing about the last card's footer
     // deferral may make this card skip its cheap first look (review R2-#8).
-    reset() { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, // A pending verify survives (it IS a real read); a verified guess is a
+    reset() { lastQuad = null; stillRun = 0; lastDeferred = null; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }, // A pending verify survives (it IS a real read); a verified guess is a
     // cached answer and goes, like tracked.
     resetCache() { tracked = null; if (guessed?.verified) guessed = null; } };
 }

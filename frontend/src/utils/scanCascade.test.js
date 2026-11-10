@@ -386,6 +386,18 @@ test('second look: a non-sheet title keeps the v1 stage order (tall before retro
   assert.equal(res.ok, false); assert.ok(calls() >= 6, `calls ${calls()}`);
 });
 
+test('first look: a NEW card after a deferred one keeps the cheap path (Duras after L\'Rell)', async () => {
+  // Frame 1 damn: 1 title + 2 first batch -> deferred. Frame 2 grief (another
+  // card): 3 title + 4 first batch -> deferred again, not the full cascade.
+  const { r, calls } = reader((c) => (c === 1 ? 'damn' : c === 3 ? 'grief' : 'izzy'));
+  const r1 = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(r1.deferred, true, JSON.stringify(r1));
+  const r2 = (await r.read(sharpFrame(), small, { requireStill: true })).results[0];
+  assert.equal(r2.title, 'grief', JSON.stringify(r2));
+  assert.equal(r2.deferred, true, JSON.stringify(r2));
+  assert.equal(calls(), 4, 'second card paid only its own first look');
+});
+
 test('a title that starts a longer title never proves its unique printing alone (Mind / Mind Roots)', async () => {
   const { loadIndex, uniqueTitlePrinting } = await import('../../../shared/clientScan/text.mjs');
   const idx = loadIndex({ names: ['mind', 'mind roots', 'flicker', 'flickering hound', 'growth curve'], canon: {}, excluded: [], sets: ['akh', 'sos', 'uds', 'gtc'],
