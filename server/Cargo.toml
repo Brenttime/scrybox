@@ -25,6 +25,7 @@ base64 = "0.22"
 flate2 = "1"
 bytes = "1"
 form_urlencoded = "1"
+libc = "0.2"
 
 # Server crate must unwind, not abort (plan section 9: a panic in one request
 # must not take the whole front door down).

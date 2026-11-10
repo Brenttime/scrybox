@@ -14,7 +14,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -673,6 +673,19 @@ const REFRESH_DEBOUNCE_TICKS: u8 = 2;
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Soft cap on the recently-requested-shape map (params variety × users).
 const RECENT_MAX: usize = 256;
+
+/// Byte budget for stored bodies (raw + lazy gz). The 64-shape cap alone is
+/// not a memory bound: six ~27 MB full-collection shapes plus allocator-
+/// retained freed blocks ratcheted RSS to ~3 GB over a realistic run
+/// (iter-15). Above this budget `put` LRU-evicts (least-recently-served
+/// first) until the stored bytes fit.
+const STORE_MAX_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Freed bytes (pruned/evicted) in one `put` before the refresher tick is
+/// asked to return heap to the OS (`malloc_trim`). Small churn is left for
+/// the allocator to reuse; the refresher swaps this flag off the request
+/// path so the trim never lands on a serving thread.
+const TRIM_DIRTY_BYTES: u64 = 64 << 20; // 64 MiB
 /// Cost gate for the pre-warm fan-out (iter 15). Unbudgeted fan-out over
 /// every recent shape — cheap paged builds included — kept 2 of the 4 cores
 /// busy on every write-mix tick, starved the search_db request path
@@ -701,6 +714,16 @@ pub struct CacheEntry {
     /// build time charged ~300 ms per rebuild even on clients (and the bench)
     /// that never send Accept-Encoding.
     gz: OnceCell<Bytes>,
+    /// Monotonic LRU clock value: stamped at `put`, refreshed on every cache
+    /// hit in `get`. Eviction under `STORE_MAX_BYTES` drops the smallest.
+    seen: AtomicU64,
+}
+
+impl CacheEntry {
+    /// Heap held by this entry (raw + gz if it was ever built).
+    fn bytes(&self) -> u64 {
+        self.raw.len() as u64 + self.gz.get().map_or(0, |g| g.len() as u64)
+    }
 }
 
 /// Single-flight slot, same shape as the stats cache (stats.rs): every
@@ -732,6 +755,20 @@ pub struct CollectionCache {
     /// unbounded builds under stampede drove RSS to ~4 GB in iter 4's
     /// realistic run).
     builds: Arc<Semaphore>,
+    /// Monotonic LRU clock stamped into `CacheEntry::seen` (a clock, not a
+    /// wall clock: tests get deterministic eviction order).
+    clock: AtomicU64,
+    /// Byte budget for `Inner::entries` bodies; settable in tests.
+    max_bytes: AtomicU64,
+    /// Freed-bytes threshold that arms `trim_dirty`; settable in tests.
+    trim_dirty_bytes: AtomicU64,
+    /// True once a `put` freed at least `trim_dirty_bytes` and the heap has
+    /// not been returned yet (the refresher tick swaps it off).
+    trim_dirty: AtomicBool,
+    /// Highest revision any entry was built for. Entries from older
+    /// generations are dead weight (`get` filters by exact rev) and get
+    /// pruned on the next `put`.
+    max_rev: AtomicI64,
 }
 
 impl Default for CollectionCache {
@@ -740,6 +777,11 @@ impl Default for CollectionCache {
             inner: Mutex::new(Inner::default()),
             computes: AtomicU64::new(0),
             builds: Arc::new(Semaphore::new(2)),
+            clock: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(STORE_MAX_BYTES),
+            trim_dirty_bytes: AtomicU64::new(TRIM_DIRTY_BYTES),
+            trim_dirty: AtomicBool::new(false),
+            max_rev: AtomicI64::new(i64::MIN),
         }
     }
 }
@@ -750,24 +792,84 @@ impl CollectionCache {
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<CacheEntry>> {
         let e = self.inner.lock().unwrap();
-        e.entries.get(key).filter(|e| e.rev == rev).cloned()
+        let hit = e.entries.get(key).filter(|e| e.rev == rev).cloned();
+        if let Some(entry) = &hit {
+            // Serve = most-recently-used; the byte-budget eviction reads
+            // this clock to pick its victim.
+            entry.seen.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        }
+        hit
     }
     /// Store a freshly built entry and return it. `cost` is the measured
     /// build time (permit acquired → body complete), recorded for the
     /// pre-warm cost gate (iter 15).
+    ///
+    /// Memory hygiene (iter 16), all under the entries lock:
+    /// - bodies from superseded generations are dropped (`get` filters by
+    ///   exact rev, so they are pure RSS weight);
+    /// - total stored bytes are held under `max_bytes` by evicting the
+    ///   least-recently-served entries first;
+    /// - a big enough drop arms `trim_dirty` so the refresher tick returns
+    ///   the freed heap to the OS off the request path (glibc keeps large
+    ///   freed blocks in its arenas otherwise).
     fn put(&self, key: String, rev: i64, raw: Vec<u8>, total: Option<u64>, cost: Duration) -> Arc<CacheEntry> {
         let etag = body_etag(&raw);
-        let entry = Arc::new(CacheEntry { rev, raw: Bytes::from(raw), total, etag, gz: OnceCell::new() });
+        let seen = self.clock.fetch_add(1, Ordering::Relaxed);
+        let entry = Arc::new(CacheEntry {
+            rev,
+            raw: Bytes::from(raw),
+            total,
+            etag,
+            gz: OnceCell::new(),
+            seen: AtomicU64::new(seen),
+        });
+        self.max_rev.fetch_max(rev, Ordering::Relaxed);
+        let live_rev = self.max_rev.load(Ordering::Relaxed);
+        let mut freed: u64 = 0;
         {
             let mut e = self.inner.lock().unwrap();
             if e.entries.len() > 64 {
+                freed += e.entries.values().map(|v| v.bytes()).sum::<u64>();
                 e.entries.clear();
             }
             e.cost.insert(key.clone(), cost.as_millis() as u64);
             e.entries.insert(key, entry.clone());
+            e.entries.retain(|_, v| {
+                if v.rev != live_rev {
+                    freed += v.bytes();
+                    false
+                } else {
+                    true
+                }
+            });
+            let budget = self.max_bytes.load(Ordering::Relaxed);
+            let mut total_bytes: u64 = e.entries.values().map(|v| v.bytes()).sum();
+            while total_bytes > budget && e.entries.len() > 1 {
+                let victim = e
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, v)| v.seen.load(Ordering::Relaxed))
+                    .map(|(k, _)| k.clone());
+                match victim {
+                    Some(k) => {
+                        if let Some(v) = e.entries.remove(&k) {
+                            total_bytes -= v.bytes();
+                            freed += v.bytes();
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) {
+            self.trim_dirty.store(true, Ordering::Relaxed);
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
         entry
+    }
+    /// Swap off the "heap was freed" flag (refresher tick → malloc_trim).
+    fn take_trim(&self) -> bool {
+        self.trim_dirty.swap(false, Ordering::Relaxed)
     }
     /// The coalescing slot for a key (created on first miss).
     fn slot(&self, key: &str) -> Arc<ComputeSlot> {
@@ -849,6 +951,31 @@ impl CollectionCache {
     }
 }
 
+/// glibc holds freed multi-MB blocks in its arenas (dynamic mmap threshold
+/// climbs to 32 MB, and `free` only trims the heap top), so a run that
+/// repeatedly rebuilds the ~27 MB full-collection body ratchets RSS upward
+/// even when the cache map holds only a few live bodies (iter-15: ~3 GB
+/// against a live set well under 1 GB). Two levers, set once at boot:
+/// allocations ≥ 64 MB always go through mmap (munmapped on free — covers
+/// gz members concatenated and future bigger bodies), and the trim threshold
+/// is pinned so `malloc_trim` can return the rest.
+fn tune_allocator() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 20);
+    }
+}
+
+/// Return free heap pages to the OS. Runs on the refresher timer only
+/// (never a serving thread); armed by `put` freeing ≥ `TRIM_DIRTY_BYTES`.
+fn trim_heap() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Background pre-warm (iter 14, owner hint): poll the `collection_read_revision`
 /// counter and, after a bump settles, pre-build the current body for every
 /// recently-requested shape through the SAME single-flight slot and build
@@ -872,6 +999,7 @@ pub fn spawn_refresher(state: &AppState) {
     let Some(pool) = state.db.clone() else { return };
     let cache = Arc::clone(&state.collection_cache);
     let min_cost_ms = state.prewarm_min_cost_ms;
+    tune_allocator();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -880,6 +1008,11 @@ pub fn spawn_refresher(state: &AppState) {
         let mut built_rev: Option<i64> = None;
         loop {
             tick.tick().await;
+            // Heap hygiene: a big prune/eviction above arms the flag; the
+            // trim runs here on the timer, never on a serving thread.
+            if cache.take_trim() {
+                trim_heap();
+            }
             let active = cache.prewarm_keys(REFRESH_ACTIVE, min_cost_ms, PREWARM_GEN_BUDGET_MS);
             if active.is_empty() {
                 continue;
@@ -1402,5 +1535,111 @@ mod prewarm_gate {
         assert_eq!(keys.len(), 2, "budget must cut the third 900 ms shape: {keys:?}");
         assert_eq!(keys[0].1.offset, 200, "fan-out must be MRU-first");
         assert_eq!(keys[1].1.offset, 100);
+    }
+}
+
+#[cfg(test)]
+mod store_budget {
+    //! Iter-16 store RSS hygiene: superseded-generation bodies are dropped
+    //! on the next put, stored bytes are held under a byte budget by
+    //! least-recently-served eviction, and a big drop arms the deferred
+    //! malloc_trim for the refresher tick.
+
+    use super::*;
+
+    fn params(offset: i64) -> CollectionParams {
+        CollectionParams {
+            user_id: 1,
+            is_trade: None,
+            card_id: None,
+            paginated: true,
+            limit: 100,
+            offset,
+            alloc: false,
+            count_zero: false,
+            qs: String::new(),
+        }
+    }
+
+    #[test]
+    fn superseded_generation_bodies_are_dropped() {
+        let cache = CollectionCache::new();
+        // Two bodies from generation 1.
+        cache.put(params(0).cache_key(), 1, vec![1u8; 1000], None, Duration::from_millis(50));
+        cache.put(params(100).cache_key(), 1, vec![2u8; 1000], None, Duration::from_millis(50));
+        assert_eq!(cache.inner.lock().unwrap().entries.len(), 2);
+        // A generation-2 body lands: the generation-1 bodies are dead weight
+        // (get filters by exact rev) and must be dropped, not just shadowed.
+        cache.put(params(200).cache_key(), 2, vec![3u8; 32], None, Duration::from_millis(50));
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.entries.len(), 1, "superseded-generation bodies must be dropped");
+        assert_eq!(inner.entries.values().next().unwrap().rev, 2);
+    }
+
+    #[test]
+    fn late_stale_put_does_not_resurrect_old_generation() {
+        let cache = CollectionCache::new();
+        cache.put(params(0).cache_key(), 2, vec![1u8; 64], None, Duration::from_millis(50));
+        // A slow generation-1 build lands after generation 2 settled: its
+        // body is served to its own requester (returned Arc) but never
+        // stored.
+        let stale =
+            cache.put(params(100).cache_key(), 1, vec![2u8; 1000], None, Duration::from_millis(50));
+        assert_eq!(stale.rev, 1, "the caller still gets its own body");
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.entries.values().next().unwrap().rev, 2);
+    }
+
+    #[test]
+    fn byte_budget_evicts_least_recently_served_first() {
+        let cache = CollectionCache::new();
+        // Budget fits exactly three 1000-byte bodies; the fourth forces one
+        // eviction and the LRU clock picks the victim.
+        cache.max_bytes.store(3000, Ordering::Relaxed);
+        let body = vec![9u8; 1000];
+        cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        cache.put(params(100).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        cache.put(params(200).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        // Serving refreshes the LRU clock, so offset-0 must survive eviction
+        // even though it was inserted first.
+        assert!(cache.get(&params(0).cache_key(), 1).is_some());
+        cache.put(params(300).cache_key(), 1, body, None, Duration::from_millis(50));
+        let inner = cache.inner.lock().unwrap();
+        let stored: usize = inner.entries.values().map(|e| e.raw.len()).sum();
+        assert!(stored <= 3000, "stored bytes must fit the budget: {stored}");
+        assert!(inner.entries.contains_key(&params(0).cache_key()), "recently served survives");
+        assert!(inner.entries.contains_key(&params(300).cache_key()), "the new entry survives");
+        assert!(
+            !inner.entries.contains_key(&params(100).cache_key()),
+            "oldest serve (unrefreshed) is the victim"
+        );
+    }
+
+    #[test]
+    fn big_evictions_arm_the_deferred_heap_trim() {
+        let cache = CollectionCache::new();
+        cache.max_bytes.store(2500, Ordering::Relaxed);
+        cache.trim_dirty_bytes.store(1000, Ordering::Relaxed);
+        let body = vec![7u8; 1000];
+        cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        cache.put(params(100).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        assert!(!cache.take_trim(), "no big drop yet");
+        // Third body forces one eviction (>= trim_dirty_bytes freed).
+        cache.put(params(200).cache_key(), 1, body, None, Duration::from_millis(50));
+        assert!(cache.take_trim(), "evicting >= trim_dirty_bytes must arm the trim");
+        assert!(!cache.take_trim(), "take_trim swaps the flag off");
+    }
+
+    #[test]
+    fn single_oversized_entry_is_never_self_evicted() {
+        let cache = CollectionCache::new();
+        cache.max_bytes.store(500, Ordering::Relaxed);
+        cache.put(params(0).cache_key(), 1, vec![3u8; 4000], None, Duration::from_millis(50));
+        let inner = cache.inner.lock().unwrap();
+        assert!(
+            inner.entries.contains_key(&params(0).cache_key()),
+            "the only entry survives even over budget (hot full shape)"
+        );
     }
 }
