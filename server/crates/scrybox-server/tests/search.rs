@@ -50,6 +50,16 @@ fn seeded_db(dir: &std::path::Path) -> PathBuf {
     )
     .unwrap();
     conn.execute_batch(include_str!("schema_fixture.sql")).unwrap();
+    // Node's db.js owns this migration; the q leg shares the table, so the
+    // fixture mirrors it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS collection_query_cache (
+           query TEXT NOT NULL, lang TEXT NOT NULL DEFAULT '', names TEXT NOT NULL,
+           upstream_total INTEGER, fetched_count INTEGER NOT NULL DEFAULT 0,
+           complete INTEGER NOT NULL DEFAULT 1, resolved_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL, PRIMARY KEY (query, lang));",
+    )
+    .unwrap();
     conn.execute_batch(
         "
         INSERT INTO users (id, username, password_hash, role, share_token, api_key)
@@ -676,8 +686,17 @@ async fn spawn_fake_sidecar() -> (String, Arc<Mutex<Vec<(String, i64)>>>) {
                 (41, 41) // the real sidecar's total for the first-word fallback
             } else if q.starts_with("Elvish Mystic") {
                 (200, 75)
+            } else if q.starts_with("sol ring") {
+                (4, 4) // collection walk: 4 unique:cards printings, one name
+            } else if q.starts_with("fire // ice") {
+                (1, 1) // one DFC — the walk must add full + both faces
+            } else if q.starts_with("dfcwalk") {
+                (1, 1) // match list containing a DFC, reached by a gated name query
             } else if q.contains("boom") {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
+            } else if q.contains("invalidq") {
+                // The engine's own syntax verdict → INVALID_QUERY 400, uncached.
+                return (StatusCode::UNPROCESSABLE_ENTITY, "").into_response();
             } else if q.contains("nomatch") {
                 // Scryfall "no cards found" family — tryQuery's 404/422 catch.
                 return (StatusCode::NOT_FOUND, "").into_response();
@@ -689,9 +708,16 @@ async fn spawn_fake_sidecar() -> (String, Arc<Mutex<Vec<(String, i64)>>>) {
             let data: Vec<Value> = (0..n)
                 .map(|i| {
                     let idx = start + i;
+                    let card_name = if q.starts_with("sol ring") {
+                        "Sol Ring".to_string()
+                    } else if q.starts_with("fire // ice") || q.starts_with("dfcwalk") {
+                        "Fire // Ice".to_string()
+                    } else {
+                        q.split_whitespace().next().unwrap_or("Card").to_string()
+                    };
                     raw_card(
                         &format!("sid-{q}-p{page}-{i}"),
-                        q.split_whitespace().next().unwrap_or("Card"),
+                        &card_name,
                         &format!("{}", idx + 1),
                         (idx % 8) as i64,
                     )
@@ -975,4 +1001,303 @@ async fn concurrent_misses_coalesce_into_one_build() {
         assert_eq!(b, &hits[0].2, "every waiter in the burst gets the same body");
     }
     assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
+}
+
+// --- collection-scope q leg (iter 9) ---------------------------------------
+//
+// Node answers `scope=collection&q=…` via resolveCollectionQuery: a match
+// list from the durable collection_query_cache (walked through the sidecar
+// on miss), intersected with the LIVE collection via ownedByNames. Rust
+// serves ONLY the name-only free-text branch natively; every structured
+// query stays on Node, and the deterministic engine verdicts (404 empty,
+// 400/422 invalid) reproduce Node's contract byte-for-byte.
+
+/// Seed one durable collection_query_cache row (Node's own upsert shape).
+fn seed_cqc(path: &std::path::Path, query: &str, lang: &str, names: &str, total: i64, complete: i64, resolved_at: i64) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS collection_query_cache (
+           query TEXT NOT NULL, lang TEXT NOT NULL DEFAULT '', names TEXT NOT NULL,
+           upstream_total INTEGER, fetched_count INTEGER NOT NULL DEFAULT 0,
+           complete INTEGER NOT NULL DEFAULT 1, resolved_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL, PRIMARY KEY (query, lang));",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO collection_query_cache (query, lang, names, upstream_total, fetched_count, complete, resolved_at, expires_at)
+         VALUES (?, ?, ?, ?, 3, ?, ?, ?)",
+        rusqlite::params![query, lang, names, total, complete, resolved_at, resolved_at + 7 * 24 * 3600 * 1000],
+    )
+    .unwrap();
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn cqc_row(path: &std::path::Path, query: &str, lang: &str) -> Option<(String, Option<i64>, i64)> {
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collection_query_cache (
+           query TEXT NOT NULL, lang TEXT NOT NULL DEFAULT '', names TEXT NOT NULL,
+           upstream_total INTEGER, fetched_count INTEGER NOT NULL DEFAULT 0,
+           complete INTEGER NOT NULL DEFAULT 1, resolved_at INTEGER NOT NULL,
+           expires_at INTEGER NOT NULL, PRIMARY KEY (query, lang));",
+        [],
+    )
+    .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT names, upstream_total, complete FROM collection_query_cache WHERE query = ? AND lang = ?")
+        .unwrap();
+    let mut rows = stmt.query(rusqlite::params![query, lang]).unwrap();
+    rows.next().unwrap().map(|r| {
+        (
+            r.get::<_, String>(0).unwrap(),
+            r.get::<_, Option<i64>>(1).unwrap(),
+            r.get::<_, i64>(2).unwrap(),
+        )
+    })
+}
+
+/// The exact response key order of the q leg (ownedByNames projection +
+/// base_rarity). oracle_id/price_etched distinguish it from /api/collection.
+fn q_row_keys() -> Vec<&'static str> {
+    vec![
+        "entry_id", "card_id", "quantity", "condition", "printing", "language", "purchase_price",
+        "added_at", "is_trade", "notes", "is_proxy", "oracle_id", "name", "printed_name",
+        "supertype", "subtypes", "types", "cmc", "color_identity", "rarity", "set_id", "set_name",
+        "number", "image_url", "price_trend", "price_normal", "price_holofoil", "price_etched",
+        "price_currency", "price_source", "price_estimated", "tcgplayer_url", "cardmarket_url",
+        "tcgplayer_product_id", "base_rarity",
+    ]
+}
+
+#[tokio::test]
+async fn collq_durable_hit_serves_native_shape_and_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    // Durable entry: the match list Node's walk would have produced. No
+    // sidecar is wired at all — a walk attempt would show as an x-node hop.
+    seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
+    let upstream = spawn_fake_node().await;
+    let r = router_for(path.clone(), &["search"], &format!("http://{upstream}"));
+    // Whitespace/case normalization must land on the durable key 'sol ring'.
+    let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=%20SOL%20%20Ring%20&limit=60&page=1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none(), "durable hit must not walk or proxy");
+    assert_eq!(h["x-total-count"], "3", "user 1 owns three Sol Ring printings");
+    assert_eq!(h["x-catalog-complete"], "1");
+    assert_eq!(h["x-catalog-upstream-total"], "4");
+    assert_eq!(h["x-catalog-cache"], "fresh");
+    assert_eq!(h["x-catalog-snapshot"], "remote:29e29f45850c995b7b8a:4", "membershipVersion must match Node's sha256");
+    // resolveCollectionQuery answers with LIVE_SOURCE on every sidecar path;
+    // only X-Catalog-Cache carries the age.
+    assert_eq!(h["x-source"], "sidecar");
+    assert_eq!(
+        h["access-control-expose-headers"],
+        "X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source"
+    );
+    let rows = b.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    // ORDER BY added_at DESC, id DESC → entry 3? (2024-01-05 > 04 > 03) → 1,2,3.
+    assert_eq!(rows[0]["entry_id"], 1);
+    assert_eq!(rows[1]["entry_id"], 2);
+    assert_eq!(rows[2]["entry_id"], 3);
+    assert_eq!(
+        rows[0].as_object().unwrap().keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+        q_row_keys()
+    );
+    // price_trend override: cc1 price_trend 4.01 (normal path of resolveCardPrice).
+    assert_eq!(rows[0]["price_trend"], serde_json::json!(4.01));
+    assert_eq!(rows[0]["subtypes"], serde_json::json!(["Artifact"]));
+    assert_eq!(rows[0]["base_rarity"], "Uncommon");
+
+    // count=0 suppresses X-Total-Count only (Node: includeTotal false).
+    let (s, h, _) = get_json(&r, "/api/search?scope=collection&q=sol%20ring&limit=60&page=1&count=0").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-total-count").is_none());
+}
+
+#[tokio::test]
+async fn collq_structured_queries_and_params_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
+    let upstream = spawn_fake_node().await;
+    let r = router_for(path.clone(), &["search", "search_sidecar"], &format!("http://{upstream}"));
+    for url in [
+        "/api/search?scope=collection&q=t%3Acreature%20c%3Ag&limit=60", // operator
+        "/api/search?scope=collection&q=%21sol%20ring",                  // exact name
+        "/api/search?scope=collection&q=sol%20ring%20or%20plains",       // keyword token
+        "/api/search?scope=collection&q=sol%20ring%20not",               // keyword token
+        "/api/search?scope=collection&q=sol%20%28ring%29",               // grouping
+        "/api/search?scope=collection&q=%22sol%20ring%22",               // quoted
+        "/api/search?scope=collection&q=sol%20ring&snapshot=x",          // expectedSnapshot contract
+        "/api/search?scope=collection&q=sol%20ring&count=0&count=1",     // qs array
+        "/api/search?scope=database&q=sol%20ring",                       // other scope
+    ] {
+        let (s, h, _) = get_json(&r, url).await;
+        assert_eq!(s, StatusCode::OK, "{url}");
+        assert_eq!(h["x-node"], "1", "{url} must proxy to Node");
+    }
+}
+
+#[tokio::test]
+async fn collq_walk_resolves_persists_and_joins_single_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let st = sidecar_state(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let r = app(st.clone());
+
+    let hits = burst(&r, "/api/search?scope=collection&q=Sol%20Ring&limit=60&page=1").await;
+    for (s, h, b) in &hits {
+        assert_eq!(*s, StatusCode::OK);
+        // The requests that performed the walk report resolved/sidecar —
+        // Node's contract for the resolving request.
+        assert_eq!(h["x-catalog-cache"], "resolved");
+        assert_eq!(h["x-source"], "sidecar");
+        assert_eq!(h["x-total-count"], "3");
+        let v: Value = serde_json::from_slice(b).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3);
+    }
+    let g = seen.lock().unwrap();
+    let walked: Vec<_> = g.iter().filter(|(q, _)| q == "sol ring unique:cards").collect();
+    assert_eq!(walked.len(), 1, "burst of 8 must pay exactly ONE sidecar walk");
+    drop(g);
+    // Durable upsert with Node's row shape.
+    let (names, total, complete) = cqc_row(&path, "sol ring", "en").expect("row persisted");
+    assert_eq!(names, r#"["sol ring"]"#);
+    assert_eq!(total, Some(4));
+    assert_eq!(complete, 1);
+    assert_eq!(st.collq_cache.walks(), 1);
+
+    // Second burst: in-memory entry, zero sidecar traffic, SearchCache hit.
+    // X-Catalog-Cache ages per-request (Node semantics); X-Source stays
+    // 'sidecar' — LIVE_SOURCE on every resolveCollectionQuery path.
+    let hits2 = burst(&r, "/api/search?scope=collection&q=Sol%20Ring&limit=60&page=1").await;
+    assert_eq!(hits2[0].1["x-catalog-cache"], "fresh");
+    assert_eq!(hits2[0].1["x-source"], "sidecar");
+    let g2 = seen.lock().unwrap();
+    let walked2: Vec<_> = g2.iter().filter(|(q, _)| q == "sol ring unique:cards").collect();
+    assert_eq!(walked2.len(), 1, "warm entries must not re-walk");
+    drop(g2);
+}
+
+#[tokio::test]
+async fn collq_404_is_durable_empty_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, _seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=nomatch%20card&limit=20&page=1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-catalog-cache"], "resolved");
+    assert_eq!(h["x-catalog-complete"], "1");
+    assert_eq!(h["x-catalog-upstream-total"], "0");
+    assert_eq!(h["x-total-count"], "0");
+    assert_eq!(h["x-source"], "sidecar");
+    assert_eq!(b, json!([]));
+    let (names, total, complete) = cqc_row(&path, "nomatch card", "en").expect("404 answer persisted");
+    assert_eq!(names, "[]");
+    assert_eq!(total, Some(0));
+    assert_eq!(complete, 1);
+}
+
+#[tokio::test]
+async fn collq_engine_422_is_400_invalid_query_and_stays_uncached() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let (s, _h, b) = get_json(&r, "/api/search?scope=collection&q=invalidq%20name").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(b, json!({ "error": "INVALID_QUERY" }));
+    assert!(cqc_row(&path, "invalidq name", "en").is_none(), "400 must not persist an entry");
+    // Node re-walks on every retry (its catch caches nothing) — so must we.
+    let _ = get_json(&r, "/api/search?scope=collection&q=invalidq%20name").await;
+    let n = seen.lock().unwrap().iter().filter(|(q, _)| q.starts_with("invalidq name")).count();
+    assert_eq!(n, 2, "invalid answers are never cached");
+}
+
+#[tokio::test]
+async fn collq_transport_failure_and_missing_sidecar_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, _seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let (s, h, _) = get_json(&r, "/api/search?scope=collection&q=boom%20thing").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-node"], "1", "sidecar 500 → Node answers (local-fallback/503 is Node's)");
+    assert_eq!(h["x-source"], "live");
+
+    // Kill switch off (no search_sidecar): a cold key with no durable row
+    // proxies instead of walking.
+    let r2 = router_for(path.clone(), &["search"], &format!("http://{upstream}"));
+    let (_s, h2, _) = get_json(&r2, "/api/search?scope=collection&q=some%20cold%20name").await;
+    assert_eq!(h2["x-node"], "1");
+}
+
+#[tokio::test]
+async fn collq_window_semantics_and_stale_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
+    let upstream = spawn_fake_node().await;
+    let r = router_for(path.clone(), &["search"], &format!("http://{upstream}"));
+
+    // No page/limit keys → the COMPLETE owned result (no window), total set.
+    let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=sol%20ring").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b.as_array().unwrap().len(), 3);
+    assert_eq!(h["x-total-count"], "3");
+    // Explicit page=2&limit=2 → window (third entry), total unaffected.
+    let (_, _h, b2) = get_json(&r, "/api/search?scope=collection&q=sol%20ring&page=2&limit=2").await;
+    let rows = b2.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["entry_id"], 3);
+    // Empty-string page key still counts as "explicit pagination" (qs != null).
+    let (_, _h, b3) = get_json(&r, "/api/search?scope=collection&q=sol%20ring&page=").await;
+    assert_eq!(b3.as_array().unwrap().len(), 3, "page='' → parseInt NaN → 1 → full window fits");
+
+    // Incomplete + older than the stale bound (7d) → re-walk required.
+    seed_cqc(path.as_path(), "plains", "en", "[]", 1, 0, now_ms() - 8 * 24 * 3600 * 1000);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r2 = sidecar_router(path.clone(), &format!("http://{upstream}"), &sidecar);
+    let (s, _h, _b) = get_json(&r2, "/api/search?scope=collection&q=plains").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(seen.lock().unwrap().iter().any(|(q, _)| q == "plains unique:cards"), "expired-incomplete entry must re-walk");
+
+    // Incomplete but within the stale bound → served immediately ('stale').
+    seed_cqc(path.as_path(), "swamp", "en", r#"["swamp"]"#, 1, 0, now_ms() - 8 * 3600 * 1000);
+    let (s2, h2, _b2) = get_json(&r2, "/api/search?scope=collection&q=swamp").await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(h2["x-catalog-cache"], "stale");
+    assert!(!seen.lock().unwrap().iter().any(|(q, _)| q == "swamp unique:cards"), "stale-usable entry must NOT walk");
+}
+
+#[tokio::test]
+async fn collq_dfc_walk_stores_full_and_face_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = spawn_fake_node().await;
+    let (sidecar, _seen) = spawn_fake_sidecar().await;
+    let r = sidecar_router(path.clone(), &format!("http://{upstream}"), &sidecar);
+    // A gated name query whose MATCH LIST contains a double-faced card: the
+    // walk must persist the full "A // B" plus both faces (Node's Set).
+    let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=dfcwalk&limit=20&page=1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-catalog-cache"], "resolved");
+    assert_eq!(h["x-catalog-upstream-total"], "1");
+    assert_eq!(b, json!([]), "fixture owns no Fire // Ice printings");
+    let (names, _t, _c) = cqc_row(&path, "dfcwalk", "en").expect("persisted");
+    let parsed: Vec<String> = serde_json::from_str(&names).unwrap();
+    assert_eq!(parsed, vec!["fire // ice", "fire", "ice"], "walk stores full + faces, insertion order");
 }

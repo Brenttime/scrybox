@@ -24,6 +24,7 @@ use hyper_util::{
 use tower_http::services::ServeDir;
 
 pub mod auth;
+pub mod collq;
 pub mod collection;
 pub mod db;
 pub mod name_index;
@@ -98,6 +99,9 @@ pub struct AppState {
     /// Response cache for the native /stats route (stats.rs mirrors
     /// backend/src/utils/statsCache.js); disabled without a DB, same rule.
     pub stats_cache: Arc<stats::StatsCache>,
+    /// In-process half of the shared `collection_query_cache` (match lists
+    /// for the collection-scope q leg, collq.rs) + walk single-flight.
+    pub collq_cache: Arc<collq::CollQCache>,
 }
 
 impl AppState {
@@ -121,7 +125,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).

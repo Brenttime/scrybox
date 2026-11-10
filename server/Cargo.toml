@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 flate2 = "1"
 bytes = "1"

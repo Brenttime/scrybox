@@ -61,6 +61,14 @@ const EXTRA_SEARCH = [
   '/api/search?scope=database&name=Elvish%20Mystic&page=2&limit=60',
   '/api/search?scope=database&name=Lightning%20Bolt&page=4&limit=60',
   '/api/search?scope=database&name=Shalai%2C%20Voice%20of%20Plenty&page=3&limit=100',
+  // Collection q-leg (iter 9): name-only free-text match list + live owned
+  // intersect, served natively. These ride the SHARED collection_query_cache,
+  // so whichever backend walks first, both then answer from the same entry —
+  // body equality (incl. row order and prices) asserts the whole leg.
+  '/api/search?scope=collection&q=March%20of%20Wretched%20Sorrow&limit=20&page=1',
+  "/api/search?scope=collection&q=G'raha%20Tia&limit=60&page=1",
+  '/api/search?scope=collection&q=Neerdiv%2C%20Devious%20Diver&limit=60&page=1',
+  '/api/search?scope=collection&q=definitely%20no%20such%20card%20xyz&limit=20&page=1',
 ];
 
 // Stats coverage for the ported /api/stats (iter 3): the bench scenario URL

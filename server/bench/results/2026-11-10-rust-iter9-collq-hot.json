@@ -1,0 +1,106 @@
+{"name":"health","conc":16,"n":16835,"variants":1,"rps":1682.7,"p50_ms":8.41,"p99_ms":22.95,"peak_rss_mb":365.2,"codes":{"200":16835}}
+{"name":"collection_page100","conc":16,"n":53042,"variants":1,"rps":5303.7,"p50_ms":2.7,"p99_ms":7,"peak_rss_mb":238.4,"codes":{"200":53042}}
+{"name":"collection_full_27MB","conc":2,"n":861,"variants":1,"rps":57.4,"p50_ms":32.98,"p99_ms":58.58,"peak_rss_mb":267.7,"codes":{"200":861}}
+{"name":"stats","conc":16,"n":83918,"variants":1,"rps":8391.8,"p50_ms":1.7,"p99_ms":3.99,"peak_rss_mb":267.9,"codes":{"200":83918}}
+{"name":"search_coll_t_creature_c_g","conc":16,"n":429,"variants":1,"rps":41.8,"p50_ms":376.79,"p99_ms":496.38,"peak_rss_mb":269.4,"codes":{"200":429}}
+{"name":"search_coll_sol_ring","conc":16,"n":61116,"variants":1,"rps":6111,"p50_ms":2.51,"p99_ms":5.35,"peak_rss_mb":269.8,"codes":{"200":61116}}
+{"name":"search_db_name_sol_ring","conc":16,"n":69252,"variants":1,"rps":6925.2,"p50_ms":2.22,"p99_ms":4.67,"peak_rss_mb":272.9,"codes":{"200":69252}}
+{
+  "at": "2026-11-10T06:54:38.275Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": null,
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 16835,
+      "variants": 1,
+      "rps": 1682.7,
+      "p50_ms": 8.41,
+      "p99_ms": 22.95,
+      "peak_rss_mb": 365.2,
+      "codes": {
+        "200": 16835
+      }
+    },
+    {
+      "name": "collection_page100",
+      "conc": 16,
+      "n": 53042,
+      "variants": 1,
+      "rps": 5303.7,
+      "p50_ms": 2.7,
+      "p99_ms": 7,
+      "peak_rss_mb": 238.4,
+      "codes": {
+        "200": 53042
+      }
+    },
+    {
+      "name": "collection_full_27MB",
+      "conc": 2,
+      "n": 861,
+      "variants": 1,
+      "rps": 57.4,
+      "p50_ms": 32.98,
+      "p99_ms": 58.58,
+      "peak_rss_mb": 267.7,
+      "codes": {
+        "200": 861
+      }
+    },
+    {
+      "name": "stats",
+      "conc": 16,
+      "n": 83918,
+      "variants": 1,
+      "rps": 8391.8,
+      "p50_ms": 1.7,
+      "p99_ms": 3.99,
+      "peak_rss_mb": 267.9,
+      "codes": {
+        "200": 83918
+      }
+    },
+    {
+      "name": "search_coll_t_creature_c_g",
+      "conc": 16,
+      "n": 429,
+      "variants": 1,
+      "rps": 41.8,
+      "p50_ms": 376.79,
+      "p99_ms": 496.38,
+      "peak_rss_mb": 269.4,
+      "codes": {
+        "200": 429
+      }
+    },
+    {
+      "name": "search_coll_sol_ring",
+      "conc": 16,
+      "n": 61116,
+      "variants": 1,
+      "rps": 6111,
+      "p50_ms": 2.51,
+      "p99_ms": 5.35,
+      "peak_rss_mb": 269.8,
+      "codes": {
+        "200": 61116
+      }
+    },
+    {
+      "name": "search_db_name_sol_ring",
+      "conc": 16,
+      "n": 69252,
+      "variants": 1,
+      "rps": 6925.2,
+      "p50_ms": 2.22,
+      "p99_ms": 4.67,
+      "peak_rss_mb": 272.9,
+      "codes": {
+        "200": 69252
+      }
+    }
+  ]
+}

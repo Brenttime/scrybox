@@ -41,7 +41,7 @@ use rusqlite::{Connection, Row};
 use serde_json::{Map, Value};
 
 use crate::{
-    auth,
+    auth, collq,
     collection::{body_etag, etag_matches, gzip_bytes, parse_array_col, sqlite_value, truthy, wants_encoding},
     db::DbPool,
     name_index::{self, NameIndex, OwnedCache, Txn},
@@ -154,7 +154,27 @@ fn clean_number(raw: &str) -> String {
 /// Outcome of the native-gate decision.
 pub enum Plan {
     Native(SearchQuery),
+    /// Collection-scope free-text `q` leg (collq.rs).
+    CollectionQ(Arc<collq::CollectionQ>),
     Proxy,
+}
+
+/// `languages.resolve(input)` → (code, scryfall) — the two codes the q-leg
+/// needs separately: `.code` keys the durable walk cache, `.scryfall` drives
+/// langSearch's ` lang:xx` scoping and the non-English parenthesisation.
+pub(crate) fn lang_codes(input: Option<&str>) -> (String, String) {
+    let default = || (langs()[0].0.clone(), langs()[0].2.clone());
+    let Some(input) = input.filter(|s| !s.is_empty()) else { return default() };
+    let lower = input.trim().to_lowercase();
+    for (code, name, scry) in langs() {
+        if lower == *code
+            || lower == name.to_lowercase()
+            || (!scry.is_empty() && lower == *scry)
+        {
+            return (code.clone(), scry.clone());
+        }
+    }
+    default()
 }
 
 /// Decide whether Rust may answer this GET, mirroring the branches of
@@ -174,7 +194,16 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
     }
     // `q` present and non-blank: Node takes the raw-query path (parser +
     // sidecar). A blank q is trimmed to '' and behaves as absent — same here.
-    if !first("q").unwrap_or_default().trim().is_empty() {
+    if let Some(qraw) = first("q").filter(|v| !v.trim().is_empty()) {
+        // Collection scope routes to resolveCollectionQuery BEFORE the
+        // field-filter path; the name-only branch is ported in collq.rs,
+        // everything else (any operator syntax, other scopes) proxies.
+        let scope0 = first("scope").unwrap_or_else(|| "database".to_string());
+        if scope0 == "collection" {
+            if let Some(cq) = plan_collection_q(user_id, &pairs, &qraw, first) {
+                return Plan::CollectionQ(Arc::new(cq));
+            }
+        }
         return Plan::Proxy;
     }
     // Destructure default only fires when the key is absent; `scope=` (empty)
@@ -214,6 +243,35 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
             && first("set").unwrap_or_default().is_empty()
             && to_name(first("lang").as_deref()) == "English",
     })
+}
+
+/// Gate + normalization for the collection-scope q leg
+/// (`searchCards`' `scope === 'collection' && q.trim()` branch). Returns
+/// None (→ proxy) whenever anything outside the ported name-only subset is
+/// involved, including the `snapshot` parameter (expectedSnapshot mismatch
+/// is Node's 409 contract) and duplicate `count` keys (qs array semantics).
+fn plan_collection_q(
+    user_id: i64,
+    pairs: &[(String, String)],
+    qraw: &str,
+    first: impl Fn(&str) -> Option<String>,
+) -> Option<collq::CollectionQ> {
+    if pairs.iter().any(|(k, _)| k == "snapshot") {
+        return None;
+    }
+    if pairs.iter().filter(|(k, _)| k == "count").count() > 1 {
+        return None;
+    }
+    let walk_base = collq::free_text_walk_base(qraw)?;
+    let (lang_code, scry_code) = lang_codes(first("lang").as_deref());
+    // Route-level parsing, collection+q variant: maxLimit is 2000 here.
+    let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let page = if page == 0 { 1 } else { page }.max(1);
+    let limit = first("limit").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let limit = if limit == 0 { 60 } else { limit }.clamp(1, 2000);
+    let has_window = pairs.iter().any(|(k, _)| k == "page" || k == "limit");
+    let include_total = first("count").as_deref() != Some("0");
+    Some(collq::CollectionQ { user_id, walk_base, lang_code, scry_code, has_window, page, limit, include_total })
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +516,17 @@ fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuer
 // Cache
 // ---------------------------------------------------------------------------
 
+/// The q-leg's X-Catalog-* surface (route lines 142–165 of
+/// backend/src/routes/collection.js), frozen at build time.
+pub(crate) struct CatalogMeta {
+    /// X-Total-Count when include_total; None omits the header.
+    total: Option<String>,
+    complete: bool,
+    upstream_total: Option<String>,
+    status: &'static str,
+    snapshot: String,
+}
+
 pub struct SearchEntry {
     rev: i64,
     raw: Bytes,
@@ -467,6 +536,9 @@ pub struct SearchEntry {
     /// Node source label; cache-path entries are (None, "cache").
     total: Option<u64>,
     source: &'static str,
+    /// Set only on the collection-scope q leg (collq.rs): switches the
+    /// response to the resolveCollectionQuery header contract.
+    catalog: Option<CatalogMeta>,
 }
 
 /// Single-flight slot, same shape as the collection/stats caches: every
@@ -562,6 +634,9 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let raw_query = uri.query().map(|s| s.to_string());
     let p = match plan(user.id, raw_query.as_deref()) {
         Plan::Native(p) => p,
+        Plan::CollectionQ(cq) => {
+            return serve_collq(st, req, pool, cq).await;
+        }
         Plan::Proxy => return crate::proxy(State(st.clone()), req).await,
     };
 
@@ -682,7 +757,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     };
                     Ok(Ok(Some(init_cache.insert(
                         init_key,
-                        SearchEntry { rev: rev_i, raw: body, gz, etag, total, source },
+                        SearchEntry { rev: rev_i, raw: body, gz, etag, total, source, catalog: None },
                     ))))
                 })
                 .await;
@@ -702,10 +777,59 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
 
     // Express's default body ETag on res.json(cards): a matching conditional
     // GET replays as an empty 304, with the headers set before send().
+    respond_entry(&entry, inm.as_deref(), ae.as_deref(), None)
+}
+
+/// Emit a cached native search response, honoring the entry's header
+/// contract (plain X-Source for the field-filter legs; the full
+/// X-Catalog-* surface for the q leg).
+fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, dyn_: Option<(&'static str, &'static str)>) -> Response {
+    // (X-Catalog-Cache, X-Source) for this request; Node recomputes both per
+    // request from the match-list entry's age, so the q leg passes them in
+    // rather than replaying baked bytes.
+    let (cat_status, src) = match dyn_ {
+        Some((s, src)) => (s, HeaderValue::from_static(src)),
+        None => (
+            entry.catalog.as_ref().map(|c| c.status).unwrap_or("cache"),
+            HeaderValue::from_str(entry.source).unwrap(),
+        ),
+    };
     let tag = entry.etag.clone();
-    let src = HeaderValue::from_str(entry.source).unwrap();
-    let total_hdr = entry.total.map(|t| (header::HeaderName::from_static("x-total-count"), HeaderValue::from_str(&t.to_string()).unwrap()));
-    if etag_matches(inm.as_deref(), &tag) {
+    let total_hdr = entry
+        .total
+        .map(|t| (header::HeaderName::from_static("x-total-count"), HeaderValue::from_str(&t.to_string()).unwrap()));
+
+    // The q-leg header set (route lines 142–165): X-Total-Count when
+    // requested, complete/upstream/cache/snapshot, X-Source (always
+    // 'sidecar' here — the only value Node emits in sidecar mode), and the
+    // matching expose list. Express keeps res.set() headers on 304s, so the
+    // conditional path sends the same set.
+    let catalog: Vec<(header::HeaderName, HeaderValue)> = match &entry.catalog {
+        None => Vec::new(),
+        Some(c) => {
+            let mut v: Vec<(header::HeaderName, HeaderValue)> = Vec::with_capacity(5);
+            if let Some(t) = &c.total {
+                v.push((header::HeaderName::from_static("x-total-count"), HeaderValue::from_str(t).unwrap()));
+            }
+            v.push((
+                header::HeaderName::from_static("x-catalog-complete"),
+                HeaderValue::from_static(if c.complete { "1" } else { "0" }),
+            ));
+            if let Some(u) = &c.upstream_total {
+                v.push((header::HeaderName::from_static("x-catalog-upstream-total"), HeaderValue::from_str(u).unwrap()));
+            }
+            v.push((header::HeaderName::from_static("x-catalog-cache"), HeaderValue::from_static(cat_status)));
+            v.push((header::HeaderName::from_static("x-catalog-snapshot"), HeaderValue::from_str(&c.snapshot).unwrap()));
+            v
+        }
+    };
+    let expose: &'static str = if entry.catalog.is_some() {
+        "X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source"
+    } else {
+        "X-Total-Count, X-Source"
+    };
+
+    if etag_matches(inm, &tag) {
         let mut b = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, HeaderValue::from_str(&tag).unwrap())
@@ -713,13 +837,16 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         if let Some((k, v)) = total_hdr {
             b = b.header(k, v);
         }
+        for (k, v) in catalog {
+            b = b.header(k, v);
+        }
         return b
-            .header("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"))
+            .header("access-control-expose-headers", HeaderValue::from_static(expose))
             .body(Body::empty())
             .unwrap();
     }
 
-    let use_gzip = wants_encoding(ae.as_deref(), "gzip", entry.raw.len());
+    let use_gzip = wants_encoding(ae, "gzip", entry.raw.len());
     let (body, encoding) = if use_gzip { (entry.gz.clone(), Some("gzip")) } else { (entry.raw.clone(), None) };
 
     let mut b = Response::builder().status(StatusCode::OK).header(
@@ -736,7 +863,98 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     if let Some((k, v)) = total_hdr {
         b = b.header(k, v);
     }
-    b.header("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"))
+    for (k, v) in catalog {
+        b = b.header(k, v);
+    }
+    b.header("access-control-expose-headers", HeaderValue::from_static(expose))
         .body(Body::from(body))
         .unwrap()
+}
+
+/// The collection-scope q leg for one planned request: rev-gated response
+/// cache over (params, revision), names from the shared collectionQueryCache
+/// (single-flight walk inside collq::get_names), owned intersect + shaping
+/// in one pinned read transaction. Node-owned outcomes proxy verbatim.
+async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<collq::CollectionQ>) -> Response {
+    let headers = req.headers();
+    let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    let rev_i = pool
+        .get()
+        .ok()
+        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+        .unwrap_or(-1);
+
+    let key = cq.cache_key();
+
+    // Match list FIRST: Node derives X-Catalog-Cache/X-Source from the match
+    // list entry's age per request, so even cache replays need it fresh.
+    // Shared in-flight walk, durable-row reuse, and the deterministic engine
+    // verdicts (404 empty / 400-422 invalid) resolve here; anything Node
+    // must answer itself comes back as Proxy.
+    let (entry, resolved_now) = match collq::get_names(st.clone(), &cq).await {
+        collq::NamesOutcome::Ready(e, r) => (e, r),
+        collq::NamesOutcome::Proxy => return crate::proxy(State(st.clone()), req).await,
+        collq::NamesOutcome::InvalidQuery => return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY"),
+    };
+    let status: &'static str = if resolved_now { "resolved" } else { collq::status_of(&entry) };
+    // resolveCollectionQuery returns source: LIVE_SOURCE on every
+    // sidecar-mode path (lines 1456/1489/1525) — age only drives
+    // X-Catalog-Cache, never X-Source. 'local-fallback' belongs to Node.
+    let source: &'static str = "sidecar";
+
+    if let Some(e) = st.search_cache.get(&key, rev_i) {
+        return respond_entry(&e, inm.as_deref(), ae.as_deref(), Some((status, source)));
+    }
+
+    let cache = Arc::clone(&st.search_cache);
+    let slot_key = format!("{key}\u{0}{rev_i}");
+    let slot = cache.slot(&slot_key);
+    let init_cache = Arc::clone(&cache);
+    let init_key = key.clone();
+    let build_pool = Arc::clone(&pool);
+    let build_cq = (*cq).clone();
+    let res: Result<&Result<Option<Arc<SearchEntry>>, String>, String> = slot
+        .get_or_try_init(move || async move {
+            let built = tokio::task::spawn_blocking(move || collq::build(&build_pool, &build_cq, &entry))
+                .await
+                .unwrap_or_else(|e| collq::BuildOutcome::Failed(format!("collq build task panicked: {e}")));
+            let built = match built {
+                collq::BuildOutcome::Built(b) => b,
+                collq::BuildOutcome::Proxy => return Ok(Ok(None)),
+                collq::BuildOutcome::Failed(e) => return Err(e),
+            };
+            let body = bytes::Bytes::from(built.raw);
+            let etag = body_etag(&body);
+            let gz = gzip_bytes(&body);
+            Ok(Ok(Some(init_cache.insert(
+                init_key,
+                SearchEntry {
+                    rev: rev_i,
+                    raw: body,
+                    gz,
+                    etag,
+                    total: None,
+                    source,
+                    catalog: Some(CatalogMeta {
+                        total: built.total_header,
+                        complete: built.complete,
+                        upstream_total: built.upstream_total,
+                        status,
+                        snapshot: built.snapshot,
+                    }),
+                },
+            ))))
+        })
+        .await;
+    cache.finish(&slot_key);
+    match res {
+        Ok(Ok(Some(e))) => respond_entry(e, inm.as_deref(), ae.as_deref(), Some((status, source))),
+        Ok(Ok(None)) => crate::proxy(State(st.clone()), req).await,
+        Ok(Err(ref e)) | Err(ref e) => {
+            tracing::error!(error = %e, "collq build failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
+        }
+    }
 }

@@ -545,6 +545,143 @@ fn first_word(clean: &str) -> &str {
     &clean[..end]
 }
 
+// ---------------------------------------------------------------------------
+// collection-scope q-walk (iter 9) — runWalk port for fetchCollectionNames
+// ---------------------------------------------------------------------------
+
+/// Outcome of a `runWalk` name-set walk (collq.rs is the caller; it owns the
+/// cache entry shape, persistence and the durable-key contract).
+pub struct NamesWalk {
+    /// Insertion-ordered deduped lowercased names (JS Set semantics: full
+    /// "A // B" plus each trimmed face for DFCs).
+    pub names: Vec<String>,
+    /// `!hasMore` — false only when the walk stopped at the page cap.
+    pub complete: bool,
+    /// upstream total_cards as the engine reported it (kept as Value to
+    /// round-trip through the durable table byte-exactly).
+    pub total: Option<Value>,
+    pub fetched_count: u64,
+}
+
+pub enum NamesWalkErr {
+    /// 400/422: the engine's own verdict on this query. Node maps it to
+    /// `INVALID_QUERY` 400 and caches NOTHING (every retry re-pays the walk).
+    Invalid,
+    /// Anything else (transport, timeout, 429, 5xx): Node falls through to
+    /// its local-fallback/503 semantics, so Rust proxies instead.
+    Transport,
+}
+
+/// One page for the names walk. Unlike `scry_page` this keeps 404 and
+/// 400/422 distinct because runWalk's catch treats them differently: a 404
+/// ANYWHERE collapses the whole window to a durable empty answer, a 400/422
+/// aborts the request with INVALID_QUERY, anything else is a transport-style
+/// failure (local-fallback / 503 in Node → proxy in Rust).
+struct NamesPage {
+    data: Vec<Value>,
+    has_more: bool,
+    total: Option<Value>,
+}
+
+async fn names_page(st: &crate::AppState, base: &str, q: &str, page: i64, multilingual: bool) -> Result<NamesPage, NamesWalkErr> {
+    let mut uri = format!("{base}/cards/search?q={}&page={}", encode_uri_component(q), page);
+    if multilingual {
+        uri.push_str("&include_multilingual=true");
+    }
+    let req = hyper::Request::get(uri.parse::<hyper::Uri>().map_err(|_| NamesWalkErr::Transport)?)
+        .header("user-agent", "Scrybox/1.0")
+        .body(axum::body::Body::empty())
+        .map_err(|_| NamesWalkErr::Transport)?;
+    let res = tokio::time::timeout(PAGE_TIMEOUT, st.client.request(req))
+        .await
+        .map_err(|_| NamesWalkErr::Transport)?
+        .map_err(|_| NamesWalkErr::Transport)?;
+    let status = res.status().as_u16();
+    if status == 404 {
+        // runWalk catch: fetched=[], hasMore=false, total=0.
+        return Ok(NamesPage { data: Vec::new(), has_more: false, total: Some(Value::from(0)) });
+    }
+    if status == 400 || status == 422 {
+        return Err(NamesWalkErr::Invalid);
+    }
+    if status != 200 {
+        return Err(NamesWalkErr::Transport);
+    }
+    let bytes = http_body_util::BodyExt::collect(res.into_body())
+        .await
+        .map_err(|_| NamesWalkErr::Transport)?
+        .to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).map_err(|_| NamesWalkErr::Transport)?;
+    let data = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let has_more = json.get("has_more").map(|v| truthy(Some(v))).unwrap_or(false);
+    let total = match json.get("total_cards") {
+        Some(Value::Number(n)) => Some(Value::Number(n.clone())),
+        Some(Value::Null) | None => None,
+        Some(_) => Some(Value::from(u64::MAX)), // JS Number(non-number) → NaN; unreachable with scryfall-local
+    };
+    Ok(NamesPage { data, has_more, total })
+}
+
+/// `fetchWindow(walkQ, lang, 0, walkLimit)` + runWalk's name-set build, for
+/// the collection-scope walk. `walk_q` is the durable-key query already
+/// (parenthesised for non-English per resolveCollectionQuery, ` unique:cards`
+/// appended per fetchCollectionNames); `lang_code`/`multilingual` carry
+/// langSearch's non-English scoping (` lang:xx` keyword + the
+/// include_multilingual parameter — the engine ignores a bare `lang` URL
+/// param, which is why the keyword form is load-bearing).
+pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &str, lang_code: &str, walk_limit: i64) -> Result<NamesWalk, NamesWalkErr> {
+    let non_en = lang_code != "en";
+    let scoped = if non_en { format!("{walk_q} lang:{lang_code}") } else { walk_q.to_string() };
+    let mut page = 1i64;
+    let mut out_len: i64 = 0;
+    let mut has_more = false;
+    let mut total: Option<Value> = None;
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while out_len < walk_limit {
+        let p = names_page(st, base, &scoped, page, non_en).await?;
+        if p.total.is_some() {
+            total = p.total;
+        }
+        out_len += p.data.len() as i64;
+        for raw in &p.data {
+            // String(raw.name || ''): falsy (absent, null, false, 0, '') →
+            // ''; a number stringifies, anything else object/bool text.
+            let full = match raw.get("name") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => String::new(),
+            };
+            let full = full.trim().to_lowercase();
+            if full.is_empty() {
+                continue;
+            }
+            let is_dfc = full.contains(" // ");
+            if seen.insert(full.clone()) {
+                names.push(full.clone());
+            }
+            if is_dfc {
+                for part in full.split(" // ") {
+                    let p2 = part.trim();
+                    if !p2.is_empty() && seen.insert(p2.to_string()) {
+                        names.push(p2.to_string());
+                    }
+                }
+            }
+        }
+        has_more = p.has_more;
+        if !has_more {
+            break;
+        }
+        page += 1;
+    }
+    // fetchWindow's cut: cards = out.slice(0, limit) and
+    // hasMore = hasMore || out.length > limit — a walk that stopped because
+    // the window filled is a REAL but INCOMPLETE prefix (runWalk's comment).
+    let truncated = out_len > walk_limit;
+    Ok(NamesWalk { names, complete: !has_more && !truncated, total, fetched_count: out_len.min(walk_limit).max(0) as u64 })
+}
+
 /// The field-filter walk for the name-only branch:
 /// `exact = []` (no number ⇒ specificQuery null), broad query, first-word
 /// fallback, dedup-by-id merge, printed-number stable sort. Empty merge →
