@@ -1,0 +1,13 @@
+{
+ "pid": 941478,
+ "probed_at": "2026-11-10T14:42:48.146Z",
+ "routes": {
+  "health": 50,
+  "collection_page100": 80,
+  "collection_full_27MB": 500,
+  "stats": 1110,
+  "search_coll_t_creature_c_g": 190,
+  "search_coll_sol_ring": 70,
+  "search_db_name_sol_ring": 320
+ }
+}

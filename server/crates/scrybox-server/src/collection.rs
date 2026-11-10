@@ -457,7 +457,9 @@ pub fn build_values(
         None
     };
     let raw = collect_raw_rows(&conn, p, &filter_sql, &params)?;
-    let out = raw.into_iter().map(|r| shape_row(r, alloc.as_ref())).collect::<Result<Vec<_>, _>>()?;
+    let out = (0..raw.len())
+        .map(|i| shape_row(raw.row(i), alloc.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((out, total))
 }
 
@@ -466,10 +468,11 @@ pub fn build_values(
 /// The SQLite cursor stays on one connection (one consistent snapshot) for
 /// row collection; `checked_out_allocation` overlaps on a second pool
 /// connection; shaping + per-row serialization run on scoped worker threads.
-/// Per-row `to_vec` parts are stitched into the array by hand — byte-identical
-/// to `serde_json::to_vec` over the whole `Vec<Value>` (element serialization
-/// and comma joining are the same code path), pinned by a test against the
-/// sequential oracle.
+/// Each worker serializes its contiguous row range into ONE pooled chunk
+/// buffer (iter-18 chunk arena) and the groups are stitched by hand —
+/// byte-identical to `serde_json::to_vec` over the whole `Vec<Value>`
+/// (`to_writer` shares the element formatter; comma joining is the same code
+/// path), pinned by a test against the sequential oracle.
 pub fn build_body_parallel(
     pool: &Arc<DbPool>,
     p: &CollectionParams,
@@ -485,7 +488,7 @@ pub fn build_body_parallel(
     let alloc_pool = Arc::clone(pool);
     let user_id = p.user_id;
     let (raw_rows, alloc) = if need_alloc {
-        std::thread::scope(|s| -> Result<(Vec<Vec<Value>>, Option<HashMap<i64, f64>>), String> {
+        std::thread::scope(|s| -> Result<(RowStore, Option<HashMap<i64, f64>>), String> {
             let alloc_handle = s.spawn(move || -> Result<HashMap<i64, f64>, String> {
                 let conn = alloc_pool.get().map_err(|e| e.to_string())?;
                 checked_out_allocation(&conn, user_id).map_err(|e| e.to_string())
@@ -499,59 +502,103 @@ pub fn build_body_parallel(
     };
 
     let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 4);
-    let parts: Vec<Vec<u8>> = if raw_rows.len() < 4000 || nthreads == 1 {
-        raw_rows
-            .into_iter()
-            .map(|r| shape_row(r, alloc.as_ref()).and_then(|v| serde_json::to_vec(&v).map_err(|e| e.to_string())))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        let step = raw_rows.len().div_ceil(nthreads);
-        let mut raw_rows = raw_rows;
-        let mut groups: Vec<Vec<Vec<Value>>> = Vec::with_capacity(nthreads);
-        while !raw_rows.is_empty() {
-            let take = step.min(raw_rows.len());
-            groups.push(raw_rows.drain(..take).collect());
+    let n = raw_rows.len();
+    // Each group buffer holds `row,row,...` for one contiguous row range.
+    let groups: Vec<Vec<u8>> = if n < 4000 || nthreads == 1 {
+        let mut buf = take_chunk(n.saturating_mul(CHUNK_ROW_EST_BYTES) + 64);
+        for r in 0..n {
+            if r > 0 {
+                buf.push(b',');
+            }
+            let v = match shape_row(raw_rows.row(r), alloc.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    give_chunk(buf);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = serde_json::to_writer(&mut buf, &v) {
+                give_chunk(buf);
+                return Err(format!("serialize row {r}: {e}"));
+            }
         }
+        vec![buf]
+    } else {
+        let step = n.div_ceil(nthreads);
         let alloc_ref = alloc.as_ref();
-        std::thread::scope(|s| {
-            let handles: Vec<_> = groups
-                .into_iter()
-                .map(|group| {
-                    s.spawn(move || {
-                        group
-                            .into_iter()
-                            .map(|r| {
-                                shape_row(r, alloc_ref)
-                                    .and_then(|v| serde_json::to_vec(&v).map_err(|e| e.to_string()))
-                            })
-                            .collect::<Result<Vec<Vec<u8>>, String>>()
+        let store = &raw_rows;
+        let results = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..nthreads)
+                .map(|t| {
+                    let lo = t * step;
+                    let hi = (lo + step).min(n);
+                    s.spawn(move || -> Result<Vec<u8>, String> {
+                        if lo >= hi {
+                            return Ok(Vec::new());
+                        }
+                        let mut buf = take_chunk((hi - lo) * CHUNK_ROW_EST_BYTES + 64);
+                        for r in lo..hi {
+                            if r > lo {
+                                buf.push(b',');
+                            }
+                            let v = match shape_row(store.row(r), alloc_ref) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    give_chunk(buf);
+                                    return Err(e);
+                                }
+                            };
+                            if let Err(e) = serde_json::to_writer(&mut buf, &v) {
+                                give_chunk(buf);
+                                return Err(format!("serialize row {r}: {e}"));
+                            }
+                        }
+                        Ok(buf)
                     })
                 })
                 .collect();
-            let mut per_thread: Vec<Result<Vec<Vec<u8>>, String>> = Vec::new();
-            for h in handles {
-                per_thread.push(h.join().map_err(|_| "shape thread panicked".to_string())?);
+            handles
+                .into_iter()
+                .map(|h| h.join().map_err(|_| "shape thread panicked".to_string())?)
+                .collect::<Vec<Result<Vec<u8>, String>>>()
+        });
+        let mut groups: Vec<Vec<u8>> = Vec::with_capacity(results.len());
+        for g in results {
+            match g {
+                Ok(g) => groups.push(g),
+                Err(e) => {
+                    for g in groups {
+                        give_chunk(g);
+                    }
+                    return Err(e);
+                }
             }
-            let mut merged: Vec<Vec<u8>> = Vec::new();
-            for pt in per_thread {
-                merged.extend(pt?);
-            }
-            Ok::<_, String>(merged)
-        })?
+        }
+        groups
     };
 
     // Stitch the array: serde_json writes elements back-to-back separated by
-    // ',' inside the brackets, so concatenating per-row parts reproduces the
-    // whole-array serialization byte for byte.
-    let mut body = Vec::with_capacity(parts.iter().map(|p| p.len() + 1).sum::<usize>() + 2);
+    // ',' inside the brackets, so concatenating the group buffers (with ','
+    // between non-empty groups) reproduces the whole-array serialization byte
+    // for byte. The group buffers then return to the arena instead of being
+    // freed to glibc — that churn is the collection_full p99 tail.
+    let mut body = Vec::with_capacity(groups.iter().map(|g| g.len() + 1).sum::<usize>() + 2);
     body.push(b'[');
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for g in &groups {
+        if g.is_empty() {
+            continue;
+        }
+        if !first {
             body.push(b',');
         }
-        body.extend_from_slice(part);
+        body.extend_from_slice(g);
+        first = false;
     }
     body.push(b']');
+    for g in groups {
+        give_chunk(g);
+    }
     Ok((body, total))
 }
 
@@ -578,13 +625,104 @@ fn count_total(
     Ok(Some(n as u64))
 }
 
+// ---------------------------------------------------------------------------
+// Row store + chunk arena (iter 18)
+// ---------------------------------------------------------------------------
+
+/// Row-major strided store of the raw (unshaped) column values, one row of
+/// `ALL_COLS.len()` values per stride. The old `Vec<Vec<Value>>` cost one
+/// heap block per row (~27k blocks per full-collection build, all freed back
+/// to glibc on every invalidation); the stride makes it one. `Arc` keeps the
+/// shared-build `Clone` cheap.
+#[derive(Clone)]
+struct RowStore {
+    vals: Arc<Vec<Value>>,
+    width: usize,
+}
+
+impl RowStore {
+    fn len(&self) -> usize {
+        self.vals.len() / self.width
+    }
+    fn row(&self, r: usize) -> &[Value] {
+        let off = r * self.width;
+        &self.vals[off..off + self.width]
+    }
+}
+
+/// Chunk arena (iter 18): a full-collection build serializes ~27k rows. It
+/// used to allocate one `Vec<u8>` per row part; instead each worker
+/// serializes its whole row range into ONE buffer borrowed from this pool,
+/// which survives across builds. That kills the ~54k short-lived allocations
+/// per invalidation behind the collection_full write-mix p99 tail (656–977 ms
+/// at iter 17) and feeds the RSS ratchet (iter 15/16) far less: only the
+/// final stitched body the cache keeps is a fresh allocation.
+const CHUNK_KEEP_MAX_CAP: usize = 32 << 20;
+const CHUNK_POOL_MAX_BUFFERS: usize = 8; // ≤ 2 concurrent builds × 4 workers
+const CHUNK_POOL_MAX_BYTES: u64 = 128 << 20;
+/// Per-row serialization-size estimate used to pre-size buffers (full
+/// collection runs ≈1 KB/row).
+const CHUNK_ROW_EST_BYTES: usize = 1152;
+
+static CHUNK_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static CHUNK_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Borrow a serialize buffer with at least `desired` capacity, preferring the
+/// smallest pooled buffer that fits (best fit) so the big full-build buffers
+/// stay reserved for full-build shapes.
+fn take_chunk(desired: usize) -> Vec<u8> {
+    let mut pool = CHUNK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut best: Option<usize> = None;
+    for (i, b) in pool.iter().enumerate() {
+        if b.capacity() >= desired && best.map_or(true, |j| b.capacity() < pool[j].capacity()) {
+            best = Some(i);
+        }
+    }
+    match best {
+        Some(i) => {
+            let mut b = pool.swap_remove(i);
+            CHUNK_POOL_BYTES.fetch_sub(b.capacity() as u64, Ordering::Relaxed);
+            b.clear();
+            b
+        }
+        None => Vec::with_capacity(desired),
+    }
+}
+
+/// Return a serialize buffer for a later build to reuse. Oversized buffers
+/// and retention beyond the pool budget are dropped to the allocator instead
+/// of being hoarded.
+fn give_chunk(mut buf: Vec<u8>) {
+    let cap = buf.capacity();
+    if cap == 0 || cap > CHUNK_KEEP_MAX_CAP {
+        return;
+    }
+    if CHUNK_POOL_BYTES.fetch_add(cap as u64, Ordering::Relaxed) + cap as u64 > CHUNK_POOL_MAX_BYTES {
+        CHUNK_POOL_BYTES.fetch_sub(cap as u64, Ordering::Relaxed);
+        return;
+    }
+    buf.clear();
+    let mut pool = CHUNK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() >= CHUNK_POOL_MAX_BUFFERS {
+        drop(pool);
+        CHUNK_POOL_BYTES.fetch_sub(cap as u64, Ordering::Relaxed);
+        return;
+    }
+    pool.push(buf);
+}
+
+#[cfg(test)]
+fn chunk_pool_len() -> usize {
+    CHUNK_POOL.lock().unwrap().len()
+}
+
 /// Step the main SELECT, returning the raw (unshaped) column values per row.
 fn collect_raw_rows(
     conn: &rusqlite::Connection,
     p: &CollectionParams,
     filter_sql: &str,
     params: &[rusqlite::types::Value],
-) -> Result<Vec<Vec<Value>>, String> {
+) -> Result<RowStore, String> {
     let mut sql = format!("{SELECT_BODY}\n      {filter_sql}\n      ORDER BY c.added_at DESC, c.id DESC");
     let mut params: Vec<rusqlite::types::Value> = params.to_vec();
     if p.paginated {
@@ -594,21 +732,19 @@ fn collect_raw_rows(
     }
     let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter())).map_err(|e| e.to_string())?;
-    let mut out: Vec<Vec<Value>> = Vec::new();
+    let mut vals: Vec<Value> = Vec::with_capacity(ALL_COLS.len() * 512);
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let mut raw = Vec::with_capacity(ALL_COLS.len());
         for i in 0..ALL_COLS.len() {
-            raw.push(sqlite_value(row, i).map_err(|e| e.to_string())?);
+            vals.push(sqlite_value(row, i).map_err(|e| e.to_string())?);
         }
-        out.push(raw);
     }
-    Ok(out)
+    Ok(RowStore { vals: Arc::new(vals), width: ALL_COLS.len() })
 }
 
 /// Parity-critical single-row shaping (parseCardRow + applyProxyRarity +
 /// resolveCardPrice + checkedOutAllocation). Shared by the sequential and
 /// parallel paths so the shaping logic lives in exactly one place.
-fn shape_row(raw: Vec<Value>, alloc: Option<&HashMap<i64, f64>>) -> Result<Value, String> {
+fn shape_row(raw: &[Value], alloc: Option<&HashMap<i64, f64>>) -> Result<Value, String> {
     let idx = |name: &str| ALL_COLS.iter().position(|c| *c == name).unwrap();
     let is_proxy = &raw[idx("is_proxy")];
     let printing = &raw[idx("printing")];
@@ -1535,6 +1671,52 @@ mod prewarm_gate {
         assert_eq!(keys.len(), 2, "budget must cut the third 900 ms shape: {keys:?}");
         assert_eq!(keys[0].1.offset, 200, "fan-out must be MRU-first");
         assert_eq!(keys[1].1.offset, 100);
+    }
+}
+
+#[cfg(test)]
+mod chunk_arena {
+    //! Iter-18 chunk arena: pooled serialize buffers for `build_body_parallel`.
+
+    use super::*;
+
+    #[test]
+    fn pooled_buffers_are_reused_empty_and_capped() {
+        // The arena relies on `to_writer(&mut Vec<u8>)` producing the exact
+        // bytes `to_vec` produces (the sequential oracle uses `to_vec`).
+        let vs = vec![
+            serde_json::json!(1.5),
+            serde_json::json!(-0.125),
+            serde_json::json!(1234.5678),
+            serde_json::json!({"a": [1, null, true], "b": 0.0, "c": -0.0}),
+            serde_json::json!("Ünïcode & \"quoted\" <c> — 東京"),
+        ];
+        for v in &vs {
+            let mut buf = Vec::new();
+            serde_json::to_writer(&mut buf, v).unwrap();
+            assert_eq!(buf, serde_json::to_vec(v).unwrap(), "to_writer bytes must match to_vec");
+        }
+        // Returned buffers come back cleared with capacity intact (reuse),
+        // best-fit preferring the smallest sufficient buffer.
+        let big = take_chunk(1 << 20);
+        let cap = big.capacity();
+        let mut big = big;
+        big.extend_from_slice(b"dirt-dirt-dirt");
+        give_chunk(big);
+        let reused = take_chunk(1024);
+        assert!(reused.is_empty(), "returned buffers arrive cleared");
+        assert!(reused.capacity() >= cap, "best-fit must hand back the pooled capacity");
+        give_chunk(reused);
+        // Retention stops at the buffer cap; extras drop to the allocator.
+        for _ in 0..(CHUNK_POOL_MAX_BUFFERS + 4) {
+            give_chunk(Vec::with_capacity(64));
+        }
+        assert!(
+            chunk_pool_len() <= CHUNK_POOL_MAX_BUFFERS,
+            "pool must stop at the buffer cap: {} > {}",
+            chunk_pool_len(),
+            CHUNK_POOL_MAX_BUFFERS
+        );
     }
 }
 
