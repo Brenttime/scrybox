@@ -23,8 +23,12 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
+use tokio::sync::OnceCell;
 
 use axum::{
     body::Body,
@@ -465,11 +469,28 @@ pub struct SearchEntry {
     source: &'static str,
 }
 
+/// Single-flight slot, same shape as the collection/stats caches: every
+/// concurrent miss on one key shares a single build (and sidecar walk).
+/// Without it, the every-2s write-mix invalidation stampede re-runs the
+/// query — and re-pages the ~30 ms/page sidecar — once per in-flight request
+/// on the same key (iter-7 realistic p99 sat at ~1 s because of this).
+/// `Ok(Some(entry))` = serve; `Ok(None)` = Node owns this leg, every waiter
+/// proxies; `Err` = 500.
+type ComputeSlot = OnceCell<Result<Option<Arc<SearchEntry>>, String>>;
+
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<String, Arc<SearchEntry>>,
+    inflight: HashMap<String, Arc<ComputeSlot>>,
+}
+
 /// Serialized native search responses keyed by (params, revision). Bounded
 /// the same way the collection cache is.
 #[derive(Default)]
 pub struct SearchCache {
-    entries: Mutex<HashMap<String, Arc<SearchEntry>>>,
+    inner: Mutex<Inner>,
+    /// Number of full bodies actually computed (single-flight test + ops).
+    computes: AtomicU64,
 }
 
 impl SearchCache {
@@ -477,17 +498,32 @@ impl SearchCache {
         Self::default()
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<SearchEntry>> {
-        let e = self.entries.lock().unwrap();
-        e.get(key).filter(|e| e.rev == rev).cloned()
+        let e = self.inner.lock().unwrap();
+        e.entries.get(key).filter(|e| e.rev == rev).cloned()
     }
     fn insert(&self, key: String, entry: SearchEntry) -> Arc<SearchEntry> {
-        let mut e = self.entries.lock().unwrap();
-        if e.len() > 64 {
-            e.clear();
-        }
         let entry = Arc::new(entry);
-        e.insert(key, entry.clone());
+        {
+            let mut e = self.inner.lock().unwrap();
+            if e.entries.len() > 64 {
+                e.entries.clear();
+            }
+            e.entries.insert(key, entry.clone());
+        }
+        self.computes.fetch_add(1, Ordering::Relaxed);
         entry
+    }
+    /// The coalescing slot for a key (created on first miss).
+    fn slot(&self, key: &str) -> Arc<ComputeSlot> {
+        self.inner.lock().unwrap().inflight.entry(key.to_string()).or_default().clone()
+    }
+    /// Drop a finished slot so the NEXT miss starts a fresh computation.
+    fn finish(&self, key: &str) {
+        self.inner.lock().unwrap().inflight.remove(key);
+    }
+    /// Observability for the single-flight test and ops dashboards.
+    pub fn computes(&self) -> u64 {
+        self.computes.load(Ordering::Relaxed)
     }
 }
 
@@ -542,90 +578,125 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let entry: Arc<SearchEntry> = match st.search_cache.get(&key, rev_i) {
         Some(e) => e,
         None => {
-            let build_pool = Arc::clone(&pool);
-            let build_idx = Arc::clone(&st.name_index);
-            let build_owned = Arc::clone(&st.owned_index);
-            let p2 = p.clone();
-            let built = tokio::task::spawn_blocking(move || {
-                let Some((body, _total)) = build_body(&build_pool, &build_idx, &build_owned, &p2)? else {
-                    return Ok::<_, String>(None);
-                };
-                let body = bytes::Bytes::from(body);
-                let etag = body_etag(&body);
-                let gz = gzip_bytes(&body);
-                Ok(Some((body, gz, etag, None, "cache")))
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("build task panicked: {e}")));
-            let (body, gz, etag, total, source) = match built {
-                // The local cache had nothing. Node's next leg is the
-                // sidecar walk; for the branch we port, run it ourselves —
-                // anything else (or any sidecar failure) proxies and Node
-                // answers verbatim, upserts/503s and all.
-                Ok(None) => {
-                    let Some(base) = st
-                        .cfg
-                        .sidecar_url
-                        .as_deref()
-                        .filter(|_| p.walkable && st.owns("search_sidecar"))
-                    else {
-                        return crate::proxy(State(st.clone()), req).await;
-                    };
-                    let offset = (p.page - 1).saturating_mul(p.limit);
-                    let outcome = match sidecar::walk_name(&st, base, &p.name, &p.lang_name, offset, p.limit).await {
-                        Ok(o) => o,
-                        Err(_) => {
-                            tracing::debug!(name = %p.name, "sidecar walk failed → proxy");
-                            return crate::proxy(State(st.clone()), req).await;
-                        }
-                    };
-                    let walk_pool = Arc::clone(&pool);
-                    let walk_owned = Arc::clone(&st.owned_index);
-                    let p3 = p.clone();
-                    let walked = tokio::task::spawn_blocking(move || -> Result<_, String> {
-                        let mut cards = outcome.cards;
-                        let conn = walk_pool.get().map_err(|e| e.to_string())?;
-                        let mut attached = false;
-                        if rev_i >= 0 {
-                            if let Some(map) = walk_owned.owned_map(&walk_pool, p3.user_id, rev_i) {
-                                attached = name_index::attach_owned_from_snapshot(&mut cards, &map);
-                            }
-                        }
-                        if !attached {
-                            attach_owned_qty(&conn, &mut cards[..], p3.user_id)?;
-                        }
-                        let body = Bytes::from(serde_json::to_vec(&cards).map_err(|e| e.to_string())?);
-                        Ok::<_, String>((body, outcome.total, outcome.source))
+            // Coalesced regeneration (CollectionCache iter-5 pattern): every
+            // concurrent miss on this key awaits ONE build+walk through a
+            // shared OnceCell slot. The revision rides in the slot key so a
+            // request that observed a newer revision never shares a slot
+            // built under an older one; the entry itself is still rev-gated
+            // in the cache.
+            let cache = Arc::clone(&st.search_cache);
+            let slot_key = format!("{key}\u{0}{rev_i}");
+            let slot = cache.slot(&slot_key);
+            let init_cache = Arc::clone(&cache);
+            let init_st = st.clone();
+            let init_pool = Arc::clone(&pool);
+            let init_key = key.clone();
+            let init_p = p.clone();
+            let res: Result<&Result<Option<Arc<SearchEntry>>, String>, String> = slot
+                .get_or_try_init(move || async move {
+                    let build_pool = Arc::clone(&init_pool);
+                    let build_idx = Arc::clone(&init_st.name_index);
+                    let build_owned = Arc::clone(&init_st.owned_index);
+                    let p2 = init_p.clone();
+                    let built = tokio::task::spawn_blocking(move || {
+                        let Some((body, _total)) =
+                            build_body(&build_pool, &build_idx, &build_owned, &p2)?
+                        else {
+                            return Ok::<_, String>(None);
+                        };
+                        let body = bytes::Bytes::from(body);
+                        let etag = body_etag(&body);
+                        let gz = gzip_bytes(&body);
+                        Ok(Some((body, gz, etag, None, "cache")))
                     })
-                    .await;
-                    let walked = match walked {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!(error = %e, "sidecar walk task panicked");
-                            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+                    .await
+                    .unwrap_or_else(|e| Err(format!("build task panicked: {e}")))?;
+
+                    let (body, gz, etag, total, source) = match built {
+                        Some(v) => v,
+                        // The local cache had nothing. Node's next leg is the
+                        // sidecar walk; for the branch we port, run it
+                        // ourselves — anything else (or any sidecar failure)
+                        // answers Ok(None): every waiter then proxies and
+                        // Node answers verbatim, upserts/503s and all.
+                        None => {
+                            let Some(base) = init_st
+                                .cfg
+                                .sidecar_url
+                                .as_deref()
+                                .filter(|_| init_p.walkable && init_st.owns("search_sidecar"))
+                            else {
+                                return Ok(Ok(None));
+                            };
+                            let offset = (init_p.page - 1).saturating_mul(init_p.limit);
+                            let outcome = match sidecar::walk_name(
+                                &init_st,
+                                base,
+                                &init_p.name,
+                                &init_p.lang_name,
+                                offset,
+                                init_p.limit,
+                            )
+                            .await
+                            {
+                                Ok(o) => o,
+                                Err(_) => {
+                                    tracing::debug!(
+                                        name = %init_p.name,
+                                        "sidecar walk failed → proxy"
+                                    );
+                                    return Ok(Ok(None));
+                                }
+                            };
+                            let walk_pool = Arc::clone(&init_pool);
+                            let walk_owned = Arc::clone(&init_st.owned_index);
+                            let p3 = init_p.clone();
+                            let walked = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                                let mut cards = outcome.cards;
+                                let conn = walk_pool.get().map_err(|e| e.to_string())?;
+                                let mut attached = false;
+                                if rev_i >= 0 {
+                                    if let Some(map) =
+                                        walk_owned.owned_map(&walk_pool, p3.user_id, rev_i)
+                                    {
+                                        attached = name_index::attach_owned_from_snapshot(
+                                            &mut cards, &map,
+                                        );
+                                    }
+                                }
+                                if !attached {
+                                    attach_owned_qty(&conn, &mut cards[..], p3.user_id)?;
+                                }
+                                let body = Bytes::from(
+                                    serde_json::to_vec(&cards).map_err(|e| e.to_string())?,
+                                );
+                                Ok::<_, String>((body, outcome.total, outcome.source))
+                            })
+                            .await
+                            .map_err(|e| format!("sidecar walk task panicked: {e}"))??;
+                            let (body, total, source) = walked;
+                            let etag = body_etag(&body);
+                            let gz = gzip_bytes(&body);
+                            (body, gz, etag, total, source)
                         }
                     };
-                    let (body, total, source) = match walked {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!(error = %e, "sidecar walk build failed");
-                            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
-                        }
-                    };
-                    let etag = body_etag(&body);
-                    let gz = gzip_bytes(&body);
-                    (body, gz, etag, total, source)
-                }
-                Ok(Some(v)) => v,
-                Err(err) => {
-                    tracing::error!(error = %err, "search build failed");
+                    Ok(Ok(Some(init_cache.insert(
+                        init_key,
+                        SearchEntry { rev: rev_i, raw: body, gz, etag, total, source },
+                    ))))
+                })
+                .await;
+            cache.finish(&slot_key);
+            // get_or_try_init nests: outer Err carries a clone of the init
+            // error, outer Ok wraps the stored Result.
+            match res {
+                Ok(Ok(Some(e))) => e.clone(),
+                Ok(Ok(None)) => return crate::proxy(State(st.clone()), req).await,
+                Ok(Err(ref e)) | Err(ref e) => {
+                    tracing::error!(error = %e, "search build failed");
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
                 }
-            };
-            st.search_cache.insert(
-                key,
-                SearchEntry { rev: rev_i, raw: body, gz, etag, total, source },
-            )
+            }
         }
     };
 

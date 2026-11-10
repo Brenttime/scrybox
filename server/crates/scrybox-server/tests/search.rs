@@ -883,3 +883,96 @@ async fn sidecar_walk_entry_caches_and_invalidates_with_rev() {
     assert_eq!(b3, b1, "same body after rebuild");
     assert_eq!(seen.lock().unwrap().len(), 2, "rev bump forced a re-walk");
 }
+
+// --- single-flight (iter 8) ------------------------------------------------
+
+fn sidecar_state(path: PathBuf, upstream: &str, sidecar: &str) -> AppState {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: ["search".to_string(), "search_sidecar".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        db_path: Some(path),
+        sidecar_url: Some(sidecar.to_string()),
+    };
+    AppState::new(cfg)
+}
+
+async fn burst(r: &Router, url: &str) -> Vec<(StatusCode, HeaderMap, Vec<u8>)> {
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let r = r.clone();
+        let u = url.to_string();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri(u)
+                .header("authorization", "Bearer tok-session")
+                .body(Body::empty())
+                .unwrap();
+            let res = r.oneshot(req).await.unwrap();
+            let (parts, body) = res.into_parts();
+            (
+                parts.status,
+                parts.headers,
+                axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec(),
+            )
+        }));
+    }
+    let mut hits = Vec::new();
+    for h in handles {
+        hits.push(h.await.unwrap());
+    }
+    hits
+}
+
+/// The write-mix moment: a burst of concurrent requests hits one cold key.
+/// Without single-flight each request runs its own build — and, on the walk
+/// leg, pages the sidecar for itself (the iter-7 realistic p99 tail). With
+/// it, exactly ONE computation serves the burst (mirrors the collection and
+/// stats tests; the sidecar `seen` log is the walk-path computes()).
+#[tokio::test]
+async fn concurrent_misses_coalesce_into_one_sidecar_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, seen) = spawn_fake_sidecar().await;
+    let r = app(sidecar_state(path, &upstream, &sidecar));
+
+    let hits = burst(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20").await;
+    for (s, h, b) in &hits {
+        assert_eq!(*s, StatusCode::OK);
+        assert_eq!(h.get("x-source").unwrap(), "scryfall");
+        assert!(h.get("x-node").is_none(), "burst must not fall through to Node");
+        assert_eq!(b, &hits[0].2, "every waiter in the burst gets the same body");
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "burst of 8 cold requests must page the sidecar exactly once, got {seen:?}");
+}
+
+#[tokio::test]
+async fn concurrent_misses_coalesce_into_one_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream,
+        static_dir: None,
+        rust_routes: ["search".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(path),
+        sidecar_url: None,
+    };
+    let st = AppState::new(cfg);
+    let cache = Arc::clone(&st.search_cache);
+    let r = app(st);
+
+    let hits = burst(&r, "/api/search?scope=database&name=Sol%20Ring").await;
+    for (s, _, b) in &hits {
+        assert_eq!(*s, StatusCode::OK);
+        assert_eq!(b, &hits[0].2, "every waiter in the burst gets the same body");
+    }
+    assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
+}
