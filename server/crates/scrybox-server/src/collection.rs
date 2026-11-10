@@ -13,9 +13,14 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use tokio::sync::{OnceCell, Semaphore};
 
 use axum::{
     body::Body,
@@ -424,93 +429,224 @@ fn checked_out_allocation(conn: &rusqlite::Connection, user_id: i64) -> rusqlite
 
 /// Run the full query + shaping for one cache miss. Errors surface as the
 /// route's 500 body, matching Node's catch block.
-fn build_body(
+///
+/// Sequential reference implementation — the parallel fast path
+/// (`build_body_parallel`) must stay byte-identical to this; that identity is
+/// what the collection test suite pins.
+pub fn build_body(
     pool: &DbPool,
     p: &CollectionParams,
 ) -> Result<(Vec<u8>, Option<u64>), String> {
+    let (values, total) = build_values(pool, p)?;
+    let body = serde_json::to_vec(&values).map_err(|e| e.to_string())?;
+    Ok((body, total))
+}
+
+/// Query + parity-critical row shaping only (no serialization) — split out of
+/// `build_body` so the perf probe can time the stages independently.
+pub fn build_values(
+    pool: &DbPool,
+    p: &CollectionParams,
+) -> Result<(Vec<Value>, Option<u64>), String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
-    let (filter_sql, mut params) = filter_clause(p);
-
-    let total = if p.paginated && !p.count_zero {
-        let sql = format!(
-            "SELECT COUNT(*) AS count
-         FROM collection c
-         JOIN card_cache cc ON c.card_id = cc.id
-         {filter_sql}"
-        );
-        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-        let n: i64 = stmt
-            .query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        Some(n as u64)
-    } else {
-        None
-    };
-
-    let mut sql = format!("{SELECT_BODY}\n      {filter_sql}\n      ORDER BY c.added_at DESC, c.id DESC");
-    if p.paginated {
-        sql.push_str("\n      LIMIT ? OFFSET ?");
-        params.push(rusqlite::types::Value::Integer(p.limit));
-        params.push(rusqlite::types::Value::Integer(p.offset));
-    }
-
+    let (filter_sql, params) = filter_clause(p);
+    let total = count_total(&conn, p, &filter_sql, &params)?;
     let alloc = if !p.paginated || p.alloc {
         Some(checked_out_allocation(&conn, p.user_id).map_err(|e| e.to_string())?)
     } else {
         None
     };
+    let raw = collect_raw_rows(&conn, p, &filter_sql, &params)?;
+    let out = raw.into_iter().map(|r| shape_row(r, alloc.as_ref())).collect::<Result<Vec<_>, _>>()?;
+    Ok((out, total))
+}
 
+/// The parallel fast path used by the handler on cache miss.
+///
+/// The SQLite cursor stays on one connection (one consistent snapshot) for
+/// row collection; `checked_out_allocation` overlaps on a second pool
+/// connection; shaping + per-row serialization run on scoped worker threads.
+/// Per-row `to_vec` parts are stitched into the array by hand — byte-identical
+/// to `serde_json::to_vec` over the whole `Vec<Value>` (element serialization
+/// and comma joining are the same code path), pinned by a test against the
+/// sequential oracle.
+pub fn build_body_parallel(
+    pool: &Arc<DbPool>,
+    p: &CollectionParams,
+) -> Result<(Vec<u8>, Option<u64>), String> {
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let (filter_sql, params) = filter_clause(p);
+    let total = count_total(&conn, p, &filter_sql, &params)?;
+    let need_alloc = !p.paginated || p.alloc;
+
+    // Overlap the allocation queries with row collection: second connection,
+    // same WAL snapshot semantics as running them sequentially (they were
+    // already separate autocommit read statements).
+    let alloc_pool = Arc::clone(pool);
+    let user_id = p.user_id;
+    let (raw_rows, alloc) = if need_alloc {
+        std::thread::scope(|s| -> Result<(Vec<Vec<Value>>, Option<HashMap<i64, f64>>), String> {
+            let alloc_handle = s.spawn(move || -> Result<HashMap<i64, f64>, String> {
+                let conn = alloc_pool.get().map_err(|e| e.to_string())?;
+                checked_out_allocation(&conn, user_id).map_err(|e| e.to_string())
+            });
+            let raw = collect_raw_rows(&conn, p, &filter_sql, &params)?;
+            let a = alloc_handle.join().map_err(|_| "alloc thread panicked".to_string())??;
+            Ok::<_, String>((raw, Some(a)))
+        })?
+    } else {
+        (collect_raw_rows(&conn, p, &filter_sql, &params)?, None)
+    };
+
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 4);
+    let parts: Vec<Vec<u8>> = if raw_rows.len() < 4000 || nthreads == 1 {
+        raw_rows
+            .into_iter()
+            .map(|r| shape_row(r, alloc.as_ref()).and_then(|v| serde_json::to_vec(&v).map_err(|e| e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let step = raw_rows.len().div_ceil(nthreads);
+        let mut raw_rows = raw_rows;
+        let mut groups: Vec<Vec<Vec<Value>>> = Vec::with_capacity(nthreads);
+        while !raw_rows.is_empty() {
+            let take = step.min(raw_rows.len());
+            groups.push(raw_rows.drain(..take).collect());
+        }
+        let alloc_ref = alloc.as_ref();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = groups
+                .into_iter()
+                .map(|group| {
+                    s.spawn(move || {
+                        group
+                            .into_iter()
+                            .map(|r| {
+                                shape_row(r, alloc_ref)
+                                    .and_then(|v| serde_json::to_vec(&v).map_err(|e| e.to_string()))
+                            })
+                            .collect::<Result<Vec<Vec<u8>>, String>>()
+                    })
+                })
+                .collect();
+            let mut per_thread: Vec<Result<Vec<Vec<u8>>, String>> = Vec::new();
+            for h in handles {
+                per_thread.push(h.join().map_err(|_| "shape thread panicked".to_string())?);
+            }
+            let mut merged: Vec<Vec<u8>> = Vec::new();
+            for pt in per_thread {
+                merged.extend(pt?);
+            }
+            Ok::<_, String>(merged)
+        })?
+    };
+
+    // Stitch the array: serde_json writes elements back-to-back separated by
+    // ',' inside the brackets, so concatenating per-row parts reproduces the
+    // whole-array serialization byte for byte.
+    let mut body = Vec::with_capacity(parts.iter().map(|p| p.len() + 1).sum::<usize>() + 2);
+    body.push(b'[');
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(part);
+    }
+    body.push(b']');
+    Ok((body, total))
+}
+
+/// COUNT(*) companion for paginated shapes (same SQL as Node's count query).
+fn count_total(
+    conn: &rusqlite::Connection,
+    p: &CollectionParams,
+    filter_sql: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<Option<u64>, String> {
+    if !p.paginated || p.count_zero {
+        return Ok(None);
+    }
+    let sql = format!(
+        "SELECT COUNT(*) AS count
+         FROM collection c
+         JOIN card_cache cc ON c.card_id = cc.id
+         {filter_sql}"
+    );
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    let n: i64 = stmt
+        .query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(Some(n as u64))
+}
+
+/// Step the main SELECT, returning the raw (unshaped) column values per row.
+fn collect_raw_rows(
+    conn: &rusqlite::Connection,
+    p: &CollectionParams,
+    filter_sql: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<Vec<Vec<Value>>, String> {
+    let mut sql = format!("{SELECT_BODY}\n      {filter_sql}\n      ORDER BY c.added_at DESC, c.id DESC");
+    let mut params: Vec<rusqlite::types::Value> = params.to_vec();
+    if p.paginated {
+        sql.push_str("\n      LIMIT ? OFFSET ?");
+        params.push(rusqlite::types::Value::Integer(p.limit));
+        params.push(rusqlite::types::Value::Integer(p.offset));
+    }
     let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter())).map_err(|e| e.to_string())?;
-    let mut out: Vec<Value> = Vec::new();
+    let mut out: Vec<Vec<Value>> = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        // Raw values first (resolveCardPrice/applyProxyRarity read the raw row).
         let mut raw = Vec::with_capacity(ALL_COLS.len());
         for i in 0..ALL_COLS.len() {
             raw.push(sqlite_value(row, i).map_err(|e| e.to_string())?);
         }
-        let idx = |name: &str| ALL_COLS.iter().position(|c| *c == name).unwrap();
-        let is_proxy = &raw[idx("is_proxy")];
-        let printing = &raw[idx("printing")];
-        let rarity_raw = &raw[idx("rarity")];
-
-        let mut obj = Map::with_capacity(ALL_COLS.len() + 2);
-        for (i, name) in ALL_COLS.iter().enumerate() {
-            let v = match *name {
-                "is_proxy" => Value::from(if truthy(is_proxy) { 1 } else { 0 }),
-                "rarity" => {
-                    if truthy(is_proxy) {
-                        Value::String("Proxy".into())
-                    } else {
-                        rarity_raw.clone()
-                    }
-                }
-                "subtypes" | "types" | "color_identity" => parse_array_col(&raw[i])?,
-                "price_trend" => resolve_card_price(
-                    is_proxy,
-                    printing,
-                    &raw[idx("price_trend")],
-                    &raw[idx("price_normal")],
-                    &raw[idx("price_holofoil")],
-                ),
-                _ => raw[i].clone(),
-            };
-            obj.insert((*name).to_string(), v);
-        }
-        // applyProxyRarity appends base_rarity as a brand-new key (the SELECT
-        // has no base_rarity column), landing it after the row keys.
-        obj.insert("base_rarity".to_string(), rarity_raw.clone());
-        if let Some(alloc) = &alloc {
-            obj.insert(
-                "checked_out_qty".to_string(),
-                alloc.get(&raw[idx("entry_id")].as_i64().unwrap_or(-1)).map(|q| json_num(*q)).unwrap_or(Value::from(0)),
-            );
-        }
-        out.push(Value::Object(obj));
+        out.push(raw);
     }
+    Ok(out)
+}
 
-    let body = serde_json::to_vec(&out).map_err(|e| e.to_string())?;
-    Ok((body, total))
+/// Parity-critical single-row shaping (parseCardRow + applyProxyRarity +
+/// resolveCardPrice + checkedOutAllocation). Shared by the sequential and
+/// parallel paths so the shaping logic lives in exactly one place.
+fn shape_row(raw: Vec<Value>, alloc: Option<&HashMap<i64, f64>>) -> Result<Value, String> {
+    let idx = |name: &str| ALL_COLS.iter().position(|c| *c == name).unwrap();
+    let is_proxy = &raw[idx("is_proxy")];
+    let printing = &raw[idx("printing")];
+    let rarity_raw = &raw[idx("rarity")];
+
+    let mut obj = Map::with_capacity(ALL_COLS.len() + 2);
+    for (i, name) in ALL_COLS.iter().enumerate() {
+        let v = match *name {
+            "is_proxy" => Value::from(if truthy(is_proxy) { 1 } else { 0 }),
+            "rarity" => {
+                if truthy(is_proxy) {
+                    Value::String("Proxy".into())
+                } else {
+                    rarity_raw.clone()
+                }
+            }
+            "subtypes" | "types" | "color_identity" => parse_array_col(&raw[i])?,
+            "price_trend" => resolve_card_price(
+                is_proxy,
+                printing,
+                &raw[idx("price_trend")],
+                &raw[idx("price_normal")],
+                &raw[idx("price_holofoil")],
+            ),
+            _ => raw[i].clone(),
+        };
+        obj.insert((*name).to_string(), v);
+    }
+    // applyProxyRarity appends base_rarity as a brand-new key (the SELECT
+    // has no base_rarity column), landing it after the row keys.
+    obj.insert("base_rarity".to_string(), rarity_raw.clone());
+    if let Some(alloc) = &alloc {
+        obj.insert(
+            "checked_out_qty".to_string(),
+            alloc.get(&raw[idx("entry_id")].as_i64().unwrap_or(-1)).map(|q| json_num(*q)).unwrap_or(Value::from(0)),
+        );
+    }
+    Ok(Value::Object(obj))
 }
 
 // ---------------------------------------------------------------------------
@@ -520,17 +656,47 @@ fn build_body(
 pub struct CacheEntry {
     rev: i64,
     raw: Bytes,
-    gz: Bytes,
     total: Option<u64>,
     /// Express-default body ETag, computed once with the body.
     etag: String,
+    /// gzip is filled lazily on the first gzip-demanding hit. Node pays for
+    /// compression inside each response that asks for it; precomputing at
+    /// build time charged ~300 ms per rebuild even on clients (and the bench)
+    /// that never send Accept-Encoding.
+    gz: OnceCell<Bytes>,
+}
+
+/// Single-flight slot, same shape as the stats cache (stats.rs): every
+/// concurrent miss on one key shares a single query+shape+serialize. Without
+/// it, a write-mix bench stampede runs duplicate ~26 MB builds per shape.
+type ComputeSlot = OnceCell<Result<Arc<CacheEntry>, String>>;
+
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<String, Arc<CacheEntry>>,
+    inflight: HashMap<String, Arc<ComputeSlot>>,
 }
 
 /// Serialized responses keyed by (params, collection_read_revision).
 /// Node's write triggers bump the revision, which invalidates every entry.
-#[derive(Default)]
 pub struct CollectionCache {
-    entries: Mutex<HashMap<String, Arc<CacheEntry>>>,
+    inner: Mutex<Inner>,
+    /// Number of full bodies actually computed (single-flight test + ops).
+    computes: AtomicU64,
+    /// Cross-key cap on concurrent full builds (a full shape is ~26 MB raw;
+    /// unbounded builds under stampede drove RSS to ~4 GB in iter 4's
+    /// realistic run).
+    builds: Arc<Semaphore>,
+}
+
+impl Default for CollectionCache {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            computes: AtomicU64::new(0),
+            builds: Arc::new(Semaphore::new(2)),
+        }
+    }
 }
 
 impl CollectionCache {
@@ -538,27 +704,81 @@ impl CollectionCache {
         Self::default()
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<CacheEntry>> {
-        let e = self.entries.lock().unwrap();
-        e.get(key).filter(|e| e.rev == rev).cloned()
+        let e = self.inner.lock().unwrap();
+        e.entries.get(key).filter(|e| e.rev == rev).cloned()
     }
-    fn insert(&self, key: String, entry: CacheEntry) -> Arc<CacheEntry> {
-        let mut e = self.entries.lock().unwrap();
-        if e.len() > 64 {
-            e.clear();
+    /// Store a freshly built entry and return it.
+    fn put(&self, key: String, rev: i64, raw: Vec<u8>, total: Option<u64>) -> Arc<CacheEntry> {
+        let etag = body_etag(&raw);
+        let entry = Arc::new(CacheEntry { rev, raw: Bytes::from(raw), total, etag, gz: OnceCell::new() });
+        {
+            let mut e = self.inner.lock().unwrap();
+            if e.entries.len() > 64 {
+                e.entries.clear();
+            }
+            e.entries.insert(key, entry.clone());
         }
-        let entry = Arc::new(entry);
-        e.insert(key, entry.clone());
+        self.computes.fetch_add(1, Ordering::Relaxed);
         entry
+    }
+    /// The coalescing slot for a key (created on first miss).
+    fn slot(&self, key: &str) -> Arc<ComputeSlot> {
+        self.inner.lock().unwrap().inflight.entry(key.to_string()).or_default().clone()
+    }
+    /// Drop a finished slot so the NEXT miss starts a fresh computation.
+    fn finish(&self, key: &str) {
+        self.inner.lock().unwrap().inflight.remove(key);
+    }
+    /// Observability for the single-flight test and ops dashboards.
+    pub fn computes(&self) -> u64 {
+        self.computes.load(Ordering::Relaxed)
+    }
+    async fn build_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        // acquire() only fails on close(), which never happens here.
+        Arc::clone(&self.builds).acquire_owned().await.expect("build semaphore")
     }
 }
 
 pub(crate) fn gzip_bytes(raw: &[u8]) -> Bytes {
+    Bytes::from(gzip_at(raw, 6))
+}
+
+fn gzip_at(raw: &[u8], level: u32) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    let mut enc = GzEncoder::new(Vec::new(), Compression::new(level));
     enc.write_all(raw).expect("vec write");
-    Bytes::from(enc.finish().expect("gzip"))
+    enc.finish().expect("gzip")
 }
+
+/// Multi-member gzip (the pigz technique): independently compressed
+/// members concatenated. Any conformant gunzip (browsers, curl, undici)
+/// transparently decompresses the concatenation, and the members compress
+/// in parallel — 26 MB of full-collection JSON drops from ~310 ms to ~150 ms
+/// on 4 cores while keeping the same deflate level (6) as Node's zlib default.
+fn gzip_members(raw: &[u8], level: u32) -> Vec<u8> {
+    const MEMBER: usize = 4 << 20; // 4 MB per member
+    if raw.len() <= MEMBER {
+        return gzip_at(raw, level);
+    }
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    let chunks: Vec<&[u8]> = if raw.len() / nthreads >= MEMBER {
+        raw.chunks(MEMBER).collect()
+    } else {
+        raw.chunks(raw.len().div_ceil(nthreads)).collect()
+    };
+    let members: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let handles: Vec<_> = chunks.iter().map(|c| s.spawn(move || gzip_at(c, level))).collect();
+        handles.into_iter().map(|h| h.join().expect("gzip member thread")).collect()
+    });
+    let total: usize = members.iter().map(|m| m.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for m in members {
+        out.extend_from_slice(&m);
+    }
+    out
+}
+
 
 /// compression@1.x behaviour: gzip when Accept-Encoding offers it and the
 /// body clears the 1 KB threshold.
@@ -647,25 +867,38 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let entry: Arc<CacheEntry> = match st.collection_cache.get(&key, rev_i) {
         Some(e) => e,
         None => {
-            let build_pool = Arc::clone(&pool);
-            let p2 = p.clone();
-            // Query + shaping + gzip all run off the async runtime: the full
-            // response is ~27 MB raw.
-            let built = tokio::task::spawn_blocking(move || {
-                let (body, total) = build_body(&build_pool, &p2)?;
-                let etag = body_etag(&body);
-                let gz = gzip_bytes(&body);
-                Ok::<_, String>((body, gz, total, etag))
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("build task panicked: {e}")));
-            match built {
-                Ok((body, gz, total, etag)) => st.collection_cache.insert(
-                    key,
-                    CacheEntry { rev: rev_i, raw: Bytes::from(body), gz, total, etag },
-                ),
-                Err(err) => {
-                    tracing::error!(error = %err, "collection build failed");
+            // Coalesced regeneration (stats.rs pattern): every concurrent
+            // miss on this key awaits ONE build_body_parallel through a
+            // shared OnceCell slot, gated by the cross-key build semaphore.
+            let cache = Arc::clone(&st.collection_cache);
+            let slot = cache.slot(&key);
+            let init_cache = Arc::clone(&cache);
+            let init_pool = Arc::clone(&pool);
+            let init_key = key.clone();
+            let init_p = p.clone();
+            let res: Result<&Result<Arc<CacheEntry>, String>, String> = slot
+                .get_or_try_init(move || async move {
+                    let _permit = init_cache.build_permit().await;
+                    let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
+                        let (body, total) = build_body_parallel(&init_pool, &init_p)?;
+                        Ok(init_cache.put(init_key, rev_i, body, total))
+                    })
+                    .await
+                    .map_err(|e| format!("collection build task panicked: {e}"))?;
+                    Ok(r)
+                })
+                .await;
+            cache.finish(&key);
+            // get_or_try_init nests: outer Err carries a clone of the init
+            // error, outer Ok wraps the stored Result<Arc<CacheEntry>, String>.
+            match res {
+                Ok(Ok(e)) => e.clone(),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "collection build failed");
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch collection");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "collection build failed");
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch collection");
                 }
             }
@@ -689,7 +922,30 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
 
     let use_gzip = wants_encoding(ae.as_deref(), "gzip", entry.raw.len());
     let (body, encoding) = if use_gzip {
-        (entry.gz.clone(), Some("gzip"))
+        // Compressed on first demand, then shared by every later hit; members
+        // compress in parallel (see gzip_members).
+        let gz = entry
+            .gz
+            .get_or_try_init(|| {
+                let raw = entry.raw.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || Ok::<_, std::io::Error>(Bytes::from(gzip_members(
+                        &raw, 6,
+                    ))))
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::other(format!("gzip task panicked: {e}"))
+                    })?
+                }
+            })
+            .await;
+        match gz {
+            Ok(gz) => (gz.clone(), Some("gzip")),
+            Err(e) => {
+                tracing::error!(error = %e, "collection gzip failed; serving raw");
+                (entry.raw.clone(), None)
+            }
+        }
     } else {
         (entry.raw.clone(), None)
     };
@@ -713,4 +969,163 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         }
     }
     b.body(Body::from(body)).unwrap()
+}
+
+#[cfg(test)]
+mod perf_probe {
+    //! Ignored stage-timing probe for the full (unpaginated) collection build
+    //! against the real DB copy: `SCRYBOX_DB_PATH=... cargo test --lib --
+    //! --ignored --nocapture perf_probe`. Not part of `cargo test` default run.
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "perf probe: needs SCRYBOX_DB_PATH pointing at the prod DB copy"]
+    fn full_build_stage_timings() {
+        let Ok(path) = std::env::var("SCRYBOX_DB_PATH") else {
+            eprintln!("skip: SCRYBOX_DB_PATH unset");
+            return;
+        };
+        let pool = DbPool::open(&path, 4).expect("open pool");
+        let user_id = std::env::var("SCRYBOX_PROBE_USER").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let p = CollectionParams {
+            user_id,
+            is_trade: None,
+            card_id: None,
+            paginated: false,
+            limit: 100,
+            offset: 0,
+            alloc: false,
+            count_zero: false,
+            qs: String::new(),
+        };
+        for round in 0..3 {
+            let t0 = Instant::now();
+            let (vals, _total) = build_values(&pool, &p).unwrap();
+            let t1 = Instant::now();
+            let body = serde_json::to_vec(&vals).unwrap();
+            let t2 = Instant::now();
+            let _etag = body_etag(&body);
+            let t3 = Instant::now();
+            let gz6 = gzip_at(&body, 6);
+            let t4 = Instant::now();
+            let gz3 = gzip_at(&body, 3);
+            let t5 = Instant::now();
+            let gz1 = gzip_at(&body, 1);
+            let t6 = Instant::now();
+            let par = {
+                let pool = Arc::new(DbPool::open(&path, 4).unwrap());
+                let (b, _t) = build_body_parallel(&pool, &p).unwrap();
+                assert_eq!(b, body, "parallel build must be byte-identical");
+                b.len()
+            };
+            let t7 = Instant::now();
+            println!(
+                "round {round}: rows={} raw={}MB | values={:?} to_vec={:?} etag={:?} gz6={:?}({}MB) gz3={:?}({}MB) gz1={:?}({}MB) total={:?} | parallel_build={:?}",
+                vals.len(),
+                body.len() / 1_048_576,
+                t1 - t0,
+                t2 - t1,
+                t3 - t2,
+                t4 - t3,
+                gz6.len() / 1_048_576,
+                t5 - t4,
+                gz3.len() / 1_048_576,
+                t6 - t5,
+                gz1.len() / 1_048_576,
+                t6 - t0,
+                t7 - t6,
+            );
+            let _ = par;
+        }
+    }
+
+    #[test]
+    #[ignore = "perf probe: needs SCRYBOX_DB_PATH pointing at the prod DB copy"]
+    fn full_build_substage_timings() {
+        let Ok(path) = std::env::var("SCRYBOX_DB_PATH") else { eprintln!("skip"); return };
+        let pool = DbPool::open(&path, 8).expect("open pool");
+        let user_id = std::env::var("SCRYBOX_PROBE_USER").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let p = CollectionParams { user_id, is_trade: None, card_id: None, paginated: false,
+            limit: 100, offset: 0, alloc: false, count_zero: false, qs: String::new() };
+        for round in 0..3 {
+            let t0 = Instant::now();
+            let (filter_sql, params) = filter_clause(&p);
+            let conn = pool.get().unwrap();
+            let mut sql = format!("{SELECT_BODY}\n      {filter_sql}\n      ORDER BY c.added_at DESC, c.id DESC");
+            if p.paginated { sql.push_str("\n      LIMIT ? OFFSET ?"); }
+            let mut stmt = conn.prepare_cached(&sql).unwrap();
+            let mut raw_rows: Vec<Vec<Value>> = Vec::new();
+            {
+                let mut rows = stmt.query(rusqlite::params_from_iter(params.iter())).unwrap();
+                while let Some(row) = rows.next().unwrap() {
+                    let mut raw = Vec::with_capacity(ALL_COLS.len());
+                    for i in 0..ALL_COLS.len() { raw.push(sqlite_value(row, i).unwrap()); }
+                    raw_rows.push(raw);
+                }
+            }
+            drop(stmt);
+            let t1 = Instant::now();
+            let _alloc = checked_out_allocation(&conn, p.user_id).unwrap();
+            let t2 = Instant::now();
+            // shape sequentially (copy of build_values loop)
+            let idx = |name: &str| ALL_COLS.iter().position(|c| *c == name).unwrap();
+            let shape_row = |raw: &Vec<Value>| -> Value {
+                let is_proxy = &raw[idx("is_proxy")];
+                let printing = &raw[idx("printing")];
+                let rarity_raw = &raw[idx("rarity")];
+                let mut obj = Map::with_capacity(ALL_COLS.len() + 2);
+                for (i, name) in ALL_COLS.iter().enumerate() {
+                    let v = match *name {
+                        "is_proxy" => Value::from(if truthy(is_proxy) { 1 } else { 0 }),
+                        "rarity" => if truthy(is_proxy) { Value::String("Proxy".into()) } else { rarity_raw.clone() },
+                        "subtypes" | "types" | "color_identity" => parse_array_col(&raw[i]).unwrap(),
+                        "price_trend" => resolve_card_price(is_proxy, printing, &raw[idx("price_trend")], &raw[idx("price_normal")], &raw[idx("price_holofoil")]),
+                        _ => raw[i].clone(),
+                    };
+                    obj.insert((*name).to_string(), v);
+                }
+                obj.insert("base_rarity".to_string(), rarity_raw.clone());
+                Value::Object(obj)
+            };
+            let vals: Vec<Value> = raw_rows.iter().map(shape_row).collect();
+            let t3 = Instant::now();
+            // parallel shape+serialize via thread::scope chunks
+            let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4);
+            let chunk = raw_rows.len().div_ceil(nthreads);
+            let parts: Vec<Vec<u8>> = std::thread::scope(|s| {
+                let handles: Vec<_> = raw_rows.chunks(chunk).map(|chunk_rows| {
+                    s.spawn(move || chunk_rows.iter().map(shape_row).map(|v| serde_json::to_vec(&v).unwrap()).collect::<Vec<_>>())
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).flatten().collect()
+            });
+            let t4 = Instant::now();
+            let mut par_body = Vec::new();
+            par_body.push(b'[');
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 { par_body.push(b','); }
+                par_body.extend_from_slice(part);
+            }
+            par_body.push(b']');
+            let par_bytes = par_body;
+            let seq_body = serde_json::to_vec(&vals).unwrap();
+            let t5 = Instant::now();
+            // parallel gzip members over seq_body
+            let gz_par = {
+                let chunk = seq_body.len().div_ceil(nthreads);
+                let members: Vec<Vec<u8>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = seq_body.chunks(chunk).map(|c| s.spawn(move || gzip_at(c, 6))).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                members.concat()
+            };
+            let t6 = Instant::now();
+            assert_eq!(seq_body, par_bytes, "parallel body must be byte-identical");
+            println!(
+                "round {round}: raw_rows={:?} alloc={:?} shape_seq={:?} par_shape_tovec={:?} stitch_ser={:?} gzmulti={:?} (gz {}MB -> {}MB)",
+                t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5,
+                seq_body.len() / 1_048_576, gz_par.len() / 1_048_576,
+            );
+        }
+    }
 }

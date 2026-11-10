@@ -478,3 +478,154 @@ async fn unowned_routes_and_non_get_still_proxy_to_node() {
     let b = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&b[..], b"NODE");
 }
+
+// ---------------------------------------------------------------------------
+// Iter 5: parallel build fast path — oracle byte-identity, lazy gzip,
+// single-flight.
+// ---------------------------------------------------------------------------
+
+/// Bulk variant of `seeded_db_named`: enough rows (and enough edge-case
+/// variety — unicode names, quotes, nulls, empty-string JSON columns,
+/// proxies, holofoil printings, float prices) to push the parallel shaper
+/// past its 4000-row threshold and cover every shaping branch.
+fn seeded_bulk_db(dir: &std::path::Path, name: &str, rows: usize) -> PathBuf {
+    let path = seeded_db_named(dir, name);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..300 {
+        let (subtype, types, rarity, pt, pn, ph, ci): (&str, &str, &str, Option<f64>, Option<f64>, Option<f64>, Option<&str>) =
+            match i % 6 {
+                0 => ("[]", "[\"Artifact\"]", "Common", Some(2.5), Some(3.0), Some(4.5), Some("[]")),
+                1 => ("", "[]", "Uncommon", None, None, None, None),
+                2 => ("[\"Human\",\"Wizard\"]", "[\"Creature\"]", "Rare", Some(0.0), Some(0.0), None, Some("[\"U\",\"B\"]")),
+                3 => ("[\"Land\"]", "[\"Land\"]", "Basic Land", None, Some(0.01), None, Some("[]")),
+                4 => ("[\"Elf\"]", "[\"Creature\",\"Elf\"]", "Mythic Rare", Some(1234.5678), Some(1000.0), Some(1500.0), Some("[\"G\"]")),
+                _ => ("[\"Weird \\\"Quoted\\\" Token\"]", "[\"Creature\"]", "", Some(-1.5), None, Some(0.0), Some("[\"R\"]")),
+            };
+        conn.execute(
+            "INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name, number,
+                                      price_trend, price_normal, price_holofoil, cmc, color_identity, image_url)
+             VALUES (?1, ?2, 'Card', ?3, ?4, ?5, 'wk1', 'Wéird Set \"Q\"', ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                format!("bulk{i}"),
+                format!("Ünïcode & \"quoted\" <card> {i} — 東京"),
+                subtype, types, rarity, format!("{i}½"), pt, pn, ph,
+                rusqlite::types::Value::Real((i % 9) as f64 + 0.125), ci,
+                if i % 7 == 0 { None } else { Some(format!("https://img/{i}.jpg")) },
+            ],
+        )
+        .unwrap();
+    }
+    for j in 0..rows {
+        conn.execute(
+            "INSERT INTO collection (id, card_id, quantity, condition, printing, language, purchase_price,
+                                      added_at, notes, is_trade, user_id, is_proxy)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'English', ?6, ?7, ?8, ?9, 1, ?10)",
+            rusqlite::params![
+                1000 + j as i64,
+                format!("bulk{}", j % 300),
+                (j % 4) as i64 + 1,
+                ["Near Mint", "Lightly Played", "Damaged"][j % 3],
+                if j % 3 == 0 { "Holofoil" } else { "Normal" },
+                if j % 5 == 0 { None } else { Some(j as f64 * 0.05) },
+                format!("2024-{:02}-{:02} 00:00:00", j % 12 + 1, j % 28 + 1),
+                if j % 11 == 0 { "ñotes \"x\"" } else { "" },
+                (j % 2) as i64,
+                (j % 9 == 0) as i64,
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    path
+}
+
+#[test]
+fn parallel_build_matches_sequential_oracle_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "bulk-identity.db", 4500);
+    let pool = std::sync::Arc::new(scrybox_server::db::DbPool::open(&path, 4).unwrap());
+    let cases = [
+        None,
+        Some(""),
+        Some("is_trade=1"),
+        Some("is_trade=0"),
+        Some("limit=1000&offset=0"),
+        Some("limit=2000&offset=1000"),
+        Some("limit=4499&offset=0"),
+        Some("include_allocation=1"),
+        Some("count=0&limit=10"),
+        Some("card_id=bulk7"),
+        Some("include_allocation=1&count=0&limit=2000&offset=500"),
+    ];
+    for qs in cases {
+        let p = scrybox_server::collection::parse_params(1, qs);
+        let seq = scrybox_server::collection::build_body(&pool, &p).expect("sequential build");
+        let par = scrybox_server::collection::build_body_parallel(&pool, &p).expect("parallel build");
+        assert_eq!(seq.1, par.1, "x-total-count mismatch for {qs:?}");
+        assert_eq!(seq.0, par.0, "body bytes diverged for {qs:?}");
+    }
+}
+
+#[tokio::test]
+async fn lazy_gzip_body_decompresses_to_the_raw_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "lazy-gz.db", 4500);
+    let r = router_for(path, &["collection"], "http://127.0.0.1:1");
+    let (s1, _, raw) = get(&r, "/api/collection", &auth()).await;
+    assert_eq!(s1, StatusCode::OK);
+    let (s2, h2, gzipped) = get(&r, "/api/collection", &[("authorization", "Bearer tok-session"), ("accept-encoding", "gzip")]).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(h2[header::CONTENT_ENCODING], "gzip");
+    use std::io::Read;
+    let mut dec = flate2::read::GzDecoder::new(&gzipped[..]);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, raw, "lazy multi-member gzip must decompress to the exact raw body");
+}
+
+#[tokio::test]
+async fn concurrent_misses_coalesce_into_one_computation() {
+    // The write-mix moment: a burst of concurrent requests hits a cold cache.
+    // Without single-flight every one of them runs the full ~26 MB-shape
+    // build (what Node does); with it, exactly ONE computation serves the
+    // burst. computes()==1 is the contract (mirrors the stats.rs test).
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "coalesce.db", 4500);
+    let upstream = fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.clone(),
+        static_dir: None,
+        rust_routes: ["collection".to_string()].into_iter().collect(),
+        db_path: Some(path),
+    };
+    let state = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&state.collection_cache);
+    let r = app(state);
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let r = r.clone();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/collection")
+                .header("authorization", "Bearer tok-session")
+                .body(Body::empty())
+                .unwrap();
+            let res = r.oneshot(req).await.unwrap();
+            let (parts, body) = res.into_parts();
+            (parts.status, axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec())
+        }));
+    }
+    let mut hits = Vec::new();
+    for h in handles {
+        hits.push(h.await.unwrap());
+    }
+    for (s, b) in &hits {
+        assert_eq!(*s, StatusCode::OK);
+        assert_eq!(b, &hits[0].1, "every waiter in the burst gets the same body");
+    }
+    assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
+}
