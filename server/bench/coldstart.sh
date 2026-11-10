@@ -6,9 +6,9 @@
 set -e
 cd "$(dirname "$0")"
 TS=$(date +%H%M%S)
-node coldstart-probe.mjs --scenario ../../../scen-rust.json --duration-ms 4000 --out "results/coldstart-$TS.json" &
+node coldstart-probe.mjs --scenario ../../../scen-rust.json --duration-ms 8000 --out "results/coldstart-$TS.json" &
 PROBE=$!
 sleep 0.3
-../../restart-rust.sh
+../../../restart-rust.sh
 wait $PROBE
 echo "wrote results/coldstart-$TS.json"

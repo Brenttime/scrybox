@@ -102,6 +102,10 @@ pub struct AppState {
     /// In-process half of the shared `collection_query_cache` (match lists
     /// for the collection-scope q leg, collq.rs) + walk single-flight.
     pub collq_cache: Arc<collq::CollQCache>,
+    /// Pre-warm cost gate (collection.rs, iter 15): shapes whose last build
+    /// was cheaper than this never fan out. `SCRYBOX_PREWARM_MIN_COST_MS`
+    /// overrides; tests set the field directly.
+    pub prewarm_min_cost_ms: u64,
 }
 
 impl AppState {
@@ -125,7 +129,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).

@@ -657,7 +657,10 @@ async fn refresher_prebuilds_post_bump_body_without_requests() {
         db_path: Some(path.clone()),
         sidecar_url: None,
     };
-    let state = AppState::new(cfg);
+    let mut state = AppState::new(cfg);
+    // Fixture builds take <1 ms; the iter-15 cost gate would (correctly)
+    // never fan them out — disable it to test the fan-out mechanics.
+    state.prewarm_min_cost_ms = 0;
     let cache = std::sync::Arc::clone(&state.collection_cache);
     let r = app(state);
 
@@ -703,7 +706,8 @@ async fn refresher_does_no_unrequested_work_or_spurious_builds() {
         db_path: Some(path.clone()),
         sidecar_url: None,
     };
-    let state = AppState::new(cfg);
+    let mut state = AppState::new(cfg);
+    state.prewarm_min_cost_ms = 0; // see note in the sibling refresher test
     let cache = std::sync::Arc::clone(&state.collection_cache);
     let r = app(state);
 

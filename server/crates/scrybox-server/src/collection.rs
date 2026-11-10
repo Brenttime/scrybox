@@ -673,6 +673,20 @@ const REFRESH_DEBOUNCE_TICKS: u8 = 2;
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Soft cap on the recently-requested-shape map (params variety × users).
 const RECENT_MAX: usize = 256;
+/// Cost gate for the pre-warm fan-out (iter 15). Unbudgeted fan-out over
+/// every recent shape — cheap paged builds included — kept 2 of the 4 cores
+/// busy on every write-mix tick, starved the search_db request path
+/// (realistic rps collapsed 5136 → 32–186) and grew RSS to ~3.5 GB vs
+/// iter-12's 1147 MB. Only shapes whose LAST successful build cost at least
+/// this many ms are worth pre-warming; cheap shapes rebuild lazily for free.
+/// Overridable per-process via `AppState::prewarm_min_cost_ms`
+/// (`SCRYBOX_PREWARM_MIN_COST_MS`).
+pub(crate) const PREWARM_MIN_COST_MS_DEFAULT: u64 = 40;
+/// Per-generation estimate-time budget (iter 15): a settled revision fans out
+/// at most this much estimated build time (summed from last-build costs),
+/// most-recently-requested first. Bounds the blast radius when many expensive
+/// shapes are all recent at once.
+const PREWARM_GEN_BUDGET_MS: u64 = 2_000;
 /// Recent entries older than this are dropped when the reaper runs.
 const RECENT_WINDOW: Duration = Duration::from_secs(120);
 
@@ -701,6 +715,9 @@ struct Inner {
     /// Shapes requested recently, with their parsed params — the candidate
     /// set for the background refresher (see `spawn_refresher`).
     recent: HashMap<String, (CollectionParams, Instant)>,
+    /// Last successful build time (ms) per shape key — the pre-warm cost
+    /// gate's input (iter 15). Absent = never built, so never pre-warmed.
+    cost: HashMap<String, u64>,
     /// Per-key backoff after a failed pre-build (refresher only).
     cooldown: HashMap<String, Instant>,
 }
@@ -735,8 +752,10 @@ impl CollectionCache {
         let e = self.inner.lock().unwrap();
         e.entries.get(key).filter(|e| e.rev == rev).cloned()
     }
-    /// Store a freshly built entry and return it.
-    fn put(&self, key: String, rev: i64, raw: Vec<u8>, total: Option<u64>) -> Arc<CacheEntry> {
+    /// Store a freshly built entry and return it. `cost` is the measured
+    /// build time (permit acquired → body complete), recorded for the
+    /// pre-warm cost gate (iter 15).
+    fn put(&self, key: String, rev: i64, raw: Vec<u8>, total: Option<u64>, cost: Duration) -> Arc<CacheEntry> {
         let etag = body_etag(&raw);
         let entry = Arc::new(CacheEntry { rev, raw: Bytes::from(raw), total, etag, gz: OnceCell::new() });
         {
@@ -744,6 +763,7 @@ impl CollectionCache {
             if e.entries.len() > 64 {
                 e.entries.clear();
             }
+            e.cost.insert(key.clone(), cost.as_millis() as u64);
             e.entries.insert(key, entry.clone());
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
@@ -764,22 +784,40 @@ impl CollectionCache {
         if e.recent.len() > RECENT_MAX && !e.recent.contains_key(&key) {
             e.recent.retain(|_, (_, seen)| seen.elapsed() < RECENT_WINDOW);
             e.cooldown.retain(|_, t| t.elapsed() < REFRESH_COOLDOWN);
+            let alive: std::collections::HashSet<String> = e.recent.keys().cloned().collect();
+            e.cost.retain(|k, _| alive.contains(k));
         }
         e.recent.insert(key, (p.clone(), Instant::now()));
     }
-    /// Params shapes requested within `window` — the refresher's fan-out set,
-    /// most-recently-requested first (the round-robin's next victim rebuilds
-    /// at the head of the build-semaphore queue, not the tail).
-    fn active_keys(&self, window: Duration) -> Vec<(String, CollectionParams)> {
+    /// The refresher's fan-out set for one generation (iter 15): recent
+    /// shapes that (a) were built at least once, (b) whose last build cost
+    /// ≥ `min_cost_ms` (cheap shapes are cheaper to rebuild lazily than to
+    /// pre-build on every bump), taken most-recently-requested first until
+    /// `budget_ms` of estimated build time is spent. Never-built shapes are
+    /// excluded — the request path pays their first build and records the
+    /// cost for a later generation.
+    fn prewarm_keys(&self, window: Duration, min_cost_ms: u64, budget_ms: u64) -> Vec<(String, CollectionParams)> {
         let e = self.inner.lock().unwrap();
         let mut v: Vec<_> = e
             .recent
             .iter()
             .filter(|(_, (_, seen))| seen.elapsed() < window)
-            .map(|(k, (p, seen))| (k.clone(), p.clone(), *seen))
+            .filter_map(|(k, (p, seen))| e.cost.get(k).map(|c| (k.clone(), p.clone(), *seen, *c)))
             .collect();
-        v.sort_by_key(|(_, _, seen)| std::cmp::Reverse(*seen));
-        v.into_iter().map(|(k, p, _)| (k, p)).collect()
+        v.sort_by_key(|(_, _, seen, _)| std::cmp::Reverse(*seen));
+        let mut out = Vec::new();
+        let mut spent: u64 = 0;
+        for (k, p, _, c) in v {
+            if c < min_cost_ms {
+                continue;
+            }
+            if !out.is_empty() && spent + c > budget_ms {
+                break;
+            }
+            spent += c;
+            out.push((k, p));
+        }
+        out
     }
     /// True when the stored entry for `key` already carries the current rev.
     fn is_current(&self, key: &str, rev: i64) -> bool {
@@ -820,15 +858,20 @@ impl CollectionCache {
 /// path, so this cannot change any response — strict parity is preserved
 /// (unlike the stats route's bounded-SWR exception, this route needs none).
 ///
-/// Costs are bounded: only shapes requested within REFRESH_ACTIVE, only after
-/// the revision has been observed stable for REFRESH_DEBOUNCE_TICKS ticks
-/// (edit+revert write-mix pairs must not fan out builds for intermediate
-/// states), a failed pre-build backs off per key for REFRESH_COOLDOWN, and
-/// concurrent builds never exceed the cross-key semaphore the request path
-/// already enforces.
+/// Costs are bounded: only shapes requested within REFRESH_ACTIVE, only
+/// shapes whose last build cost ≥ the cost gate (cheap shapes rebuild
+/// lazily — unbudgeted fan-out of 50+ cheap shapes per write-mix tick
+/// starved the request path and ballooned RSS, iter-15 fix), at most
+/// PREWARM_GEN_BUDGET_MS of estimated build time per settled revision, only
+/// after the revision has been observed stable for REFRESH_DEBOUNCE_TICKS
+/// ticks (edit+revert write-mix pairs must not fan out builds for
+/// intermediate states), a failed pre-build backs off per key for
+/// REFRESH_COOLDOWN, and concurrent builds never exceed the cross-key
+/// semaphore the request path already enforces.
 pub fn spawn_refresher(state: &AppState) {
     let Some(pool) = state.db.clone() else { return };
     let cache = Arc::clone(&state.collection_cache);
+    let min_cost_ms = state.prewarm_min_cost_ms;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -837,7 +880,7 @@ pub fn spawn_refresher(state: &AppState) {
         let mut built_rev: Option<i64> = None;
         loop {
             tick.tick().await;
-            let active = cache.active_keys(REFRESH_ACTIVE);
+            let active = cache.prewarm_keys(REFRESH_ACTIVE, min_cost_ms, PREWARM_GEN_BUDGET_MS);
             if active.is_empty() {
                 continue;
             }
@@ -889,9 +932,10 @@ pub fn spawn_refresher(state: &AppState) {
                     let init_key = key2.clone();
                     let init = move || async move {
                         let _permit = init_cache.build_permit().await;
+                        let t0 = Instant::now();
                         let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
                             let (body, total) = build_body_parallel(&init_pool, &p)?;
-                            Ok(init_cache.put(init_key, rev, body, total))
+                            Ok(init_cache.put(init_key, rev, body, total, t0.elapsed()))
                         })
                         .await
                         .map_err(|e| format!("collection refresh join: {e}"))?;
@@ -1060,9 +1104,10 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             let res: Result<&Result<Arc<CacheEntry>, String>, String> = slot
                 .get_or_try_init(move || async move {
                     let _permit = init_cache.build_permit().await;
+                    let t0 = Instant::now();
                     let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
                         let (body, total) = build_body_parallel(&init_pool, &init_p)?;
-                        Ok(init_cache.put(init_key, rev_i, body, total))
+                        Ok(init_cache.put(init_key, rev_i, body, total, t0.elapsed()))
                     })
                     .await
                     .map_err(|e| format!("collection build task panicked: {e}"))?;
@@ -1308,5 +1353,54 @@ mod perf_probe {
                 seq_body.len() / 1_048_576, gz_par.len() / 1_048_576,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prewarm_gate {
+    //! Iter-15 cost gate + per-generation budget for the refresher fan-out
+    //! (unbudgeted fan-out of cheap shapes starved the request path).
+    use super::*;
+
+    fn params(offset: i64) -> CollectionParams {
+        CollectionParams {
+            user_id: 1,
+            is_trade: None,
+            card_id: None,
+            paginated: true,
+            limit: 100,
+            offset,
+            alloc: false,
+            count_zero: false,
+            qs: String::new(),
+        }
+    }
+
+    fn seed(cache: &CollectionCache, p: &CollectionParams, cost_ms: u64) {
+        cache.touch(p);
+        let _ = cache.put(p.cache_key(), 1, b"{}".to_vec(), None, Duration::from_millis(cost_ms));
+    }
+
+    #[test]
+    fn cheap_and_never_built_shapes_never_fan_out() {
+        let cache = CollectionCache::new();
+        seed(&cache, &params(0), 2); // below the 40 ms gate
+        cache.touch(&params(100)); // touched but never built
+        let keys = cache.prewarm_keys(REFRESH_ACTIVE, PREWARM_MIN_COST_MS_DEFAULT, PREWARM_GEN_BUDGET_MS);
+        assert!(keys.is_empty(), "cheap or never-built shapes must not fan out: {keys:?}");
+    }
+
+    #[test]
+    fn expensive_shapes_fan_out_mru_first_until_budget_exhausts() {
+        let cache = CollectionCache::new();
+        // 2000 ms budget vs three 900 ms shapes: the third must not fit.
+        seed(&cache, &params(0), 900);
+        seed(&cache, &params(100), 900);
+        seed(&cache, &params(200), 900);
+        seed(&cache, &params(300), 5); // cheapest but freshest: must be skipped
+        let keys = cache.prewarm_keys(REFRESH_ACTIVE, PREWARM_MIN_COST_MS_DEFAULT, PREWARM_GEN_BUDGET_MS);
+        assert_eq!(keys.len(), 2, "budget must cut the third 900 ms shape: {keys:?}");
+        assert_eq!(keys[0].1.offset, 200, "fan-out must be MRU-first");
+        assert_eq!(keys[1].1.offset, 100);
     }
 }

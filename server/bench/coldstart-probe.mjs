@@ -45,13 +45,19 @@ const mainPid = () => {
 };
 
 const first200 = new Map();
+// Iter-15 fix: the probe starts while the OLD server is still answering —
+// without this latch the recorded "first 200" are warm responses from the
+// dying process (iter-14's coldstart JSON showed uptime-sized numbers, not
+// since-start deltas). Only start latching after we've SEEN the restart
+// (first ECONNREFUSED during stop/build).
+let sawDown = false;
 
 function fire(s) {
   const req = http.request({ host: base.hostname, port: base.port, path: s.path, method: 'GET', headers: s.headers }, (res) => {
     res.resume();
-    if (res.statusCode === 200 && !first200.has(s.name)) first200.set(s.name, uptimeSec());
+    if (res.statusCode === 200 && sawDown && !first200.has(s.name)) first200.set(s.name, uptimeSec());
   });
-  req.on('error', () => {});
+  req.on('error', () => { sawDown = true; });
   req.end();
 }
 
