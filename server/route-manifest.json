@@ -5,7 +5,7 @@
   "DELETE /api/auth/api-key": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_no_token (auth-gate). Key-revoke path cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_ok (known key 401s on the opposite server after revoke) + authr_apikey_delete_no_token"
   },
   "DELETE /api/card-art/:cardId": {
     "status": "node"
@@ -240,27 +240,27 @@
   "POST /api/auth/api-key": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_post_no_token (auth-gate). Key-gen path cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_post_ok (bnd_+48hex shape; fresh key GET-works + POST-403 + persisted, verified on the opposite server) + authr_apikey_post_no_token"
   },
   "POST /api/auth/bootstrap": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::bootstrap_creates_owner_and_adopts_orphans; parity.mjs authr_bootstrap_users_exist/short_pw. Owner-create path cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth.rs::bootstrap_creates_owner_and_adopts_orphans; parity.mjs authr_bootstrap_users_exist/short_pw + parity-auth-ephemeral.mjs bootstrap_201/session_cross_read/again_409 (throwaway empty-DB pair)"
   },
   "POST /api/auth/login": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::login_success_legacy_and_parser_quirks + rate_limit_shared_bucket_per_ip; parity.mjs authr_login_missing_fields/wrong. Session-insert success path compared cargo-vs-fixture; live write parity queued iter 21"
+    "tests": "tests/auth.rs::login_success_legacy_and_parser_quirks + rate_limit_shared_bucket_per_ip; parity.mjs authr_login_ok (200 + token shape + fresh session cross-server read as rusttest_parity) + authr_login_missing_fields/wrong"
   },
   "POST /api/auth/logout": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_logout_no_token (auth-gate). Session-delete path cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_logout_ok (seeded session; revoked row 401s on the opposite server) + authr_logout_no_token"
   },
   "POST /api/auth/register": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled. Success path cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled + parity-auth-ephemeral.mjs register_201/duplicate_400/short_pw_400/cross_login (throwaway ALLOW_REGISTRATION=true pair)"
   },
   "POST /api/card-art/:cardId": {
     "status": "node"
@@ -381,7 +381,7 @@
   "PUT /api/auth/settings": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
     "status": "verified",
-    "tests": "tests/auth.rs::settings_password_share_and_readonly_gating; parity.mjs authr_settings_no_token (auth-gate). Mutation paths cargo-vs-fixture; live write parity iter 21"
+    "tests": "tests/auth.rs::settings_password_share_and_readonly_gating; parity.mjs authr_settings_share_toggle/share_regen/password_change (new pw verifies on the opposite server, old rejected)/pwchange_wrong_401 (no partial write) + authr_settings_no_token"
   },
   "PUT /api/collection/:id": {
     "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes) ; card_id-change to a printing absent from card_cache forwards to Node (Node would hydrate from Scryfall)",
