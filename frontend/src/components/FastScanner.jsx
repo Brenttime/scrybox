@@ -45,9 +45,15 @@ const REPOINT_TIMEOUT_MS = 8000;
 const FIX_RETRY_MS = 3000;
 const AUTO_FRAME_MAX_EXTRA_MS = 40;
 // Phones (coarse pointer) ask for 1080p, desktops 1440p (see startCamera).
+// localStorage 'scan.res' = 720 / 1080 / 1440 overrides it for A/B rounds:
+// more pixels read the footer better but cost the on-device re-detect
+// (Lanczos to 384 px) ~4x VGA's time at 1080p.
+const RES = { 720: [1280, 720], 1080: [1920, 1080], 1440: [2560, 1440] };
 function cameraSize() {
+  let pick = null;
+  try { pick = RES[localStorage.getItem('scan.res')]; } catch { /* default */ }
   const phone = typeof matchMedia !== 'undefined' && matchMedia('(pointer: coarse)').matches;
-  return phone ? [1920, 1080] : [2560, 1440];
+  return pick || (phone ? RES[1080] : RES[1440]);
 }
 // Some browsers still hand back VGA for an 'ideal' they could have met (seen
 // on iOS); ask again once, explicitly, before scanning starts.
