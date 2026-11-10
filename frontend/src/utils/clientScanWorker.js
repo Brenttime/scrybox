@@ -10,7 +10,7 @@
 // cross-origin isolated (backend coep.js: credentialless on Blink/Gecko,
 // require-corp on WebKit); otherwise one thread.
 import * as ort from 'onnxruntime-web/wasm';
-import { createReader } from '../../../shared/clientScan/pipeline.mjs';
+import { createReader, CORN_SIZE } from '../../../shared/clientScan/pipeline.mjs';
 import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 
 ort.env.wasm.wasmPaths = '/ort/';
@@ -87,6 +87,12 @@ async function cornBytes(cache) {
   return new Uint8Array(await hit.arrayBuffer());
 }
 
+async function warmUp(rec, cornelius) {
+  const zeros = (dims) => new ort.Tensor('float32', new Float32Array(dims.reduce((a, b) => a * b, 1)), dims);
+  await cornelius.run({ image: zeros([1, 3, CORN_SIZE, CORN_SIZE]) });
+  await rec.run({ [rec.inputNames[0]]: zeros([1, 3, 48, 320]) });
+}
+
 async function load(manifest = null) {
   const t0 = performance.now();
   // Ask the browser not to evict the ~25 MB of models and index under storage
@@ -115,10 +121,15 @@ async function load(manifest = null) {
     gunzip(indexGz).then(text => loadIndex(JSON.parse(text))),
   ]);
   const chars = buildCharset(new TextDecoder().decode(dictBytes));
+  // Warm-up: the first run of each session allocates and plans its kernels
+  // (hundreds of ms on a phone); pay that here, not on the first card.
+  const tWarm = performance.now();
+  await warmUp(rec, cornelius).catch(() => {});
+  const warmMs = Math.round(performance.now() - tWarm);
   const reader = createReader({ ort, cornelius, rec, chars, index, fastSettle: !!FLAGS.fastSettle, titleGate: !!FLAGS.titleGate, retroFirst: FLAGS.retroFirst ?? ort.env.wasm.numThreads >= 4 });
   // Which assets this worker actually runs, for scan telemetry: rules out a
   // stale cached index/model when live and replay disagree.
-  const info = { index: manifest.index, rec: manifest.rec, cornBytes: corn.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false, fetchMs };
+  const info = { index: manifest.index, rec: manifest.rec, cornBytes: corn.length, threads: ort.env.wasm.numThreads, threadsOverride: THREAD_OVERRIDE, flags: FLAGS, isolated: !!self.crossOriginIsolated, simd: ort.env.wasm.simd !== false, fetchMs, warmMs };
   return { reader, info, manifest, loadMs: Math.round(performance.now() - t0) };
 }
 
