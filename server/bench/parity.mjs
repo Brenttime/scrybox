@@ -519,7 +519,14 @@ cases.push({
 // are tagged with a unique marker in `notes`; teardown deletes ONLY rows
 // whose notes match, never pre-existing user data.
 let ipSeq = 1;
-function xff() { const n = ipSeq++; return `10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}`; }
+// RFC 2544 benchmark space 198.18.0.0/15: NOT private, so proxy-addr / the
+// Rust Trust rules treat it as the real client (unlike 10.x — under
+// TRUST_PROXY=loopback,uniquelocal a trusted XFF collapses to the socket
+// bucket, which is production-correct but made every harness request share
+// one authLimiter window and the auth-writer password cases 429 once Rust
+// restarted mid-iteration). /15 gives 65k unique keys; key_for() uses the
+// full v4 string, so every request gets its own limiter bucket.
+function xff() { const n = ipSeq++; return `198.18.${(n >> 8) & 255}.${n & 255}`; }
 
 const CW_CARD = 'mtg-dda6f965-cbdf-4dbc-b0b1-00c27e32f5f2'; // parity fixture card (in card_cache + owned)
 async function apiReq(base, method, path, headers, body) {
@@ -748,6 +755,88 @@ async function etagParity(c) {
   }
   return diffs;
 }
+
+  // --- add-group cases (iter 24: POST /api/collection, POST
+  // /api/collection/bulk-add; RUST_ROUTES=collection_adds). Adds CREATE
+  // rows, so the request response carries the ids: readBack stashes them
+  // for teardown AND reads them back through the OPPOSITE server (owner
+  // ruling iter 21 — a write is only verified when the other server sees
+  // it), so a Rust write that Node's reads can't confirm fails the case.
+  // ids/id/entries are autoincrement-random and stripped from the
+  // cross-side diff; the persisted-view JSON carries the real values. ---
+  const addCtx = async () => ({ ctx: {} });
+  const collectAddIds = (json) => [
+    ...(Array.isArray(json?.ids) ? json.ids : []),
+    ...(Array.isArray(json?.entries) ? json.entries.flatMap((e) => e?.ids || []) : []),
+  ];
+  function addReadBack(why, pred) {
+    return async (other, ctx, resp) => {
+      const ids = collectAddIds(resp?.json);
+      if (ctx) ctx.ids = ids;
+      if (!ids.length) return { ok: false, why: `${why}: response carried no ids` };
+      const rows = await rowsByIdsVia(other, ids);
+      if (rows.length !== ids.length) {
+        return { ok: false, why: `${why}: ${ids.length} ids -> ${rows.length} rows via ${other}` };
+      }
+      return { ok: pred(rows, resp), why: `${why} -> ${JSON.stringify(rows)}`, seen: persistView(rows) };
+    };
+  }
+
+  cases.push(
+    { name: 'ca_add_401', path: '/api/collection', headers: {}, method: 'POST', body: JSON.stringify({ card_id: CW_CARD }) },
+    { name: 'ca_add_missing_400', path: '/api/collection', headers: CW_JSON, method: 'POST', body: '{}' },
+    { name: 'ca_add_null_card_400', path: '/api/collection', headers: CW_JSON, method: 'POST', body: '{"card_id":null}' },
+    { name: 'ca_add_bad_printing_400', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, printing: 'Foil' }) },
+    { name: 'ca_add_bool_printing_400', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, printing: true }) },
+    { name: 'ca_add_success_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 2, condition: 'Lightly Played', printing: 'Normal',
+        language: 'English', purchase_price: '2.5', is_trade: 1 }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('add rows', (rows) =>
+        rows.length === 2 && rows.every((r) => r.condition === 'Lightly Played' && r.quantity === 1
+          && r.is_trade === 1 && r.purchase_price === 2.5)) },
+    { name: 'ca_add_stack_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 3, stackable: true }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('stacked row', (rows) =>
+        rows.length === 1 && rows[0].quantity === 3) },
+    { name: 'ca_add_zero_qty_200', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, quantity: 0 }),
+      strip: ['$.id', '$.ids'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('floored row', (rows) =>
+        rows.length === 1 && rows[0].quantity === 1) },
+    // Unknown card: Node fetches Scryfall and 404s on the miss; Rust must
+    // forward (both sides end on the identical Node-shaped 404).
+    { name: 'ca_add_unknown_404', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: 'mtg-00000000-0000-4000-8000-000000000000' }) },
+    // condition is not validated up front (only printing is): the collection
+    // CHECK rejects it inside the add, surfacing as the generic 500 shape.
+    { name: 'ca_add_bad_condition_500', path: '/api/collection', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_id: CW_CARD, condition: 'Played' }) },
+
+    { name: 'ca_bulk_add_missing_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST', body: '{}' },
+    { name: 'ca_bulk_add_empty_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: '{"card_ids":[]}' },
+    { name: 'ca_bulk_add_badids_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: '{"card_ids":"x"}' },
+    { name: 'ca_bulk_add_over_400', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: Array.from({ length: 251 }, () => CW_CARD) }) },
+    { name: 'ca_bulk_add_success_200', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [CW_CARD, CW_CARD], condition: 'Damaged', quantity: '2' }),
+      strip: ['$.entries'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('bulk rows', (rows) =>
+        rows.length === 4 && rows.every((r) => r.condition === 'Damaged' && r.quantity === 1)) },
+    { name: 'ca_bulk_add_mixed_200', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [CW_CARD, {}] }),
+      strip: ['$.entries'], setup: addCtx, teardown: deleteProbes,
+      readBack: addReadBack('bulk partial', (rows, resp) =>
+        rows.length === 1 && resp.json.message === 'Added 1 of 2 cards; 1 failed.'
+        && resp.json.failed[0].error === 'card_id is required' && resp.json.failed[0].index === 1) },
+    { name: 'ca_bulk_add_all_fail_500', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
+      body: JSON.stringify({ card_ids: [{}, {}] }) },
+  );
 
 // --- run ---------------------------------------------------------------------
 

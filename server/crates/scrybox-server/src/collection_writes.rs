@@ -1620,3 +1620,470 @@ fn bulk_add_to_deck(
         &json!({ "message": msg, "affected": json_num(added), "rejected": rejected.len() }),
     ))
 }
+
+// ---------------------------------------------------------------------------
+// POST /collection and POST /collection/bulk-add (collection_adds group)
+// ---------------------------------------------------------------------------
+//
+// Native port of routes/collection.js `addCardToCollection` (+ its two
+// routes) and `bulkAddToCollection`. The Scryfall-touching legs — the
+// `cardApi.getCardById` cache-miss fetch and the `getPrintingInLang`
+// network fetch behind `printingInLanguage` — are never attempted here:
+// whenever the plan would need them (card or localized printing absent
+// from card_cache), the whole request forwards to Node untouched, exactly
+// like the PUT card_id branch above. Scryfall is lane B's scryfallApi
+// territory; this module stays read-DB-only + INSERT.
+//
+// Two documented deviations (both only reachable on DB failure, which
+// Node's separate autocommit statements would half-apply anyway):
+//   - inserts + recordPrice share one BEGIN IMMEDIATE transaction, so a
+//     mid-add DB error rolls the whole add back instead of leaving rows;
+//   - bulk-add plans every entry (validation + cache probes) before any
+//     write, so a Forward decision cannot strand already-inserted cards.
+
+/// JS falsiness of a body value: `!card_id` — a missing key (undefined),
+/// null, false, 0/NaN and "" are falsy; every array/object is truthy.
+fn js_falsy(v: Option<&Value>) -> bool {
+    match v {
+        None => true,
+        Some(v) => !truthy(v),
+    }
+}
+
+/// Input for `languages.toName`/`resolve` from a JSON/sqlite value: JS
+/// String()-coerces inside resolve(), and null/undefined take the falsy
+/// DEFAULT (English) path, modelled as None.
+fn lang_input(v: Option<&Value>) -> Option<String> {
+    match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(js_to_string(Some(other))),
+    }
+}
+
+/// Read-only phase of one `addCardToCollection` call: everything up to (but
+/// not including) the INSERTs, decided from the merged body. `Reject` is the
+/// only caller-visible AddCardError the native path can reach (both throws
+/// in addCardToCollection are 400; the 404 requires the Scryfall fetch,
+/// which is a `Forward` here).
+enum AddPlan {
+    Ready {
+        card_id: SqlValue,
+        count: i64,
+        stack: bool,
+        condition: Value,
+        printing: Value,
+        language: Value,
+        purchase_price: Value,
+        is_trade: bool,
+        price: Value,
+    },
+    Reject(String),
+    Forward,
+}
+
+/// Pure-read twin of addCardToCollection's pre-insert block (hydration is a
+/// no-op since v3). Node-strict order: card_id → printing → cache lookup →
+/// printingInLanguage → quantity/stack/pricing defaults.
+fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, WriteError> {
+    let card_id_v = merged.get("card_id");
+    if js_falsy(card_id_v) {
+        return Ok(AddPlan::Reject("card_id is required".into()));
+    }
+    let printing_default = Value::String("Normal".into());
+    let printing = merged.get("printing").unwrap_or(&printing_default);
+    // Array.prototype.includes is strict ===: only exact strings match.
+    if !PRINTING_VALUES.iter().any(|p| Some(*p) == printing.as_str()) {
+        return Ok(AddPlan::Reject(format!(
+            "Invalid printing: {}",
+            js_to_string(Some(printing))
+        )));
+    }
+
+    let mut row = match get_row_map(
+        conn,
+        "SELECT * FROM card_cache WHERE id = ?1",
+        &[json_to_sql(card_id_v)?],
+    )? {
+        Some(r) => r,
+        // Node would cardApi.getCardById() → Scryfall. Not Rust's to do.
+        None => return Ok(AddPlan::Forward),
+    };
+
+    let language_default = Value::String("English".into());
+    let language = merged.get("language").unwrap_or(&language_default);
+    let mut card_id_bind = json_to_sql(card_id_v)?;
+
+    // cardApi.printingInLanguage(card, language) — null keeps the picked row.
+    let card_lang = row.get("language").cloned().unwrap_or(Value::Null);
+    if crate::search::to_name(lang_input(Some(&card_lang)).as_deref())
+        != crate::search::to_name(lang_input(Some(language)).as_deref())
+    {
+        let (_code, scry) = crate::search::lang_codes(lang_input(Some(language)).as_deref());
+        // getPrintingInLang early-outs on scryfall code 'en', empty set or
+        // empty number (all keep the picked row without touching the DB).
+        if scry != "en" {
+            let set_raw = match row.get("set_id") {
+                Some(v) if truthy(v) => js_to_string(Some(v)),
+                _ => String::new(),
+            };
+            let set = set_raw
+                .strip_prefix("mtg-")
+                .unwrap_or(&set_raw)
+                .to_lowercase();
+            let number = row.get("number").cloned();
+            if !set.is_empty() && !js_falsy(number.as_ref()) {
+                match get_row_map(
+                    conn,
+                    "SELECT * FROM card_cache WHERE set_id = ?1 AND number = ?2 AND language = ?3 LIMIT 1",
+                    &[
+                        SqlValue::Text(set),
+                        json_to_sql(number.as_ref())?,
+                        SqlValue::Text(crate::search::to_name(Some(&scry))),
+                    ],
+                )? {
+                    Some(loc) => {
+                        // Node: card = localized; cardId = localized.id.
+                        card_id_bind = match loc.get("id") {
+                            Some(v) => json_to_sql_value(v),
+                            None => SqlValue::Null,
+                        };
+                        row = loc;
+                    }
+                    // Network fetch + cacheCards — Node's job.
+                    None => return Ok(AddPlan::Forward),
+                }
+            }
+        }
+    }
+
+    // count = Math.max(1, parseInt(quantity, 10) || 1) — undefined/NaN/0
+    // all land on 1.
+    let count = match merged.get("quantity") {
+        None => 1,
+        Some(v) => js_parse_int_v(Some(v)).unwrap_or(1).max(1),
+    };
+    let stack = merged.get("stackable").map(truthy).unwrap_or(false);
+    let purchase_price = match merged.get("purchase_price") {
+        Some(v) if truthy(v) => v.clone(),
+        _ => Value::from(0),
+    };
+    Ok(AddPlan::Ready {
+        card_id: card_id_bind,
+        count,
+        stack,
+        condition: merged
+            .get("condition")
+            .cloned()
+            .unwrap_or_else(|| Value::String("Near Mint".into())),
+        printing: printing.clone(),
+        language: language.clone(),
+        purchase_price,
+        is_trade: tr(merged.get("is_trade")),
+        price: row.get("price_trend").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// priceHelpers.recordPrice — the movement-guarded INSERT (not the brief's
+/// older date-keyed OR-REPLACE; the source is canonical). Returns whether a
+/// row landed.
+fn record_price(conn: &Connection, card_id: &SqlValue, price: &Value) -> Result<bool, WriteError> {
+    let p = js_to_number(Some(price));
+    let card_empty = match card_id {
+        SqlValue::Null => true,
+        SqlValue::Text(s) => s.is_empty(),
+        _ => false,
+    };
+    if card_empty || !(p > 0.0) {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "WITH latest(price, recorded_at) AS (
+           SELECT price, recorded_at
+           FROM price_history
+           WHERE card_id = ?1
+           ORDER BY recorded_at DESC, rowid DESC
+           LIMIT 1
+         ), candidate(ts) AS (SELECT strftime('%Y-%m-%d %H:%M:%f', 'now'))
+         INSERT INTO price_history (card_id, price, recorded_at)
+         SELECT ?1, ?2, CASE
+           WHEN (SELECT recorded_at FROM latest) IS NULL
+             OR (SELECT recorded_at FROM latest) < candidate.ts THEN candidate.ts
+           ELSE strftime('%Y-%m-%d %H:%M:%f', (SELECT recorded_at FROM latest), '+0.001 seconds')
+         END
+         FROM candidate
+         WHERE NOT EXISTS (SELECT 1 FROM latest WHERE price = ?2)",
+        rusqlite::params![card_id, p],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Writes the planned copies (stack = one qty-N row; else one qty-1 row per
+/// copy, matching Node's sequential INSERTs) and records the price, in one
+/// BEGIN IMMEDIATE transaction so the revision triggers fire on commit like
+/// every other native write group.
+fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Result<(i64, Vec<i64>), WriteError> {
+    let AddPlan::Ready { card_id, count, stack, condition, printing, language, purchase_price, is_trade, price } = plan else {
+        return Ok((0, Vec::new()));
+    };
+    let mut tx = Tx::begin(conn)?;
+    let mut ids: Vec<i64> = Vec::new();
+    let quantities: Vec<i64> = if *stack { vec![*count] } else { vec![1; *count as usize] };
+    let mut last = 0i64;
+    for q in quantities {
+        conn.execute(
+            "INSERT INTO collection (
+               card_id, user_id, quantity, condition, printing, language, purchase_price,
+               is_trade
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                card_id,
+                user_id,
+                q,
+                json_to_sql_value(condition),
+                json_to_sql_value(printing),
+                json_to_sql_value(language),
+                json_to_sql_value(purchase_price),
+                if *is_trade { 1 } else { 0 },
+            ],
+        )?;
+        last = conn.last_insert_rowid();
+        ids.push(last);
+    }
+    record_price(conn, card_id, price)?;
+    tx.commit()?;
+    Ok((last, ids))
+}
+
+/// `POST /collection` — routes/collection.js route 3.
+pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        return crate::proxy(State(st), req).await;
+    }
+    let Some(pool) = st.db.clone() else {
+        return crate::proxy(State(st), req).await;
+    };
+    let (parts, bytes) = read_parts(req).await;
+    let headers = parts.headers.clone();
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate(&pool, token.as_deref(), false) {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // express.json hands a non-object body to destructuring as values that
+    // never carry card_id; `{}` models both cases (parse_body already maps
+    // arrays there).
+    let empty = Map::new();
+    let m = body.as_object().unwrap_or(&empty);
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "add card pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+        }
+    };
+    let plan = match plan_add(&conn, m) {
+        Ok(AddPlan::Reject(msg)) => return json_error(StatusCode::BAD_REQUEST, &msg),
+        Ok(AddPlan::Forward) => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(p @ AddPlan::Ready { .. }) => p,
+        Err(e) => {
+            tracing::error!(error=?e, "add card failed");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+        }
+    };
+    let resp = match execute_add(&conn, user.id, &plan) {
+        Ok((last, ids)) => json_response(
+            StatusCode::OK,
+            &json!({ "message": "Card added to collection", "id": last, "ids": ids }),
+        ),
+        Err(e) => {
+            tracing::error!(error=?e, "add card failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card")
+        }
+    };
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &Method::POST, "/api/collection", &headers);
+    }
+    resp
+}
+
+/// One pass-1 outcome per bulk-add entry. `Failed` carries the per-entry
+/// report body; `Forward` (any of them) forwards the WHOLE request, since
+/// Node must author the Scryfall fetches (and their side effects) itself.
+enum BulkEntry {
+    Ready { plan: AddPlan, card_id: Option<Value>, index: usize },
+    Failed { error: String, card_id: Option<Value>, index: usize },
+    Forward,
+}
+
+/// routes/collection.js bulkAddToCollection + its route (BULK_ADD_MAX=250).
+pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        return crate::proxy(State(st), req).await;
+    }
+    let Some(pool) = st.db.clone() else {
+        return crate::proxy(State(st), req).await;
+    };
+    let (parts, bytes) = read_parts(req).await;
+    let headers = parts.headers.clone();
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate(&pool, token.as_deref(), false) {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // `const { card_ids = [], ...shared } = req.body` — null/non-array and
+    // a missing key both take the falsy 400 branch.
+    let body_map = body.as_object().cloned();
+    let card_ids: Vec<Value> = match body_map.as_ref().and_then(|m| m.get("card_ids")) {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return json_error(StatusCode::BAD_REQUEST, "card_ids is required"),
+    };
+    if card_ids.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "card_ids is required");
+    }
+    if card_ids.len() > 250 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Cannot add more than 250 cards at once.",
+        );
+    }
+    let mut shared = body_map.unwrap_or_default();
+    shared.remove("card_ids");
+
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "bulk add pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        }
+    };
+
+    // Pass 1 — pure reads: the {...shared, ...perCard, card_id} merge and
+    // every validation/probe, before any write can commit.
+    let mut outcomes: Vec<BulkEntry> = Vec::with_capacity(card_ids.len());
+    for (index, entry) in card_ids.iter().enumerate() {
+        // `entry && typeof entry === 'object'` — null is NOT keyed; arrays
+        // are (and carry no card_id, like any other object).
+        let keyed = matches!(entry, Value::Object(_) | Value::Array(_));
+        let mut merged = shared.clone();
+        let card_id: Option<Value> = if keyed {
+            let obj = entry.as_object();
+            let cid = obj.and_then(|o| o.get("card_id")).cloned();
+            if let Some(o) = obj {
+                for k in ["quantity", "purchase_price", "condition", "printing"] {
+                    if let Some(v) = o.get(k) {
+                        // perCard only overrides when the value is neither
+                        // null nor stringifies to ''.
+                        if !v.is_null() && js_to_string(Some(v)) != "" {
+                            merged.insert(k.into(), v.clone());
+                        }
+                    }
+                }
+            }
+            cid
+        } else {
+            Some(entry.clone())
+        };
+        if let Some(v) = card_id.clone() {
+            merged.insert("card_id".into(), v);
+        }
+        outcomes.push(match plan_add(&conn, &merged) {
+            Ok(p @ AddPlan::Ready { .. }) => BulkEntry::Ready { plan: p, card_id, index },
+            Ok(AddPlan::Reject(msg)) => BulkEntry::Failed { error: msg, card_id, index },
+            Ok(AddPlan::Forward) => BulkEntry::Forward,
+            // Non-AddCardError: Node console.errors and reports the generic
+            // per-card message.
+            Err(e) => {
+                tracing::error!(error=?e, "bulk add card failed");
+                BulkEntry::Failed { error: "Failed to add card".into(), card_id, index }
+            }
+        });
+    }
+    if outcomes.iter().any(|o| matches!(o, BulkEntry::Forward)) {
+        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+    }
+
+    // Pass 2 — sequential writes in request order, per-entry transactions
+    // (a throwing entry costs Node exactly that one entry: its INSERT
+    // autocommits never ran; Rust rolls back only that entry's tx).
+    let mut added: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let fail_obj = |card_id: &Option<Value>, error: &str, index: usize| {
+        let mut m = Map::new();
+        if let Some(v) = card_id {
+            m.insert("card_id".into(), v.clone());
+        }
+        m.insert("error".into(), json!(error));
+        m.insert("index".into(), json!(index));
+        Value::Object(m)
+    };
+    for outcome in outcomes {
+        match outcome {
+            BulkEntry::Ready { plan, card_id, index } => match execute_add(&conn, user.id, &plan) {
+                Ok((id, ids)) => {
+                    let mut m = Map::new();
+                    if let Some(v) = card_id {
+                        m.insert("card_id".into(), v.clone());
+                    }
+                    m.insert("id".into(), json!(id));
+                    m.insert("ids".into(), json!(ids));
+                    m.insert("index".into(), json!(index));
+                    added.push(Value::Object(m));
+                }
+                Err(e) => {
+                    tracing::error!(error=?e, "bulk add card failed");
+                    failed.push(fail_obj(&card_id, "Failed to add card", index));
+                }
+            },
+            BulkEntry::Failed { error, card_id, index } => {
+                failed.push(fail_obj(&card_id, &error, index));
+            }
+            BulkEntry::Forward => unreachable!("handled by the pre-write forward"),
+        }
+    }
+
+    let qty = match shared.get("quantity") {
+        Some(v) => js_parse_int_v(Some(v)).unwrap_or(1).max(1),
+        None => 1,
+    };
+    let status = if !failed.is_empty() && added.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    let message = if !failed.is_empty() {
+        format!(
+            "Added {} of {} cards; {} failed.",
+            added.len(),
+            card_ids.len(),
+            failed.len()
+        )
+    } else {
+        format!(
+            "Added {} card{}{} to collection.",
+            added.len(),
+            if added.len() == 1 { "" } else { "s" },
+            if qty > 1 { format!(" (x{qty} each)") } else { String::new() }
+        )
+    };
+    let mut out = Map::new();
+    out.insert("message".into(), json!(message));
+    out.insert("added".into(), json!(added.len()));
+    out.insert("entries".into(), Value::Array(added));
+    out.insert("failed".into(), Value::Array(failed));
+    let resp = json_response(status, &Value::Object(out));
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &Method::POST, "/api/collection/bulk-add", &headers);
+    }
+    resp
+}

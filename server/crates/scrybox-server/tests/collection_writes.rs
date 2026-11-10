@@ -832,3 +832,496 @@ async fn bulk_add_to_deck_merges_alt_printings() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/collection + POST /api/collection/bulk-add (collection_adds,
+// iter 24). Expectations read from routes/collection.js addCardToCollection
+// / bulkAddToCollection and utils/{priceHelpers,cardApi,languages}.js.
+// ---------------------------------------------------------------------------
+
+async fn call_add(
+    db: PathBuf,
+    token: Option<&str>,
+    body: &str,
+) -> (StatusCode, Value) {
+    let (s, h, b) = send(
+        db,
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection",
+        token,
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("application/json; charset=utf-8"),
+        "content-type for add (body: {})",
+        String::from_utf8_lossy(&b)
+    );
+    (s, serde_json::from_slice(&b).unwrap())
+}
+
+async fn add(db: PathBuf, body: &str) -> (StatusCode, Value) {
+    call_add(db, Some("tok-session"), body).await
+}
+
+async fn bulk_add(db: PathBuf, body: &str) -> (StatusCode, Value) {
+    let (s, h, b) = send(
+        db,
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection/bulk-add",
+        Some("tok-session"),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("application/json; charset=utf-8"),
+        "content-type for bulk-add (body: {})",
+        String::from_utf8_lossy(&b)
+    );
+    (s, serde_json::from_slice(&b).unwrap())
+}
+
+#[tokio::test]
+async fn add_unauthenticated_401() {
+    let (_d, db) = db();
+    let (s, body) = call_add(db, None, r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn add_api_key_write_403() {
+    let (_d, db) = db();
+    let (s, body) = call_add(db, Some("tok-api"), r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "API keys are read-only. Use a login session for this request.");
+}
+
+#[tokio::test]
+async fn add_missing_card_id_400() {
+    let (_d, db) = db();
+    for body in ["{}", r#"{"card_id":""}"#, r#"{"card_id":null}"#, r#"{"card_id":0}"#, r#"{"card_id":false}"#] {
+        let (s, json) = add(db.clone(), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(json["error"], "card_id is required", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn add_bad_printing_400() {
+    let (_d, db) = db();
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","printing":"Foil"}"#).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "Invalid printing: Foil");
+    // JS String() coercion inside the message (printing defaults only when
+    // the key is ABSENT — null/true stay and fail the includes check).
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","printing":true}"#).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "Invalid printing: true");
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","printing":null}"#).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "Invalid printing: null");
+}
+
+#[tokio::test]
+async fn add_single_success_defaults_price_and_revisions() {
+    let (_d, db) = db();
+    // The fixture's stub tables own collection_snapshot/deck_list_revision;
+    // the live-schema revision ROWS (which the prod triggers UPDATE) are
+    // seeded here, as tests/collection.rs seeds its own.
+    exec(&db, "INSERT OR IGNORE INTO collection_read_revision (id, revision) VALUES (1, 0);
+               INSERT OR IGNORE INTO stats_aux_revision (id, revision) VALUES (1, 0);");
+    let rev = scalar(&db, "SELECT revision FROM collection_read_revision WHERE id = 1");
+    let aux = scalar(&db, "SELECT revision FROM stats_aux_revision WHERE id = 1");
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Card added to collection");
+    let id = json["id"].as_i64().unwrap();
+    assert_eq!(json["ids"], json!([id]));
+    // Key order message,id,ids (deepDiff compares key order in parity too).
+    assert_eq!(
+        json.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        ["message", "id", "ids"]
+    );
+    assert_eq!(scalar(&db, &format!("SELECT COUNT(*) FROM collection WHERE id = {id} AND user_id = 1 AND card_id = 'c1' AND quantity = 1")), 1);
+    assert_eq!(text(&db, &format!("SELECT condition FROM collection WHERE id = {id}")), "Near Mint");
+    assert_eq!(text(&db, &format!("SELECT printing FROM collection WHERE id = {id}")), "Normal");
+    assert_eq!(text(&db, &format!("SELECT language FROM collection WHERE id = {id}")), "English");
+    assert_eq!(real(&db, &format!("SELECT purchase_price FROM collection WHERE id = {id}")), Some(0.0));
+    assert_eq!(scalar(&db, &format!("SELECT is_trade FROM collection WHERE id = {id}")), 0);
+    // recordPrice moved on the fresh card (c1 price_trend 45.0).
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c1'"), 1);
+    assert_eq!(real(&db, "SELECT price FROM price_history WHERE card_id = 'c1'"), Some(45.0));
+    // BEGIN IMMEDIATE commit fired the prod revision triggers.
+    assert!(scalar(&db, "SELECT revision FROM collection_read_revision WHERE id = 1") > rev);
+    assert!(scalar(&db, "SELECT revision FROM stats_aux_revision WHERE id = 1") > aux);
+}
+
+#[tokio::test]
+async fn add_price_history_dedupes_on_no_movement() {
+    let (_d, db) = db();
+    let (s, _) = add(db.clone(), r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = add(db.clone(), r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    // Same price again → the movement guard keeps ONE row (priceHelpers.js).
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c1'"), 1);
+    exec(&db, "UPDATE card_cache SET price_trend = 50 WHERE id = 'c1';");
+    let (s, _) = add(db.clone(), r#"{"card_id":"c1"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c1'"), 2);
+}
+
+#[tokio::test]
+async fn add_zero_or_null_price_records_nothing() {
+    let (_d, db) = db();
+    exec(&db, "UPDATE card_cache SET price_trend = 0 WHERE id = 'c4';");
+    let (s, _) = add(db.clone(), r#"{"card_id":"c4"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c4'"), 0);
+    exec(&db, "UPDATE card_cache SET price_trend = NULL WHERE id = 'c4';");
+    let (s, _) = add(db.clone(), r#"{"card_id":"c4"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c4'"), 0);
+}
+
+#[tokio::test]
+async fn add_quantity_rows_vs_stack() {
+    let (_d, db) = db();
+    // Non-stack: `count` separate quantity-1 rows, ids in insert order.
+    let (s, json) = add(db.clone(), r#"{"card_id":"c4","quantity":3}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let ids = json["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(json["id"], ids[2]);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c4' AND user_id = 1 AND quantity = 1"), 4); // 1 seeded + 3
+    // String quantity parses like parseInt.
+    let (s, json) = add(db.clone(), r#"{"card_id":"c4","quantity":"2"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["ids"].as_array().unwrap().len(), 2);
+    // Unparseable/0/negative floor at 1 row.
+    for q in [r#""x""#, "0", "-4", "null"] {
+        let (s, json) = add(db.clone(), &format!(r#"{{"card_id":"c4","quantity":{q}}}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{q}");
+        assert_eq!(json["ids"].as_array().unwrap().len(), 1, "{q}");
+    }
+    // Stack: one row with quantity=count.
+    let (s, json) = add(db.clone(), r#"{"card_id":"c4","quantity":4,"stackable":true}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let id = json["id"].as_i64().unwrap();
+    assert_eq!(json["ids"].as_array().unwrap().len(), 1);
+    assert_eq!(scalar(&db, &format!("SELECT quantity FROM collection WHERE id = {id}")), 4);
+}
+
+#[tokio::test]
+async fn add_body_value_coercions() {
+    let (_d, db) = db();
+    // purchase_price || 0: '' and null fall to 0; numeric strings bind and
+    // REAL affinity converts them (same as Node's raw binding).
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","purchase_price":""}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(real(&db, &format!("SELECT purchase_price FROM collection WHERE id = {}", json["id"].as_i64().unwrap())), Some(0.0));
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","purchase_price":"12.5"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(real(&db, &format!("SELECT purchase_price FROM collection WHERE id = {}", json["id"].as_i64().unwrap())), Some(12.5));
+    // is_trade ? 1 : 0 — ANY truthy value, including the string "no".
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","is_trade":"no"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scalar(&db, &format!("SELECT is_trade FROM collection WHERE id = {}", json["id"].as_i64().unwrap())), 1);
+    let (s, json) = add(db.clone(), r#"{"card_id":"c1","is_trade":0}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scalar(&db, &format!("SELECT is_trade FROM collection WHERE id = {}", json["id"].as_i64().unwrap())), 0);
+}
+
+#[tokio::test]
+async fn add_localized_printing_wins() {
+    let (_d, db) = db();
+    exec(&db, "INSERT INTO card_cache (id, name, supertype, subtypes, set_id, number, language, price_trend)
+               VALUES ('c2ja', 'カウンター呪文', 'Instant', '[\"Instant\"]', 'm10', '42', 'Japanese', 4.4);");
+    let (s, json) = add(db.clone(), r#"{"card_id":"c2","language":"ja"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let id = json["id"].as_i64().unwrap();
+    // cardId follows the localized row; the column keeps the RAW language
+    // value from the body (Node binds `language`, not the display name).
+    assert_eq!(text(&db, &format!("SELECT card_id FROM collection WHERE id = {id}")), "c2ja");
+    assert_eq!(text(&db, &format!("SELECT language FROM collection WHERE id = {id}")), "ja");
+    // recordPrice ran against the LOCALIZED card.
+    assert_eq!(real(&db, "SELECT price FROM price_history WHERE card_id = 'c2ja'"), Some(4.4));
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM price_history WHERE card_id = 'c2'"), 0);
+}
+
+#[tokio::test]
+async fn add_localized_cache_miss_forwards() {
+    let (_d, db) = db();
+    // No Japanese row for m10/42 → Node would fetch it from Scryfall; Rust
+    // must hand the whole request over (dead upstream → 502 proves it).
+    let (s, _h, _b) = send(
+        db.clone(),
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection",
+        Some("tok-session"),
+        Some(r#"{"card_id":"c2","language":"Japanese"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection WHERE user_id = 1 AND language = 'Japanese'"), 0);
+}
+
+#[tokio::test]
+async fn add_unknown_card_forwards() {
+    let (_d, db) = db();
+    let (s, _h, _b) = send(
+        db.clone(),
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection",
+        Some("tok-session"),
+        Some(r#"{"card_id":"mtg-not-in-cache"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn add_english_equivalent_languages_stay_native() {
+    let (_d, db) = db();
+    // 'en'/'English'/unknown all resolve to English → printingInLanguage
+    // early-outs (code === 'en' / same name), no cache probe, no forward.
+    for lang in ["en", "English", "xx", "42"] {
+        let (s, json) = add(db.clone(), &format!(r#"{{"card_id":"c2","language":"{lang}"}}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{lang}");
+        assert_eq!(text(&db, &format!("SELECT language FROM collection WHERE id = {}", json["id"].as_i64().unwrap())), lang);
+    }
+    // null language: destructuring keeps null (NOT the default) → resolve
+    // falls to English; the column stores NULL like Node binds it.
+    let (s, json) = add(db.clone(), r#"{"card_id":"c2","language":null}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        text(&db, &format!("SELECT COALESCE(language, '<NULL>') FROM collection WHERE id = {}", json["id"].as_i64().unwrap())),
+        "<NULL>"
+    );
+}
+
+#[tokio::test]
+async fn add_get_still_native_and_proxied_alone() {
+    // Both groups mounted: GET keeps the collection group's native handler
+    // (the post() MethodRouter only overrides POST on the same path).
+    let (_d, db) = db();
+    let (s, h, _b) = send(
+        db.clone(),
+        &["collection", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::GET,
+        "/api/collection?limit=1",
+        Some("tok-session"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.contains_key("x-total-count"), "GET stayed native");
+    // collection_adds ALONE: GET has no route → falls through to the proxy.
+    let (s, _h, _b) = send(
+        db,
+        &["collection_adds"],
+        "http://127.0.0.1:1",
+        Method::GET,
+        "/api/collection?limit=1",
+        Some("tok-session"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn bulk_add_validation_400s() {
+    let (_d, db) = db();
+    for body in ["{}", r#"{"card_ids":[]}"#, r#"{"card_ids":"x"}"#, r#"{"card_ids":null}"#, r#"{"card_ids":{}}"#] {
+        let (s, json) = bulk_add(db.clone(), body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(json["error"], "card_ids is required", "{body}");
+    }
+    let many: Vec<String> = (0..251).map(|_| "\"c2\"".to_string()).collect();
+    let (s, json) = bulk_add(db.clone(), &format!(r#"{{"card_ids":[{}]}}"#, many.join(","))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"], "Cannot add more than 250 cards at once.");
+}
+
+#[tokio::test]
+async fn bulk_add_success_message_and_rows() {
+    let (_d, db) = db();
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c1","c2"],"condition":"Lightly Played"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Added 2 cards to collection.");
+    assert_eq!(json["added"], 2);
+    assert_eq!(json["failed"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        json.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        ["message", "added", "entries", "failed"]
+    );
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(
+        entries[0].as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        ["card_id", "id", "ids", "index"]
+    );
+    assert_eq!(entries[0]["card_id"], "c1");
+    assert_eq!(entries[0]["index"], 0);
+    assert_eq!(entries[1]["card_id"], "c2");
+    assert_eq!(entries[1]["index"], 1);
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM collection WHERE user_id = 1 AND condition = 'Lightly Played'"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn bulk_add_quantity_message_and_multipliers() {
+    let (_d, db) = db();
+    // Shared quantity multiplies every entry; the message carries (xN each).
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c2"],"quantity":"3"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Added 1 card (x3 each) to collection.");
+    assert_eq!(json["entries"][0]["ids"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c2' AND user_id = 1 AND quantity = 1"),
+        1 + 3 // seeded row + three copies
+    );
+    // Unparseable shared quantity → qty 1, no suffix.
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c2"],"quantity":"x"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Added 1 card to collection.");
+    // Per-entry quantity overrides the shared one.
+    let (s, json) = bulk_add(
+        db.clone(),
+        r#"{"card_ids":[{"card_id":"c2","quantity":2}],"quantity":1,"condition":"Damaged"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["entries"][0]["ids"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c2' AND user_id = 1 AND condition = 'Damaged'"),
+        2
+    );
+    // '' / null per-entry overrides fall THROUGH to the shared value.
+    let (s, json) = bulk_add(
+        db.clone(),
+        r#"{"card_ids":[{"card_id":"c2","quantity":"","condition":null}],"quantity":2,"condition":"Near Mint"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["entries"][0]["ids"].as_array().unwrap().len(), 2);
+    // condition is NOT validated before INSERT (only printing is): a value
+    // outside the collection CHECK fails per-entry as a non-AddCardError —
+    // generic message, and 500 when nothing landed (Node does the same:
+    // bulkAddToCollection's catch reports, the route's ternary picks 500).
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c2"],"condition":"Played"}"#).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json["message"], "Added 0 of 1 cards; 1 failed.");
+    assert_eq!(json["failed"][0]["error"], "Failed to add card");
+    // Same shape on the single route: route-level catch → generic 500.
+    let (s, json) = add(db.clone(), r#"{"card_id":"c2","condition":"Played"}"#).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json["error"], "Failed to add card");
+}
+
+#[tokio::test]
+async fn bulk_add_mixed_report_shape() {
+    let (_d, db) = db();
+    // Object entry without card_id → per-entry AddCardError; the failed
+    // object omits the card_id key entirely (JS drops undefined).
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c2",{},"c3"]}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Added 2 of 3 cards; 1 failed.");
+    assert_eq!(json["added"], 2);
+    let failed = json["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].as_object().unwrap().keys().cloned().collect::<Vec<_>>(), ["error", "index"]);
+    assert_eq!(failed[0]["error"], "card_id is required");
+    assert_eq!(failed[0]["index"], 1);
+    assert_eq!(json["entries"][1]["index"], 2);
+    // null entry is NOT keyed → card_id = null (key present, value null).
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":[null]}"#).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    let failed = json["failed"].as_array().unwrap();
+    assert_eq!(
+        failed[0].as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+        ["card_id", "error", "index"]
+    );
+    assert!(failed[0]["card_id"].is_null());
+    assert_eq!(json["message"], "Added 0 of 1 cards; 1 failed.");
+}
+
+#[tokio::test]
+async fn bulk_add_all_failed_is_500() {
+    let (_d, db) = db();
+    // Both entries fail validation (no network involved) → 500 shape.
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":[{},{}]}"#).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json["message"], "Added 0 of 2 cards; 2 failed.");
+    assert_eq!(json["added"], 0);
+    // A bad printing fails just that entry; the rest still land (200).
+    let (s, json) = bulk_add(db.clone(), r#"{"card_ids":["c2",{"card_id":"c1","printing":"Foil"}]}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["message"], "Added 1 of 2 cards; 1 failed.");
+    assert_eq!(json["failed"][0]["error"], "Invalid printing: Foil");
+}
+
+#[tokio::test]
+async fn bulk_add_forward_on_any_cache_miss() {
+    let (_d, db) = db();
+    // One cached + one uncached entry: Node would fetch the uncached one and
+    // report per-card results, so the WHOLE request must go to Node (and
+    // nothing may be written natively first).
+    let (s, _h, _b) = send(
+        db.clone(),
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection/bulk-add",
+        Some("tok-session"),
+        Some(r#"{"card_ids":["c2","mtg-missing"]}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    // c2 got no extra copies (pass 1 wrote nothing): seeded 1 row for user 1.
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c2' AND user_id = 1"), 1);
+}
+
+#[tokio::test]
+async fn bulk_add_ownership_and_auth_gates() {
+    let (_d, db) = db();
+    let (s, _h, _b) = send(
+        db.clone(),
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection/bulk-add",
+        None,
+        Some(r#"{"card_ids":["c2"]}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _h, b) = send(
+        db.clone(),
+        &["collection_writes", "collection_adds"],
+        "http://127.0.0.1:1",
+        Method::POST,
+        "/api/collection/bulk-add",
+        Some("tok-other"),
+        Some(r#"{"card_ids":["c2"]}"#),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["entries"][0]["card_id"], "c2");
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c2' AND user_id = 2"), 2);
+}

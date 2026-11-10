@@ -293,7 +293,9 @@
     "status": "node"
   },
   "POST /api/collection": {
-    "status": "node"
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group \u2014 with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::add_* (15 incl. defaults, quantity rows vs stack, price-history dedupe, coercion edge cases, localized card_id + recordPrice, CHECK-violation 500, cache-miss forwards, GET-fallback both ways); parity.mjs ca_add_* (10: gates, 400s, successes verified by cross-side read-back per owner ruling iter-21, unknown-card 404, bad-condition 500)"
   },
   "POST /api/collection/bulk": {
     "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
@@ -301,7 +303,9 @@
     "tests": "tests/collection_writes.rs::bulk_* (10 incl. delete/trade/condition/printing, purchase_split weighted+equal, add_to_deck matrix, checked-out 409s, ownership rejections); parity.mjs cw_bulk_*/cw_split_* (15: gates, validation 400s, deck 400/404/409 pre-write branches, successes verified by cross-side read-back per owner ruling iter-21; entry_ids contract)"
   },
   "POST /api/collection/bulk-add": {
-    "status": "node"
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node \u2014 Node reports per-card results so partial-native execution would change the response",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
   },
   "POST /api/decks": {
     "status": "node"

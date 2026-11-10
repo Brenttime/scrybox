@@ -15,7 +15,7 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
     Router,
 };
 use hyper_util::{
@@ -266,6 +266,30 @@ pub fn app(state: AppState) -> Router {
             .route("/api/collection/cardlist", any(collection_writes::handle_cardlist))
             .route("/api/collection/bulk", any(collection_writes::handle_bulk))
             .route("/api/collection/{id}", any(collection_writes::handle_entry))
+    } else {
+        router
+    };
+    // Collection ADD group (iter 24): POST /api/collection and POST
+    // /api/collection/bulk-add. Registered as a `post`-only MethodRouter on
+    // /api/collection so it overrides the `collection` group's `any` fallback
+    // for POST only; GET keeps answering. Any add whose card (or localized
+    // printing) is not in card_cache — Node would fetch it from Scryfall —
+    // forwards to Node untouched, so the Rust port never needs a Scryfall
+    // client (that's lane B's scryfallApi territory).
+    let router = if state.owns("collection_adds") {
+        // With the `collection` group mounted, its `any()` fallback answers
+        // every non-POST method and the merged POST entry wins for POST.
+        // Alone, this group must NOT swallow GET with a 405 — a kill-switch
+        // combination has to look like the port doesn't exist, so the
+        // MethodRouter falls through to the Node proxy for other methods.
+        let adds = if state.owns("collection") {
+            post(collection_writes::handle_add)
+        } else {
+            post(collection_writes::handle_add).fallback(crate::proxy)
+        };
+        router
+            .route("/api/collection", adds)
+            .route("/api/collection/bulk-add", any(collection_writes::handle_bulk_add))
     } else {
         router
     };
