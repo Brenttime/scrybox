@@ -73,7 +73,7 @@ const groups = { collection_page: collectionPage, collection_full: collectionFul
 const scenarios = [
   { name: 'health', path: '/api/health' },
   { name: 'collection_page_varied', paths: groups.collection_page, headers: authOf('collection_page100') },
-  { name: 'collection_full_varied', paths: groups.collection_full, concurrency: 2, duration: 15, headers: authOf('collection_full_27MB') },
+  { name: 'collection_full_varied', paths: groups.collection_full, concurrency: 2, duration: 15, workers: 1, headers: authOf('collection_full_27MB') },
   { name: 'stats_varied', paths: groups.stats, headers: authOf('stats') },
   { name: 'search_db_varied', paths: groups.search_db, headers: authOf('search_db_name_sol_ring') },
   { name: 'search_coll_varied', paths: groups.search_coll, headers: authOf('search_coll_sol_ring') },
