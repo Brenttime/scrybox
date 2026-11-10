@@ -26,6 +26,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod collection;
 pub mod db;
+pub mod search;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -76,6 +77,9 @@ pub struct AppState {
     /// Read pool over the shared DB copy; `None` when SCRYBOX_DB_PATH unset.
     pub db: Option<Arc<db::DbPool>>,
     pub collection_cache: Arc<collection::CollectionCache>,
+    /// Response cache for the ported search route, keyed by
+    /// (params, user, collection_read_revision).
+    pub search_cache: Arc<search::SearchCache>,
 }
 
 impl AppState {
@@ -94,7 +98,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -211,6 +215,11 @@ pub fn app(state: AppState) -> Router {
     // an owned path still proxy to Node (the handler dispatches internally).
     let router = if state.owns("collection") {
         router.route("/api/collection", any(collection::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("search") {
+        router.route("/api/search", any(search::handle))
     } else {
         router
     };

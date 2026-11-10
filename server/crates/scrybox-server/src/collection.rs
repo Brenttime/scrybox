@@ -78,7 +78,7 @@ pub fn body_etag(raw: &[u8]) -> String {
 }
 
 /// Node: `inm.split(',').some(t => t.trim() === tag || t.trim() === '*')`.
-fn etag_matches(inm: Option<&str>, tag: &str) -> bool {
+pub(crate) fn etag_matches(inm: Option<&str>, tag: &str) -> bool {
     let Some(inm) = inm else { return false };
     inm.split(',').any(|t| {
         let t = t.trim();
@@ -203,7 +203,7 @@ const ALL_COLS: &[&str] = &{
     cols
 };
 
-fn sqlite_value(row: &Row, idx: usize) -> rusqlite::Result<Value> {
+pub(crate) fn sqlite_value(row: &Row, idx: usize) -> rusqlite::Result<Value> {
     Ok(match row.get_ref(idx)? {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(i) => Value::from(i),
@@ -222,7 +222,7 @@ fn sqlite_value(row: &Row, idx: usize) -> rusqlite::Result<Value> {
 
 /// JSON.stringify formatting for doubles: integral values print without a
 /// fraction ("-0" prints as "0", NaN/Infinity as null — like Node).
-fn json_num(f: f64) -> Value {
+pub(crate) fn json_num(f: f64) -> Value {
     if f.is_nan() || f.is_infinite() {
         return Value::Null;
     }
@@ -236,7 +236,7 @@ fn json_num(f: f64) -> Value {
 }
 
 /// JS truthiness for the raw SQLite values this route touches.
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -284,7 +284,7 @@ fn resolve_card_price(is_proxy: &Value, printing: &Value, pt: &Value, pn: &Value
 }
 
 /// JSON.parse(row.col || '[]') from parseCardRow.
-fn parse_array_col(v: &Value) -> Result<Value, String> {
+pub(crate) fn parse_array_col(v: &Value) -> Result<Value, String> {
     if v.is_null() {
         return Ok(Value::Array(Vec::new()));
     }
@@ -552,7 +552,7 @@ impl CollectionCache {
     }
 }
 
-fn gzip_bytes(raw: &[u8]) -> Bytes {
+pub(crate) fn gzip_bytes(raw: &[u8]) -> Bytes {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
@@ -562,7 +562,7 @@ fn gzip_bytes(raw: &[u8]) -> Bytes {
 
 /// compression@1.x behaviour: gzip when Accept-Encoding offers it and the
 /// body clears the 1 KB threshold.
-fn wants_encoding(ae: Option<&str>, needle: &str, len: usize) -> bool {
+pub(crate) fn wants_encoding(ae: Option<&str>, needle: &str, len: usize) -> bool {
     len >= 1024 && ae.map(|a| a.to_ascii_lowercase().contains(needle)).unwrap_or(false)
 }
 

@@ -1,0 +1,91 @@
+{
+  "at": "2026-11-10T01:33:38.699Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 9895,
+      "rps": 988.4,
+      "p50_ms": 14.75,
+      "p99_ms": 41.05,
+      "peak_rss_mb": 584.9,
+      "codes": {
+        "200": 9895
+      }
+    },
+    {
+      "name": "collection_page100",
+      "conc": 16,
+      "n": 23363,
+      "rps": 2335.6,
+      "p50_ms": 6.21,
+      "p99_ms": 17.14,
+      "peak_rss_mb": 585,
+      "codes": {
+        "200": 23363
+      }
+    },
+    {
+      "name": "collection_full_27MB",
+      "conc": 2,
+      "n": 622,
+      "rps": 41.4,
+      "p50_ms": 45.74,
+      "p99_ms": 95.95,
+      "peak_rss_mb": 585,
+      "codes": {
+        "200": 622
+      }
+    },
+    {
+      "name": "stats",
+      "conc": 16,
+      "n": 5854,
+      "rps": 584,
+      "p50_ms": 25.98,
+      "p99_ms": 54.27,
+      "peak_rss_mb": 585.1,
+      "codes": {
+        "200": 5854
+      }
+    },
+    {
+      "name": "search_coll_t_creature_c_g",
+      "conc": 16,
+      "n": 211,
+      "rps": 20.1,
+      "p50_ms": 783.16,
+      "p99_ms": 995.93,
+      "peak_rss_mb": 585.3,
+      "codes": {
+        "200": 211
+      }
+    },
+    {
+      "name": "search_coll_sol_ring",
+      "conc": 16,
+      "n": 1039,
+      "rps": 102.4,
+      "p50_ms": 152.92,
+      "p99_ms": 249.36,
+      "peak_rss_mb": 585.6,
+      "codes": {
+        "200": 1039
+      }
+    },
+    {
+      "name": "search_db_name_sol_ring",
+      "conc": 16,
+      "n": 29383,
+      "rps": 2938,
+      "p50_ms": 4.93,
+      "p99_ms": 12.94,
+      "peak_rss_mb": 585.7,
+      "codes": {
+        "200": 29383
+      }
+    }
+  ]
+}

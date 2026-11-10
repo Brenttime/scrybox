@@ -35,6 +35,26 @@ const EXTRA_COLLECTION = [
   '/api/collection?limit=100&offset=0&count=1&foo=%C3%A9',
 ];
 
+// Search coverage for the ported local-cache fast path (iter 2): native
+// shapes (name/number/set/lang/page/limit), the proxy-gated forms, and the
+// zero-row live path. deepDiff compares parsed JSON including array order,
+// so the card_cache row order is asserted against Node, not eyeballed.
+const EXTRA_SEARCH = [
+  '/api/search?scope=database&name=Black%20Lotus',
+  '/api/search?name=black%20lotus',
+  '/api/search?name=%20Sol%20Ring%20',
+  '/api/search?name=Sol%20Ring&page=2&limit=10',
+  '/api/search?name=Sol%20Ring&number=%23160%2Fbrc',
+  '/api/search?name=Sol%20Ring&set=brc',
+  '/api/search?name=%E3%82%BD%E3%83%BC%E3%83%AB&lang=ja',
+  '/api/search?name=Ancestral%20Recall&lang=English',
+  '/api/search?name=Sol%20Ring&lang=xx&limit=1',
+  '/api/search?q=%20&name=Sol%20Ring',
+  '/api/search',
+  '/api/search?scope=collection&name=Sol%20Ring',
+  '/api/search?name=__definitely_no_such_card__',
+];
+
 const cases = [];
 for (const s of scen.scenarios) {
   cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET' });
@@ -42,6 +62,9 @@ for (const s of scen.scenarios) {
 const authHeaders = scen.scenarios.find(s => s.headers?.Authorization)?.headers || {};
 for (const [i, p] of EXTRA_COLLECTION.entries()) {
   cases.push({ name: `extra${i + 1}_${p.slice('/api/collection'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
+}
+for (const [i, p] of EXTRA_SEARCH.entries()) {
+  cases.push({ name: `search${i + 1}_${p.slice('/api/search'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
 // Auth-surface cases (BRIEF rule 2): exact 401/403 bodies.
 cases.push({ name: 'auth_no_token', path: '/api/collection?limit=10', headers: {}, method: 'GET' });
@@ -66,6 +89,7 @@ async function fetchSide(base, c) {
     body,
     json: body && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(body) : undefined,
     total: res.headers.get('x-total-count'),
+    source: res.headers.get('x-source'),
     etag: res.headers.get('etag'),
     ctype: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
     ms: Date.now() - t0,
@@ -106,6 +130,7 @@ function compareCase(c, r, n) {
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
   if (r.ctype !== n.ctype) diffs.push(`content-type ${r.ctype} vs ${n.ctype}`);
   if ((r.total ?? undefined) !== (n.total ?? undefined)) diffs.push(`x-total-count ${r.total} vs ${n.total}`);
+  if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
     if (r.json === undefined || n.json === undefined) diffs.push('one side non-JSON body');
     else deepDiff(r.json, n.json, '$', diffs);
@@ -152,7 +177,7 @@ function rawGet(base, path, headers) {
 ///     are byte-identical the tags must be identical, which cross-checks the
 ///     Rust serializer against Node's at byte level.
 async function etagParity(c) {
-  if (!c.path.startsWith('/api/collection')) return [];
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search')) return [];
   const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
   if (r.status !== 200 || n.status !== 200) return [];
   const diffs = [];
