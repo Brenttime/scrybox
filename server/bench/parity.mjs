@@ -638,6 +638,69 @@ cases.push({ name: 'mb_backups_list', path: '/api/admin/backups', headers: authH
 cases.push({ name: 'mb_backups_list_member', path: '/api/admin/backups', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
 cases.push({ name: 'mb_backups_list_no_token', path: '/api/admin/backups', headers: {}, method: 'GET' });
 
+// --- iter 34: settings group (Lane A port: GET/PUT /api/settings,
+// GET /api/settings/version, RUST_ROUTES=settings) ----------------------------
+// The effective-settings fold is DB (app_settings row) + env half; restart-
+// rust.sh mirrors the container's PUBLIC_BASE_URL / LOCAL_SCRYFALL_ENABLED /
+// LOCAL_WEB_PORTAL_ENABLED into the Rust unit, so the merged body must be
+// byte-equal including key ORDER. The check=1 GitHub leg is volatile (fetched
+// + published_at stamp, external API) and stays cargo-fixture-only; the
+// check=0 arm plus the full auth ladder run live. Write cases restore the
+// row from a snapshot captured in setup (both sides answer from the same
+// start; teardown always runs, retry-safe).
+const SET_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const SET_COLS = ['public_base_url', 'price_refresh_days', 'scan_exclude_tokens', 'scan_exclude_art_cards',
+  'scan_exclude_jumpstart', 'scan_exclude_promos', 'setup_complete', 'moxfield_decklist_interval_min',
+  'moxfield_content_interval_min'];
+function setSnap() {
+  return dbWrite((d) => d.prepare(`SELECT ${SET_COLS.join(', ')} FROM app_settings WHERE id = 1`).get());
+}
+function setRestore(snap) {
+  dbWrite((d) => d.prepare(`UPDATE app_settings SET ${SET_COLS.map((c) => c + ' = ?').join(', ')} WHERE id = 1`)
+    .run(...SET_COLS.map((c) => snap[c])));
+}
+cases.push({ name: 'set_get_admin', path: '/api/settings', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'set_get_member', path: '/api/settings', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
+cases.push({ name: 'set_get_no_token', path: '/api/settings', headers: {}, method: 'GET' });
+cases.push({ name: 'set_version_admin', path: '/api/settings/version?check=0', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'set_version_no_token', path: '/api/settings/version', headers: {}, method: 'GET' });
+cases.push({ name: 'set_put_no_token', path: '/api/settings', headers: { 'content-type': 'application/json' }, method: 'PUT', body: '{"price_refresh_days":3}' });
+cases.push({ name: 'set_put_member', path: '/api/settings', headers: { Authorization: `Bearer ${MEMBER_SESSION}`, 'content-type': 'application/json' }, method: 'PUT', body: '{"price_refresh_days":3}' });
+cases.push({ name: 'set_put_badjson_noauth', path: '/api/settings', headers: { 'content-type': 'application/json' }, method: 'PUT', body: '{oops' });
+cases.push({
+  name: 'set_put_price_7', path: '/api/settings', headers: SET_JSON, method: 'PUT',
+  body: JSON.stringify({ price_refresh_days: 7 }),
+  setup: async () => ({ ctx: { snap: setSnap() } }),
+  teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
+  readBack: async (other) => {
+    const r = await fetch(other + '/api/settings', { headers: authHeaders });
+    const j = await r.json();
+    return { ok: j.price_refresh_days === 7, why: `price read-back ${j.price_refresh_days}`, seen: j.price_refresh_days };
+  },
+});
+cases.push({
+  name: 'set_put_price_prefix_400', path: '/api/settings', headers: SET_JSON, method: 'PUT',
+  body: JSON.stringify({ price_refresh_days: '7.9abc' }),
+  setup: async () => ({ ctx: { snap: setSnap() } }),
+  teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
+});
+cases.push({
+  name: 'set_put_baseurl_trim', path: '/api/settings', headers: SET_JSON, method: 'PUT',
+  body: JSON.stringify({ public_base_url: '  https://parity.test:9  ' }),
+  setup: async () => ({ ctx: { snap: setSnap() } }),
+  teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
+  readBack: async (other) => {
+    const r = await fetch(other + '/api/settings', { headers: authHeaders });
+    const j = await r.json();
+    return { ok: j.public_base_url === 'https://parity.test:9', why: `base_url read-back ${JSON.stringify(j.public_base_url)}`, seen: j.public_base_url };
+  },
+});
+cases.push({
+  name: 'set_put_noop_empty', path: '/api/settings', headers: SET_JSON, method: 'PUT', body: '{}',
+  setup: async () => ({ ctx: { snap: setSnap() } }),
+  teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
+});
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
