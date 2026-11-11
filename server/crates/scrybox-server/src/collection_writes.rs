@@ -102,7 +102,7 @@ const ALLOCATION_CONFLICT: &str = "Check in the deck using this card before redu
 
 /// JS `String(value)` for the JSON values that can arrive in a request body
 /// (or come out of SQLite through `sqlite_value`).
-fn js_to_string(v: Option<&Value>) -> String {
+pub(crate) fn js_to_string(v: Option<&Value>) -> String {
     match v {
         None | Some(Value::Null) => "null".to_string(), // `null` prints as null; undefined handled by callers passing None
         Some(Value::Bool(b)) => b.to_string(),
@@ -173,7 +173,7 @@ fn math_round(x: f64) -> f64 {
 }
 
 /// JS `parseInt(String(v), 10)` (NaN modelled as None).
-fn js_parse_int_v(v: Option<&Value>) -> Option<i64> {
+pub(crate) fn js_parse_int_v(v: Option<&Value>) -> Option<i64> {
     js_parse_int(&js_to_string(v))
 }
 
@@ -265,7 +265,7 @@ fn json_to_sql(v: Option<&Value>) -> Result<SqlValue, WriteError> {
     })
 }
 
-fn json_to_sql_value(v: &Value) -> SqlValue {
+pub(crate) fn json_to_sql_value(v: &Value) -> SqlValue {
     // For values read back out of SQLite (already normalised JSON) — no bind
     // errors possible.
     json_to_sql(Some(v)).unwrap_or(SqlValue::Null)
@@ -278,7 +278,7 @@ fn dv(m: &Map<String, Value>, k: &str) -> Value {
 }
 
 /// JS truthiness over `Option<&Value>` (collection::truthy takes &Value).
-fn tr(v: Option<&Value>) -> bool {
+pub(crate) fn tr(v: Option<&Value>) -> bool {
     v.is_some_and(|x| truthy(x))
 }
 
@@ -310,7 +310,7 @@ fn sql_is_basic_land(alias: &str) -> String {
 // DB plumbing
 // ---------------------------------------------------------------------------
 
-enum WriteError {
+pub(crate) enum WriteError {
     Sql(rusqlite::Error),
     /// node-sqlite3 refuses to bind an object/array — same 500 as its throw.
     Bind,
@@ -331,7 +331,7 @@ impl std::fmt::Debug for WriteError {
     }
 }
 
-fn get_row_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<Map<String, Value>>, WriteError> {
+pub(crate) fn get_row_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<Map<String, Value>>, WriteError> {
     let mut stmt = conn.prepare_cached(sql)?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
@@ -616,7 +616,7 @@ pub(crate) async fn read_parts(req: Request) -> (axum::http::request::Parts, Vec
     (parts, bytes)
 }
 
-fn rebuild(parts: axum::http::request::Parts, bytes: &[u8]) -> Request {
+pub(crate) fn rebuild(parts: axum::http::request::Parts, bytes: &[u8]) -> Request {
     Request::from_parts(parts, Body::from(bytes.to_vec()))
 }
 
@@ -1397,8 +1397,11 @@ pub(crate) fn is_basic_land(card: &Map<String, Value>) -> bool {
 }
 
 /// deckRules.js validateDeckAddition — returns Err(message) for the reject
-/// strings. deckId is unused by the Node implementation; kept out.
-fn validate_deck_addition(
+/// strings. deckId is unused by the Node implementation; kept out. Callers
+/// that get a raw body value (decks.js POST /:id/cards passes `quantity`
+/// straight to parseInt) parse it first and pass the finite non-negative
+/// number through; the internal re-parse of the number is a no-op.
+pub(crate) fn validate_deck_addition(
     conn: &Connection,
     user_id: i64,
     card_id: &Value,
@@ -1792,7 +1795,7 @@ fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, W
 /// priceHelpers.recordPrice — the movement-guarded INSERT (not the brief's
 /// older date-keyed OR-REPLACE; the source is canonical). Returns whether a
 /// row landed.
-fn record_price(conn: &Connection, card_id: &SqlValue, price: &Value) -> Result<bool, WriteError> {
+pub(crate) fn record_price(conn: &Connection, card_id: &SqlValue, price: &Value) -> Result<bool, WriteError> {
     let p = js_to_number(Some(price));
     let card_empty = match card_id {
         SqlValue::Null => true,

@@ -407,16 +407,24 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
-    // Lane A iter-28/29: deck writes (PUT/DELETE, `decks_writes`) and deck
-    // reads (GET list / detail / locations, `decks_reads`). Both groups share
-    // the /api/decks/{id} shape, so one dispatcher route owns it: GET goes to
-    // decks_reads when that group is on, PUT/DELETE to decks_writes, and
-    // everything else (or groups that are off) falls through to the catch-all
-    // proxy — never 405 here.
+    // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
+    // `decks_writes`) and deck reads (GET list / detail / locations,
+    // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
+    // shapes, so one dispatcher route owns each: GET goes to decks_reads
+    // when that group is on, POST/PUT/DELETE to decks_writes, and everything
+    // else (or groups that are off) falls through to the catch-all proxy —
+    // never 405 here.
     let router = if state.owns("decks_reads") {
+        router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
         router
-            .route("/api/decks", any(decks_reads::handle_list))
-            .route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    };
+    let router = if state.owns("decks_reads") && state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::route_collection))
+    } else if state.owns("decks_reads") {
+        router.route("/api/decks", any(decks_reads::handle_list))
+    } else if state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::handle_create))
     } else {
         router
     };
@@ -426,7 +434,12 @@ pub fn app(state: AppState) -> Router {
         router
     };
     let router = if state.owns("decks_writes") {
-        router.route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+        router
+            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .route("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
+            .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
+            .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
+            .route("/api/decks/{id}/return", any(decks_writes::handle_return))
     } else {
         router
     };

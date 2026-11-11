@@ -244,7 +244,8 @@ fn fresh_allows_304(headers: &HeaderMap) -> bool {
 // ---------------------------------------------------------------------------
 
 /// ECMAScript WhiteSpace + LineTerminator set used by Number(String).
-fn js_trim(s: &str) -> &str {
+/// Identical to the JS regex `\s` class (used by the decklist importer).
+pub(crate) fn js_trim(s: &str) -> &str {
     let is_ws = |c: char| {
         matches!(
             c,
@@ -474,7 +475,7 @@ fn empty_deck_minimum_value() -> Map<String, Value> {
     out
 }
 
-fn sql_card_key(alias: &str) -> String {
+pub(crate) fn sql_card_key(alias: &str) -> String {
     format!("LOWER(TRIM(COALESCE({alias}.name, '')))")
 }
 
@@ -488,7 +489,7 @@ fn chunked<T>(values: &[T], size: usize) -> Vec<&[T]> {
 // same semantics).
 // ---------------------------------------------------------------------------
 
-fn rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, rusqlite::Error> {
+pub(crate) fn rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
@@ -1317,7 +1318,7 @@ fn build_deck_detail(conn: &Connection, deck_id: &str, user_id: i64) -> Result<V
 // GET /api/decks/:id/locations — getDeckCoverageRows
 // ---------------------------------------------------------------------------
 
-fn coverage_sql() -> String {
+pub(crate) fn coverage_sql() -> String {
     format!(
         "
     WITH requested AS (

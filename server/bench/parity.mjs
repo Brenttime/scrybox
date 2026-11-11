@@ -1414,6 +1414,262 @@ async function etagParity(c) {
     },
   });
 
+  // ===== decks_writes iter 30: POST /api/decks, POST /api/decks/:id/cards,
+  // POST /api/decks/:id/register-collection, PUT /api/decks/:id/checkout,
+  // PUT /api/decks/:id/return. Own id range (931011..931018) and two
+  // private card_cache rows (rusttest-dk2-*) so fixture churn cannot leak
+  // into the iter-28/29 cases or the stats/networth bodies. 931012 (the
+  // checked-out deck) carries CW_CARD, NOT the dk2 cards: the checkout
+  // locked/supply CTEs scan the user's checked-out decks, and CW_CARD's
+  // logical name must not collide with the checkout cases' expectations.
+  // Setup runs per side, so both side-runs see identical rows. =====
+  const DK2_A = 'rusttest-dk2-alpha';
+  const DK2_B = 'rusttest-dk2-beta';
+  const DK2_NAME_A = 'rusttest DK2 Alpha';
+  const DK2_NAME_B = 'rusttest DK2 Beta';
+  function dk2Clear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931011 AND 931018').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931011 AND 931018').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931011 AND 931018').run();
+    d.prepare("DELETE FROM decks WHERE name IN ('DK2 Fresh','DK2 Import')").run();
+    d.prepare('DELETE FROM collection WHERE card_id IN (?, ?)').run(DK2_A, DK2_B);
+    d.prepare('DELETE FROM price_history WHERE card_id IN (?, ?)').run(DK2_A, DK2_B);
+    d.prepare('DELETE FROM card_cache WHERE id IN (?, ?)').run(DK2_A, DK2_B);
+  }
+  function dk2Prep() {
+    dbWrite((d) => {
+      dk2Clear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK2_A, DK2_NAME_A, '["Artifact"]', '[]', 'Rare', 0.1);
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK2_B, DK2_NAME_B, '["Creature"]', '[]', 'Common', 0.2);
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931011, uid, 'DK2 Add', '', 0, '2026-01-01 00:00:00');
+      ins.run(931012, uid, 'DK2 Checked Out', '', 1, '2026-01-01 00:00:00');
+      ins.run(931013, other.id, 'DK2 Foreign', '', 0, '2026-01-01 00:00:00');
+      ins.run(931014, uid, 'DK2 Empty', '', 0, '2026-01-01 00:00:00');
+      ins.run(931015, uid, 'DK2 Broken', '', 0, '2026-01-01 00:00:00');
+      ins.run(931016, uid, 'DK2 Reg', '', 0, '2026-01-01 00:00:00');
+      ins.run(931017, uid, 'DK2 Out', '', 0, '2026-01-01 00:00:00');
+      ins.run(931018, uid, 'DK2 Short', '', 0, '2026-01-01 00:00:00');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931012, CW_CARD, 1);            // checked-out deck: CW_CARD only (see note)
+      dc.run(931015, 'rusttest-dk2-unresolved', 1);
+      dc.run(931016, DK2_A, 2);
+      dc.run(931016, DK2_B, 1);
+      dc.run(931017, DK2_A, 2);
+      dc.run(931017, DK2_B, 1);
+      dc.run(931018, DK2_B, 2);
+      d.prepare('UPDATE decks SET checked_out = 1, checked_out_at = CURRENT_TIMESTAMP WHERE id = 931012').run();
+    });
+  }
+  function dk2FundA(qty) {
+    dbWrite((d) => {
+      const uid = dkUid(d);
+      d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)').run(DK2_A, qty, uid);
+    });
+  }
+  function dk2Teardown() { dbWrite((d) => dk2Clear(d)); }
+  const dk2Db = (sql, ...args) => dbWrite((d) => d.prepare(sql).all(...args));
+  cases.push({
+    name: 'dk2_create_201', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{"name":"DK2 Fresh"}', etagReplay: false, strip: ['id'],
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async (other) => {
+      // id stripped (autoincrement differs by side); row persisted with Node defaults.
+      const rows = dk2Db("SELECT name, description, format, category, accent_color, target_size FROM decks WHERE name='DK2 Fresh'");
+      const want = { name: 'DK2 Fresh', description: '', format: 'Standard', category: 'Competitive', accent_color: '#eab308', target_size: 60 };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `create row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Decklist import twin of /^(\d+)x?\s+(.+)$/i — uppercase 'X' line must
+    // ALSO match (/i flag); junk line silently skipped; upsert stacks to 5.
+    name: 'dk2_create_decklist_201', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{"name":"DK2 Import","decklist_text":"4x rusttest DK2 Alpha\\nnot a line\\n1X rusttest DK2 Alpha\\n"}',
+    etagReplay: false, strip: ['id'],
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db(
+        "SELECT dc.card_id, dc.quantity FROM deck_cards dc JOIN decks dd ON dd.id = dc.deck_id WHERE dd.name='DK2 Import' ORDER BY dc.card_id",
+      );
+      return { ok: rows.length === 1 && rows[0].card_id === DK2_A && rows[0].quantity === 5, why: `import rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_create_no_name_400', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db("SELECT COUNT(*) n FROM decks WHERE name LIKE 'DK2 Fresh%'");
+      return { ok: rows[0].n === 0, why: `400 created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_create_noauth_401', path: '/api/decks', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{"name":"DK2 Nope"}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db("SELECT COUNT(*) n FROM decks WHERE name='DK2 Nope'");
+      return { ok: rows[0].n === 0, why: `noauth created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_addcard_200', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":"2"}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const cards = dk2Db('SELECT card_id, quantity FROM deck_cards WHERE deck_id=931011 ORDER BY card_id');
+      const ph = dk2Db('SELECT COUNT(*) n FROM price_history WHERE card_id=?', DK2_A);
+      return { ok: cards.length === 1 && cards[0].card_id === DK2_A && cards[0].quantity === 2 && ph[0].n === 1, why: `added -> ${JSON.stringify(cards)} ph=${ph[0].n}`, seen: { cards, ph } };
+    },
+  });
+  cases.push({
+    name: 'dk2_addcard_no_card_400', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: '{"quantity":1}', etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_foreign_404', path: '/api/decks/931013/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_checkedout_409', path: '/api/decks/931012/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_over_owned_400', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":6}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_noauth_401', path: '/api/decks/931011/cards', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931011');
+      return { ok: rows[0].n === 0, why: `noauth added nothing (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_register_201', path: '/api/decks/931016/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db(
+        'SELECT card_id, quantity, condition, language, is_trade FROM collection WHERE card_id IN (?, ?) ORDER BY card_id',
+        DK2_A, DK2_B,
+      );
+      const want = [
+        { card_id: DK2_A, quantity: 2, condition: 'Near Mint', language: 'English', is_trade: 0 },
+        { card_id: DK2_B, quantity: 1, condition: 'Near Mint', language: 'English', is_trade: 0 },
+      ];
+      return { ok: JSON.stringify(rows) === JSON.stringify(want), why: `registered rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_register_empty_400', path: '/api/decks/931014/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_unresolved_422', path: '/api/decks/931015/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_checkedout_409', path: '/api/decks/931012/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    // express.json runs before auth on this route: the body is parsed (and
+    // 500s on bad JSON) even though the handler ignores it.
+    name: 'dk2_register_badjson_500', path: '/api/decks/931016/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{oops', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_noauth_401', path: '/api/decks/931016/register-collection', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT COUNT(*) n FROM collection WHERE card_id IN (?, ?)', DK2_A, DK2_B);
+      return { ok: rows[0].n === 0, why: `noauth registered nothing (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_checkout_200', path: '/api/decks/931017/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(2); dbWrite((d) => { d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)').run(DK2_B, 1, dkUid(d)); }); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co, (checked_out_at IS NOT NULL) at_set FROM decks WHERE id=931017');
+      return { ok: rows.length === 1 && rows[0].co === 1 && rows[0].at_set === 1, why: `checkout state -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Shortfall ladder: DK2_B needed 2, owned 0, in-use 0 -> deterministic
+    // details array (unclamped available, raw row values in the template).
+    name: 'dk2_checkout_shortage_400', path: '/api/decks/931018/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931018');
+      return { ok: rows[0].co === 0, why: `shortfall did not check out (${rows[0].co})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_checkout_already_409', path: '/api/decks/931012/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_missing_404', path: '/api/decks/999999/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_badjson_500', path: '/api/decks/931017/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_noauth_401', path: '/api/decks/931017/checkout', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931017');
+      return { ok: rows[0].co === 0, why: `noauth left deck in (${rows[0].co})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_return_200', path: '/api/decks/931012/return', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co, checked_out_at at FROM decks WHERE id=931012');
+      return { ok: rows[0].co === 0 && rows[0].at === null, why: `return cleared flags -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_return_missing_404', path: '/api/decks/999999/return', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_return_noauth_401', path: '/api/decks/931012/return', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931012');
+      return { ok: rows[0].co === 1, why: `noauth kept deck checked out (${rows[0].co})`, seen: rows };
+    },
+  });
+
   // ===== decks_reads (iter 29): GET /api/decks, GET /api/decks/:id,
   // GET /api/decks/:id/locations. Fixed ids, realistic scryfall-local row
   // shape (supertype 'MTG', types = colour words, subtypes = TYPE words

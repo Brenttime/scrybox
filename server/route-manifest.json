@@ -348,13 +348,19 @@
     "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
   },
   "POST /api/decks": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks POST under RUST_ROUTES=decks_writes; INSERT + decklist upsert loop, per-line regex twin of /^(\\d+)x?\\s+(.+)$/i incl. backtracking + /i)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::create_deck_contract (falsy-name 400 set incl. [], parseInt(target_size,10)||60 strings/junk/0/null, defaults row read-back, decklist import stacks 4x+1X same card, non-string decklist skipped); parity.mjs dk2_create_201 (id stripped, opposite-server row defaults), dk2_create_decklist_201 (uppercase-X line lands, junk line skipped), dk2_create_no_name_400, dk2_create_noauth_401"
   },
   "POST /api/decks/:id/cards": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/cards POST under RUST_ROUTES=decks_writes; logical-card fold + guarded UPDATE/INSERT, Scryfall hydration for uncached ids stays Node-side)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::add_card_contract (400 falsy card_id, 404 missing deck, 409 checked-out, non-string card_id -> Node getCardById-throw 500 twin, cache-miss string id whole-request forward, owned-cap/max-4/'Invalid quantity' 400 messages, quantity '3' parseInt twin + price_history row, alt-printing collapse keeps one representative row); parity.mjs dk2_addcard_200 (quantity '2' parseInt twin, price_history trend row), dk2_addcard_no_card_400, dk2_addcard_foreign_404, dk2_addcard_checkedout_409, dk2_addcard_over_owned_400, dk2_addcard_noauth_401"
   },
   "POST /api/decks/:id/register-collection": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/register-collection POST under RUST_ROUTES=decks_writes; guarded INSERT..SELECT..RETURNING, register-vs-checkout linearizable, per-card recordPrice caught, sweep SELECT 500s as in Node)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::register_collection_contract (400 no-cards / 422 unresolved / 404 foreign / 409 checked-out, 201 body + stacked rows (no dedup, register twice -> 6 rows), language COALESCE 'English', price sweep one row per distinct card); parity.mjs dk2_register_201 (opposite-server collection rows incl. condition/language/is_trade), dk2_register_empty_400, dk2_register_unresolved_422, dk2_register_checkedout_409, dk2_register_badjson_500 (parse-before-auth on body-ignoring route), dk2_register_noauth_401"
   },
   "POST /api/export": {
     "status": "node"
@@ -440,10 +446,14 @@
     "tests": "tests/decks_writes.rs::put_deck_contract (JS-falsy 400 set, non-object 500, Node-driver binding shapes 42->'42'/true->'1'/{}/[]->'[object Object]', cross-user/missing 404, charset+weak-ETag), auth_gate_and_parse_order (401/403, bad-JSON-500-before-auth), shape_guards_proxy_untouched_never_405; parity.mjs dk_put_200 (opposite-server GET name/description), dk_put_missing_404, dk_put_foreign_404, dk_put_no_name_400, dk_put_noauth_401, dk_put_badjson_500, dk_put_apikey_403"
   },
   "PUT /api/decks/:id/checkout": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/checkout PUT under RUST_ROUTES=decks_writes; withAllocationLock + single guarded UPDATE w/ supply CTEs, deficit diagnostics reuse decks_reads coverage_sql)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::checkout_contract (404/409-already/400-empty/422-unresolved ladder, unclamped-available deficit 'Missing 2x Counterspell (Owned: 0, In Use: 1)' live-pinned, logical-key fold across printings, locked-net-of-self happy path sets checked_out+at, second checkout 409; return clears flags, idempotent 200, 404s); parity.mjs dk2_checkout_200 (opposite-server flag read-back), dk2_checkout_shortage_400 (deterministic details array), dk2_checkout_already_409, dk2_checkout_missing_404, dk2_checkout_badjson_500, dk2_checkout_noauth_401, dk2_return_200, dk2_return_missing_404, dk2_return_noauth_401"
   },
   "PUT /api/decks/:id/return": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/return PUT under RUST_ROUTES=decks_writes; unconditional UPDATE after 404 ownership gate, mirrors Node)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::checkout_contract (return section: 200 clears checked_out/checked_out_at, idempotent second return 200, foreign/missing 404); parity.mjs dk2_return_200 (opposite-server flags cleared), dk2_return_missing_404, dk2_return_noauth_401 (keeps deck checked out)"
   },
   "PUT /api/lists/:id": {
     "status": "node"

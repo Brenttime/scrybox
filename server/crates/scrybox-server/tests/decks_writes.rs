@@ -133,6 +133,17 @@ async fn kill_switch_proxies_everything_untouched() {
     assert_eq!(h.get("x-node").unwrap(), "1");
     let (_s, h, _) = request(&r, "DELETE", "/api/decks/931001/cards/c-sol-a", &AUTH, None).await;
     assert_eq!(h.get("x-node").unwrap(), "1");
+    // iter-30 legs: with the group OFF everything still proxies untouched.
+    for (m, p) in [
+        ("POST", "/api/decks"),
+        ("POST", "/api/decks/931004/cards"),
+        ("POST", "/api/decks/931001/register-collection"),
+        ("PUT", "/api/decks/931001/checkout"),
+        ("PUT", "/api/decks/931001/return"),
+    ] {
+        let (_s, h, _) = request(&r, m, p, &JSON_CT, Some("{}")).await;
+        assert_eq!(h.get("x-node").unwrap(), "1", "{m} {p}");
+    }
 }
 
 #[tokio::test]
@@ -146,11 +157,11 @@ async fn shape_guards_proxy_untouched_never_405() {
         ("GET", "/api/decks"),
         ("GET", "/api/decks/931001"),
         ("GET", "/api/decks/931001/combos"),
-        ("POST", "/api/decks/931001/cards"),
         ("PUT", "/api/decks/931001/combos"),
-        ("POST", "/api/decks"),
         ("POST", "/api/decks/931001"),
         ("GET", "/api/decks/931001/"), // trailing slash: Express loose match stays proxied
+        ("DELETE", "/api/decks/931001/checkout"), // owned shape, wrong method
+        ("PATCH", "/api/decks/931001/register-collection"),
     ] {
         let (_s, h, _) = request(&r, m, p, &JSON_CT, Some("{}")).await;
         assert_eq!(h.get("x-node").unwrap(), "1", "{m} {p} must proxy, not 405/404 from this router");
@@ -163,7 +174,16 @@ async fn auth_gate_and_parse_order() {
     let upstream = spawn_fake_node().await;
     let r = router_for(seeded_db(dir.path(), "auth.db"), &["decks_writes"], &format!("http://{upstream}"));
 
-    for (m, p) in [("PUT", "/api/decks/931001"), ("DELETE", "/api/decks/931001"), ("DELETE", "/api/decks/931001/cards/c-sol-a")] {
+    for (m, p) in [
+        ("PUT", "/api/decks/931001"),
+        ("DELETE", "/api/decks/931001"),
+        ("DELETE", "/api/decks/931001/cards/c-sol-a"),
+        ("POST", "/api/decks"),
+        ("POST", "/api/decks/931004/cards"),
+        ("POST", "/api/decks/931001/register-collection"),
+        ("PUT", "/api/decks/931001/checkout"),
+        ("PUT", "/api/decks/931001/return"),
+    ] {
         let (s, _, b) = request(&r, m, p, &[], None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "{m} {p}");
         assert_eq!(json_body(&b), json!({ "error": "Access denied. No token provided." }));
@@ -348,4 +368,304 @@ async fn delete_card_removes_all_printings_of_logical_card() {
         conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM deck_cards WHERE deck_id=931001", [], |r| r.get(0)).unwrap(),
         1
     );
+}
+
+// ---------------------------------------------------------------------------
+// iter-30: POST /api/decks, POST /:id/cards, POST /:id/register-collection,
+// PUT /:id/checkout, PUT /:id/return
+// ---------------------------------------------------------------------------
+
+fn fund(conn: &Connection, card_id: &str, user_id: i64, qty: i64) {
+    conn.execute(
+        "INSERT INTO collection (card_id, user_id, quantity) VALUES (?1, ?2, ?3)",
+        rusqlite::params![card_id, user_id, qty],
+    )
+    .unwrap();
+}
+
+fn deck_cards_of(conn: &Connection, deck_id: i64) -> Vec<(String, i64)> {
+    conn.prepare("SELECT card_id, quantity FROM deck_cards WHERE deck_id=?1 ORDER BY card_id")
+        .unwrap()
+        .query_map(rusqlite::params![deck_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn create_deck_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let db = seeded_db(dir.path(), "create.db");
+    let r = router_for(db.clone(), &["decks_writes"], &format!("http://{upstream}"));
+    let conn = open(&db);
+
+    // Falsy name -> 400 before any DB touch.
+    for body in ["{}", "{\"name\":\"\"}", "{\"name\":0}", "{\"name\":null}", "[]"] {
+        let (s, _, b) = request(&r, "POST", "/api/decks", &JSON_CT, Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "body {body}");
+        assert_eq!(json_body(&b), json!({ "error": "Deck name is required" }));
+    }
+
+    // Minimal create + defaults (description '', format Standard, ...).
+    let (s, h, b) = request(&r, "POST", "/api/decks", &JSON_CT, Some("{\"name\":\"Fresh\"}")).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let created = json_body(&b);
+    assert_eq!(created["message"], "Deck created successfully");
+    let new_id = created["id"].as_i64().unwrap();
+    assert!(new_id > 931004, "id {new_id}");
+    assert_eq!(h.get(header::CONTENT_TYPE).unwrap().to_str().unwrap(), "application/json; charset=utf-8");
+    let row: (String, String, String, String, String, i64) = conn
+        .query_row(
+            "SELECT name, description, format, category, accent_color, target_size FROM decks WHERE id=?1",
+            rusqlite::params![new_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("Fresh".into(), "".into(), "Standard".into(), "Competitive".into(), "#eab308".into(), 60));
+
+    // parseInt(target_size,10) || 60 twin: strings parse, junk/0/null -> 60.
+    for (body, want) in [
+        ("{\"name\":\"TS1\",\"target_size\":\"40\"}", 40),
+        ("{\"name\":\"TS2\",\"target_size\":\"abc\"}", 60),
+        ("{\"name\":\"TS3\",\"target_size\":0}", 60),
+        ("{\"name\":\"TS4\",\"target_size\":null}", 60),
+        ("{\"name\":\"TS5\",\"target_size\":20}", 20),
+    ] {
+        let (s, _, b) = request(&r, "POST", "/api/decks", &JSON_CT, Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let id = json_body(&b)["id"].as_i64().unwrap();
+        let ts: i64 = conn.query_row("SELECT target_size FROM decks WHERE id=?1", rusqlite::params![id], |r| r.get(0)).unwrap();
+        assert_eq!(ts, want, "{body}");
+    }
+
+    // Decklist import: /^(\d+)x?\s+(.+)$/i per trimmed line, unresolved
+    // names silently skipped, 'Sol Ring' resolves to the first cache match.
+    let body = json!({"name":"Imported","decklist_text":"4x Sol Ring\n 1x Counterspell \nnot a line\n\n"}).to_string();
+    let (s, _, b) = request(&r, "POST", "/api/decks", &JSON_CT, Some(&body)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let id = json_body(&b)["id"].as_i64().unwrap();
+    assert_eq!(deck_cards_of(&conn, id), vec![("c-other".to_string(), 1), ("c-sol-a".to_string(), 4)]);
+
+    // Empty string / non-string decklist_text import nothing.
+    for body in ["{\"name\":\"E1\",\"decklist_text\":\"\"}", "{\"name\":\"E2\",\"decklist_text\":5}"] {
+        let (s, _, b) = request(&r, "POST", "/api/decks", &JSON_CT, Some(body)).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let id = json_body(&b)["id"].as_i64().unwrap();
+        assert!(deck_cards_of(&conn, id).is_empty(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn add_card_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let db = seeded_db(dir.path(), "add.db");
+    let r = router_for(db.clone(), &["decks_writes"], &format!("http://{upstream}"));
+    let conn = open(&db);
+
+    // Missing card_id -> 400; unknown deck -> 404; checked-out deck -> 409.
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"quantity\":1}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "card_id is required" }));
+    let (s, _, b) = request(&r, "POST", "/api/decks/999999/cards", &JSON_CT, Some("{\"card_id\":\"c-other\"}")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&b), json!({ "error": "Deck not found or unauthorized" }));
+    let (s, _, b) = request(&r, "POST", "/api/decks/931002/cards", &JSON_CT, Some("{\"card_id\":\"c-other\"}")).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(json_body(&b), json!({ "error": "Check this deck in before changing its cards." }));
+
+    // cardApi.getCardById would throw on a non-string cardId; the throw is
+    // inside the route's try, so Node answers its catch message.
+    fund(&conn, "c-other", 1, 10);
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":42}")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json_body(&b), json!({ "error": "Failed to add card to deck" }));
+
+    // Cache-miss with a string card_id -> whole request forwarded to Node
+    // (Scryfall hydration stays on the node lane).
+    let (s, h, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":\"c-unknown-xyz\"}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap(), "1");
+    assert_eq!(json_body(&b)["body"], "{\"card_id\":\"c-unknown-xyz\"}");
+
+    // Ownership gate: nothing owned -> 400 with the exact Node message.
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":\"c-sol-a\"}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "You only own 0 copies of Sol Ring." }));
+
+    // quantity destructuring default (1) + string quantity, and price
+    // history recorded for the effective card.
+    fund(&conn, "c-sol-a", 1, 5);
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":\"c-sol-a\",\"quantity\":\"3\"}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_body(&b), json!({ "message": "Card added/updated in deck successfully" }));
+    assert_eq!(deck_cards_of(&conn, 931004), vec![("c-sol-a".to_string(), 3)]);
+    let ph: i64 = conn
+        .query_row("SELECT COUNT(*) FROM price_history WHERE card_id='c-sol-a' AND price=0.5", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ph, 1);
+
+    // Invalid quantity flows through validateDeckAddition (parseInt -> NaN).
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":\"c-sol-a\",\"quantity\":\"abc\"}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "Invalid quantity" }));
+    // Non-basic > 4 copies blocked.
+    fund(&conn, "c-other", 1, 10);
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/cards", &JSON_CT, Some("{\"card_id\":\"c-other\",\"quantity\":5}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "Cannot have more than 4 copies of Counterspell." }));
+
+    // Alt-printing collapse: deck 931001 holds c-sol-a x2 and c-sol-b x1
+    // (same LOWER(TRIM(name)) key); adding c-sol-b repoints the rows to the
+    // requested printing and drops the zeros.
+    let (s, _, _) = request(&r, "POST", "/api/decks/931001/cards", &JSON_CT, Some("{\"card_id\":\"c-sol-b\",\"quantity\":4}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(deck_cards_of(&conn, 931001), vec![("c-other".to_string(), 1), ("c-sol-b".to_string(), 4)]);
+}
+
+#[tokio::test]
+async fn register_collection_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let db = seeded_db(dir.path(), "reg.db");
+    let r = router_for(db.clone(), &["decks_writes"], &format!("http://{upstream}"));
+    let conn = open(&db);
+    conn.execute_batch(
+        "INSERT INTO decks (id,user_id,name,checked_out) VALUES (931005,1,'Broken',0);
+         INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (931005,'c-missing-x',1);",
+    )
+    .unwrap();
+
+    // Empty / unresolved / foreign decks.
+    let (s, _, b) = request(&r, "POST", "/api/decks/931004/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "This deck has no cards to register." }));
+    let (s, _, b) = request(&r, "POST", "/api/decks/931005/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json_body(&b),
+        json!({ "error": "This deck contains cards whose details are unavailable. Refresh or re-import it before registering." })
+    );
+    let (s, _, b) = request(&r, "POST", "/api/decks/931003/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&b), json!({ "error": "Deck not found or unauthorized" }));
+    // Checked out (deck 931002 holds c-other for user 1).
+    let (s, _, b) = request(&r, "POST", "/api/decks/931002/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(json_body(&b), json!({ "error": "This deck is already checked out for play." }));
+
+    // Happy path: deck 931001 = c-sol-a x2 + c-sol-b x1 + c-other x1.
+    let (s, _, b) = request(&r, "POST", "/api/decks/931001/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(
+        json_body(&b),
+        json!({ "message": "Added 4 cards from Deck One to your collection.", "added": 4, "card_types": 3 })
+    );
+    let rows: Vec<(String, i64, String, i64)> = conn
+        .prepare("SELECT card_id, quantity, language, is_trade FROM collection WHERE user_id=1 ORDER BY card_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("c-other".to_string(), 1, "English".to_string(), 0),
+            ("c-sol-a".to_string(), 2, "English".to_string(), 0),
+            ("c-sol-b".to_string(), 1, "English".to_string(), 0),
+        ]
+    );
+    // Auxiliary price sweep: one row per distinct card, failures swallowed.
+    let ph: i64 = conn.query_row("SELECT COUNT(DISTINCT card_id) FROM price_history", [], |r| r.get(0)).unwrap();
+    assert_eq!(ph, 3);
+
+    // No dedup: registering twice duplicates the rows (Node has no guard).
+    let (s, _, _) = request(&r, "POST", "/api/decks/931001/register-collection", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM collection WHERE user_id=1", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 6);
+}
+
+#[tokio::test]
+async fn checkout_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let db = seeded_db(dir.path(), "checkout.db");
+    let r = router_for(db.clone(), &["decks_writes"], &format!("http://{upstream}"));
+    let conn = open(&db);
+    conn.execute_batch(
+        "INSERT INTO decks (id,user_id,name,checked_out) VALUES (931005,1,'Broken',0);
+         INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (931005,'c-missing-x',1);",
+    )
+    .unwrap();
+
+    // Error-first ladder: 404 / already / empty / unresolved.
+    let (s, _, b) = request(&r, "PUT", "/api/decks/999999/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&b), json!({ "error": "Deck not found or unauthorized" }));
+    let (s, _, _b) = request(&r, "PUT", "/api/decks/931003/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "foreign deck");
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931002/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(json_body(&b), json!({ "error": "This deck is already checked out for play." }));
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931004/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({ "error": "This deck has no cards to check out." }));
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931005/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        json_body(&b),
+        json!({ "error": "This deck contains cards whose details are unavailable. Refresh or re-import it before checkout." })
+    );
+
+    // Shortfall diagnostics: deck 931006 (Counterspell x1) with deck 931002
+    // (same key) checked out elsewhere -> available -1, deficit 2, and the
+    // template prints the raw row values (COALESCEd to 0).
+    conn.execute_batch(
+        "INSERT INTO decks (id,user_id,name,checked_out) VALUES (931006,1,'Shortfall',0);
+         INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (931006,'c-other',1);",
+    )
+    .unwrap();
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931006/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&b),
+        json!({ "error": "Not enough cards available to check out this deck.", "details": ["Missing 2x Counterspell (Owned: 0, In Use: 1)"] })
+    );
+
+    // Happy path: 3x Sol Ring (both printings fold into one key) and
+    // Counterspell net of the deck-931002 lock (owned 2, locked 1).
+    fund(&conn, "c-sol-a", 1, 3);
+    fund(&conn, "c-other", 1, 2);
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931001/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_body(&b), json!({ "message": "Deck checked out successfully" }));
+    let (co, at): (i64, Option<String>) = conn
+        .query_row("SELECT checked_out, checked_out_at FROM decks WHERE id=931001", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(co, 1);
+    assert!(at.is_some());
+
+    // Second checkout -> 409 already-out.
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931001/checkout", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(json_body(&b), json!({ "error": "This deck is already checked out for play." }));
+
+    // Return: 200, flags cleared, idempotent second return, 404s.
+    let (s, _, b) = request(&r, "PUT", "/api/decks/931001/return", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_body(&b), json!({ "message": "Deck returned to collection successfully" }));
+    let (co, at): (i64, Option<String>) = conn
+        .query_row("SELECT checked_out, checked_out_at FROM decks WHERE id=931001", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(co, 0);
+    assert_eq!(at, None);
+    let (s, _, _) = request(&r, "PUT", "/api/decks/931001/return", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::OK, "returning an unchecked deck is still 200");
+    let (s, _, _) = request(&r, "PUT", "/api/decks/931003/return", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = request(&r, "PUT", "/api/decks/999999/return", &JSON_CT, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 }
