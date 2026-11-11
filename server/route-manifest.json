@@ -28,7 +28,10 @@
   "status": "node"
  },
  "DELETE /api/moxfield/authors/:id": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "DELETE /api/search-history": {
   "status": "node"
@@ -166,7 +169,10 @@
   "status": "node"
  },
  "GET /api/moxfield": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "GET /api/precons": {
   "status": "node"
@@ -371,16 +377,28 @@
   "status": "node"
  },
  "POST /api/moxfield/authors": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "POST /api/moxfield/authors/:id/sync-contents": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "POST /api/moxfield/authors/:id/sync-decklist": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "POST /api/moxfield/decks/:publicId/sync": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "POST /api/precons/import": {
   "status": "node"
@@ -435,7 +453,10 @@
   "status": "node"
  },
  "PUT /api/moxfield/decks/:publicId": {
-  "status": "node"
+  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+  "status": "verified",
+  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
  },
  "PUT /api/settings": {
   "status": "node"

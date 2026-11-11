@@ -39,6 +39,9 @@ pub mod collection;
 pub mod collection_writes;
 pub mod db;
 pub mod health;
+pub mod mfx_payload;
+pub mod moxfield;
+pub mod moxfield_api;
 pub mod name_index;
 pub mod scryfall;
 pub mod scry_jobs;
@@ -130,6 +133,11 @@ pub struct AppState {
     /// Shared Scryfall client (Lane B): rate-limited queue + 404 breaker.
     /// One per process so the queue is global, like Node's module state.
     pub scry: Arc<scryfall::Scry>,
+    /// Moxfield API client (Lane B unit 3): execs curl/curl-impersonate,
+    /// GET only. `from_env` at boot (MOXFIELD_API_BASE / MOXFIELD_CURL_BIN /
+    /// curl-impersonate probe), like Node's require-time constants; tests
+    /// point it at a mock by setting the field.
+    pub mfx: Arc<crate::moxfield_api::MfxApi>,
     /// cardSets.js getScryfallSets memo (tree=1 folds, 6 h TTL).
     pub scryfall_sets: sets::ScryfallSetsMemo,
     /// authLimiter twin (middleware/auth.js): one fixed window per client IP
@@ -165,7 +173,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -363,6 +371,37 @@ pub fn app(state: AppState) -> Router {
             .route("/api/card-art/{cardId}", any(card_art::handle_png))
             .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
             .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
+    } else {
+        router
+    };
+    // Lane B unit 3a: Moxfield sync — status, author CRUD, forced syncs,
+    // per-deck enable switch, all under RUST_ROUTES=moxfield. The 20-second
+    // scheduler + boot catch-up ride the same gate (Node's twin is disabled
+    // with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER, server.js).
+    let router = if state.owns("moxfield") {
+        // Scheduler twin of Node's server.js kill switch: the harness runs
+        // the test instance with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1 (and
+        // the Node container's flag file marks its tick off) so the shared
+        // DB copy stays quiescent for parity — the tick/boot-catch-up
+        // semantics are proven by cargo tests, like the sets/price jobs are
+        // by the jobs binary + DB-diff. Flip this env off (and remove the
+        // container flag file) to hand the live tick to Rust.
+        let sched_off = std::env::var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if sched_off {
+            tracing::info!("Moxfield scheduler disabled (SCRYBOX_DISABLE_MOXFIELD_SCHEDULER) — no tick runs on this instance");
+        } else {
+            moxfield::spawn_scheduler(&state);
+        }
+        router
+            .route("/api/moxfield", any(moxfield::handle_status))
+            .route("/api/moxfield/authors", any(moxfield::handle_add_author))
+            .route("/api/moxfield/authors/{id}", any(moxfield::handle_delete_author))
+            .route("/api/moxfield/authors/{id}/sync-decklist", any(moxfield::handle_sync_decklist))
+            .route("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
+            .route("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
+            .route("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
     } else {
         router
     };

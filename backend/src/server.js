@@ -375,7 +375,15 @@ db.initDb()
     // Moxfield sync: the 20-second tick polls each tracked author's deck list
     // (slow interval) and checks every tracked deck's contents for changes
     // (fast interval). No-op until somebody adds an author.
-    require('./moxfieldScheduler').startMoxfieldScheduler();
+    //
+    // Lane B: when the Rust server owns the Moxfield routes it also owns the
+    // scheduler — the test container runs with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=true
+    // so the tick never runs twice (same pattern as SCRYBOX_DISABLE_SETS_REFRESH).
+    if (process.env.SCRYBOX_DISABLE_MOXFIELD_SCHEDULER === 'true') {
+      console.log('Moxfield scheduler disabled (SCRYBOX_DISABLE_MOXFIELD_SCHEDULER) — Rust scheduler owns it.');
+    } else {
+      require('./moxfieldScheduler').startMoxfieldScheduler();
+    }
   })
   .catch(err => {
     console.error('Failed to initialize database:', err);

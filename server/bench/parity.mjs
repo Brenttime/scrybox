@@ -585,6 +585,22 @@ cases.push({
   },
 });
 
+// --- Moxfield parity (Lane B unit3a) -----------------------------------------
+// The status route is the deep fold (authors + their tracked decks + interval
+// settings from app_settings) over the shared DB copy; the scenario token
+// owns the real moxfield_authors row so the fold is exercised, not empty.
+// Scheduler ticks are quiesced on BOTH sides (Rust
+// SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container flag file), so the
+// stamps stay stable between the two reads. Remaining cases cover the auth
+// ladder and the validation/404 arms — none mutate the DB.
+cases.push({ name: 'mox_status', path: '/api/moxfield', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mox_status_no_token', path: '/api/moxfield', headers: {}, method: 'GET' });
+cases.push({ name: 'mox_add_author_missing', path: '/api/moxfield/authors', headers: authHeaders, method: 'POST', body: '{}' });
+cases.push({ name: 'mox_add_author_nonstring', path: '/api/moxfield/authors', headers: authHeaders, method: 'POST', body: JSON.stringify({ author: 123 }) });
+cases.push({ name: 'mox_delete_missing', path: '/api/moxfield/authors/999999', headers: authHeaders, method: 'DELETE' });
+cases.push({ name: 'mox_deck_put_missing', path: '/api/moxfield/decks/no-such-public-id', headers: authHeaders, method: 'PUT', body: '{"enabled":true}' });
+cases.push({ name: 'mox_deck_sync_missing', path: '/api/moxfield/decks/no-such-public-id/sync', headers: authHeaders, method: 'POST' });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each

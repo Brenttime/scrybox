@@ -52,7 +52,7 @@ const BASIC_NAMES: &[&str] = &["Plains", "Island", "Swamp", "Mountain", "Forest"
 /// Node's withAllocationLock is a per-process FIFO mutex. Rust mirrors it with
 /// one async mutex around every allocation-guarded section (plus BEGIN
 /// IMMEDIATE for cross-process serialisation against Node's own writes).
-fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
     static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     L.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -305,7 +305,7 @@ fn sql_is_basic_land(alias: &str) -> String {
 // DB plumbing
 // ---------------------------------------------------------------------------
 
-enum WriteError {
+pub(crate) enum WriteError {
     Sql(rusqlite::Error),
     /// node-sqlite3 refuses to bind an object/array — same 500 as its throw.
     Bind,
@@ -368,22 +368,22 @@ fn get_i64(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<i
 /// additionally needs a real write transaction so the multi-statement
 /// allocate/read-check-write sequences are atomic and serialise against
 /// Node's own writes on the shared WAL file.
-struct Tx<'a> {
+pub(crate) struct Tx<'a> {
     conn: &'a Connection,
     done: bool,
 }
 
 impl<'a> Tx<'a> {
-    fn begin(conn: &'a Connection) -> Result<Self, WriteError> {
+    pub(crate) fn begin(conn: &'a Connection) -> Result<Self, WriteError> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         Ok(Self { conn, done: false })
     }
-    fn commit(&mut self) -> Result<(), WriteError> {
+    pub(crate) fn commit(&mut self) -> Result<(), WriteError> {
         self.done = true;
         self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
-    fn rollback(&mut self) {
+    pub(crate) fn rollback(&mut self) {
         if !self.done {
             let _ = self.conn.execute_batch("ROLLBACK");
             self.done = true;
