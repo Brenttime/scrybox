@@ -25,7 +25,7 @@ use crate::AppState;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn json_response(status: StatusCode, v: &Value) -> Response {
+pub(crate) fn json_response(status: StatusCode, v: &Value) -> Response {
     // Same shape every other ported group uses: Express res.json() bytes
     // (application/json; charset=utf-8, no ETag surprises).
     let bytes = serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
@@ -42,7 +42,7 @@ fn json_response(status: StatusCode, v: &Value) -> Response {
         .into_response()
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn json_error(status: StatusCode, msg: &str) -> Response {
     json_response(status, &Value::Object({
         let mut m = Map::new();
         m.insert("error".into(), Value::String(msg.to_string()));
@@ -69,7 +69,7 @@ fn encode_uri_component(s: &str) -> String {
 /// `decodeURIComponent` for path params: returns None on malformed % escapes
 /// (Node's Express router throws URIError there and the global error handler
 /// answers 500 {error:'Internal server error'}).
-fn decode_uri_component(s: &str) -> Option<String> {
+pub(crate) fn decode_uri_component(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -90,7 +90,7 @@ fn decode_uri_component(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     let q = query?;
     for pair in q.split('&') {
         let mut it = pair.splitn(2, '=');

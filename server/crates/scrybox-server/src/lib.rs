@@ -29,7 +29,9 @@ pub mod auth_routes;
 pub mod auth_support;
 pub mod card_cache;
 pub mod card_norm;
+pub mod card_art;
 pub mod cards_tags;
+pub mod catalog_read;
 pub mod collq;
 pub mod ip_limit;
 pub mod oidc;
@@ -136,6 +138,13 @@ pub struct AppState {
     /// authLimiter twin (middleware/auth.js): one fixed window per client IP
     /// shared by login/register/bootstrap/api-key/settings.
     pub auth_limiter: Arc<ip_limit::FixedWindowLimiter>,
+    /// Repo `shared/` directory (SCRYBOX_SHARED_DIR): the layers
+    /// `cardArt.BUNDLED_DIR` and `utils/languages.js` read. None makes the
+    /// catalog_art file-dependent handlers proxy instead of guessing.
+    pub shared_dir: Option<std::path::PathBuf>,
+    /// CV_MODEL_DIR — catalog meta/model dir catalog.js/cvScan.js stat.
+    /// None => catalog-read handlers proxy (no silent empty answers).
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -159,7 +168,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -374,6 +383,21 @@ pub fn app(state: AppState) -> Router {
     };
     let router = if state.owns("shared") {
         router.route("/api/shared/{token}", any(shared::handle))
+    } else {
+        router
+    };
+    // Lane B unit 2b: catalog_art = the stateless card-art reads and the
+    // two DB/FS-only catalog views. Mutating card-art routes and the
+    // build-control routes stay unregistered so the catch-all proxies them.
+    let router = if state.owns("catalog_art") {
+        router
+            .route("/api/card-art/index", any(card_art::handle_index))
+            // matchit has no `{param}.png` suffix segments — Node's route is
+            // `/:cardId.png`; the handler enforces the literal suffix and
+            // proxies anything else (Node 404s those too).
+            .route("/api/card-art/{cardId}", any(card_art::handle_png))
+            .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
+            .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
     } else {
         router
     };

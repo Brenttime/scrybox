@@ -48,7 +48,9 @@
     "status": "node"
   },
   "GET /api/admin/catalogs/languages": {
-    "status": "node"
+    "module": "scrybox-server::catalog_read (lib.rs GET /api/admin/catalogs/languages)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (catalog_languages_admin_ladder_and_shape, catalog_languages_method_mismatch_proxies); parity.mjs catalog_langs_ok/catalog_langs_game_pokemon/catalog_langs_no_token/catalog_langs_member/catalog_langs_apikey"
   },
   "GET /api/admin/catalogs/progress": {
     "status": "node"
@@ -80,10 +82,14 @@
     "tests": "tests/oidc_e2e.rs::full_oidc_ladder (stub HS256 IdP, PKCE/nonce/tamper legs); parity.mjs authr_oidc_login_disabled"
   },
   "GET /api/card-art/:cardId.png": {
-    "status": "node"
+    "module": "scrybox-server::card_art (lib.rs GET /api/card-art/{cardId}, .png suffix enforced)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (png_serves_user_layer_over_bundled, png_404_unknown_invalid_ids_and_proxies_other_paths); parity.mjs card_art_png_ok/card_art_png_404/card_art_png_bad_shape"
   },
   "GET /api/card-art/index": {
-    "status": "node"
+    "module": "scrybox-server::card_art (lib.rs GET /api/card-art/index)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (index_folds_layers_sorted_deduped, index_absent_dirs_answer_empty); parity.mjs card_art_index"
   },
   "GET /api/cards/:id/decks": {
     "status": "node"
@@ -174,7 +180,9 @@
     "status": "node"
   },
   "GET /api/scan-sets": {
-    "status": "node"
+    "module": "scrybox-server::catalog_read (lib.rs GET /api/scan-sets)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (scan_sets_counts_and_gates, scan_sets_missing_langs_or_model_proxies); parity.mjs scan_sets_ok/scan_sets_lang_ja/scan_sets_lang_es/scan_sets_no_token"
   },
   "GET /api/search": {
     "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
@@ -218,18 +226,18 @@
   },
   "GET /api/stats/history": {
     "status": "verified",
-    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} — same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); SQL verbatim-verified vs backend/src/routes/stats.js (WHITESPACE-NORMALIZED full-text check); sweep/qs/label semantics are node-generated unit vectors (unit tests in stats_subs.rs; qs expectations captured from qs.parse in scrybox-rusttest-node)",
-    "tests": "tests/stats_subs.rs::history_period_counts_and_label_style (counts 7/30/12/20 incl empty/unknown/dup/array + per-period label styles incl cache-name aliasing ?period[]=7d==?period=7d which Node reproduces through cached()), history_names_have_independent_cache_entries_and_coexist_with_stats, price_history_write_bumps_aux_trigger_and_freshens_named_entries (trigger bump ==1, next req is miss with FRESH body — no SWR, Node has no stale fallback for these names), proxied_write_bumps_only_that_users_generation, auth_failures_match_node_bodies, kill_switch_off_proxies_everything, non_exact_paths_and_methods_proxied_authed; module unit tests (labels_match_node_toulocaledatestring_vectors, period_resolution_matches_express_qs, sweep_matches_node_vectors, ...); parity.mjs ss_history_* (9 incl dup/encoded/empty, 2 user1) byte-diffed incl key order"
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); SQL verbatim-verified vs backend/src/routes/stats.js (WHITESPACE-NORMALIZED full-text check); sweep/qs/label semantics are node-generated unit vectors (unit tests in stats_subs.rs; qs expectations captured from qs.parse in scrybox-rusttest-node)",
+    "tests": "tests/stats_subs.rs::history_period_counts_and_label_style (counts 7/30/12/20 incl empty/unknown/dup/array + per-period label styles incl cache-name aliasing ?period[]=7d==?period=7d which Node reproduces through cached()), history_names_have_independent_cache_entries_and_coexist_with_stats, price_history_write_bumps_aux_trigger_and_freshens_named_entries (trigger bump ==1, next req is miss with FRESH body \u2014 no SWR, Node has no stale fallback for these names), proxied_write_bumps_only_that_users_generation, auth_failures_match_node_bodies, kill_switch_off_proxies_everything, non_exact_paths_and_methods_proxied_authed; module unit tests (labels_match_node_toulocaledatestring_vectors, period_resolution_matches_express_qs, sweep_matches_node_vectors, ...); parity.mjs ss_history_* (9 incl dup/encoded/empty, 2 user1) byte-diffed incl key order"
   },
   "GET /api/stats/networth": {
     "status": "verified",
-    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} — same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); networth SQL verbatim-verified; asOf fresh-stamped per request on BOTH paths (Node's cached() onHit semantics reproduced on hit; miss body carries the compute-time asOf as Node does)",
-    "tests": "tests/stats_subs.rs::networth_user1_matches_node_oracle_bytes + networth_user2_empty_matches_node_oracle_bytes (byte-exact vs tests/stats_subs_oracle.mjs — the REAL handlers + priceHelpers.js run inside scrybox-rusttest-node over the stats_seed fixture), networth_hit_restamps_asof_only, etag/miss/hit + kill-switch/auth/proxy tests as history; parity.mjs ss_networth(+_user1, strip $.asOf random-by-design), ss_networth_asof_shape (ISO-ms shape), ss_networth_head (HEAD proxied, Express answers) — etagReplay:false (304 unreachable by construction BOTH sides: per-request restamp); ss_networth_noauth + ss_networth_badtoken (401 error-path byte parity incl error body, etagReplay:false — closes orchestrator audit 2026-11-10 20:20 ruling 1)"
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); networth SQL verbatim-verified; asOf fresh-stamped per request on BOTH paths (Node's cached() onHit semantics reproduced on hit; miss body carries the compute-time asOf as Node does)",
+    "tests": "tests/stats_subs.rs::networth_user1_matches_node_oracle_bytes + networth_user2_empty_matches_node_oracle_bytes (byte-exact vs tests/stats_subs_oracle.mjs \u2014 the REAL handlers + priceHelpers.js run inside scrybox-rusttest-node over the stats_seed fixture), networth_hit_restamps_asof_only, etag/miss/hit + kill-switch/auth/proxy tests as history; parity.mjs ss_networth(+_user1, strip $.asOf random-by-design), ss_networth_asof_shape (ISO-ms shape), ss_networth_head (HEAD proxied, Express answers) \u2014 etagReplay:false (304 unreachable by construction BOTH sides: per-request restamp); ss_networth_noauth + ss_networth_badtoken (401 error-path byte parity incl error body, etagReplay:false \u2014 closes orchestrator audit 2026-11-10 20:20 ruling 1)"
   },
   "GET /api/stats/top-mover": {
     "status": "verified",
-    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} — same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); top-mover SQL verbatim-verified (incl WHERE p.prev > 0 AND p.cur > p.prev, 24h prev window)",
-    "tests": "tests/stats_subs.rs::top_mover_user1_matches_node_oracle_bytes (full static body incl card key order + Math.round price/pct vectors) + top_mover_user2_no_owned_moves ({card:null}), miss_hit_304_replay_and_byte_stability, price_history_write_bumps_aux_trigger_and_freshens_named_entries (winner flips Sol Ring->Zephyr Falcon, pct=172.7 vs node-computed vector), proxied-write gen test, auth + kill-switch + path tests; parity.mjs ss_topmover(+_user1) byte-diffed incl key order; ss_topmover_noauth + ss_topmover_badtoken (401 error-path byte parity incl error body, etagReplay:false — closes orchestrator audit 2026-11-10 20:20 ruling 1)"
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); top-mover SQL verbatim-verified (incl WHERE p.prev > 0 AND p.cur > p.prev, 24h prev window)",
+    "tests": "tests/stats_subs.rs::top_mover_user1_matches_node_oracle_bytes (full static body incl card key order + Math.round price/pct vectors) + top_mover_user2_no_owned_moves ({card:null}), miss_hit_304_replay_and_byte_stability, price_history_write_bumps_aux_trigger_and_freshens_named_entries (winner flips Sol Ring->Zephyr Falcon, pct=172.7 vs node-computed vector), proxied-write gen test, auth + kill-switch + path tests; parity.mjs ss_topmover(+_user1) byte-diffed incl key order; ss_topmover_noauth + ss_topmover_badtoken (401 error-path byte parity incl error body, etagReplay:false \u2014 closes orchestrator audit 2026-11-10 20:20 ruling 1)"
   },
   "GET /api/suggest": {
     "status": "node"
@@ -315,7 +323,7 @@
     "status": "node"
   },
   "POST /api/collection": {
-    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group — with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group \u2014 with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
     "status": "verified",
     "tests": "tests/collection_writes.rs::add_* (15 incl. defaults, quantity rows vs stack, price-history dedupe, coercion edge cases, localized card_id + recordPrice, CHECK-violation 500, cache-miss forwards, GET-fallback both ways); parity.mjs ca_add_* (10: gates, 400s, successes verified by cross-side read-back per owner ruling iter-21, unknown-card 404, bad-condition 500)"
   },
@@ -325,7 +333,7 @@
     "tests": "tests/collection_writes.rs::bulk_* (10 incl. delete/trade/condition/printing, purchase_split weighted+equal, add_to_deck matrix, checked-out 409s, ownership rejections); parity.mjs cw_bulk_*/cw_split_* (15: gates, validation 400s, deck 400/404/409 pre-write branches, successes verified by cross-side read-back per owner ruling iter-21; entry_ids contract)"
   },
   "POST /api/collection/bulk-add": {
-    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node — Node reports per-card results so partial-native execution would change the response",
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node \u2014 Node reports per-card results so partial-native execution would change the response",
     "status": "verified",
     "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
   },
