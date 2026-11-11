@@ -510,6 +510,19 @@ cases.push({
   teardown: deleteProbes,
 });
 
+// Sets route group (Lane B unit 1 port: GET /api/sets; RUST_ROUTES=sets).
+// Both sides read the shared `sets` table, so deepDiff (values, row order,
+// key order) asserts the whole SQL port; ?tree=1 additionally drives the
+// Scryfall child-set fold (cardSets.js getMtgChildSetMap through the
+// rate-limited client), the part with real porting risk. ?lang is accepted
+// and ignored by Node (void lang) — must stay byte-equal.
+cases.push({ name: 'sets_flat', path: '/api/sets', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sets_tree', path: '/api/sets?tree=1', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sets_lang_de', path: '/api/sets?lang=de', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sets_empty_query', path: '/api/sets?', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sets_no_token', path: '/api/sets', headers: {}, method: 'GET' });
+cases.push({ name: 'sets_bad_token', path: '/api/sets', headers: { Authorization: '***' }, method: 'GET' });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each

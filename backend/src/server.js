@@ -269,8 +269,15 @@ db.initDb()
     const splitCount = await splitStackedEntries(db);
     if (splitCount > 0) console.log(`Split ${splitCount} stacked collection copies into individual rows.`);
 
-    // Sync sets on startup.
-    await scryfallApi.fetchAndCacheSets();
+    // Sync sets on startup. Lane B port ruling: when the Rust front runs the
+    // set-sync job (RUST_JOBS=scryfall) the test container recreates with
+    // SCRYBOX_DISABLE_SETS_REFRESH=true so the job never runs twice. Off by
+    // default — production Node behaviour is unchanged.
+    if (process.env.SCRYBOX_DISABLE_SETS_REFRESH === 'true') {
+      console.log('Set sync disabled (SCRYBOX_DISABLE_SETS_REFRESH) — Rust job owns it.');
+    } else {
+      await scryfallApi.fetchAndCacheSets();
+    }
     // Load sets into the card-sort memory cache. The storage half of the old
     // compartmentSort went away with the Storage feature (d2fab84) and took the
     // boot-time import with it; the sort half lives in utils/cardSort, which is
@@ -304,9 +311,12 @@ db.initDb()
     // restart. Scryfall's guidance is that gameplay/set data changes rarely and
     // weekly is plenty — prices are on their own schedule below.
     setInterval(async () => {
+      // Lane B: when the Rust job owns set sync, skip only the Scryfall legs —
+      // the catalog auto-update is Node-internal and keeps its schedule.
+      const setsOwned = process.env.SCRYBOX_DISABLE_SETS_REFRESH !== 'true';
       try {
-        await scryfallApi.fetchAndCacheSets(true);
-        await loadSetsCache(db);
+        if (setsOwned) await scryfallApi.fetchAndCacheSets(true);
+        if (setsOwned) await loadSetsCache(db);
         await autoUpdateCatalogs();
       } catch (err) {
         console.error('Weekly sets refresh failed:', err);
@@ -324,6 +334,7 @@ db.initDb()
     // The checkpoint after the sweep retries any WAL truncate that an active
     // startup reader deferred.
     setInterval(() => {
+      if (process.env.SCRYBOX_DISABLE_PRICE_SWEEP === 'true') return; // Rust job owns the sweep (lane B)
       scryfallApi.updateCollectionPrices().catch((error) => {
         console.error('MTG price update failed:', error.message);
       }).finally(() => {
@@ -341,10 +352,12 @@ db.initDb()
       // runMaintenance de-duplicates with the Oracle service's own startup run.
       // Unforced, so a sweep still inside the interval does not run.
       await oracleTags.runMaintenance();
-      await scryfallApi.updateCollectionPrices().catch((error) => {
-        console.error('MTG boot price catch-up failed:', error.message);
-      });
-      await scryfallApi.refreshPriceEstimates();
+      if (process.env.SCRYBOX_DISABLE_PRICE_SWEEP !== 'true') {
+        await scryfallApi.updateCollectionPrices().catch((error) => {
+          console.error('MTG boot price catch-up failed:', error.message);
+        });
+        await scryfallApi.refreshPriceEstimates();
+      }
       await oracleTags.checkpointWal();
     }, 30000);
 
