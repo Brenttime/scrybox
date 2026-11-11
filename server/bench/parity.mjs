@@ -888,6 +888,16 @@ async function etagParity(c) {
   sub('ss_history_7d_user1', '/api/stats/history?period=7d', { headers: u1 });
   sub('ss_networth_user1', '/api/stats/networth', { headers: u1, strip: ['$.asOf'], etagReplay: false });
   sub('ss_topmover_user1', '/api/stats/top-mover', { headers: u1 });
+  // Error-path parity (orchestrator audit 2026-11-10 20:20, ruling 1):
+  // networth/top-mover need no-token 401 + bad-token 401 byte parity —
+  // same 401 bodies as the /api/stats surface (middleware/auth), asserted
+  // cross-side. etagReplay:false: 401 has no cache semantics to replay.
+  const noauth = { headers: {}, etagReplay: false };
+  const badtok = { headers: { Authorization: '***' }, etagReplay: false };
+  sub('ss_networth_noauth', '/api/stats/networth', noauth);
+  sub('ss_networth_badtoken', '/api/stats/networth', badtok);
+  sub('ss_topmover_noauth', '/api/stats/top-mover', noauth);
+  sub('ss_topmover_badtoken', '/api/stats/top-mover', badtok);
   // asOf shape (fresh-stamp contract): each side's own asOf must be exact
   // ISO-8601 UTC with ms (new Date().toISOString() shape); the value itself
   // is random-by-design (restamped per request) and stripped from equality.
