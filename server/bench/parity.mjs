@@ -619,20 +619,40 @@ function expectPersisted(idsOf, pred, why) {
   };
 }
 
-async function fetchSide(base, c) {
+async function fetchSide(base, c, opts = {}) {
   const t0 = Date.now();
   let path = c.path, body = c.body, headers = c.headers, ctx = null;
   if (c.setup) {
     const s = await c.setup(base, c);
     if (s) { path = s.path ?? path; body = s.body ?? body; headers = s.headers ?? headers; ctx = s.ctx ?? null; }
   }
-  const res = await fetch(base + path, {
-    method: c.method,
-    headers: { ...headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
-    body,
-    redirect: 'manual',
-  });
-  const resBody = res.status === 304 ? '' : await res.text();
+  // Connection-level flakes (undici `TypeError: fetch failed` with an
+  // EPIPE/ECONNRESET cause — a stale keep-alive socket or an early server
+  // close mid-upload) must not crash the suite: the whole case is compared
+  // under MAX_TRIES, but an exception escaping here skipped even that.
+  // Retry the fetch itself (string bodies — safe to resend; write cases run
+  // serially with a fresh setup, and a duplicate landing surfaces as a
+  // cross-side mismatch on the next MAX_TRIES attempt, not a false PASS).
+  let res, resBody;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      res = await fetch(base + path, {
+        method: c.method,
+        headers: { ...headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
+        body,
+        redirect: 'manual',
+      });
+      resBody = res.status === 304 ? '' : await res.text();
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (!(e instanceof TypeError)) break; // only connection-level errors are retryable
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+    }
+  }
+  if (lastErr) throw lastErr;
   const parsed = resBody && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(resBody) : undefined;
   // Cross-side write verification BEFORE teardown (the probe must still exist).
   // `parsed` lets auth-writer readBacks assert the SHAPE of freshly issued
@@ -644,7 +664,13 @@ async function fetchSide(base, c) {
     try { readback = await c.readBack(other, ctx, { json: parsed, status: res.status }); }
     catch (e) { readback = { ok: false, why: `readBack threw ${e}`, seen: null }; }
   }
-  if (c.teardown) { try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
+  // etagParity refetches pass skipTeardown: tearing down here would wipe the
+  // seeded rows and the ETag replays below would then read an emptied
+  // fixture (the iter-27 shrd_* replay failures: 200-with-empty-body instead
+  // of 304). etagParity runs the case's teardown itself once after replays.
+  if (c.teardown && !opts.skipTeardown) {
+    try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); }
+  }
   return {
     status: res.status,
     body: resBody,
@@ -768,10 +794,18 @@ async function etagParity(c) {
   // Replay only makes sense for idempotent GETs; write cases are compared by
   // response alone (their ETag is Express's default body tag, not a contract).
   if ((c.method || 'GET') !== 'GET') return [];
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats')) return [];
-  const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared')) return [];
+  // Sequential on purpose: setup-bearing cases reseed shared DB rows, and
+  // two parallel setups would race each other's DELETE/INSERT mid-request
+  // (the iter-27 shrd_* replay failures). Same rationale as the write-case
+  // serial rule in the main loop. skipTeardown: the refetch must leave the
+  // fixture in place for the self-replay probes below; the case teardown
+  // then runs once in the finally.
+  let diffs = [];
+  try {
+  const r = await fetchSide(RUST, c, { skipTeardown: true });
+  const n = await fetchSide(NODE, c, { skipTeardown: true });
   if (r.status !== 200 || n.status !== 200) return [];
-  const diffs = [];
   const segs = t => /^W\/"col-([^-]+)-([^-]+)-([^-]+)-([^"]+)"$/.exec(t || '');
   const rs = segs(r.etag), ns = segs(n.etag);
   if (rs || ns) {
@@ -802,6 +836,9 @@ async function etagParity(c) {
     if (again.bytes !== 0) diffs.push(`${name}: 304 carried a body (${again.bytes} bytes)`);
   }
   return diffs;
+  } finally {
+    if (c.teardown) { try { await c.teardown(RUST, null); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
+  }
 }
 
   // --- add-group cases (iter 24: POST /api/collection, POST
@@ -920,7 +957,7 @@ async function etagParity(c) {
   // same 401 bodies as the /api/stats surface (middleware/auth), asserted
   // cross-side. etagReplay:false: 401 has no cache semantics to replay.
   const noauth = { headers: {}, etagReplay: false };
-  const badtok = { headers: { Authorization: '***' }, etagReplay: false };
+  const badtok = { headers: { Authorization: `Bearer ${'Bad' + 'Token999'}` }, etagReplay: false };
   sub('ss_networth_noauth', '/api/stats/networth', noauth);
   sub('ss_networth_badtoken', '/api/stats/networth', badtok);
   sub('ss_topmover_noauth', '/api/stats/top-mover', noauth);
@@ -943,6 +980,242 @@ async function etagParity(c) {
   // POST is not routed in Express — 404 either side through the proxy.
   cases.push({ name: 'ss_history_post', path: '/api/stats/history', headers: authHeaders, method: 'POST', body: '{}' });
 }
+
+// --- iter 27: search-history + shared (RUST_ROUTES=search_history,shared) ---
+// GET/POST/DELETE /api/search-history (per-user deflate-raw blob, session
+// gate) and the PUBLIC GET /api/shared/:share_token. Writes ride the HTTP
+// API channel only (rule 2); the per-user rows live and die with the
+// rusttest_parity fixture user, and every write case read-back-verifies
+// through the OPPOSITE server — which is also the cross-side codec test:
+// Rust's deflateRaw(level 9) blob must be readable by Node's inflateRawSync
+// and vice versa. Body-parser runs ABOVE the auth gate in server.js, so the
+// malformed-JSON POST answers 500 even without a token (shx_post_badjson).
+{
+  const SH = { Authorization: `Bearer ${'rusttest' + '-sh'}` };
+  const SH_JSON = { ...SH, 'content-type': 'application/json' };
+  function shClear() {
+    dbWrite((d) => {
+      const u = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+      if (u) d.prepare('DELETE FROM search_history WHERE user_id = ?').run(u.id);
+    });
+  }
+  async function shSeedItems(base, items) {
+    const r = await apiReq(base, 'POST', '/api/search-history', SH_JSON, JSON.stringify({ items }));
+    if (r.status !== 200) throw new Error(`parity shx seed failed: ${r.status} ${r.text.slice(0, 120)}`);
+  }
+  const shPrep = async () => { resetParityUser(); seedSession('rusttest-sh'); shClear(); return { ctx: null }; };
+
+  // --- error paths (no state touched) ---
+  const noauth = { headers: {}, etagReplay: false };
+  const badtok = { headers: { Authorization: `Bearer ${'Bad' + 'Token999'}` }, etagReplay: false };
+  cases.push({ name: 'shx_get_noauth', path: '/api/search-history', ...noauth });
+  cases.push({ name: 'shx_get_badtoken', path: '/api/search-history', ...badtok });
+  cases.push({ name: 'shx_post_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{"q":"x"}', etagReplay: false });
+  // Malformed JSON parses (and fails) BEFORE the gate — 500 with the generic
+  // error-handler body, not 401. Proves the parse/auth ORDER is ported too.
+  cases.push({ name: 'shx_post_badjson_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{oops', etagReplay: false });
+  // express.json({limit:'1mb'}) sits ABOVE the auth gate: a >1mb body is a
+  // 413 with the custom too-large message even with no token. Pins the
+  // limit + message on both sides.
+  cases.push({ name: 'shx_post_too_large_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{"q":"' + 'x'.repeat(1.2 * 1024 * 1024) + '"}', etagReplay: false });
+
+  // --- empty read (Express default ETag + 304 replay via etagParity) ---
+  cases.push({ name: 'shx_get_empty', path: '/api/search-history', headers: SH, setup: shPrep });
+
+  // --- deterministic import of several items: dedupe (max-at wins), trim,
+  // empty-q filter, Number() coercion (string at), sort desc, key order. ---
+  const SH_ITEMS = [
+    { q: 'delta force', at: 1760000000000 },
+    { q: '  spaced  ', at: 1760000001000 },
+    { q: 'delta force', at: 1759999999000 },
+    { q: '   ' },
+    { q: 'emoji 🧪', at: '1760000002500' },
+  ];
+  const SH_EXPECT = [
+    { q: 'emoji 🧪', at: 1760000002000 },
+    { q: 'spaced', at: 1760000001000 },
+    { q: 'delta force', at: 1760000000000 },
+  ];
+  cases.push({
+    name: 'shx_post_items_ok', path: '/api/search-history', headers: SH_JSON, method: 'POST',
+    body: JSON.stringify({ items: SH_ITEMS }), etagReplay: false,
+    setup: shPrep, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const seen = JSON.stringify(g.json);
+      return { ok: g.status === 200 && JSON.stringify(g.json) === JSON.stringify(SH_EXPECT), why: `opposite GET -> ${g.status} ${seen}`, seen };
+    },
+  });
+
+  // --- single {q} add: at = now (random by design) — stripped; the readBack
+  // pins shape + freshness AND confirms the Rust-written blob on Node. ---
+  cases.push({
+    name: 'shx_post_q_ok', path: '/api/search-history', headers: SH_JSON, method: 'POST',
+    body: JSON.stringify({ q: '  parity solo q 🧪  ' }), strip: ['$.0.at'], etagReplay: false,
+    setup: shPrep, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const e = Array.isArray(g.json) ? g.json[0] : null;
+      const ok = g.status === 200 && Array.isArray(g.json) && g.json.length === 1
+        && e?.q === 'parity solo q 🧪' && typeof e?.at === 'number'
+        && Math.abs(e.at - Date.now()) < 5 * 60 * 1000;
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { q: e?.q, atShape: typeof e?.at } };
+    },
+  });
+
+  // --- 400 branches (empty add after cleaning) ---
+  cases.push({ name: 'shx_post_empty', path: '/api/search-history', headers: SH, method: 'POST', setup: shPrep, teardown: () => shClear(), etagReplay: false });
+  cases.push({ name: 'shx_post_items_all_blank', path: '/api/search-history', headers: SH_JSON, method: 'POST', body: JSON.stringify({ items: [{ q: '  ' }, {}] }), setup: shPrep, teardown: () => shClear(), etagReplay: false });
+  cases.push({ name: 'shx_post_array_body', path: '/api/search-history', headers: SH_JSON, method: 'POST', body: '[]', setup: shPrep, teardown: () => shClear(), etagReplay: false });
+
+  // --- deletes: seed 3 through the side's own API, then delete one / all. ---
+  const shSeedThree = async (base) => {
+    await shPrep();
+    await shSeedItems(base, [
+      { q: 'a one', at: 1760000000000 },
+      { q: 'b two', at: 1760000001000 },
+      { q: 'c three', at: 1760000002000 },
+    ]);
+    return { ctx: null };
+  };
+  cases.push({
+    name: 'shx_delete_one', path: '/api/search-history', headers: SH_JSON, method: 'DELETE',
+    body: JSON.stringify({ q: 'b two' }), etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const seen = JSON.stringify(g.json);
+      const ok = g.status === 200 && seen === JSON.stringify([
+        { q: 'c three', at: 1760000002000 }, { q: 'a one', at: 1760000000000 },
+      ]);
+      return { ok, why: `opposite GET -> ${g.status} ${seen}`, seen };
+    },
+  });
+  cases.push({
+    name: 'shx_delete_clear', path: '/api/search-history', headers: SH_JSON, method: 'DELETE',
+    body: '{}', etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const ok = g.status === 200 && JSON.stringify(g.json) === '[]';
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { cleared: ok } };
+    },
+  });
+  // No body at all: express.json skips (no content-type) -> req.body = {} ->
+  // q '' -> clear-everything. Ported decision, not assumed.
+  cases.push({
+    name: 'shx_delete_nobody', path: '/api/search-history', headers: SH, method: 'DELETE',
+    etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const ok = g.status === 200 && JSON.stringify(g.json) === '[]';
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { cleared: ok } };
+    },
+  });
+
+  // --- API key on a write: 403 from the gate (keys are GET-only). ---
+  cases.push({
+    name: 'shx_post_apikey_403', path: '/api/search-history',
+    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    method: 'POST', body: '{"q":"nope"}', etagReplay: false,
+    setup: async () => { await shPrep(); dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
+    teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
+  });
+
+  // ===== shared (public, no session) =====
+  const SHARED_CARD2 = 'mtg-0001c639-8bd0-426f-89cb-4ca61f3cc054'; // Surge of Brilliance (fixture in card_cache)
+  const BAD_CARD = 'rusttest-shared-bad-types';
+  function shrdPrep({ trade = false, enable = true, rows = true, badRow = false } = {}) {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE username = ?)').run(PARITY_USER);
+      d.prepare('DELETE FROM users WHERE username = ?').run(PARITY_USER);
+      const r = d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, api_key) VALUES (?, ?, ?, ?, ?, NULL)')
+        .run(PARITY_USER, 'x', 'member', SHARE_T0, enable ? 1 : 0);
+      const uid = Number(r.lastInsertRowid);
+      d.prepare('DELETE FROM collection WHERE user_id = ? OR id BETWEEN 930001 AND 930010').run(uid);
+      d.prepare('DELETE FROM card_cache WHERE id = ?').run(BAD_CARD);
+      if (!rows) return;
+      // Explicit ids: etagParity re-runs setup per side; autoincrement ids
+      // would shift entry_id between the two runs and make the route's body
+      // ETag (and therefore the 304 replay) unreproducible by construction.
+      const ins = d.prepare('INSERT INTO collection (id, card_id, quantity, condition, printing, language, added_at, is_trade, user_id, is_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      ins.run(930001, CW_CARD, 2, 'Near Mint', 'Holofoil', 'English', '2026-01-03 10:00:00', 0, uid, 0);
+      ins.run(930002, SHARED_CARD2, 1, 'Lightly Played', 'Normal', 'English', '2026-01-02 10:00:00', trade ? 1 : 0, uid, 0);
+      ins.run(930003, SHARED_CARD2, 3, 'Near Mint', 'Normal', 'Japanese', '2026-01-01 10:00:00', 0, uid, 1);
+      if (badRow) {
+        d.prepare('INSERT INTO card_cache (id, name, types, subtypes, rarity, price_trend, price_estimated) VALUES (?, ?, ?, ?, ?, ?, 0)')
+          .run(BAD_CARD, 'Parity Bad Types', 'oops', '[]', 'Common', 1.5);
+        ins.run(930004, BAD_CARD, 1, 'Near Mint', 'Normal', 'English', '2025-12-31 10:00:00', 0, uid, 0);
+      }
+    });
+  }
+  function shrdTeardown() {
+    dbWrite((d) => {
+      const u = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+      if (u) d.prepare('DELETE FROM collection WHERE user_id = ?').run(u.id);
+      d.prepare('DELETE FROM card_cache WHERE id = ?').run(BAD_CARD);
+    });
+  }
+  // entry_id is autoincrement-random across the two side-runs — stripped per
+  // index (row count is fixture-deterministic); the persisted join is the
+  // same physical DB both sides read.
+  cases.push({
+    name: 'shrd_ok', path: `/api/shared/${SHARE_T0}`, headers: {},
+    // No teardown: etagParity replays AFTER both side fetches, and
+    // shrdTeardown's row-deletion would flip the replay GET to an empty
+    // collection (200, not 304). Rows are rebuilt deterministically
+    // (fixed ids) by every setup, and cleared by later cases.
+    setup: () => { shrdPrep({}); },
+  });
+  cases.push({
+    name: 'shrd_trade', path: `/api/shared/${SHARE_T0}?list=trade`, headers: {},
+    setup: () => { shrdPrep({ trade: true }); },
+  });
+  // Repeated list= becomes an ARRAY in qs (not === 'trade') -> collection
+  // branch; the trade row must appear again. Pins the qs semantics.
+  cases.push({
+    name: 'shrd_dup_list_param', path: `/api/shared/${SHARE_T0}?list=trade&list=trade`, headers: {},
+    setup: () => { shrdPrep({}); },
+  });
+  // qs ARRAY semantics: FIRST value 'trade' but a duplicate param -> value
+  // is an array !== 'trade' -> collection branch (trade row visible again).
+  cases.push({
+    name: 'shrd_list_conflict', path: `/api/shared/${SHARE_T0}?list=trade&list=foo`, headers: {},
+    setup: () => { shrdPrep({ trade: true }); },
+  });
+  // Malformed % in a query VALUE: qs 6.15.3 does NOT throw (verified against
+  // the container's own qs: qs.parse('x=%ZZ') -> {x:'%ZZ'}), so the raw
+  // value simply fails the === 'trade' equality and the collection branch
+  // answers normally. Pinned here with a valid token + seeded rows; if
+  // either server started throwing (Express 5 qs behaviour) this diverges.
+  cases.push({
+    name: 'shrd_bad_query_percent', path: `/api/shared/${SHARE_T0}?x=%ZZ`, headers: {}, etagReplay: false,
+    strip: ['$.collection.0.entry_id', '$.collection.1.entry_id', '$.collection.2.entry_id'],
+    setup: () => { shrdPrep({}); }, teardown: shrdTeardown,
+  });
+  cases.push({
+    name: 'shrd_empty', path: `/api/shared/${SHARE_T0}`, headers: {},
+    setup: () => { shrdPrep({ rows: false }); }, teardown: shrdTeardown,
+  });
+  cases.push({ name: 'shrd_notfound', path: '/api/shared/definitely-not-a-token', headers: {}, etagReplay: false });
+  cases.push({
+    name: 'shrd_disabled', path: `/api/shared/${SHARE_T0}`, headers: {}, etagReplay: false,
+    setup: () => { shrdPrep({ enable: false }); }, teardown: shrdTeardown,
+  });
+  // Percent-decoded param: %2F stays one raw segment -> 'abc/def' -> 404;
+  // invalid escape -> decodeURIComponent throws in routing -> generic 500.
+  cases.push({ name: 'shrd_percent_token', path: '/api/shared/abc%2Fdef', headers: {}, etagReplay: false });
+  cases.push({ name: 'shrd_bad_percent', path: '/api/shared/a%ZZb', headers: {}, etagReplay: false });
+  // Bad array column -> JSON.parse throws inside the try -> 500 body.
+  cases.push({
+    name: 'shrd_bad_types_500', path: `/api/shared/${SHARE_T0}`, headers: {}, etagReplay: false,
+    setup: () => { shrdPrep({ badRow: true }); }, teardown: shrdTeardown,
+  });
+  // HEAD: Rust proxies (port owns GET only); Express answers HEAD natively.
+  cases.push({ name: 'shrd_head', path: `/api/shared/${SHARE_T0}`, headers: {}, method: 'HEAD', setup: () => { shrdPrep({}); }, teardown: shrdTeardown });
+}
+
 
 // --- run ---------------------------------------------------------------------
 

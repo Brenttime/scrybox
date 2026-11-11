@@ -649,7 +649,7 @@ pub(crate) fn row_to_object(row: &Row) -> rusqlite::Result<Map<String, Value>> {
 /// fires here (kept for the row-missing parity). Spread semantics: existing
 /// keys keep their SELECT position; base_rarity is brand-new for these
 /// queries and appends at the end (insertion-ordered Map).
-fn apply_proxy_rarity(mut row: Map<String, Value>) -> Map<String, Value> {
+pub(crate) fn apply_proxy_rarity(mut row: Map<String, Value>) -> Map<String, Value> {
     let Some(_is_proxy_raw) = row.get("is_proxy").cloned() else { return row };
     let base = match row.get("base_rarity") {
         Some(v) => v.clone(),

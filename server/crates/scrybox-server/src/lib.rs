@@ -46,6 +46,8 @@ pub mod sidecar;
 pub mod stats;
 mod stats_sql;
 pub mod stats_subs;
+pub mod search_history;
+pub mod shared;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -355,6 +357,23 @@ pub fn app(state: AppState) -> Router {
             .route("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
             .route("/api/cards/role-tags", any(cards_tags::handle_role_tags))
             .route("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
+    } else {
+        router
+    };
+    // Search-history + shared group (iter 27): the "stats/sets/search-history/
+    // shared" P2 cluster's remainder. search-history owns exactly
+    // /api/search-history (trailing-slash variants keep Express's
+    // loose-match answer through the proxy, per the iter-25 ruling); shared
+    // owns the PUBLIC GET /api/shared/:token (Node mounts it above the auth
+    // gate — Rust answers it without any session too). Methods/paths the
+    // port does not own proxy to Node untouched.
+    let router = if state.owns("search_history") {
+        router.route("/api/search-history", any(search_history::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("shared") {
+        router.route("/api/shared/{token}", any(shared::handle))
     } else {
         router
     };

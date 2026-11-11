@@ -31,7 +31,9 @@
     "status": "node"
   },
   "DELETE /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "GET *": {
     "status": "node"
@@ -180,7 +182,9 @@
     "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
   },
   "GET /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "GET /api/secret-lair": {
     "status": "node"
@@ -200,7 +204,9 @@
     "status": "node"
   },
   "GET /api/shared/:share_token": {
-    "status": "node"
+    "module": "scrybox-server::shared (lib.rs /api/shared/{token} under RUST_ROUTES=shared; PUBLIC route, Node mounts above the auth gate)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::shared_public_read, shared_bad_array_column_is_500_with_route_body, kill_switch_proxies_everything_untouched; parity.mjs shrd_ok/shrd_trade/shrd_dup_list_param/shrd_list_conflict/shrd_bad_query_percent/shrd_empty/shrd_notfound/shrd_disabled/shrd_percent_token/shrd_bad_percent/shrd_bad_types_500/shrd_head"
   },
   "GET /api/stats": {
     "module": "scrybox-server::stats (+stats_sql; lib.rs GET /api/stats)",
@@ -390,7 +396,9 @@
     "status": "node"
   },
   "POST /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "POST /api/secret-lair/add": {
     "status": "node"
