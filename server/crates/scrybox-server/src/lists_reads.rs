@@ -211,12 +211,14 @@ fn qs_get(query: Option<&str>, key: &str) -> QsVal {
         // `key[...]` makes the value an object.
         let (base, push) = match k.split_once('[') {
             None => (k.as_ref(), None),
-            Some((base, rest)) if rest == "]" => (base, Some(true)),
-            Some((base, _)) => {
-                if base == key {
-                    result = Some(QsVal::Obj);
+            Some((base, rest)) => {
+                if rest != "]" {
+                    if base == key {
+                        result = Some(QsVal::Obj);
+                    }
+                    continue;
                 }
-                continue;
+                (base, Some(true))
             }
         };
         if base != key || result == Some(QsVal::Obj) {
@@ -281,7 +283,7 @@ fn unresolved_list_card_count(conn: &Connection, list_id: &str) -> Result<f64, L
     let n = row
         .as_ref()
         .and_then(|r| r.get("count"))
-        .and_then(|v| js_number_or(v))
+        .and_then(js_number_or)
         .unwrap_or(0.0);
     Ok(n)
 }
