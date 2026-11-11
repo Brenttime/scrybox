@@ -215,14 +215,6 @@ fn csv_parser_rfc4180_quirks() {
     assert_eq!(rows[0].get("a").unwrap(), "abc,d");
 }
 
-fn full_header(extra: &str) -> String {
-    if extra.is_empty() {
-        HEADER.to_string()
-    } else {
-        format!("{HEADER},{extra}")
-    }
-}
-
 fn good_row(qty: &str, added: &str) -> String {
     binder_row("Alpha Card", "My Binder", "xyz", "1", "normal", qty, UUID_A, "near_mint", "en", added)
 }

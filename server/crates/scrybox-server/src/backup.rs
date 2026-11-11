@@ -176,44 +176,75 @@ pub fn spawn_auto_backup(st: &AppState) -> bool {
     true
 }
 
-fn js_parse_float_env(s: &str) -> f64 {
-    // parseFloat(trimmed numeric prefix); 'abc' -> NaN.
-    let t = s.trim();
-    let b = t.as_bytes();
+/// parseFloat on a raw env string: JS trims ECMAScript WhiteSpace (same set
+/// as mfx_payload's js_parse_int), matches 'NaN'/'Infinity' CASE-SENSITIVELY
+/// after an optional sign ('infinity' is NaN), then takes the longest
+/// parseable numeric prefix — exponent included ('1e3' -> 1000).
+fn js_parse_float_env(v: &str) -> f64 {
+    let t = v.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let (sign, rest) = match t.strip_prefix('-') {
+        Some(r) => (-1.0f64, r),
+        None => (1.0f64, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if rest == "NaN" {
+        return f64::NAN;
+    }
+    // parseFloat prefixes-match the word Infinity ('InfinityX' -> Infinity),
+    // case-sensitively.
+    if rest.starts_with("Infinity") {
+        return sign * f64::INFINITY;
+    }
+    // Longest numeric prefix over the float token charset; shrinking accepts
+    // '5e' -> 5, '5e3' -> 5000, '12.' -> 12, '.5' -> 0.5, '0x10' -> 0 (all
+    // agree with parseFloat), while 'e5' and '.' fall through to NaN.
+    let b = rest.as_bytes();
     let mut end = 0usize;
-    if end < b.len() && (b[end] == b'+' || b[end] == b'-') {
+    while end < b.len()
+        && (b[end].is_ascii_digit() || matches!(b[end], b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
         end += 1;
     }
-    let d0 = end;
-    while end < b.len() && (b[end] as char).is_ascii_digit() {
-        end += 1;
-    }
-    if end < b.len() && b[end] == b'.' {
-        let dot = end;
-        end += 1;
-        let d1 = end;
-        while end < b.len() && (b[end] as char).is_ascii_digit() {
-            end += 1;
+    while end > 0 {
+        if let Ok(x) = rest[..end].parse::<f64>() {
+            return sign * x;
         }
-        if end == d1 {
-            end = dot;
-        }
-    }
-    let numeric = end > d0 || end > 0;
-    if numeric {
-        if end > 0 {
-            if let Ok(f) = t[..end].parse::<f64>() {
-                return f;
-            }
-        }
-        if let Ok(f) = t[..end.max(1)].parse::<f64>() {
-            return f;
-        }
-    }
-    if t.eq_ignore_ascii_case("infinity") || t.starts_with("Infinity") {
-        return f64::INFINITY;
+        end -= 1;
     }
     f64::NAN
+}
+
+#[cfg(test)]
+mod float_env_tests {
+    use super::js_parse_float_env as f;
+
+    // Expectations are node `parseFloat` output (verified with node -e).
+    #[test]
+    fn parse_float_env_matches_parsfloat() {
+        assert_eq!(f("  12.5abc"), 12.5);
+        assert!(f("").is_nan());
+        assert!(f("infinity").is_nan()); // case-sensitive in JS
+        assert!(f("NaN").is_nan());
+        assert!(f("nan").is_nan());
+        assert_eq!(f("Infinity"), f64::INFINITY);
+        assert_eq!(f("+Infinity"), f64::INFINITY);
+        assert_eq!(f(" -Infinity "), f64::NEG_INFINITY);
+        assert_eq!(f("InfinityX"), f64::INFINITY);
+        assert_eq!(f("+1e3"), 1000.0);
+        assert_eq!(f("1E3"), 1000.0);
+        assert_eq!(f("5e"), 5.0);
+        assert_eq!(f("5e+3"), 5000.0);
+        assert_eq!(f("5e-3"), 0.005);
+        assert!(f(".").is_nan());
+        assert_eq!(f(".5"), 0.5);
+        assert_eq!(f("5."), 5.0);
+        assert_eq!(f("0x10"), 0.0); // parseFloat, not parseInt
+        assert_eq!(f("1.5.5"), 1.5);
+        assert!(f("e5").is_nan());
+        assert_eq!(f("\u{a0}7"), 7.0); // NBSP is ECMAScript WhiteSpace
+        assert!(f("\u{a0}x7").is_nan());
+        assert_eq!(f("-0.0"), 0.0);
+        assert_eq!(f("24"), 24.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
