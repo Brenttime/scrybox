@@ -87,10 +87,14 @@
     "status": "node"
   },
   "GET /api/cards/:id/oracle": {
-    "status": "node"
+    "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (oracle_cached_row_paths, oracle_legacy_row_fetch_backfills_rules_columns, oracle_fetch_404_and_error_ladder); parity.mjs cards_oracle_ok/cards_oracle_404/cards_oracle_no_token"
   },
   "GET /api/cards/:id/oracle-tags": {
-    "status": "node"
+    "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle-tags)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (oracle_tags_direct_inherited_and_via, oracle_tags_no_gen_no_oracle_and_fallback, oracle_tags_auth_gate_and_proxy); parity.mjs cards_oracle_tags_ok/cards_oracle_tags_fallback/cards_oracle_tags_404_shape/cards_oracle_tags_no_token"
   },
   "GET /api/cards/:id/price-history": {
     "status": "node"
@@ -277,10 +281,14 @@
     "status": "node"
   },
   "POST /api/cards/role-tags": {
-    "status": "node"
+    "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/role-tags)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (role_tags_groups_by_card, role_tags_validation_and_ready_false); parity.mjs cards_role_tags_ok/cards_role_tags_missing_slugs/cards_role_tags_too_many_ids/cards_role_tags_no_token"
   },
   "POST /api/cards/tag-stats": {
-    "status": "node"
+    "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/tag-stats)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (tag_stats_filters_ranks_and_caps, tag_stats_null_label_falls_back_to_slug); parity.mjs cards_tag_stats_ok/cards_tag_stats_empty_ids/cards_tag_stats_no_token"
   },
   "POST /api/cardscan/cards": {
     "status": "node"

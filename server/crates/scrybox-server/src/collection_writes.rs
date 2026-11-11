@@ -82,7 +82,7 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 /// Re-stamp an error Response produced elsewhere (auth.rs builds axum::Json
 /// bodies without the Express charset/ETag) into Node's exact res.json form,
 /// keeping the JSON body byte-identical.
-async fn node_exact(res: Response) -> Response {
+pub(crate) async fn node_exact(res: Response) -> Response {
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap_or_default();
     match serde_json::from_slice::<Value>(&bytes) {
@@ -549,7 +549,7 @@ fn placeholders(n: usize) -> String {
 // parse failures outrank auth errors exactly as in Node.
 // ---------------------------------------------------------------------------
 
-enum BodyOutcome {
+pub(crate) enum BodyOutcome {
     Parsed(Value),
     /// entity.parse.failed → the global error handler's 500.
     Invalid,
@@ -568,7 +568,7 @@ fn is_json_ct(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
+pub(crate) fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
     if !is_json_ct(headers) {
         // body-parser leaves req.body undefined; Node's route would throw on
         // destructuring it (unhandled rejection). The port treats it as `{}`,
