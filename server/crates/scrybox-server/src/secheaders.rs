@@ -27,6 +27,7 @@ use axum::{
 };
 
 use crate::collection::body_etag;
+use crate::static_assets::compressible_ct;
 
 /// helmet 8 output for the server.js CSP config, captured verbatim from the
 /// Node instance (Content-Security-Policy-Report-Only value). helmet-csp
@@ -34,6 +35,12 @@ use crate::collection::body_etag;
 /// its own defaults (base-uri/form-action/frame-ancestors/script-src-attr);
 /// upgradeInsecureRequests: null drops that directive entirely.
 pub const CSP_REPORT_ONLY: &str = "default-src 'self';script-src 'self' 'wasm-unsafe-eval';connect-src 'self';img-src 'self' data: blob: https://cards.scryfall.io https://c1.scryfall.com https://img.scryfall.com;style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;font-src 'self' data: https://fonts.gstatic.com;object-src 'none';base-uri 'self';form-action 'self';frame-ancestors 'self';script-src-attr 'none'";
+
+/// Marker for replies whose body must NOT earn the compression Vary leg:
+/// piped/streamed bodies (compression sees len===0 + chunkedish and returns
+/// early). Inserted by static_assets' portal stream arm.
+#[derive(Clone, Copy)]
+pub struct NoCompressionVary;
 
 /// The twin of `selfSignedTls()` in backend/src/utils/tls.js:103-105.
 /// With the self-signed HTTPS listener active (and no operator-provided
@@ -266,8 +273,20 @@ fn compose_headers(
     vary: &[&str],
     hsts: bool,
     acao: Option<&str>,
+    strip_csp_coep: bool,
 ) -> HeaderMap {
     let mut out = HeaderMap::new();
+    if strip_csp_coep {
+        // Portal content arm (server.js removeHeader trio): drop any
+        // existing CSP/CSP-RO/COEP — existing-wins must not resurrect them.
+        for n in [
+            HeaderName::from_static("content-security-policy"),
+            HeaderName::from_static("content-security-policy-report-only"),
+            coep_name(),
+        ] {
+            existing.remove(&n);
+        }
+    }
     // The caller merged every existing Vary token into `vary` already; drop
     // the raw header so the tail-append below cannot replay it as a second
     // Vary line (caught live: the health-cache replay emitted vary twice —
@@ -286,6 +305,9 @@ fn compose_headers(
         out.insert(header::VARY, HeaderValue::from_str(&vary.join(", ")).unwrap());
     }
     for (n, val) in helmet_pre() {
+        if strip_csp_coep && n == "content-security-policy-report-only" {
+            continue;
+        }
         slot(&mut out, &mut existing, HeaderName::from_bytes(n.as_bytes()).unwrap(), Some(HeaderValue::from_str(val).unwrap()));
     }
     if hsts {
@@ -356,7 +378,7 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
                 }
                 (p, Body::from(body))
             };
-            parts.headers = compose_headers(std::mem::take(&mut parts.headers), coep, &["User-Agent"], hsts, None);
+            parts.headers = compose_headers(std::mem::take(&mut parts.headers), coep, &["User-Agent"], hsts, None, false);
             return Response::from_parts(parts, body);
         }
     }
@@ -375,6 +397,7 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
             &["User-Agent", "Origin", "Access-Control-Request-Headers"],
             hsts,
             origin.as_deref().filter(|o| origin_allowed(o)),
+            false,
         );
         // cors@2.8.5 preflight only answers when the callback allowed the
         // origin; ACA-Methods is the package default method list.
@@ -390,7 +413,14 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
     // Normal path: run the native handler, then stack the twin ahead of the
     // handler's own headers. Idempotent for Node-forwarded replies: their
     // identical twin headers are dropped and re-emitted in Node's order.
+    let path = req.uri().path().to_string();
     let resp = next.run(req).await;
+    // server.js portal handler strips CSP + CSP-RO + COEP for proxied
+    // content only (its 301/405/502 arms return before the removes). The
+    // portal handler marks the content replies; honour that here.
+    let strip_csp_coep = (path == "/scryfall-portal" || path.starts_with("/scryfall-portal/"))
+        && resp.extensions().get::<crate::static_assets::ProxiedContent>().is_some();
+    let coep = if strip_csp_coep { None } else { coep };
     let (mut parts, body) = resp.into_parts();
     // Vary merge: Node's order is User-Agent (COEP mw), Origin (cors,
     // unconditional for non-rejected requests), then anything else the
@@ -409,10 +439,30 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
         }
     }
     // compression() runs downstream of cors on Node and appends its own
-    // Vary: Accept-Encoding to every response that reaches the routes
-    // (rejections and preflights short-circuit at cors and never see it —
-    // verified against the Node instance).
-    if !vary.iter().any(|v| v.eq_ignore_ascii_case("accept-encoding")) {
+    // Vary: Accept-Encoding — but compression@1.8.1's res.end override only
+    // does it when the reply actually reaches the compressor: an explicit
+    // zero-length body, a 204/304, a non-compressible Content-Type (the
+    // compressible package; missing CT counts as compressible) and piped
+    // bodies (NoCompressionVary marker: no Content-Length is set, Node saw
+    // len===0 && chunkedish) all skip it. Live-pinned on :3312: static 405
+    // (CL 0) and 304 answer with plain "User-Agent, Origin", portal streamed
+    // json likewise, while native 401 JSON keeps the Accept-Encoding leg.
+    let st_code = parts.status.as_u16();
+    let no_vary_ae = parts
+        .extensions
+        .get::<NoCompressionVary>()
+        .is_some()
+        || st_code == 204
+        || st_code == 304
+        || parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "0")
+        || !compressible_ct(
+            parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        );
+    if !no_vary_ae && !vary.iter().any(|v| v.eq_ignore_ascii_case("accept-encoding")) {
         vary.push("Accept-Encoding".to_string());
     }
     let vary_refs: Vec<&str> = vary.iter().map(|s| s.as_str()).collect();
@@ -422,6 +472,7 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
         &vary_refs,
         hsts,
         origin.as_deref().filter(|o| origin_allowed(o)),
+        strip_csp_coep,
     );
     Response::from_parts(parts, body)
 }

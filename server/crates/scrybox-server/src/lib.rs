@@ -62,6 +62,7 @@ mod stats_sql;
 pub mod stats_subs;
 pub mod search_history;
 pub mod shared;
+pub mod static_assets;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -560,6 +561,27 @@ pub fn app(state: AppState) -> Router {
             .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
             .route("/api/admin/backups", any(backup::handle_backups_collection))
             .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
+    } else {
+        router
+    };
+    // Lane B unit 5b: the static trio (see static_assets.rs). Kill-switch
+    // group `static_assets`: off => everything proxies to Node's own
+    // handlers. The portal leg additionally mirrors Node's registration
+    // gate: the routes only exist when LOCAL_WEB_PORTAL_ENABLED === 'true'.
+    let router = if state.owns("static_assets") {
+        router
+            .route("/scan-assets", any(static_assets::handle_scan_assets))
+            .route("/scan-assets/{*rest}", any(static_assets::handle_scan_assets))
+            .route("/models/cornelius.onnx", any(static_assets::handle_model))
+    } else {
+        router
+    };
+    let router = if state.owns("static_assets")
+        && std::env::var("LOCAL_WEB_PORTAL_ENABLED").as_deref() == Ok("true")
+    {
+        router
+            .route("/scryfall-portal", any(static_assets::handle_portal))
+            .route("/scryfall-portal/{*rest}", any(static_assets::handle_portal))
     } else {
         router
     };
