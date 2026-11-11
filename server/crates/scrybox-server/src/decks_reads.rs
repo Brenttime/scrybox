@@ -161,7 +161,7 @@ pub async fn route_entry(Path(id): Path<String>, State(st): State<AppState>, req
 }
 
 /// Shared prologue: kill switch, body-parse-before-auth, auth gate.
-async fn guard_get<F, Fut>(st: AppState, req: Request, group: &str, f: F) -> Response
+pub(crate) async fn guard_get<F, Fut>(st: AppState, req: Request, group: &str, f: F) -> Response
 where
     F: FnOnce(Arc<DbPool>, HeaderMap, AuthUser) -> Fut,
     Fut: std::future::Future<Output = Response>,
@@ -188,7 +188,7 @@ where
 /// tag and no body (Content-Type is removed on 304 by res.send), else 200 with
 /// content-type/etag (+ optional extra headers, compression like the shared
 /// module's res.json-through-compression path).
-fn json_read_response<I, T>(headers: &HeaderMap, raw: Vec<u8>, extras: I) -> Response
+pub(crate) fn json_read_response<I, T>(headers: &HeaderMap, raw: Vec<u8>, extras: I) -> Response
 where
     I: IntoIterator<Item = (T, T)>,
     T: Into<String>,
@@ -232,7 +232,7 @@ where
 /// npm `fresh` (Express req.fresh): a request Cache-Control carrying the
 /// standalone `no-cache` directive disables the ETag 304 entirely —
 /// live-pinned vs the container's fresh@0.5.2 (iter-27).
-fn fresh_allows_304(headers: &HeaderMap) -> bool {
+pub(crate) fn fresh_allows_304(headers: &HeaderMap) -> bool {
     match headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
         Some(cc) => !cc.split(',').any(|d| d.trim() == "no-cache"),
         None => true,
@@ -391,7 +391,7 @@ fn js_math_round(x: f64) -> f64 {
 
 /// `Math.round((v + Number.EPSILON) * 100) / 100` rendered through the
 /// JSON.stringify number rules.
-fn round_cents(v: f64) -> Value {
+pub(crate) fn round_cents(v: f64) -> Value {
     let r = js_math_round((v + f64::EPSILON) * 100.0) / 100.0;
     json_num(r)
 }
@@ -418,7 +418,7 @@ fn cheapest_eligible_price(row: &Map<String, Value>) -> Option<f64> {
 
 /// deckPricing.currentPrintingPrice — USD gate with the same COALESCE
 /// semantics as the floor query.
-fn current_printing_price(row: &Map<String, Value>) -> Option<f64> {
+pub(crate) fn current_printing_price(row: &Map<String, Value>) -> Option<f64> {
     let currency = match row.get("price_currency") {
         None | Some(Value::Null) => "USD".to_string(),
         Some(v) => js_to_string(Some(v)).to_uppercase(),
@@ -430,7 +430,7 @@ fn current_printing_price(row: &Map<String, Value>) -> Option<f64> {
 }
 
 /// deckPricing.deckCurrentPrintValues over formatted card rows.
-fn deck_current_print_values(rows: &[Map<String, Value>]) -> Map<String, Value> {
+pub(crate) fn deck_current_print_values(rows: &[Map<String, Value>]) -> Map<String, Value> {
     let mut value = 0f64;
     let mut unpriced_copies = 0f64;
     let mut estimated_copies = 0f64;
@@ -466,7 +466,7 @@ fn deck_current_print_values(rows: &[Map<String, Value>]) -> Map<String, Value> 
     out
 }
 
-fn empty_deck_minimum_value() -> Map<String, Value> {
+pub(crate) fn empty_deck_minimum_value() -> Map<String, Value> {
     let mut out = Map::new();
     out.insert("minimum_value".into(), Value::from(0));
     out.insert("minimum_value_currency".into(), Value::from("USD"));
@@ -479,7 +479,7 @@ pub(crate) fn sql_card_key(alias: &str) -> String {
     format!("LOWER(TRIM(COALESCE({alias}.name, '')))")
 }
 
-fn chunked<T>(values: &[T], size: usize) -> Vec<&[T]> {
+pub(crate) fn chunked<T>(values: &[T], size: usize) -> Vec<&[T]> {
     values.chunks(size).collect()
 }
 
@@ -504,7 +504,7 @@ pub(crate) fn rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Res
     Ok(out)
 }
 
-fn one_row(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<Map<String, Value>>, rusqlite::Error> {
+pub(crate) fn one_row(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<Map<String, Value>>, rusqlite::Error> {
     Ok(rows_map(conn, sql, params)?.into_iter().next())
 }
 
@@ -536,12 +536,12 @@ fn get_deck_requirements(conn: &Connection, deck_ids: &[i64]) -> Result<Vec<Map<
     Ok(requirements)
 }
 
-struct CheapestPrinting {
+pub(crate) struct CheapestPrinting {
     card_id: Value,
     price: f64,
 }
 
-fn get_cheapest_printings(
+pub(crate) fn get_cheapest_printings(
     conn: &Connection,
     card_keys: &[String],
 ) -> Result<HashMap<String, CheapestPrinting>, rusqlite::Error> {
@@ -596,7 +596,7 @@ fn js_str_lt(a: &str, b: &str) -> bool {
     a.encode_utf16().cmp(b.encode_utf16()) == std::cmp::Ordering::Less
 }
 
-fn get_cheapest_prices(conn: &Connection, card_keys: &[String]) -> Result<HashMap<String, f64>, rusqlite::Error> {
+pub(crate) fn get_cheapest_prices(conn: &Connection, card_keys: &[String]) -> Result<HashMap<String, f64>, rusqlite::Error> {
     Ok(get_cheapest_printings(conn, card_keys)?
         .into_iter()
         .map(|(k, p)| (k, p.price))
@@ -992,7 +992,7 @@ fn parse_array_col(v: Option<&Value>) -> Result<Value, ()> {
     }
 }
 
-fn parse_card_row(row: &Map<String, Value>) -> Result<Map<String, Value>, ()> {
+pub(crate) fn parse_card_row(row: &Map<String, Value>) -> Result<Map<String, Value>, ()> {
     let mut out = apply_proxy_rarity(row.clone());
     out.insert("subtypes".into(), parse_array_col(row.get("subtypes"))?);
     out.insert("types".into(), parse_array_col(row.get("types"))?);

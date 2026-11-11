@@ -40,6 +40,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod lists_reads;
 pub mod health;
 pub mod name_index;
 pub mod scryfall;
@@ -440,6 +441,20 @@ pub fn app(state: AppState) -> Router {
             .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
             .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
             .route("/api/decks/{id}/return", any(decks_writes::handle_return))
+    } else {
+        router
+    };
+    // Lane A iter-31: card-list READS (GET /, /card-matches, /:id,
+    // /:id/cardlist) under `lists_reads`. The write routes (POST/PUT/DELETE,
+    // /order, cheapest-printings, printing, bulk*) stay proxied: the
+    // /api/lists/{id} dispatcher answers GET natively and forwards every
+    // other method, so shapes are never 405'd here.
+    let router = if state.owns("lists_reads") {
+        router
+            .route("/api/lists", any(lists_reads::handle_collection))
+            .route("/api/lists/card-matches", any(lists_reads::handle_card_matches))
+            .route("/api/lists/{id}", any(lists_reads::route_entry))
+            .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist))
     } else {
         router
     };
