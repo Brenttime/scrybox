@@ -290,6 +290,11 @@ fn sql_card_key(alias: &str) -> String {
     format!("LOWER(TRIM(COALESCE({alias}.name, '')))")
 }
 
+/// cardIdentity.sqlIsBasicLand — exposed for decks_reads (deckOwnership).
+pub(crate) fn sql_is_basic_land_expr(alias: &str) -> String {
+    sql_is_basic_land(alias)
+}
+
 fn sql_is_basic_land(alias: &str) -> String {
     let subtypes = format!("LOWER(COALESCE({alias}.subtypes, ''))");
     let is_land =
@@ -1375,7 +1380,7 @@ fn bulk_purchase_split(
 }
 
 /// deckRules.js isBasicLand(card).
-fn is_basic_land(card: &Map<String, Value>) -> bool {
+pub(crate) fn is_basic_land(card: &Map<String, Value>) -> bool {
     let subs: Vec<Value> = match card.get("subtypes") {
         Some(Value::Array(a)) => a.clone(),
         Some(Value::String(s)) if !s.is_empty() => serde_json::from_str::<Value>(s)

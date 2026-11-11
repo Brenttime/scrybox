@@ -125,16 +125,22 @@
     "tests": "tests/collection_writes.rs::cardlist_plain_exact,cardlist_detailed_exact,cardlist_empty_is_empty_string,cardlist_422_when_unresolved,cardlist_401_no_token; parity.mjs cw_cardlist_plain,detailed,no_token"
   },
   "GET /api/decks": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks GET under RUST_ROUTES=decks_reads; deckListCache twin on deck_list_revision + express-default weak body ETag)",
+    "tests": "tests/decks_reads.rs::list_shape_values_and_order (ownership basic-land exemption, commander word-match pick, USD pricing gate incl. EUR unpriced), list_cache_hit_and_revision_invalidation, list_etag_304_and_no_cache_gate, list_gzip_when_accepted; parity.mjs dr_list_200 (byte deepDiff incl. key order), dr_list_noauth_401"
   },
   "GET /api/decks/:id": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id} GET under RUST_ROUTES=decks_reads; applyOwnedPrintings swap w/ deck_list_card_id key order, current/cheapest prices, maybeboard)",
+    "tests": "tests/decks_reads.rs::detail_shape_prices_and_printing_swap (display-printing current_printing_value, dlc<cur<cheap key order), detail_404_foreign_and_422_unresolved; parity.mjs dr_detail_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/combos": {
     "status": "node"
   },
   "GET /api/decks/:id/locations": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id}/locations GET under RUST_ROUTES=decks_reads; coverage CTE: available=owned-locked, missing=required-available, own-deck-locked exclusion, missing-DESC sort)",
+    "tests": "tests/decks_reads.rs::locations_coverage_math_and_sort (negative-available math pinned live: owned2-locked3 -> missing 4), locations_ignores_other_users_locked_decks, locations_404_and_422; parity.mjs dr_locations_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/synergy": {
     "status": "node"

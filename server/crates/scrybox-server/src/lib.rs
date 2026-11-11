@@ -39,6 +39,7 @@ pub mod collection;
 pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
+pub mod decks_reads;
 pub mod health;
 pub mod name_index;
 pub mod scryfall;
@@ -146,6 +147,10 @@ pub struct AppState {
     /// CV_MODEL_DIR — catalog meta/model dir catalog.js/cvScan.js stat.
     /// None => catalog-read handlers proxy (no silent empty answers).
     pub model_dir: Option<std::path::PathBuf>,
+    /// utils/deckListCache.js `store` twin (decks_reads): userId ->
+    /// (deck_list_revision, built body bytes). Per process like Node's
+    /// module-level Map; per AppState in tests keeps fixtures isolated.
+    pub deck_list_cache: Arc<std::sync::Mutex<std::collections::HashMap<i64, (i64, Vec<u8>)>>>,
 }
 
 impl AppState {
@@ -169,7 +174,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -402,15 +407,26 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
-    // Lane A iter-28: deck META writes only (PUT /api/decks/{id},
-    // DELETE /api/decks/{id}, DELETE /api/decks/{id}/cards/{card_id}).
-    // Reads, POSTs and the checkout/return machinery stay proxied. Shapes
-    // this router does not own (e.g. /api/decks/5/combos) fall through to
-    // the catch-all proxy, never 405 here.
-    let router = if state.owns("decks_writes") {
+    // Lane A iter-28/29: deck writes (PUT/DELETE, `decks_writes`) and deck
+    // reads (GET list / detail / locations, `decks_reads`). Both groups share
+    // the /api/decks/{id} shape, so one dispatcher route owns it: GET goes to
+    // decks_reads when that group is on, PUT/DELETE to decks_writes, and
+    // everything else (or groups that are off) falls through to the catch-all
+    // proxy — never 405 here.
+    let router = if state.owns("decks_reads") {
         router
-            .route("/api/decks/{id}", any(decks_writes::handle_entry))
-            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .route("/api/decks", any(decks_reads::handle_list))
+            .route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") || state.owns("decks_writes") {
+        router.route("/api/decks/{id}", any(decks_reads::route_entry))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_writes") {
+        router.route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
     } else {
         router
     };

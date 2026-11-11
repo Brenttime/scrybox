@@ -829,7 +829,7 @@ async function etagParity(c) {
   // Replay only makes sense for idempotent GETs; write cases are compared by
   // response alone (their ETag is Express's default body tag, not a contract).
   if ((c.method || 'GET') !== 'GET') return [];
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared')) return [];
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks')) return [];
   // Sequential on purpose: setup-bearing cases reseed shared DB rows, and
   // two parallel setups would race each other's DELETE/INSERT mid-request
   // (the iter-27 shrd_* replay failures). Same rationale as the write-case
@@ -1413,6 +1413,86 @@ async function etagParity(c) {
       return { ok: n === 2, why: `noauth kept both deck_cards rows (${n})`, seen: { n } };
     },
   });
+
+  // ===== decks_reads (iter 29): GET /api/decks, GET /api/decks/:id,
+  // GET /api/decks/:id/locations. Fixed ids, realistic scryfall-local row
+  // shape (supertype 'MTG', types = colour words, subtypes = TYPE words
+  // split — deckCommander's quoted-word candidate match and sqlIsBasicLand
+  // both key off that tokenisation; live-pinned against a throwaway
+  // scrybox:3e91010-headbtn container on this same fixture). The cross-side
+  // deepDiff (values + array order + key order) is the contract; drPrep's
+  // writes bump deck_list_revision, so neither side can leak a stale
+  // per-process deck-list cache body. =====
+  const DR = {
+    etali: 'rusttest-dr-etali', etaliB: 'rusttest-dr-etali-b',
+    vial: 'rusttest-dr-vial', vialB: 'rusttest-dr-vial-b',
+    plains: 'rusttest-dr-plains', eur: 'rusttest-dr-eur',
+  };
+  function drClear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM collection WHERE card_id LIKE ?').run('rusttest-dr-%');
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-dr-%');
+  }
+  function drPrep() {
+    dbWrite((d) => {
+      drClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for dr cases');
+      const card = d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      card.run(DR.etali, 'RustTest DR Etali', 'MTG', '["Red","Green"]', '["Legendary","Creature","Dragon"]', 'Rare', 'drs', 'DR Set', '1', 'img/dr-etali-a', 1, 1, 0, 0, 0, 6, '["R","G"]', 'USD');
+      card.run(DR.etaliB, 'RustTest DR Etali ', 'MTG', '["Red","Green"]', '["Legendary","Creature","Dragon"]', 'Rare', 'drsb', 'DR Set B', '2', 'img/dr-etali-b', 0.5, 0.5, 0, 0, 0, 6, '["R","G"]', 'USD');
+      card.run(DR.vial, 'RustTest DR Vial', 'MTG', '[]', '["Artifact"]', 'Uncommon', 'drs', 'DR Set', '3', 'img/dr-vial-a', 0.1, 0.1, 0, 0, 0, 1, '[]', 'USD');
+      card.run(DR.vialB, 'RustTest DR Vial ', 'MTG', '[]', '["Artifact"]', 'Uncommon', 'drsb', 'DR Set B', '4', 'img/dr-vial-b', 0.05, 0.05, 0, 0, 0, 1, '[]', 'USD');
+      card.run(DR.plains, 'RustTest DR Plains', 'MTG', '[]', '["Basic","Land"]', 'Common', 'drs', 'DR Set', '261', null, 0.01, 0.01, 0, 0, 0, 0, '[]', 'USD');
+      card.run(DR.eur, 'RustTest DR Eur', 'MTG', '[]', '["Artifact"]', 'Common', 'drs', 'DR Set', '9', null, 2, 2, 0, 0, 0, 1, '[]', 'EUR');
+      const deck = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      deck.run(931101, uid, 'DR Commander', 'dc', 0, '2026-01-01 00:00:05');
+      deck.run(931102, uid, 'DR Coverage', 'cv', 0, '2026-01-01 00:00:04');
+      deck.run(931103, uid, 'DR Locked', 'lk', 1, '2026-01-01 00:00:03');
+      deck.run(931104, uid, 'DR Broken', 'bd', 0, '2026-01-01 00:00:02');
+      deck.run(931105, other.id, 'DR Foreign', 'fd', 0, '2026-01-01 00:00:01');
+      deck.run(931106, other.id, 'DR Their Locked', 'tl', 1, '2026-01-01 00:00:00');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity,is_commander) VALUES (?,?,?,?)');
+      dc.run(931101, DR.etali, 1, 0);
+      dc.run(931101, DR.vial, 4, 0);
+      dc.run(931102, DR.plains, 3, 0);
+      dc.run(931102, DR.vial, 1, 0);
+      dc.run(931102, DR.eur, 1, 0);
+      dc.run(931103, DR.plains, 3, 0);
+      dc.run(931104, 'rusttest-dr-nope', 1, 0);
+      dc.run(931106, DR.plains, 9, 0);
+      d.prepare('INSERT INTO deck_maybe_cards (deck_id,card_id,quantity) VALUES (?,?,?)').run(931101, DR.etaliB, 2);
+      const col = d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)');
+      col.run(DR.vialB, 2, uid);
+      col.run(DR.plains, 2, uid);
+    });
+  }
+  function drTeardown() { dbWrite((d) => drClear(d)); }
+  const drCase = (name, path, headers = authHeaders, method = 'GET') =>
+    cases.push({ name, path, headers, method, setup: drPrep, teardown: drTeardown });
+  // The list body carries total/ownership/commander/minimum-value per deck,
+  // the coverage rows carry locked-exclusion (931103 locks user's own
+  // copies; 931106 is another user's locked deck and must NOT), the basic-
+  // land flag, and the missing-DESC sort. EUR card exercises the unpriced
+  // gate; 931104 exercises the unresolved/422 paths.
+  drCase('dr_list_200', '/api/decks');
+  drCase('dr_list_noauth_401', '/api/decks', {});
+  drCase('dr_detail_200', '/api/decks/931101');
+  drCase('dr_detail_locked_200', '/api/decks/931103');
+  drCase('dr_detail_foreign_404', '/api/decks/931105');
+  drCase('dr_detail_broken_422', '/api/decks/931104');
+  drCase('dr_detail_noauth_401', '/api/decks/931101', {});
+  drCase('dr_locations_200', '/api/decks/931102/locations');
+  drCase('dr_locations_locked_200', '/api/decks/931103/locations');
+  drCase('dr_locations_foreign_404', '/api/decks/931105/locations');
+  drCase('dr_locations_broken_422', '/api/decks/931104/locations');
+  drCase('dr_locations_noauth_401', '/api/decks/931102/locations', {});
+  // (No /combos parity case: it fetches the public Spellbook API — body is
+  // upstream-flaky. The never-swallow guard is pinned by the path test
+  // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
 }
 
 
