@@ -652,7 +652,7 @@ async fn endpoint_gaps_pace_upstream() {
     let t = Instant::now();
     local.post("/cards/collection", json!({"identifiers": []}), &ScryOpts { upstream: true, ..Default::default() }).await.ok();
     let _ = mock;
-    assert!(t.elapsed().as_millis() >= 0);
+    let _ = t.elapsed(); // pace check only: the breaker must have tripped without hanging
 }
 
 #[tokio::test]

@@ -72,14 +72,6 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 // Response cache (utils/statsCache.js mirror)
 // ---------------------------------------------------------------------------
 
-struct StatsEntry {
-    raw: Bytes,
-    /// Pre-gzipped body for clients that accept it; None when the raw body
-    /// sits under the compression middleware's 1024-byte threshold.
-    gz: Option<Bytes>,
-    etag: String,
-}
-
 struct StoreEntry {
     at: Instant,
     seq: u64, // insertion order (Map iteration order in Node)
@@ -130,6 +122,31 @@ struct Inner {
     cooldown: HashMap<i64, Instant>,
 }
 
+pub(crate) struct StatsEntry {
+    raw: Bytes,
+    /// Pre-gzipped body for clients that accept it; None when the raw body
+    /// sits under the compression middleware's 1024-byte threshold.
+    gz: Option<Bytes>,
+    etag: String,
+}
+
+impl StatsEntry {
+    pub(crate) fn new(raw: Bytes) -> Self {
+        let gz = wants_encoding(Some("gzip"), "gzip", raw.len()).then(|| gzip_bytes(&raw));
+        let etag = body_etag(&raw);
+        Self { raw, gz, etag }
+    }
+    pub(crate) fn raw(&self) -> &Bytes {
+        &self.raw
+    }
+    pub(crate) fn gz(&self) -> &Option<Bytes> {
+        &self.gz
+    }
+    pub(crate) fn etag(&self) -> &str {
+        &self.etag
+    }
+}
+
 pub struct StatsCache {
     inner: Mutex<Inner>,
     /// Number of full bodies actually computed (test + observability).
@@ -171,7 +188,62 @@ impl StatsCache {
 
     /// statsCache.keyFor: `${userId}|${gen || 0}|${rev ?? ''}|${name}`.
     fn key_for(user_id: i64, gen: u64, rev: Option<&str>) -> String {
-        format!("{user_id}|{gen}|{}|stats", rev.unwrap_or(""))
+        StatsCache::key_named(user_id, gen, rev, "stats")
+    }
+
+    /// keyFor with an explicit cache name — the shape statsCache.js uses for
+    /// every `cached(nameFn, ...)` route (`history:30d`, `networth`,
+    /// `top-mover`). Same store, same gen: a bump invalidates every name for
+    /// that user, exactly like the single shared Map in statsCache.js.
+    pub(crate) fn key_named(user_id: i64, gen: u64, rev: Option<&str>, name: &str) -> String {
+        format!("{user_id}|{gen}|{}|{name}", rev.unwrap_or(""))
+    }
+
+    /// Current gen for a user WITHOUT marking them active (the stats
+    /// refresher pre-builds the `/stats` body only; a /stats/history request
+    /// must not enroll a user in that background work).
+    pub(crate) fn gen_of(&self, user_id: i64) -> u64 {
+        *self.inner.lock().unwrap().gens.get(&user_id).unwrap_or(&0)
+    }
+
+    /// statsCache.set for a NON-stats name: same store (Node's cache is one
+    /// shared Map across all cached names), but never touches the
+    /// stale-while-revalidate `latest` slot — that slot backs the `/stats`
+    /// SWR path only; a sub-route body must never be served for `/stats`.
+    pub(crate) fn set_named(&self, user_id: i64, key: String, entry: Arc<StatsEntry>) {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.store.contains_key(&key) && inner.store.len() >= MAX_ENTRIES {
+            let oldest = inner.store.values().min_by_key(|e| e.seq).map(|e| e.seq);
+            if let Some(seq) = oldest {
+                inner.store.retain(|_, v| v.seq != seq);
+            }
+        }
+        inner.seq += 1;
+        let seq = inner.seq;
+        let _ = user_id;
+        inner.store.insert(key, StoreEntry { at: Instant::now(), seq, entry });
+    }
+
+    pub(crate) fn get_entry(&self, key: &str) -> Option<Arc<StatsEntry>> {
+        self.get(key)
+    }
+
+    pub(crate) fn slot_for(&self, key: &str) -> Arc<ComputeSlot> {
+        self.slot(key)
+    }
+
+    pub(crate) fn finish_key(&self, key: &str) {
+        self.finish(key)
+    }
+
+    /// The live data revision (statsCache.dataRevision), read off the pool.
+    pub(crate) fn revision(pool: &DbPool) -> Option<String> {
+        pool.get().ok().and_then(|c| StatsCache::db_revision(&c))
+    }
+
+    /// db_revision on an already-held connection.
+    pub(crate) fn revision_of(conn: &Connection) -> Option<String> {
+        StatsCache::db_revision(conn)
     }
 
     // --- background refresher support (iter 13) -----------------------------
@@ -292,7 +364,7 @@ impl StatsCache {
     /// computed body, if computed within STALE_GRACE. Returned while a
     /// background rebuild of the current key is in flight, so writes never
     /// put the ~0.6 s aggregate on a request's critical path.
-    fn stale_for(&self, user_id: i64) -> Option<Arc<StatsEntry>> {
+    pub(crate) fn stale_for(&self, user_id: i64) -> Option<Arc<StatsEntry>> {
         let inner = self.inner.lock().unwrap();
         let (entry, at) = inner.latest.get(&user_id)?;
         (at.elapsed() <= STALE_GRACE).then(|| entry.clone())
@@ -326,7 +398,9 @@ impl StatsCache {
 /// success. API-key writes never bump (auth rejects them before Node's
 /// invalidateOnWrite would ever run), and HEAD is excluded exactly like Node.
 pub fn on_proxied_write(st: &AppState, method: &Method, path: &str, headers: &HeaderMap) {
-    if !st.owns("stats") {
+    // stats_subs shares the very same gens map (Node keeps ONE gen map across
+    // all cached names), so it needs the bump too when it owns the sub-routes.
+    if !(st.owns("stats") || st.owns("stats_subs")) {
         return;
     }
     if *method == Method::GET || *method == Method::HEAD || !path.starts_with("/api/") {
@@ -431,7 +505,7 @@ fn js_to_fixed(x: f64, n: usize) -> String {
 /// it back to the nearest double (Rust's from_str is correctly rounded, same
 /// as V8's parseFloat). -0 (e.g. from "-0.00") becomes plain 0 in JSON via
 /// json_num, matching JSON.stringify(-0) === "0".
-fn js_fixed_parsed(x: f64, n: usize) -> Value {
+pub(crate) fn js_fixed_parsed(x: f64, n: usize) -> Value {
     json_num(js_parse_float(&js_to_fixed(x, n)))
 }
 
@@ -442,7 +516,7 @@ fn js_parse_float(s: &str) -> f64 {
 
 /// `Math.round(x)`: half toward +Infinity. Implemented as floor + (frac >=
 /// 0.5) — NOT `floor(x + 0.5)`, which mis-rounds 0.49999999999999994.
-fn js_math_round(x: f64) -> f64 {
+pub(crate) fn js_math_round(x: f64) -> f64 {
     if x.is_nan() || x == 0.0 || x.is_infinite() {
         return x;
     }
@@ -494,7 +568,7 @@ fn js_num_opt(v: &Value) -> Option<f64> {
 /// subtraction, `|| 0` guards): null/undefined-like → 0, bool → 0/1, numeric
 /// string → parsed, anything else → NaN (which JSON.stringify renders null,
 /// matching NaN propagation through toFixed/round).
-fn js_to_num(v: &Value) -> f64 {
+pub(crate) fn js_to_num(v: &Value) -> f64 {
     match v {
         Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
         Value::Null => 0.0,
@@ -560,7 +634,7 @@ fn normalize_integral_floats(v: &mut Value) {
 // Row shaping (parseCardRow-lite: raw driver values, column order preserved)
 // ---------------------------------------------------------------------------
 
-fn row_to_object(row: &Row) -> rusqlite::Result<Map<String, Value>> {
+pub(crate) fn row_to_object(row: &Row) -> rusqlite::Result<Map<String, Value>> {
     let ncols = row.as_ref().column_count();
     let mut obj = Map::with_capacity(ncols);
     for i in 0..ncols {
@@ -575,7 +649,7 @@ fn row_to_object(row: &Row) -> rusqlite::Result<Map<String, Value>> {
 /// fires here (kept for the row-missing parity). Spread semantics: existing
 /// keys keep their SELECT position; base_rarity is brand-new for these
 /// queries and appends at the end (insertion-ordered Map).
-fn apply_proxy_rarity(mut row: Map<String, Value>) -> Map<String, Value> {
+pub(crate) fn apply_proxy_rarity(mut row: Map<String, Value>) -> Map<String, Value> {
     let Some(_is_proxy_raw) = row.get("is_proxy").cloned() else { return row };
     let base = match row.get("base_rarity") {
         Some(v) => v.clone(),
@@ -634,7 +708,7 @@ fn all_rows(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map
 /// `new Date(ms).toISOString()` — UTC, ms precision: YYYY-MM-DDTHH:MM:SS.sssZ
 /// (civil-from-days algorithm; no calendar dependency needed for a fixed
 /// proleptic-Gregorian conversion).
-fn iso_utc_ms(ms: i64) -> String {
+pub(crate) fn iso_utc_ms(ms: i64) -> String {
     let days = ms.div_euclid(86_400_000);
     let rem = ms.rem_euclid(86_400_000);
     let (h, rem) = (rem / 3_600_000, rem % 3_600_000);
@@ -654,7 +728,7 @@ fn iso_utc_ms(ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{milli:03}Z")
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 

@@ -16,10 +16,14 @@
     "tests": "tests/collection_writes.rs::delete_200_404_409; parity.mjs cw_delete_200,cw_delete_missing_404,cw_delete_no_token"
   },
   "DELETE /api/decks/:id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id} DELETE under RUST_ROUTES=decks_writes; withAllocationLock twin + BEGIN IMMEDIATE)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::delete_deck_contract (409 checked-out survives, cross-user/missing 404, deck_cards+deck_maybe_cards removed, deck_list_revision bump); parity.mjs dk_delete_200 (opposite-server 404 + DB row counts), dk_delete_checked_out_409, dk_delete_missing_404, dk_delete_noauth_401"
   },
   "DELETE /api/decks/:id/cards/:card_id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/cards/{card_id} DELETE under RUST_ROUTES=decks_writes; logical-card delete via LOWER(TRIM(name)) key)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::delete_card_removes_all_printings_of_logical_card (404/409/200 + both same-name printings leave, unrelated card stays); parity.mjs dk_deletecard_200 (opposite-server deck detail shows both EMH printings gone, maybeboard intact), dk_deletecard_deck_missing_404, dk_deletecard_checked_out_409, dk_deletecard_noauth_401"
   },
   "DELETE /api/lists/:id": {
     "status": "node"
@@ -34,7 +38,9 @@
     "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
   },
   "DELETE /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "GET *": {
     "status": "node"
@@ -43,7 +49,7 @@
     "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
     "status": "verified",
     "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
-    "notes": "listBackups fold: .bak filter, mtime->ISO with Node's ROUND semantics ((ns+500000)/1e6 — V8 Date rounds, truncation showed a 1 ms skew), localeCompare-desc sort. dir string is env-dependent and stripped by parity. Auto-backup timer quiesced on both harness sides (Rust env, Node container /app/auto-backup.disabled flag file + repo env switch)."
+    "notes": "listBackups fold: .bak filter, mtime->ISO with Node's ROUND semantics ((ns+500000)/1e6 \u2014 V8 Date rounds, truncation showed a 1 ms skew), localeCompare-desc sort. dir string is env-dependent and stripped by parity. Auto-backup timer quiesced on both harness sides (Rust env, Node container /app/auto-backup.disabled flag file + repo env switch)."
   },
   "GET /api/admin/backups/:file/download": {
     "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
@@ -128,16 +134,22 @@
     "tests": "tests/collection_writes.rs::cardlist_plain_exact,cardlist_detailed_exact,cardlist_empty_is_empty_string,cardlist_422_when_unresolved,cardlist_401_no_token; parity.mjs cw_cardlist_plain,detailed,no_token"
   },
   "GET /api/decks": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks GET under RUST_ROUTES=decks_reads; deckListCache twin on deck_list_revision + express-default weak body ETag)",
+    "tests": "tests/decks_reads.rs::list_shape_values_and_order (ownership basic-land exemption, commander word-match pick, USD pricing gate incl. EUR unpriced), list_cache_hit_and_revision_invalidation, list_etag_304_and_no_cache_gate, list_gzip_when_accepted; parity.mjs dr_list_200 (byte deepDiff incl. key order), dr_list_noauth_401"
   },
   "GET /api/decks/:id": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id} GET under RUST_ROUTES=decks_reads; applyOwnedPrintings swap w/ deck_list_card_id key order, current/cheapest prices, maybeboard)",
+    "tests": "tests/decks_reads.rs::detail_shape_prices_and_printing_swap (display-printing current_printing_value, dlc<cur<cheap key order), detail_404_foreign_and_422_unresolved; parity.mjs dr_detail_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/combos": {
     "status": "node"
   },
   "GET /api/decks/:id/locations": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id}/locations GET under RUST_ROUTES=decks_reads; coverage CTE: available=owned-locked, missing=required-available, own-deck-locked exclusion, missing-DESC sort)",
+    "tests": "tests/decks_reads.rs::locations_coverage_math_and_sort (negative-available math pinned live: owned2-locked3 -> missing 4), locations_ignores_other_users_locked_decks, locations_404_and_422; parity.mjs dr_locations_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/synergy": {
     "status": "node"
@@ -206,7 +218,9 @@
     "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
   },
   "GET /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "GET /api/secret-lair": {
     "status": "node"
@@ -226,7 +240,9 @@
     "status": "node"
   },
   "GET /api/shared/:share_token": {
-    "status": "node"
+    "module": "scrybox-server::shared (lib.rs /api/shared/{token} under RUST_ROUTES=shared; PUBLIC route, Node mounts above the auth gate)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::shared_public_read, shared_bad_array_column_is_500_with_route_body, kill_switch_proxies_everything_untouched; parity.mjs shrd_ok/shrd_trade/shrd_dup_list_param/shrd_list_conflict/shrd_bad_query_percent/shrd_empty/shrd_notfound/shrd_disabled/shrd_percent_token/shrd_bad_percent/shrd_bad_types_500/shrd_head"
   },
   "GET /api/stats": {
     "module": "scrybox-server::stats (+stats_sql; lib.rs GET /api/stats)",
@@ -237,13 +253,19 @@
     "status": "node"
   },
   "GET /api/stats/history": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); SQL verbatim-verified vs backend/src/routes/stats.js (WHITESPACE-NORMALIZED full-text check); sweep/qs/label semantics are node-generated unit vectors (unit tests in stats_subs.rs; qs expectations captured from qs.parse in scrybox-rusttest-node)",
+    "tests": "tests/stats_subs.rs::history_period_counts_and_label_style (counts 7/30/12/20 incl empty/unknown/dup/array + per-period label styles incl cache-name aliasing ?period[]=7d==?period=7d which Node reproduces through cached()), history_names_have_independent_cache_entries_and_coexist_with_stats, price_history_write_bumps_aux_trigger_and_freshens_named_entries (trigger bump ==1, next req is miss with FRESH body \u2014 no SWR, Node has no stale fallback for these names), proxied_write_bumps_only_that_users_generation, auth_failures_match_node_bodies, kill_switch_off_proxies_everything, non_exact_paths_and_methods_proxied_authed; module unit tests (labels_match_node_toulocaledatestring_vectors, period_resolution_matches_express_qs, sweep_matches_node_vectors, ...); parity.mjs ss_history_* (9 incl dup/encoded/empty, 2 user1) byte-diffed incl key order"
   },
   "GET /api/stats/networth": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); networth SQL verbatim-verified; asOf fresh-stamped per request on BOTH paths (Node's cached() onHit semantics reproduced on hit; miss body carries the compute-time asOf as Node does)",
+    "tests": "tests/stats_subs.rs::networth_user1_matches_node_oracle_bytes + networth_user2_empty_matches_node_oracle_bytes (byte-exact vs tests/stats_subs_oracle.mjs \u2014 the REAL handlers + priceHelpers.js run inside scrybox-rusttest-node over the stats_seed fixture), networth_hit_restamps_asof_only, etag/miss/hit + kill-switch/auth/proxy tests as history; parity.mjs ss_networth(+_user1, strip $.asOf random-by-design), ss_networth_asof_shape (ISO-ms shape), ss_networth_head (HEAD proxied, Express answers) \u2014 etagReplay:false (304 unreachable by construction BOTH sides: per-request restamp); ss_networth_noauth + ss_networth_badtoken (401 error-path byte parity incl error body, etagReplay:false \u2014 closes orchestrator audit 2026-11-10 20:20 ruling 1)"
   },
   "GET /api/stats/top-mover": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); top-mover SQL verbatim-verified (incl WHERE p.prev > 0 AND p.cur > p.prev, 24h prev window)",
+    "tests": "tests/stats_subs.rs::top_mover_user1_matches_node_oracle_bytes (full static body incl card key order + Math.round price/pct vectors) + top_mover_user2_no_owned_moves ({card:null}), miss_hit_304_replay_and_byte_stability, price_history_write_bumps_aux_trigger_and_freshens_named_entries (winner flips Sol Ring->Zephyr Falcon, pct=172.7 vs node-computed vector), proxied-write gen test, auth + kill-switch + path tests; parity.mjs ss_topmover(+_user1) byte-diffed incl key order; ss_topmover_noauth + ss_topmover_badtoken (401 error-path byte parity incl error body, etagReplay:false \u2014 closes orchestrator audit 2026-11-10 20:20 ruling 1)"
   },
   "GET /api/suggest": {
     "status": "node"
@@ -255,7 +277,7 @@
     "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
     "status": "verified",
     "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
-    "notes": "VACUUM INTO snapshot (byte-deterministic on a quiet DB — asserted), name <base>.<ISO [:.] -> ->.bak> via basename strip .db, prune listBackups().slice(KEEP_LAST) with JS slice semantics; BACKUP_KEEP_LAST parseInt||10 (cargo reads env per call, Node pins at module load — harness sets it before boot)."
+    "notes": "VACUUM INTO snapshot (byte-deterministic on a quiet DB \u2014 asserted), name <base>.<ISO [:.] -> ->.bak> via basename strip .db, prune listBackups().slice(KEEP_LAST) with JS slice semantics; BACKUP_KEEP_LAST parseInt||10 (cargo reads env per call, Node pins at module load \u2014 harness sets it before boot)."
   },
   "POST /api/admin/catalogs/build": {
     "status": "node"
@@ -332,7 +354,7 @@
     "status": "node"
   },
   "POST /api/collection": {
-    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group — with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group \u2014 with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
     "status": "verified",
     "tests": "tests/collection_writes.rs::add_* (15 incl. defaults, quantity rows vs stack, price-history dedupe, coercion edge cases, localized card_id + recordPrice, CHECK-violation 500, cache-miss forwards, GET-fallback both ways); parity.mjs ca_add_* (10: gates, 400s, successes verified by cross-side read-back per owner ruling iter-21, unknown-card 404, bad-condition 500)"
   },
@@ -342,18 +364,24 @@
     "tests": "tests/collection_writes.rs::bulk_* (10 incl. delete/trade/condition/printing, purchase_split weighted+equal, add_to_deck matrix, checked-out 409s, ownership rejections); parity.mjs cw_bulk_*/cw_split_* (15: gates, validation 400s, deck 400/404/409 pre-write branches, successes verified by cross-side read-back per owner ruling iter-21; entry_ids contract)"
   },
   "POST /api/collection/bulk-add": {
-    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node — Node reports per-card results so partial-native execution would change the response",
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node \u2014 Node reports per-card results so partial-native execution would change the response",
     "status": "verified",
     "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
   },
   "POST /api/decks": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks POST under RUST_ROUTES=decks_writes; INSERT + decklist upsert loop, per-line regex twin of /^(\\d+)x?\\s+(.+)$/i incl. backtracking + /i)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::create_deck_contract (falsy-name 400 set incl. [], parseInt(target_size,10)||60 strings/junk/0/null, defaults row read-back, decklist import stacks 4x+1X same card, non-string decklist skipped); parity.mjs dk2_create_201 (id stripped, opposite-server row defaults), dk2_create_decklist_201 (uppercase-X line lands, junk line skipped), dk2_create_no_name_400, dk2_create_noauth_401"
   },
   "POST /api/decks/:id/cards": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/cards POST under RUST_ROUTES=decks_writes; logical-card fold + guarded UPDATE/INSERT, Scryfall hydration for uncached ids stays Node-side)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::add_card_contract (400 falsy card_id, 404 missing deck, 409 checked-out, non-string card_id -> Node getCardById-throw 500 twin, cache-miss string id whole-request forward, owned-cap/max-4/'Invalid quantity' 400 messages, quantity '3' parseInt twin + price_history row, alt-printing collapse keeps one representative row); parity.mjs dk2_addcard_200 (quantity '2' parseInt twin, price_history trend row), dk2_addcard_no_card_400, dk2_addcard_foreign_404, dk2_addcard_checkedout_409, dk2_addcard_over_owned_400, dk2_addcard_noauth_401"
   },
   "POST /api/decks/:id/register-collection": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/register-collection POST under RUST_ROUTES=decks_writes; guarded INSERT..SELECT..RETURNING, register-vs-checkout linearizable, per-card recordPrice caught, sweep SELECT 500s as in Node)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::register_collection_contract (400 no-cards / 422 unresolved / 404 foreign / 409 checked-out, 201 body + stacked rows (no dedup, register twice -> 6 rows), language COALESCE 'English', price sweep one row per distinct card); parity.mjs dk2_register_201 (opposite-server collection rows incl. condition/language/is_trade), dk2_register_empty_400, dk2_register_unresolved_422, dk2_register_checkedout_409, dk2_register_badjson_500 (parse-before-auth on body-ignoring route), dk2_register_noauth_401"
   },
   "POST /api/export": {
     "status": "node"
@@ -431,7 +459,9 @@
     "status": "node"
   },
   "POST /api/search-history": {
-    "status": "node"
+    "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
+    "status": "verified",
+    "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "POST /api/secret-lair/add": {
     "status": "node"
@@ -450,13 +480,19 @@
     "tests": "tests/collection_writes.rs::put_* (11 incl. printing, quantity grow/shrink copy-row math, trade/notes, allocation 409, api-key 403, 404s, card_id cache-miss forward); parity.mjs cw_put_* (10: gates, 404, bad-printing 400, notes/condition/printing/quantity/trade successes verified by cross-side read-back per owner ruling iter-21)"
   },
   "PUT /api/decks/:id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id} PUT under RUST_ROUTES=decks_writes)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::put_deck_contract (JS-falsy 400 set, non-object 500, Node-driver binding shapes 42->'42'/true->'1'/{}/[]->'[object Object]', cross-user/missing 404, charset+weak-ETag), auth_gate_and_parse_order (401/403, bad-JSON-500-before-auth), shape_guards_proxy_untouched_never_405; parity.mjs dk_put_200 (opposite-server GET name/description), dk_put_missing_404, dk_put_foreign_404, dk_put_no_name_400, dk_put_noauth_401, dk_put_badjson_500, dk_put_apikey_403"
   },
   "PUT /api/decks/:id/checkout": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/checkout PUT under RUST_ROUTES=decks_writes; withAllocationLock + single guarded UPDATE w/ supply CTEs, deficit diagnostics reuse decks_reads coverage_sql)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::checkout_contract (404/409-already/400-empty/422-unresolved ladder, unclamped-available deficit 'Missing 2x Counterspell (Owned: 0, In Use: 1)' live-pinned, logical-key fold across printings, locked-net-of-self happy path sets checked_out+at, second checkout 409; return clears flags, idempotent 200, 404s); parity.mjs dk2_checkout_200 (opposite-server flag read-back), dk2_checkout_shortage_400 (deterministic details array), dk2_checkout_already_409, dk2_checkout_missing_404, dk2_checkout_badjson_500, dk2_checkout_noauth_401, dk2_return_200, dk2_return_missing_404, dk2_return_noauth_401"
   },
   "PUT /api/decks/:id/return": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/return PUT under RUST_ROUTES=decks_writes; unconditional UPDATE after 404 ownership gate, mirrors Node)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::checkout_contract (return section: 200 clears checked_out/checked_out_at, idempotent second return 200, foreign/missing 404); parity.mjs dk2_return_200 (opposite-server flags cleared), dk2_return_missing_404, dk2_return_noauth_401 (keeps deck checked out)"
   },
   "PUT /api/lists/:id": {
     "status": "node"

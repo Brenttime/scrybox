@@ -68,13 +68,29 @@ for (let i = 0; i < 52; i++) {
 // the constant 'stats'), so this exercises per-request routing/parse cost
 // without pretending a param the route does not have.
 const stats = Array.from({ length: 52 }, (_, i) => `/api/stats?_v=${i}`);
+// stats sub-routes (iter 25): the three cached GET names a dashboard polls —
+// history over its four real periods, networth, top-mover. 52 rotating URLs
+// land on the six cache names, the realistic hit-heavy dashboard pattern.
+const SUBS = [
+  '/api/stats/history?period=7d',
+  '/api/stats/history?period=30d',
+  '/api/stats/history?period=1y',
+  '/api/stats/history?period=5y',
+  '/api/stats/networth',
+  '/api/stats/top-mover',
+];
+const statsSubs = Array.from({ length: 52 }, (_, i) => {
+  const p = SUBS[i % SUBS.length];
+  return `${p}${p.includes('?') ? '&' : '?'}_v=${i}`;
+});
 
-const groups = { collection_page: collectionPage, collection_full: collectionFull, search_db: searchDb, search_coll: searchColl, stats };
+const groups = { collection_page: collectionPage, collection_full: collectionFull, search_db: searchDb, search_coll: searchColl, stats, stats_subs: statsSubs };
 const scenarios = [
   { name: 'health', path: '/api/health' },
   { name: 'collection_page_varied', paths: groups.collection_page, headers: authOf('collection_page100') },
   { name: 'collection_full_varied', paths: groups.collection_full, concurrency: 2, duration: 15, workers: 1, headers: authOf('collection_full_27MB') },
   { name: 'stats_varied', paths: groups.stats, headers: authOf('stats') },
+  { name: 'stats_subs_varied', paths: groups.stats_subs, headers: authOf('stats') },
   { name: 'search_db_varied', paths: groups.search_db, headers: authOf('search_db_name_sol_ring') },
   { name: 'search_coll_varied', paths: groups.search_coll, headers: authOf('search_coll_sol_ring') },
 ];

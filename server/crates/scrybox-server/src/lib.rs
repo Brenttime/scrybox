@@ -39,6 +39,8 @@ pub mod oidc;
 pub mod collection;
 pub mod collection_writes;
 pub mod db;
+pub mod decks_writes;
+pub mod decks_reads;
 pub mod health;
 pub mod manabox;
 pub mod mfx_payload;
@@ -52,6 +54,9 @@ pub mod sets;
 pub mod sidecar;
 pub mod stats;
 mod stats_sql;
+pub mod stats_subs;
+pub mod search_history;
+pub mod shared;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -152,6 +157,10 @@ pub struct AppState {
     /// CV_MODEL_DIR — catalog meta/model dir catalog.js/cvScan.js stat.
     /// None => catalog-read handlers proxy (no silent empty answers).
     pub model_dir: Option<std::path::PathBuf>,
+    /// utils/deckListCache.js `store` twin (decks_reads): userId ->
+    /// (deck_list_revision, built body bytes). Per process like Node's
+    /// module-level Map; per AppState in tests keeps fixtures isolated.
+    pub deck_list_cache: Arc<std::sync::Mutex<std::collections::HashMap<i64, (i64, Vec<u8>)>>>,
 }
 
 impl AppState {
@@ -175,7 +184,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -333,6 +342,21 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
+    let router = if state.owns("stats_subs") {
+        // GET /api/stats/history, /api/stats/networth, /api/stats/top-mover
+        // (iter 25). commander-of-the-day stays on Node (Scryfall leg is
+        // Lane B surface — forwarding it whole-request would not make it
+        // native). Exact paths only: '/api/stats/' trailing-slash variants
+        // keep Express's loose-match answer through the proxy, same policy
+        // as the /stats mount, and mounting these never changes what
+        // /api/stats itself resolves to — the groups stay independent.
+        router
+            .route("/api/stats/history", any(stats_subs::handle_history))
+            .route("/api/stats/networth", any(stats_subs::handle_networth))
+            .route("/api/stats/top-mover", any(stats_subs::handle_top_mover))
+    } else {
+        router
+    };
     // Auth route group (iter 20, FULL PORT P1): everything under /api/auth
     // not in the known-route table is proxied by the handler itself, so
     // Express keeps authoring the 404 pages.
@@ -358,6 +382,23 @@ pub fn app(state: AppState) -> Router {
             .route("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
             .route("/api/cards/role-tags", any(cards_tags::handle_role_tags))
             .route("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
+    } else {
+        router
+    };
+    // Search-history + shared group (iter 27): the "stats/sets/search-history/
+    // shared" P2 cluster's remainder. search-history owns exactly
+    // /api/search-history (trailing-slash variants keep Express's
+    // loose-match answer through the proxy, per the iter-25 ruling); shared
+    // owns the PUBLIC GET /api/shared/:token (Node mounts it above the auth
+    // gate — Rust answers it without any session too). Methods/paths the
+    // port does not own proxy to Node untouched.
+    let router = if state.owns("search_history") {
+        router.route("/api/search-history", any(search_history::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("shared") {
+        router.route("/api/shared/{token}", any(shared::handle))
     } else {
         router
     };
@@ -427,6 +468,42 @@ pub fn app(state: AppState) -> Router {
             .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
             .route("/api/admin/backups", any(backup::handle_backups_collection))
             .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
+    } else {
+        router
+    };
+    // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
+    // `decks_writes`) and deck reads (GET list / detail / locations,
+    // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
+    // shapes, so one dispatcher route owns each: GET goes to decks_reads
+    // when that group is on, POST/PUT/DELETE to decks_writes, and everything
+    // else (or groups that are off) falls through to the catch-all proxy —
+    // never 405 here.
+    let router = if state.owns("decks_reads") {
+        router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") && state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::route_collection))
+    } else if state.owns("decks_reads") {
+        router.route("/api/decks", any(decks_reads::handle_list))
+    } else if state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::handle_create))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") || state.owns("decks_writes") {
+        router.route("/api/decks/{id}", any(decks_reads::route_entry))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_writes") {
+        router
+            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .route("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
+            .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
+            .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
+            .route("/api/decks/{id}/return", any(decks_writes::handle_return))
     } else {
         router
     };

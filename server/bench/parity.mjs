@@ -186,7 +186,7 @@ const FIXED_KEY = 'bnd_' + 'f'.repeat(48);
 const SESSION_EXP = '2030-01-01 00:00:00';
 const hashPw = (pw, salt) => `${PBKDF2_ITER}:${salt}:${crypto.pbkdf2Sync(pw, salt, PBKDF2_ITER, 64, 'sha512').toString('hex')}`;
 const PW_HASH0 = hashPw(PW_OLD, SALT0);
-function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { fn(d); } finally { d.close(); } }
+function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { return fn(d); } finally { d.close(); } }
 function resetParityUser() {
   dbWrite((d) => {
     const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
@@ -707,20 +707,40 @@ function expectPersisted(idsOf, pred, why) {
   };
 }
 
-async function fetchSide(base, c) {
+async function fetchSide(base, c, opts = {}) {
   const t0 = Date.now();
   let path = c.path, body = c.body, headers = c.headers, ctx = null;
   if (c.setup) {
     const s = await c.setup(base, c);
     if (s) { path = s.path ?? path; body = s.body ?? body; headers = s.headers ?? headers; ctx = s.ctx ?? null; }
   }
-  const res = await fetch(base + path, {
-    method: c.method,
-    headers: { ...headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
-    body,
-    redirect: 'manual',
-  });
-  const resBody = res.status === 304 ? '' : await res.text();
+  // Connection-level flakes (undici `TypeError: fetch failed` with an
+  // EPIPE/ECONNRESET cause — a stale keep-alive socket or an early server
+  // close mid-upload) must not crash the suite: the whole case is compared
+  // under MAX_TRIES, but an exception escaping here skipped even that.
+  // Retry the fetch itself (string bodies — safe to resend; write cases run
+  // serially with a fresh setup, and a duplicate landing surfaces as a
+  // cross-side mismatch on the next MAX_TRIES attempt, not a false PASS).
+  let res, resBody;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      res = await fetch(base + path, {
+        method: c.method,
+        headers: { ...headers, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
+        body,
+        redirect: 'manual',
+      });
+      resBody = res.status === 304 ? '' : await res.text();
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (!(e instanceof TypeError)) break; // only connection-level errors are retryable
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+    }
+  }
+  if (lastErr) throw lastErr;
   const parsed = resBody && (res.headers.get('content-type') || '').includes('json') ? JSON.parse(resBody) : undefined;
   // Cross-side write verification BEFORE teardown (the probe must still exist).
   // `parsed` lets auth-writer readBacks assert the SHAPE of freshly issued
@@ -732,7 +752,13 @@ async function fetchSide(base, c) {
     try { readback = await c.readBack(other, ctx, { json: parsed, status: res.status }); }
     catch (e) { readback = { ok: false, why: `readBack threw ${e}`, seen: null }; }
   }
-  if (c.teardown) { try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
+  // etagParity refetches pass skipTeardown: tearing down here would wipe the
+  // seeded rows and the ETag replays below would then read an emptied
+  // fixture (the iter-27 shrd_* replay failures: 200-with-empty-body instead
+  // of 304). etagParity runs the case's teardown itself once after replays.
+  if (c.teardown && !opts.skipTeardown) {
+    try { await c.teardown(base, ctx); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); }
+  }
   return {
     status: res.status,
     body: resBody,
@@ -873,10 +899,18 @@ async function etagParity(c) {
   // Replay only makes sense for idempotent GETs; write cases are compared by
   // response alone (their ETag is Express's default body tag, not a contract).
   if ((c.method || 'GET') !== 'GET') return [];
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats')) return [];
-  const [r, n] = await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks')) return [];
+  // Sequential on purpose: setup-bearing cases reseed shared DB rows, and
+  // two parallel setups would race each other's DELETE/INSERT mid-request
+  // (the iter-27 shrd_* replay failures). Same rationale as the write-case
+  // serial rule in the main loop. skipTeardown: the refetch must leave the
+  // fixture in place for the self-replay probes below; the case teardown
+  // then runs once in the finally.
+  let diffs = [];
+  try {
+  const r = await fetchSide(RUST, c, { skipTeardown: true });
+  const n = await fetchSide(NODE, c, { skipTeardown: true });
   if (r.status !== 200 || n.status !== 200) return [];
-  const diffs = [];
   const segs = t => /^W\/"col-([^-]+)-([^-]+)-([^-]+)-([^"]+)"$/.exec(t || '');
   const rs = segs(r.etag), ns = segs(n.etag);
   if (rs || ns) {
@@ -892,6 +926,14 @@ async function etagParity(c) {
       diffs.push(`byte-identical bodies, different tags: rust=${r.etag} node=${n.etag}`);
     }
   }
+  // Cases whose body is RANDOM BY DESIGN (e.g. /stats/networth: cached()'s
+  // onHit restamps asOf = new Date().toISOString() on EVERY response, hit or
+  // miss, so the Express body-derived ETag differs per request and a client
+  // can never observe a matching If-None-Match — 304 is unreachable by
+  // construction on BOTH sides). `etagReplay: false` opts those out of the
+  // self-replay probe; the ETag-presence checks above still run, and the
+  // response's shape is pinned by a dedicated readBack case instead.
+  if (c.etagReplay === false) return diffs;
   for (const [name, base, first] of [['rust', RUST, r], ['node', NODE, n]]) {
     if (!first.etag) continue;
     const again = await rawGet(base, c.path, { ...c.headers, 'if-none-match': first.etag });
@@ -899,6 +941,9 @@ async function etagParity(c) {
     if (again.bytes !== 0) diffs.push(`${name}: 304 carried a body (${again.bytes} bytes)`);
   }
   return diffs;
+  } finally {
+    if (c.teardown) { try { await c.teardown(RUST, null); } catch (e) { console.log(`  (teardown ${c.name}: ${e})`); } }
+  }
 }
 
   // --- add-group cases (iter 24: POST /api/collection, POST
@@ -982,6 +1027,800 @@ async function etagParity(c) {
     { name: 'ca_bulk_add_all_fail_500', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
       body: JSON.stringify({ card_ids: [{}, {}] }) },
   );
+
+// --- stats-subs group cases (iter 25: GET /api/stats/history,
+// /api/stats/networth, /api/stats/top-mover; RUST_ROUTES=stats_subs). Pure
+// cached reads — no writes, no readBack needed. asOf is random-by-design on
+// EVERY networth response (Node's cached() onHit restamps it per request,
+// hit or miss — routes/stats.js onHit), so it is stripped from body equality
+// like the auth tokens AND its per-request ETag can never replay to 304 on
+// either side: those cases set etagReplay:false (shape pinned by
+// ss_networth_asof_shape instead). history/top-mover keep ETag/304 replay
+// through etagParity (/api/stats* prefix). ---
+{
+  const sub = (name, path, extra = {}) =>
+    cases.push({ name, path, headers: authHeaders, method: 'GET', ...extra });
+  sub('ss_history_30d', '/api/stats/history?period=30d');
+  sub('ss_history_7d', '/api/stats/history?period=7d');
+  sub('ss_history_1y', '/api/stats/history?period=1y');
+  sub('ss_history_5y', '/api/stats/history?period=5y');
+  sub('ss_history_default', '/api/stats/history');
+  sub('ss_history_empty', '/api/stats/history?period=');
+  sub('ss_history_unknown', '/api/stats/history?period=xyz');
+  sub('ss_history_dup', '/api/stats/history?period=7d&period=1y');
+  sub('ss_history_encoded', '/api/stats/history?period=7%64');
+  sub('ss_networth', '/api/stats/networth', { strip: ['$.asOf'], etagReplay: false });
+  sub('ss_topmover', '/api/stats/top-mover');
+  // Second user: per-user bodies (and the empty-collection {card:null} /
+  // zero-totals paths) — session seeded by scripts/seed-parity-user1-session.sh.
+  const u1 = { Authorization: `Bearer ${USER1_TOKEN}` };
+  sub('ss_history_7d_user1', '/api/stats/history?period=7d', { headers: u1 });
+  sub('ss_networth_user1', '/api/stats/networth', { headers: u1, strip: ['$.asOf'], etagReplay: false });
+  sub('ss_topmover_user1', '/api/stats/top-mover', { headers: u1 });
+  // Error-path parity (orchestrator audit 2026-11-10 20:20, ruling 1):
+  // networth/top-mover need no-token 401 + bad-token 401 byte parity —
+  // same 401 bodies as the /api/stats surface (middleware/auth), asserted
+  // cross-side. etagReplay:false: 401 has no cache semantics to replay.
+  const noauth = { headers: {}, etagReplay: false };
+  const badtok = { headers: { Authorization: `Bearer ${'Bad' + 'Token999'}` }, etagReplay: false };
+  sub('ss_networth_noauth', '/api/stats/networth', noauth);
+  sub('ss_networth_badtoken', '/api/stats/networth', badtok);
+  sub('ss_topmover_noauth', '/api/stats/top-mover', noauth);
+  sub('ss_topmover_badtoken', '/api/stats/top-mover', badtok);
+  // asOf shape (fresh-stamp contract): each side's own asOf must be exact
+  // ISO-8601 UTC with ms (new Date().toISOString() shape); the value itself
+  // is random-by-design (restamped per request) and stripped from equality.
+  cases.push({
+    name: 'ss_networth_asof_shape', path: '/api/stats/networth', headers: authHeaders, method: 'GET',
+    strip: ['$.asOf'], etagReplay: false,
+    readBack: async (_other, _ctx, resp) => ({
+      ok: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(resp?.json?.asOf || '')),
+      why: `asOf not toISOString-shaped: ${resp?.json?.asOf}`,
+      seen: { shape: 'iso-ms' },
+    }),
+  });
+  // HEAD on a sub-route: Express router.get answers HEAD; Rust proxies it.
+  // Byte-comparison of the two answers is still the contract.
+  cases.push({ name: 'ss_networth_head', path: '/api/stats/networth', headers: authHeaders, method: 'HEAD' });
+  // POST is not routed in Express — 404 either side through the proxy.
+  cases.push({ name: 'ss_history_post', path: '/api/stats/history', headers: authHeaders, method: 'POST', body: '{}' });
+}
+
+// --- iter 27: search-history + shared (RUST_ROUTES=search_history,shared) ---
+// GET/POST/DELETE /api/search-history (per-user deflate-raw blob, session
+// gate) and the PUBLIC GET /api/shared/:share_token. Writes ride the HTTP
+// API channel only (rule 2); the per-user rows live and die with the
+// rusttest_parity fixture user, and every write case read-back-verifies
+// through the OPPOSITE server — which is also the cross-side codec test:
+// Rust's deflateRaw(level 9) blob must be readable by Node's inflateRawSync
+// and vice versa. Body-parser runs ABOVE the auth gate in server.js, so the
+// malformed-JSON POST answers 500 even without a token (shx_post_badjson).
+{
+  const SH = { Authorization: `Bearer ${'rusttest' + '-sh'}` };
+  const SH_JSON = { ...SH, 'content-type': 'application/json' };
+  function shClear() {
+    dbWrite((d) => {
+      const u = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+      if (u) d.prepare('DELETE FROM search_history WHERE user_id = ?').run(u.id);
+    });
+  }
+  async function shSeedItems(base, items) {
+    const r = await apiReq(base, 'POST', '/api/search-history', SH_JSON, JSON.stringify({ items }));
+    if (r.status !== 200) throw new Error(`parity shx seed failed: ${r.status} ${r.text.slice(0, 120)}`);
+  }
+  const shPrep = async () => { resetParityUser(); seedSession('rusttest-sh'); shClear(); return { ctx: null }; };
+
+  // --- error paths (no state touched) ---
+  const noauth = { headers: {}, etagReplay: false };
+  const badtok = { headers: { Authorization: `Bearer ${'Bad' + 'Token999'}` }, etagReplay: false };
+  cases.push({ name: 'shx_get_noauth', path: '/api/search-history', ...noauth });
+  cases.push({ name: 'shx_get_badtoken', path: '/api/search-history', ...badtok });
+  cases.push({ name: 'shx_post_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{"q":"x"}', etagReplay: false });
+  // Malformed JSON parses (and fails) BEFORE the gate — 500 with the generic
+  // error-handler body, not 401. Proves the parse/auth ORDER is ported too.
+  cases.push({ name: 'shx_post_badjson_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{oops', etagReplay: false });
+  // express.json({limit:'1mb'}) sits ABOVE the auth gate: a >1mb body is a
+  // 413 with the custom too-large message even with no token. Pins the
+  // limit + message on both sides.
+  cases.push({ name: 'shx_post_too_large_noauth', path: '/api/search-history', headers: { ...AUTH_JSON }, method: 'POST', body: '{"q":"' + 'x'.repeat(1.2 * 1024 * 1024) + '"}', etagReplay: false });
+
+  // --- empty read (Express default ETag + 304 replay via etagParity) ---
+  cases.push({ name: 'shx_get_empty', path: '/api/search-history', headers: SH, setup: shPrep });
+
+  // --- deterministic import of several items: dedupe (max-at wins), trim,
+  // empty-q filter, Number() coercion (string at), sort desc, key order. ---
+  const SH_ITEMS = [
+    { q: 'delta force', at: 1760000000000 },
+    { q: '  spaced  ', at: 1760000001000 },
+    { q: 'delta force', at: 1759999999000 },
+    { q: '   ' },
+    { q: 'emoji 🧪', at: '1760000002500' },
+  ];
+  const SH_EXPECT = [
+    { q: 'emoji 🧪', at: 1760000002000 },
+    { q: 'spaced', at: 1760000001000 },
+    { q: 'delta force', at: 1760000000000 },
+  ];
+  cases.push({
+    name: 'shx_post_items_ok', path: '/api/search-history', headers: SH_JSON, method: 'POST',
+    body: JSON.stringify({ items: SH_ITEMS }), etagReplay: false,
+    setup: shPrep, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const seen = JSON.stringify(g.json);
+      return { ok: g.status === 200 && JSON.stringify(g.json) === JSON.stringify(SH_EXPECT), why: `opposite GET -> ${g.status} ${seen}`, seen };
+    },
+  });
+
+  // --- single {q} add: at = now (random by design) — stripped; the readBack
+  // pins shape + freshness AND confirms the Rust-written blob on Node. ---
+  cases.push({
+    name: 'shx_post_q_ok', path: '/api/search-history', headers: SH_JSON, method: 'POST',
+    body: JSON.stringify({ q: '  parity solo q 🧪  ' }), strip: ['$.0.at'], etagReplay: false,
+    setup: shPrep, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const e = Array.isArray(g.json) ? g.json[0] : null;
+      const ok = g.status === 200 && Array.isArray(g.json) && g.json.length === 1
+        && e?.q === 'parity solo q 🧪' && typeof e?.at === 'number'
+        && Math.abs(e.at - Date.now()) < 5 * 60 * 1000;
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { q: e?.q, atShape: typeof e?.at } };
+    },
+  });
+
+  // --- 400 branches (empty add after cleaning) ---
+  cases.push({ name: 'shx_post_empty', path: '/api/search-history', headers: SH, method: 'POST', setup: shPrep, teardown: () => shClear(), etagReplay: false });
+  cases.push({ name: 'shx_post_items_all_blank', path: '/api/search-history', headers: SH_JSON, method: 'POST', body: JSON.stringify({ items: [{ q: '  ' }, {}] }), setup: shPrep, teardown: () => shClear(), etagReplay: false });
+  cases.push({ name: 'shx_post_array_body', path: '/api/search-history', headers: SH_JSON, method: 'POST', body: '[]', setup: shPrep, teardown: () => shClear(), etagReplay: false });
+
+  // --- deletes: seed 3 through the side's own API, then delete one / all. ---
+  const shSeedThree = async (base) => {
+    await shPrep();
+    await shSeedItems(base, [
+      { q: 'a one', at: 1760000000000 },
+      { q: 'b two', at: 1760000001000 },
+      { q: 'c three', at: 1760000002000 },
+    ]);
+    return { ctx: null };
+  };
+  cases.push({
+    name: 'shx_delete_one', path: '/api/search-history', headers: SH_JSON, method: 'DELETE',
+    body: JSON.stringify({ q: 'b two' }), etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const seen = JSON.stringify(g.json);
+      const ok = g.status === 200 && seen === JSON.stringify([
+        { q: 'c three', at: 1760000002000 }, { q: 'a one', at: 1760000000000 },
+      ]);
+      return { ok, why: `opposite GET -> ${g.status} ${seen}`, seen };
+    },
+  });
+  cases.push({
+    name: 'shx_delete_clear', path: '/api/search-history', headers: SH_JSON, method: 'DELETE',
+    body: '{}', etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const ok = g.status === 200 && JSON.stringify(g.json) === '[]';
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { cleared: ok } };
+    },
+  });
+  // No body at all: express.json skips (no content-type) -> req.body = {} ->
+  // q '' -> clear-everything. Ported decision, not assumed.
+  cases.push({
+    name: 'shx_delete_nobody', path: '/api/search-history', headers: SH, method: 'DELETE',
+    etagReplay: false,
+    setup: shSeedThree, teardown: () => shClear(),
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/search-history', SH);
+      const ok = g.status === 200 && JSON.stringify(g.json) === '[]';
+      return { ok, why: `opposite GET -> ${g.status} ${JSON.stringify(g.json)}`, seen: { cleared: ok } };
+    },
+  });
+
+  // --- API key on a write: 403 from the gate (keys are GET-only). ---
+  cases.push({
+    name: 'shx_post_apikey_403', path: '/api/search-history',
+    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    method: 'POST', body: '{"q":"nope"}', etagReplay: false,
+    setup: async () => { await shPrep(); dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
+    teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
+  });
+
+  // ===== shared (public, no session) =====
+  const SHARED_CARD2 = 'mtg-0001c639-8bd0-426f-89cb-4ca61f3cc054'; // Surge of Brilliance (fixture in card_cache)
+  const BAD_CARD = 'rusttest-shared-bad-types';
+  function shrdPrep({ trade = false, enable = true, rows = true, badRow = false } = {}) {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE username = ?)').run(PARITY_USER);
+      d.prepare('DELETE FROM users WHERE username = ?').run(PARITY_USER);
+      const r = d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, api_key) VALUES (?, ?, ?, ?, ?, NULL)')
+        .run(PARITY_USER, 'x', 'member', SHARE_T0, enable ? 1 : 0);
+      const uid = Number(r.lastInsertRowid);
+      d.prepare('DELETE FROM collection WHERE user_id = ? OR id BETWEEN 930001 AND 930010').run(uid);
+      d.prepare('DELETE FROM card_cache WHERE id = ?').run(BAD_CARD);
+      if (!rows) return;
+      // Explicit ids: etagParity re-runs setup per side; autoincrement ids
+      // would shift entry_id between the two runs and make the route's body
+      // ETag (and therefore the 304 replay) unreproducible by construction.
+      const ins = d.prepare('INSERT INTO collection (id, card_id, quantity, condition, printing, language, added_at, is_trade, user_id, is_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      ins.run(930001, CW_CARD, 2, 'Near Mint', 'Holofoil', 'English', '2026-01-03 10:00:00', 0, uid, 0);
+      ins.run(930002, SHARED_CARD2, 1, 'Lightly Played', 'Normal', 'English', '2026-01-02 10:00:00', trade ? 1 : 0, uid, 0);
+      ins.run(930003, SHARED_CARD2, 3, 'Near Mint', 'Normal', 'Japanese', '2026-01-01 10:00:00', 0, uid, 1);
+      if (badRow) {
+        d.prepare('INSERT INTO card_cache (id, name, types, subtypes, rarity, price_trend, price_estimated) VALUES (?, ?, ?, ?, ?, ?, 0)')
+          .run(BAD_CARD, 'Parity Bad Types', 'oops', '[]', 'Common', 1.5);
+        ins.run(930004, BAD_CARD, 1, 'Near Mint', 'Normal', 'English', '2025-12-31 10:00:00', 0, uid, 0);
+      }
+    });
+  }
+  function shrdTeardown() {
+    dbWrite((d) => {
+      const u = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+      if (u) d.prepare('DELETE FROM collection WHERE user_id = ?').run(u.id);
+      d.prepare('DELETE FROM card_cache WHERE id = ?').run(BAD_CARD);
+    });
+  }
+  // entry_id is autoincrement-random across the two side-runs — stripped per
+  // index (row count is fixture-deterministic); the persisted join is the
+  // same physical DB both sides read.
+  cases.push({
+    name: 'shrd_ok', path: `/api/shared/${SHARE_T0}`, headers: {},
+    // No teardown: etagParity replays AFTER both side fetches, and
+    // shrdTeardown's row-deletion would flip the replay GET to an empty
+    // collection (200, not 304). Rows are rebuilt deterministically
+    // (fixed ids) by every setup, and cleared by later cases.
+    setup: () => { shrdPrep({}); },
+  });
+  cases.push({
+    name: 'shrd_trade', path: `/api/shared/${SHARE_T0}?list=trade`, headers: {},
+    setup: () => { shrdPrep({ trade: true }); },
+  });
+  // Repeated list= becomes an ARRAY in qs (not === 'trade') -> collection
+  // branch; the trade row must appear again. Pins the qs semantics.
+  cases.push({
+    name: 'shrd_dup_list_param', path: `/api/shared/${SHARE_T0}?list=trade&list=trade`, headers: {},
+    setup: () => { shrdPrep({}); },
+  });
+  // qs ARRAY semantics: FIRST value 'trade' but a duplicate param -> value
+  // is an array !== 'trade' -> collection branch (trade row visible again).
+  cases.push({
+    name: 'shrd_list_conflict', path: `/api/shared/${SHARE_T0}?list=trade&list=foo`, headers: {},
+    setup: () => { shrdPrep({ trade: true }); },
+  });
+  // Malformed % in a query VALUE: qs 6.15.3 does NOT throw (verified against
+  // the container's own qs: qs.parse('x=%ZZ') -> {x:'%ZZ'}), so the raw
+  // value simply fails the === 'trade' equality and the collection branch
+  // answers normally. Pinned here with a valid token + seeded rows; if
+  // either server started throwing (Express 5 qs behaviour) this diverges.
+  cases.push({
+    name: 'shrd_bad_query_percent', path: `/api/shared/${SHARE_T0}?x=%ZZ`, headers: {}, etagReplay: false,
+    strip: ['$.collection.0.entry_id', '$.collection.1.entry_id', '$.collection.2.entry_id'],
+    setup: () => { shrdPrep({}); }, teardown: shrdTeardown,
+  });
+  cases.push({
+    name: 'shrd_empty', path: `/api/shared/${SHARE_T0}`, headers: {},
+    setup: () => { shrdPrep({ rows: false }); }, teardown: shrdTeardown,
+  });
+  cases.push({ name: 'shrd_notfound', path: '/api/shared/definitely-not-a-token', headers: {}, etagReplay: false });
+  cases.push({
+    name: 'shrd_disabled', path: `/api/shared/${SHARE_T0}`, headers: {}, etagReplay: false,
+    setup: () => { shrdPrep({ enable: false }); }, teardown: shrdTeardown,
+  });
+  // Percent-decoded param: %2F stays one raw segment -> 'abc/def' -> 404;
+  // invalid escape -> decodeURIComponent throws in routing -> generic 500.
+  cases.push({ name: 'shrd_percent_token', path: '/api/shared/abc%2Fdef', headers: {}, etagReplay: false });
+  cases.push({ name: 'shrd_bad_percent', path: '/api/shared/a%ZZb', headers: {}, etagReplay: false });
+  // Bad array column -> JSON.parse throws inside the try -> 500 body.
+  cases.push({
+    name: 'shrd_bad_types_500', path: `/api/shared/${SHARE_T0}`, headers: {}, etagReplay: false,
+    setup: () => { shrdPrep({ badRow: true }); }, teardown: shrdTeardown,
+  });
+  // HEAD: Rust proxies (port owns GET only); Express answers HEAD natively.
+  cases.push({ name: 'shrd_head', path: `/api/shared/${SHARE_T0}`, headers: {}, method: 'HEAD', setup: () => { shrdPrep({}); }, teardown: shrdTeardown });
+
+  // ===== decks_writes (iter 28): PUT /api/decks/:id, DELETE /api/decks/:id,
+  // DELETE /api/decks/:id/cards/:card_id. Fixed ids (like shrdPrep) so both
+  // side-runs see identical starting rows; teardown clears them. =====
+  const DK_DUP = 'rusttest-dk-dup-emh'; // second printing of Emergency Medical Hologram
+  function dkUid(d) {
+    const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+    const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+    if (!s) throw new Error('parity: bench session not found for deck cases');
+    return Number(s.user_id);
+  }
+  function dkClear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM card_cache WHERE id = ?').run(DK_DUP);
+  }
+  function dkPrep() {
+    dbWrite((d) => {
+      dkClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for foreign-deck case');
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931001, uid, 'DK Seed One', 'seed one', 0, '2026-01-01 00:00:00');
+      ins.run(931002, uid, 'DK Checked Out', 'seed co', 1, '2026-01-01 00:00:00');
+      ins.run(931003, other.id, 'DK Foreign', 'fd', 0, '2026-01-01 00:00:00');
+      ins.run(931004, uid, 'DK Empty', '', 0, '2026-01-01 00:00:00');
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK_DUP, 'Emergency Medical Hologram', '["Artifact"]', '[]', 'Rare', 0.2);
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931001, CW_CARD, 2);
+      dc.run(931001, DK_DUP, 1);
+      dc.run(931002, CW_CARD, 1);
+      d.prepare('INSERT INTO deck_maybe_cards (deck_id,card_id,quantity) VALUES (?,?,?)').run(931001, CW_CARD, 1);
+    });
+  }
+  function dkTeardown() { dbWrite((d) => dkClear(d)); }
+  const dkDbCounts = () => dbWrite((d) => ({
+    dc: d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931001').get().n,
+    dm: d.prepare('SELECT COUNT(*) n FROM deck_maybe_cards WHERE deck_id=931001').get().n,
+    co: d.prepare('SELECT COUNT(*) n FROM decks WHERE id=931002').get().n,
+  }));
+  // NOTE: all dk cases set etagReplay:false — these are write routes; the
+  // 304 replay of a *read* ETag is pinned by the shared/shrd cases instead.
+  const DK_JSON = { ...authHeaders, 'content-type': 'application/json' };
+  cases.push({
+    name: 'dk_put_200', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"DK Renamed","description":"parity desc"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const seen = { name: g.json?.name, description: g.json?.description };
+      return { ok: g.status === 200 && seen.name === 'DK Renamed' && seen.description === 'parity desc', why: `PUT persisted -> ${JSON.stringify(seen)}`, seen };
+    },
+  });
+  cases.push({
+    name: 'dk_put_missing_404', path: '/api/decks/999999', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"DK Renamed"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_foreign_404', path: '/api/decks/931003', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"Hijacked"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931003', { ...authHeaders, Authorization: '***' });
+      // The foreign deck belongs to another user — even that user's session
+      // is not available here; assert it still carries its original name
+      // through the shared DB (hijack did not persist).
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931003').get());
+      return { ok: !!d0 && d0.name === 'DK Foreign', why: `foreign deck untouched -> ${JSON.stringify(d0)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_put_no_name_400', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_noauth_401', path: '/api/decks/931001', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{"name":"Nope"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const c = dkDbCounts();
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931001').get());
+      return { ok: !!d0 && d0.name === 'DK Seed One', why: `noauth left row -> ${JSON.stringify(d0)} ${JSON.stringify(c)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_put_badjson_500', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_apikey_403', path: '/api/decks/931001', method: 'PUT', etagReplay: false,
+    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    body: '{"name":"Nope"}',
+    setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); dkPrep(); },
+    teardown: () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)); dkTeardown(); },
+  });
+  cases.push({
+    name: 'dk_delete_200', path: '/api/decks/931001', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const c = dkDbCounts();
+      return { ok: g.status === 404 && c.dc === 0 && c.dm === 0, why: `delete persisted -> HTTP ${g.status}, deck_cards=${c.dc}, maybe=${c.dm}`, seen: { status: g.status, ...c } };
+    },
+  });
+  cases.push({
+    name: 'dk_delete_checked_out_409', path: '/api/decks/931002', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const c = dkDbCounts();
+      const co = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931002').get());
+      return { ok: !!co && co.name === 'DK Checked Out', why: `checked-out deck survived -> ${JSON.stringify(co)} ${JSON.stringify(c)}`, seen: co };
+    },
+  });
+  cases.push({
+    name: 'dk_delete_missing_404', path: '/api/decks/999999', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_delete_noauth_401', path: '/api/decks/931001', headers: {}, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931001').get());
+      return { ok: !!d0 && d0.name === 'DK Seed One', why: `noauth left deck -> ${JSON.stringify(d0)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_200', path: `/api/decks/931001/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const cards = Array.isArray(g.json?.cards) ? g.json.cards.map((c) => c.name).sort() : null;
+      const maybe = Array.isArray(g.json?.maybeboard) ? g.json.maybeboard.length : null;
+      // Both printings of the logical card (CW_CARD + DK_DUP share the
+      // trimmed-lower name) must be gone; the maybeboard row stays.
+      const ok = g.status === 200 && cards && !cards.includes('Emergency Medical Hologram') && maybe === 1;
+      return { ok, why: `logical-card delete -> HTTP ${g.status}, cards=${JSON.stringify(cards)}, maybe=${maybe}`, seen: { cards, maybe } };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_deck_missing_404', path: `/api/decks/999999/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_deletecard_checked_out_409', path: `/api/decks/931002/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const n = dbWrite((d) => d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931002').get().n);
+      return { ok: n === 1, why: `checked-out deck kept its card (${n})`, seen: { n } };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_noauth_401', path: `/api/decks/931001/cards/${CW_CARD}`, headers: {}, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const n = dbWrite((d) => d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931001').get().n);
+      return { ok: n === 2, why: `noauth kept both deck_cards rows (${n})`, seen: { n } };
+    },
+  });
+
+  // ===== decks_writes iter 30: POST /api/decks, POST /api/decks/:id/cards,
+  // POST /api/decks/:id/register-collection, PUT /api/decks/:id/checkout,
+  // PUT /api/decks/:id/return. Own id range (931011..931018) and two
+  // private card_cache rows (rusttest-dk2-*) so fixture churn cannot leak
+  // into the iter-28/29 cases or the stats/networth bodies. 931012 (the
+  // checked-out deck) carries CW_CARD, NOT the dk2 cards: the checkout
+  // locked/supply CTEs scan the user's checked-out decks, and CW_CARD's
+  // logical name must not collide with the checkout cases' expectations.
+  // Setup runs per side, so both side-runs see identical rows. =====
+  const DK2_A = 'rusttest-dk2-alpha';
+  const DK2_B = 'rusttest-dk2-beta';
+  const DK2_NAME_A = 'rusttest DK2 Alpha';
+  const DK2_NAME_B = 'rusttest DK2 Beta';
+  function dk2Clear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931011 AND 931018').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931011 AND 931018').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931011 AND 931018').run();
+    d.prepare("DELETE FROM decks WHERE name IN ('DK2 Fresh','DK2 Import')").run();
+    d.prepare('DELETE FROM collection WHERE card_id IN (?, ?)').run(DK2_A, DK2_B);
+    d.prepare('DELETE FROM price_history WHERE card_id IN (?, ?)').run(DK2_A, DK2_B);
+    d.prepare('DELETE FROM card_cache WHERE id IN (?, ?)').run(DK2_A, DK2_B);
+  }
+  function dk2Prep() {
+    dbWrite((d) => {
+      dk2Clear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK2_A, DK2_NAME_A, '["Artifact"]', '[]', 'Rare', 0.1);
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK2_B, DK2_NAME_B, '["Creature"]', '[]', 'Common', 0.2);
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931011, uid, 'DK2 Add', '', 0, '2026-01-01 00:00:00');
+      ins.run(931012, uid, 'DK2 Checked Out', '', 1, '2026-01-01 00:00:00');
+      ins.run(931013, other.id, 'DK2 Foreign', '', 0, '2026-01-01 00:00:00');
+      ins.run(931014, uid, 'DK2 Empty', '', 0, '2026-01-01 00:00:00');
+      ins.run(931015, uid, 'DK2 Broken', '', 0, '2026-01-01 00:00:00');
+      ins.run(931016, uid, 'DK2 Reg', '', 0, '2026-01-01 00:00:00');
+      ins.run(931017, uid, 'DK2 Out', '', 0, '2026-01-01 00:00:00');
+      ins.run(931018, uid, 'DK2 Short', '', 0, '2026-01-01 00:00:00');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931012, CW_CARD, 1);            // checked-out deck: CW_CARD only (see note)
+      dc.run(931015, 'rusttest-dk2-unresolved', 1);
+      dc.run(931016, DK2_A, 2);
+      dc.run(931016, DK2_B, 1);
+      dc.run(931017, DK2_A, 2);
+      dc.run(931017, DK2_B, 1);
+      dc.run(931018, DK2_B, 2);
+      d.prepare('UPDATE decks SET checked_out = 1, checked_out_at = CURRENT_TIMESTAMP WHERE id = 931012').run();
+    });
+  }
+  function dk2FundA(qty) {
+    dbWrite((d) => {
+      const uid = dkUid(d);
+      d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)').run(DK2_A, qty, uid);
+    });
+  }
+  function dk2Teardown() { dbWrite((d) => dk2Clear(d)); }
+  const dk2Db = (sql, ...args) => dbWrite((d) => d.prepare(sql).all(...args));
+  cases.push({
+    name: 'dk2_create_201', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{"name":"DK2 Fresh"}', etagReplay: false, strip: ['id'],
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async (other) => {
+      // id stripped (autoincrement differs by side); row persisted with Node defaults.
+      const rows = dk2Db("SELECT name, description, format, category, accent_color, target_size FROM decks WHERE name='DK2 Fresh'");
+      const want = { name: 'DK2 Fresh', description: '', format: 'Standard', category: 'Competitive', accent_color: '#eab308', target_size: 60 };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `create row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Decklist import twin of /^(\d+)x?\s+(.+)$/i — uppercase 'X' line must
+    // ALSO match (/i flag); junk line silently skipped; upsert stacks to 5.
+    name: 'dk2_create_decklist_201', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{"name":"DK2 Import","decklist_text":"4x rusttest DK2 Alpha\\nnot a line\\n1X rusttest DK2 Alpha\\n"}',
+    etagReplay: false, strip: ['id'],
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db(
+        "SELECT dc.card_id, dc.quantity FROM deck_cards dc JOIN decks dd ON dd.id = dc.deck_id WHERE dd.name='DK2 Import' ORDER BY dc.card_id",
+      );
+      return { ok: rows.length === 1 && rows[0].card_id === DK2_A && rows[0].quantity === 5, why: `import rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_create_no_name_400', path: '/api/decks', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db("SELECT COUNT(*) n FROM decks WHERE name LIKE 'DK2 Fresh%'");
+      return { ok: rows[0].n === 0, why: `400 created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_create_noauth_401', path: '/api/decks', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{"name":"DK2 Nope"}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db("SELECT COUNT(*) n FROM decks WHERE name='DK2 Nope'");
+      return { ok: rows[0].n === 0, why: `noauth created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_addcard_200', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":"2"}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const cards = dk2Db('SELECT card_id, quantity FROM deck_cards WHERE deck_id=931011 ORDER BY card_id');
+      const ph = dk2Db('SELECT COUNT(*) n FROM price_history WHERE card_id=?', DK2_A);
+      return { ok: cards.length === 1 && cards[0].card_id === DK2_A && cards[0].quantity === 2 && ph[0].n === 1, why: `added -> ${JSON.stringify(cards)} ph=${ph[0].n}`, seen: { cards, ph } };
+    },
+  });
+  cases.push({
+    name: 'dk2_addcard_no_card_400', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: '{"quantity":1}', etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_foreign_404', path: '/api/decks/931013/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_checkedout_409', path: '/api/decks/931012/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_over_owned_400', path: '/api/decks/931011/cards', headers: DK_JSON, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":6}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_addcard_noauth_401', path: '/api/decks/931011/cards', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: `{"card_id":"${DK2_A}","quantity":1}`, etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(5); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931011');
+      return { ok: rows[0].n === 0, why: `noauth added nothing (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_register_201', path: '/api/decks/931016/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db(
+        'SELECT card_id, quantity, condition, language, is_trade FROM collection WHERE card_id IN (?, ?) ORDER BY card_id',
+        DK2_A, DK2_B,
+      );
+      const want = [
+        { card_id: DK2_A, quantity: 2, condition: 'Near Mint', language: 'English', is_trade: 0 },
+        { card_id: DK2_B, quantity: 1, condition: 'Near Mint', language: 'English', is_trade: 0 },
+      ];
+      return { ok: JSON.stringify(rows) === JSON.stringify(want), why: `registered rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_register_empty_400', path: '/api/decks/931014/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_unresolved_422', path: '/api/decks/931015/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_checkedout_409', path: '/api/decks/931012/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    // express.json runs before auth on this route: the body is parsed (and
+    // 500s on bad JSON) even though the handler ignores it.
+    name: 'dk2_register_badjson_500', path: '/api/decks/931016/register-collection', headers: DK_JSON, method: 'POST',
+    body: '{oops', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_register_noauth_401', path: '/api/decks/931016/register-collection', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT COUNT(*) n FROM collection WHERE card_id IN (?, ?)', DK2_A, DK2_B);
+      return { ok: rows[0].n === 0, why: `noauth registered nothing (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_checkout_200', path: '/api/decks/931017/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); dk2FundA(2); dbWrite((d) => { d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)').run(DK2_B, 1, dkUid(d)); }); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co, (checked_out_at IS NOT NULL) at_set FROM decks WHERE id=931017');
+      return { ok: rows.length === 1 && rows[0].co === 1 && rows[0].at_set === 1, why: `checkout state -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Shortfall ladder: DK2_B needed 2, owned 0, in-use 0 -> deterministic
+    // details array (unclamped available, raw row values in the template).
+    name: 'dk2_checkout_shortage_400', path: '/api/decks/931018/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931018');
+      return { ok: rows[0].co === 0, why: `shortfall did not check out (${rows[0].co})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_checkout_already_409', path: '/api/decks/931012/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_missing_404', path: '/api/decks/999999/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_badjson_500', path: '/api/decks/931017/checkout', headers: DK_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_checkout_noauth_401', path: '/api/decks/931017/checkout', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931017');
+      return { ok: rows[0].co === 0, why: `noauth left deck in (${rows[0].co})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_return_200', path: '/api/decks/931012/return', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co, checked_out_at at FROM decks WHERE id=931012');
+      return { ok: rows[0].co === 0 && rows[0].at === null, why: `return cleared flags -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'dk2_return_missing_404', path: '/api/decks/999999/return', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+  });
+  cases.push({
+    name: 'dk2_return_noauth_401', path: '/api/decks/931012/return', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dk2Prep(); }, teardown: dk2Teardown,
+    readBack: async () => {
+      const rows = dk2Db('SELECT checked_out co FROM decks WHERE id=931012');
+      return { ok: rows[0].co === 1, why: `noauth kept deck checked out (${rows[0].co})`, seen: rows };
+    },
+  });
+
+  // ===== decks_reads (iter 29): GET /api/decks, GET /api/decks/:id,
+  // GET /api/decks/:id/locations. Fixed ids, realistic scryfall-local row
+  // shape (supertype 'MTG', types = colour words, subtypes = TYPE words
+  // split — deckCommander's quoted-word candidate match and sqlIsBasicLand
+  // both key off that tokenisation; live-pinned against a throwaway
+  // scrybox:3e91010-headbtn container on this same fixture). The cross-side
+  // deepDiff (values + array order + key order) is the contract; drPrep's
+  // writes bump deck_list_revision, so neither side can leak a stale
+  // per-process deck-list cache body. =====
+  const DR = {
+    etali: 'rusttest-dr-etali', etaliB: 'rusttest-dr-etali-b',
+    vial: 'rusttest-dr-vial', vialB: 'rusttest-dr-vial-b',
+    plains: 'rusttest-dr-plains', eur: 'rusttest-dr-eur',
+  };
+  function drClear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931101 AND 931106').run();
+    d.prepare('DELETE FROM collection WHERE card_id LIKE ?').run('rusttest-dr-%');
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-dr-%');
+  }
+  function drPrep() {
+    dbWrite((d) => {
+      drClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for dr cases');
+      const card = d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      card.run(DR.etali, 'RustTest DR Etali', 'MTG', '["Red","Green"]', '["Legendary","Creature","Dragon"]', 'Rare', 'drs', 'DR Set', '1', 'img/dr-etali-a', 1, 1, 0, 0, 0, 6, '["R","G"]', 'USD');
+      card.run(DR.etaliB, 'RustTest DR Etali ', 'MTG', '["Red","Green"]', '["Legendary","Creature","Dragon"]', 'Rare', 'drsb', 'DR Set B', '2', 'img/dr-etali-b', 0.5, 0.5, 0, 0, 0, 6, '["R","G"]', 'USD');
+      card.run(DR.vial, 'RustTest DR Vial', 'MTG', '[]', '["Artifact"]', 'Uncommon', 'drs', 'DR Set', '3', 'img/dr-vial-a', 0.1, 0.1, 0, 0, 0, 1, '[]', 'USD');
+      card.run(DR.vialB, 'RustTest DR Vial ', 'MTG', '[]', '["Artifact"]', 'Uncommon', 'drsb', 'DR Set B', '4', 'img/dr-vial-b', 0.05, 0.05, 0, 0, 0, 1, '[]', 'USD');
+      card.run(DR.plains, 'RustTest DR Plains', 'MTG', '[]', '["Basic","Land"]', 'Common', 'drs', 'DR Set', '261', null, 0.01, 0.01, 0, 0, 0, 0, '[]', 'USD');
+      card.run(DR.eur, 'RustTest DR Eur', 'MTG', '[]', '["Artifact"]', 'Common', 'drs', 'DR Set', '9', null, 2, 2, 0, 0, 0, 1, '[]', 'EUR');
+      const deck = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      deck.run(931101, uid, 'DR Commander', 'dc', 0, '2026-01-01 00:00:05');
+      deck.run(931102, uid, 'DR Coverage', 'cv', 0, '2026-01-01 00:00:04');
+      deck.run(931103, uid, 'DR Locked', 'lk', 1, '2026-01-01 00:00:03');
+      deck.run(931104, uid, 'DR Broken', 'bd', 0, '2026-01-01 00:00:02');
+      deck.run(931105, other.id, 'DR Foreign', 'fd', 0, '2026-01-01 00:00:01');
+      deck.run(931106, other.id, 'DR Their Locked', 'tl', 1, '2026-01-01 00:00:00');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity,is_commander) VALUES (?,?,?,?)');
+      dc.run(931101, DR.etali, 1, 0);
+      dc.run(931101, DR.vial, 4, 0);
+      dc.run(931102, DR.plains, 3, 0);
+      dc.run(931102, DR.vial, 1, 0);
+      dc.run(931102, DR.eur, 1, 0);
+      dc.run(931103, DR.plains, 3, 0);
+      dc.run(931104, 'rusttest-dr-nope', 1, 0);
+      dc.run(931106, DR.plains, 9, 0);
+      d.prepare('INSERT INTO deck_maybe_cards (deck_id,card_id,quantity) VALUES (?,?,?)').run(931101, DR.etaliB, 2);
+      const col = d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)');
+      col.run(DR.vialB, 2, uid);
+      col.run(DR.plains, 2, uid);
+    });
+  }
+  function drTeardown() { dbWrite((d) => drClear(d)); }
+  const drCase = (name, path, headers = authHeaders, method = 'GET') =>
+    cases.push({ name, path, headers, method, setup: drPrep, teardown: drTeardown });
+  // The list body carries total/ownership/commander/minimum-value per deck,
+  // the coverage rows carry locked-exclusion (931103 locks user's own
+  // copies; 931106 is another user's locked deck and must NOT), the basic-
+  // land flag, and the missing-DESC sort. EUR card exercises the unpriced
+  // gate; 931104 exercises the unresolved/422 paths.
+  drCase('dr_list_200', '/api/decks');
+  drCase('dr_list_noauth_401', '/api/decks', {});
+  drCase('dr_detail_200', '/api/decks/931101');
+  drCase('dr_detail_locked_200', '/api/decks/931103');
+  drCase('dr_detail_foreign_404', '/api/decks/931105');
+  drCase('dr_detail_broken_422', '/api/decks/931104');
+  drCase('dr_detail_noauth_401', '/api/decks/931101', {});
+  drCase('dr_locations_200', '/api/decks/931102/locations');
+  drCase('dr_locations_locked_200', '/api/decks/931103/locations');
+  drCase('dr_locations_foreign_404', '/api/decks/931105/locations');
+  drCase('dr_locations_broken_422', '/api/decks/931104/locations');
+  drCase('dr_locations_noauth_401', '/api/decks/931102/locations', {});
+  // (No /combos parity case: it fetches the public Spellbook API — body is
+  // upstream-flaky. The never-swallow guard is pinned by the path test
+  // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
+}
+
 
 // --- run ---------------------------------------------------------------------
 
