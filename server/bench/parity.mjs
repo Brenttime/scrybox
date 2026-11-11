@@ -601,6 +601,43 @@ cases.push({ name: 'mox_delete_missing', path: '/api/moxfield/authors/999999', h
 cases.push({ name: 'mox_deck_put_missing', path: '/api/moxfield/decks/no-such-public-id', headers: authHeaders, method: 'PUT', body: '{"enabled":true}' });
 cases.push({ name: 'mox_deck_sync_missing', path: '/api/moxfield/decks/no-such-public-id/sync', headers: authHeaders, method: 'POST' });
 
+// --- ManaBox sync + backups parity (Lane B unit3b) ---------------------------
+// preview is the deep fold (CSV parse + identity check + planCollection +
+// planLists + summary + markdown report) over the shared DB copy with the
+// fixture card already cached (no Scryfall leg fires). The report's
+// wall-clock header line is scrubbed; every other byte of body must agree.
+// Apply is exercised ONLY through the pre-write 409 arm (expectBefore guard
+// rejects before any write) — the full write path is non-idempotent across
+// the two sides and stays cargo-fixture-only (tests/manabox_sync.rs), per the
+// collection_writes precedent. Admin backup GET lists the same host
+// directory on both sides (container bind-mounts data/); the env-dependent
+// `dir` string is stripped, the listing itself is compared.
+const MB_HDR = 'Binder Name,Binder Type,Name,Set code,Collector number,Foil,Quantity,Scryfall ID,Condition,Language,Added';
+const MB_UUID = 'dda6f965-cbdf-4dbc-b0b1-00c27e32f5f2'; // parity fixture card (cached, set trk #15)
+const MB_CSV = [
+  MB_HDR,
+  `SyncTest,binder,Emergency Medical Hologram,trk,15,normal,1,${MB_UUID},mint,en,2024-01-02T03:04:05.000Z`,
+  `SyncTestList,list,Emergency Medical Hologram,trk,15,normal,1,${MB_UUID},mint,en,2024-01-01T00:00:00.000Z`,
+  `SyncTest,binder,Whatever,trk,15,metal,1,${MB_UUID},mint,en,`,
+].join('\n') + '\n';
+const MB_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const MB_TS = ['^# ManaBox sync [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC', '# ManaBox sync TS UTC'];
+cases.push({ name: 'mb_preview_ok', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV, fileName: 'parity.csv' }), scrub: [['$.report', MB_TS[0], MB_TS[1]]] });
+cases.push({ name: 'mb_preview_empty', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'mb_preview_not_export', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST', body: JSON.stringify({ csv: 'Name,Quantity\nx,2\n' }) });
+cases.push({ name: 'mb_preview_no_token', path: '/api/manabox-sync/preview', headers: { 'content-type': 'application/json' }, method: 'POST', body: JSON.stringify({ csv: MB_CSV }) });
+cases.push({ name: 'mb_preview_member', path: '/api/manabox-sync/preview', headers: { ...MB_JSON, Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV }), scrub: [['$.report', MB_TS[0], MB_TS[1]]] });
+cases.push({ name: 'mb_apply_stale_409', path: '/api/manabox-sync/apply', headers: MB_JSON, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV, expectBefore: 999999 }) });
+cases.push({ name: 'mb_apply_empty', path: '/api/manabox-sync/apply', headers: MB_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'mb_runs_empty', path: '/api/manabox-sync/runs', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mb_report_missing', path: '/api/manabox-sync/runs/999999/report', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mb_backups_list', path: '/api/admin/backups', headers: authHeaders, method: 'GET', strip: ['$.dir'] });
+cases.push({ name: 'mb_backups_list_member', path: '/api/admin/backups', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
+cases.push({ name: 'mb_backups_list_no_token', path: '/api/admin/backups', headers: {}, method: 'GET' });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
@@ -753,6 +790,23 @@ function stripPaths(obj, paths) {
   return clone;
 }
 
+/// Like stripPaths but REWRITES string leaves at `$.a.b` paths
+/// ([[path, regexSource, replacement], ...]). Used by manabox preview: the
+/// report's `# ManaBox sync <ISO minute> UTC` header is wall-clock by design,
+/// everything else in the report is a pure fold and must match byte for byte.
+function scrubStrings(obj, scrubs) {
+  if (!scrubs || !obj || typeof obj !== 'object') return obj;
+  const clone = structuredClone(obj);
+  for (const [p, re, rep] of scrubs) {
+    const parts = p.replace(/^\$\.?/, '').split('.');
+    let cur = clone;
+    for (let i = 0; i < parts.length - 1 && cur; i++) cur = cur[parts[i]];
+    const leaf = parts[parts.length - 1];
+    if (cur && typeof cur[leaf] === 'string') cur[leaf] = cur[leaf].replace(new RegExp(re, 'g'), rep);
+  }
+  return clone;
+}
+
 function compareCase(c, r, n) {
   const diffs = [];
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
@@ -761,7 +815,7 @@ function compareCase(c, r, n) {
   if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
     if (r.json === undefined || n.json === undefined) diffs.push('one side non-JSON body');
-    else deepDiff(stripPaths(r.json, c.strip), stripPaths(n.json, c.strip), '$', diffs);
+    else deepDiff(scrubStrings(stripPaths(r.json, c.strip), c.scrub), scrubStrings(stripPaths(n.json, c.strip), c.scrub), '$', diffs);
   } else if (r.body !== n.body) {
     diffs.push(`body ${fmt(r.body)} vs ${fmt(n.body)}`);
   }

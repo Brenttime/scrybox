@@ -1,464 +1,485 @@
 {
- "DELETE /api/admin/users/:id": {
-  "status": "node"
- },
- "DELETE /api/auth/api-key": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_ok (known key 401s on the opposite server after revoke) + authr_apikey_delete_no_token"
- },
- "DELETE /api/card-art/:cardId": {
-  "status": "node"
- },
- "DELETE /api/collection/:id": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::delete_200_404_409; parity.mjs cw_delete_200,cw_delete_missing_404,cw_delete_no_token"
- },
- "DELETE /api/decks/:id": {
-  "status": "node"
- },
- "DELETE /api/decks/:id/cards/:card_id": {
-  "status": "node"
- },
- "DELETE /api/lists/:id": {
-  "status": "node"
- },
- "DELETE /api/lists/:id/cards/:card_id": {
-  "status": "node"
- },
- "DELETE /api/moxfield/authors/:id": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "DELETE /api/search-history": {
-  "status": "node"
- },
- "GET *": {
-  "status": "node"
- },
- "GET /api/admin/backups": {
-  "status": "node"
- },
- "GET /api/admin/backups/:file/download": {
-  "status": "node"
- },
- "GET /api/admin/catalogs": {
-  "status": "node"
- },
- "GET /api/admin/catalogs/languages": {
-  "module": "scrybox-server::catalog_read (lib.rs GET /api/admin/catalogs/languages)",
-  "status": "verified",
-  "tests": "tests/catalog_art_route.rs (catalog_languages_admin_ladder_and_shape, catalog_languages_method_mismatch_proxies); parity.mjs catalog_langs_ok/catalog_langs_game_pokemon/catalog_langs_no_token/catalog_langs_member/catalog_langs_apikey"
- },
- "GET /api/admin/catalogs/progress": {
-  "status": "node"
- },
- "GET /api/admin/models": {
-  "status": "node"
- },
- "GET /api/admin/users": {
-  "status": "node"
- },
- "GET /api/auth/config": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::config_reports_flags_with_weak_etag; parity.mjs authr_config"
- },
- "GET /api/auth/me": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::me_requires_token_and_serialises_req_user; parity.mjs authr_me_no_token/bad_token/ok"
- },
- "GET /api/auth/oidc/callback": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/oidc_e2e.rs::full_oidc_ladder; parity.mjs authr_oidc_callback_disabled"
- },
- "GET /api/auth/oidc/login": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/oidc_e2e.rs::full_oidc_ladder (stub HS256 IdP, PKCE/nonce/tamper legs); parity.mjs authr_oidc_login_disabled"
- },
- "GET /api/card-art/:cardId.png": {
-  "module": "scrybox-server::card_art (lib.rs GET /api/card-art/{cardId}, .png suffix enforced)",
-  "status": "verified",
-  "tests": "tests/catalog_art_route.rs (png_serves_user_layer_over_bundled, png_404_unknown_invalid_ids_and_proxies_other_paths); parity.mjs card_art_png_ok/card_art_png_404/card_art_png_bad_shape"
- },
- "GET /api/card-art/index": {
-  "module": "scrybox-server::card_art (lib.rs GET /api/card-art/index)",
-  "status": "verified",
-  "tests": "tests/catalog_art_route.rs (index_folds_layers_sorted_deduped, index_absent_dirs_answer_empty); parity.mjs card_art_index"
- },
- "GET /api/cards/:id/decks": {
-  "status": "node"
- },
- "GET /api/cards/:id/oracle": {
-  "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle)",
-  "status": "verified",
-  "tests": "tests/cards_tags_route.rs (oracle_cached_row_paths, oracle_legacy_row_fetch_backfills_rules_columns, oracle_fetch_404_and_error_ladder); parity.mjs cards_oracle_ok/cards_oracle_404/cards_oracle_no_token"
- },
- "GET /api/cards/:id/oracle-tags": {
-  "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle-tags)",
-  "status": "verified",
-  "tests": "tests/cards_tags_route.rs (oracle_tags_direct_inherited_and_via, oracle_tags_no_gen_no_oracle_and_fallback, oracle_tags_auth_gate_and_proxy); parity.mjs cards_oracle_tags_ok/cards_oracle_tags_fallback/cards_oracle_tags_404_shape/cards_oracle_tags_no_token"
- },
- "GET /api/cards/:id/price-history": {
-  "status": "node"
- },
- "GET /api/cardscan/status": {
-  "status": "node"
- },
- "GET /api/collection": {
-  "module": "scrybox-server::collection (lib.rs GET /api/collection)",
-  "status": "verified",
-  "tests": "tests/collection.rs (21); parity.mjs collection_page100 + collection_full_27MB + EXTRA_COLLECTION x10"
- },
- "GET /api/collection/cardlist": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::cardlist_plain_exact,cardlist_detailed_exact,cardlist_empty_is_empty_string,cardlist_422_when_unresolved,cardlist_401_no_token; parity.mjs cw_cardlist_plain,detailed,no_token"
- },
- "GET /api/decks": {
-  "status": "node"
- },
- "GET /api/decks/:id": {
-  "status": "node"
- },
- "GET /api/decks/:id/combos": {
-  "status": "node"
- },
- "GET /api/decks/:id/locations": {
-  "status": "node"
- },
- "GET /api/decks/:id/synergy": {
-  "status": "node"
- },
- "GET /api/export": {
-  "status": "node"
- },
- "GET /api/health": {
-  "module": "scrybox-server::health (lib.rs GET /api/health)",
-  "status": "verified",
-  "tests": "tests/health.rs (4); parity.mjs health"
- },
- "GET /api/lists": {
-  "status": "node"
- },
- "GET /api/lists/:id": {
-  "status": "node"
- },
- "GET /api/lists/:id/cardlist": {
-  "status": "node"
- },
- "GET /api/lists/card-matches": {
-  "status": "node"
- },
- "GET /api/manabox-sync/runs": {
-  "status": "node"
- },
- "GET /api/manabox-sync/runs/:id/report": {
-  "status": "node"
- },
- "GET /api/marketplace/accounts": {
-  "status": "node"
- },
- "GET /api/marketplace/recent/:source": {
-  "status": "node"
- },
- "GET /api/moxfield": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "GET /api/precons": {
-  "status": "node"
- },
- "GET /api/rules": {
-  "status": "node"
- },
- "GET /api/rules/keywords": {
-  "status": "node"
- },
- "GET /api/scan-sets": {
-  "module": "scrybox-server::catalog_read (lib.rs GET /api/scan-sets)",
-  "status": "verified",
-  "tests": "tests/catalog_art_route.rs (scan_sets_counts_and_gates, scan_sets_missing_langs_or_model_proxies); parity.mjs scan_sets_ok/scan_sets_lang_ja/scan_sets_lang_es/scan_sets_no_token"
- },
- "GET /api/search": {
-  "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
-  "status": "verified",
-  "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
- },
- "GET /api/search-history": {
-  "status": "node"
- },
- "GET /api/secret-lair": {
-  "status": "node"
- },
- "GET /api/secret-lair/preview": {
-  "status": "node"
- },
- "GET /api/sets": {
-  "module": "scrybox-server::sets (lib.rs GET /api/sets)",
-  "status": "verified",
-  "tests": "tests/sets_route.rs (3); parity.mjs sets_flat/sets_tree/sets_lang_de/sets_empty_query/sets_no_token/sets_bad_token"
- },
- "GET /api/settings": {
-  "status": "node"
- },
- "GET /api/settings/version": {
-  "status": "node"
- },
- "GET /api/shared/:share_token": {
-  "status": "node"
- },
- "GET /api/stats": {
-  "module": "scrybox-server::stats (+stats_sql; lib.rs GET /api/stats)",
-  "status": "verified",
-  "tests": "tests/stats.rs (15); parity.mjs stats + stats_post_write (5 s SWR per owner ruling)"
- },
- "GET /api/stats/commander-of-the-day": {
-  "status": "node"
- },
- "GET /api/stats/history": {
-  "status": "node"
- },
- "GET /api/stats/networth": {
-  "status": "node"
- },
- "GET /api/stats/top-mover": {
-  "status": "node"
- },
- "GET /api/suggest": {
-  "status": "node"
- },
- "GET /models/cornelius.onnx": {
-  "status": "node"
- },
- "POST /api/admin/backups": {
-  "status": "node"
- },
- "POST /api/admin/catalogs/build": {
-  "status": "node"
- },
- "POST /api/admin/catalogs/stop": {
-  "status": "node"
- },
- "POST /api/admin/models/download": {
-  "status": "node"
- },
- "POST /api/admin/seed-cards": {
-  "status": "node"
- },
- "POST /api/admin/users": {
-  "status": "node"
- },
- "POST /api/auth/api-key": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_post_ok (bnd_+48hex shape; fresh key GET-works + POST-403 + persisted, verified on the opposite server) + authr_apikey_post_no_token"
- },
- "POST /api/auth/bootstrap": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::bootstrap_creates_owner_and_adopts_orphans; parity.mjs authr_bootstrap_users_exist/short_pw + parity-auth-ephemeral.mjs bootstrap_201/session_cross_read/again_409 (throwaway empty-DB pair)"
- },
- "POST /api/auth/login": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::login_success_legacy_and_parser_quirks + rate_limit_shared_bucket_per_ip; parity.mjs authr_login_ok (200 + token shape + fresh session cross-server read as rusttest_parity) + authr_login_missing_fields/wrong"
- },
- "POST /api/auth/logout": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_logout_ok (seeded session; revoked row 401s on the opposite server) + authr_logout_no_token"
- },
- "POST /api/auth/register": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled + parity-auth-ephemeral.mjs register_201/duplicate_400/short_pw_400/cross_login (throwaway ALLOW_REGISTRATION=true pair)"
- },
- "POST /api/card-art/:cardId": {
-  "status": "node"
- },
- "POST /api/cards/highlight": {
-  "status": "node"
- },
- "POST /api/cards/role-tags": {
-  "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/role-tags)",
-  "status": "verified",
-  "tests": "tests/cards_tags_route.rs (role_tags_groups_by_card, role_tags_validation_and_ready_false); parity.mjs cards_role_tags_ok/cards_role_tags_missing_slugs/cards_role_tags_too_many_ids/cards_role_tags_no_token"
- },
- "POST /api/cards/tag-stats": {
-  "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/tag-stats)",
-  "status": "verified",
-  "tests": "tests/cards_tags_route.rs (tag_stats_filters_ranks_and_caps, tag_stats_null_label_falls_back_to_slug); parity.mjs cards_tag_stats_ok/cards_tag_stats_empty_ids/cards_tag_stats_no_token"
- },
- "POST /api/cardscan/cards": {
-  "status": "node"
- },
- "POST /api/cardscan/choices": {
-  "status": "node"
- },
- "POST /api/cardscan/detect": {
-  "status": "node"
- },
- "POST /api/cardscan/frame": {
-  "status": "node"
- },
- "POST /api/cardscan/scan": {
-  "status": "node"
- },
- "POST /api/cardscan/telemetry": {
-  "status": "node"
- },
- "POST /api/collection": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group \u2014 with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::add_* (15 incl. defaults, quantity rows vs stack, price-history dedupe, coercion edge cases, localized card_id + recordPrice, CHECK-violation 500, cache-miss forwards, GET-fallback both ways); parity.mjs ca_add_* (10: gates, 400s, successes verified by cross-side read-back per owner ruling iter-21, unknown-card 404, bad-condition 500)"
- },
- "POST /api/collection/bulk": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::bulk_* (10 incl. delete/trade/condition/printing, purchase_split weighted+equal, add_to_deck matrix, checked-out 409s, ownership rejections); parity.mjs cw_bulk_*/cw_split_* (15: gates, validation 400s, deck 400/404/409 pre-write branches, successes verified by cross-side read-back per owner ruling iter-21; entry_ids contract)"
- },
- "POST /api/collection/bulk-add": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node \u2014 Node reports per-card results so partial-native execution would change the response",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
- },
- "POST /api/decks": {
-  "status": "node"
- },
- "POST /api/decks/:id/cards": {
-  "status": "node"
- },
- "POST /api/decks/:id/register-collection": {
-  "status": "node"
- },
- "POST /api/export": {
-  "status": "node"
- },
- "POST /api/import": {
-  "status": "node"
- },
- "POST /api/limited/analyze": {
-  "status": "node"
- },
- "POST /api/lists": {
-  "status": "node"
- },
- "POST /api/lists/:id/cards": {
-  "status": "node"
- },
- "POST /api/lists/:id/cards/bulk": {
-  "status": "node"
- },
- "POST /api/lists/:id/cards/bulk-remove": {
-  "status": "node"
- },
- "POST /api/lists/:id/remove-from-collection": {
-  "status": "node"
- },
- "POST /api/manabox-sync/apply": {
-  "status": "node"
- },
- "POST /api/manabox-sync/preview": {
-  "status": "node"
- },
- "POST /api/marketplace/add": {
-  "status": "node"
- },
- "POST /api/marketplace/preview": {
-  "status": "node"
- },
- "POST /api/moxfield/authors": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "POST /api/moxfield/authors/:id/sync-contents": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "POST /api/moxfield/authors/:id/sync-decklist": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "POST /api/moxfield/decks/:publicId/sync": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "POST /api/precons/import": {
-  "status": "node"
- },
- "POST /api/scan-match": {
-  "status": "node"
- },
- "POST /api/search": {
-  "status": "node"
- },
- "POST /api/search-history": {
-  "status": "node"
- },
- "POST /api/secret-lair/add": {
-  "status": "node"
- },
- "PUT /api/admin/users/:id": {
-  "status": "node"
- },
- "PUT /api/auth/settings": {
-  "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
-  "status": "verified",
-  "tests": "tests/auth.rs::settings_password_share_and_readonly_gating; parity.mjs authr_settings_share_toggle/share_regen/password_change (new pw verifies on the opposite server, old rejected)/pwchange_wrong_401 (no partial write) + authr_settings_no_token"
- },
- "PUT /api/collection/:id": {
-  "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes) ; card_id-change to a printing absent from card_cache forwards to Node (Node would hydrate from Scryfall)",
-  "status": "verified",
-  "tests": "tests/collection_writes.rs::put_* (11 incl. printing, quantity grow/shrink copy-row math, trade/notes, allocation 409, api-key 403, 404s, card_id cache-miss forward); parity.mjs cw_put_* (10: gates, 404, bad-printing 400, notes/condition/printing/quantity/trade successes verified by cross-side read-back per owner ruling iter-21)"
- },
- "PUT /api/decks/:id": {
-  "status": "node"
- },
- "PUT /api/decks/:id/checkout": {
-  "status": "node"
- },
- "PUT /api/decks/:id/return": {
-  "status": "node"
- },
- "PUT /api/lists/:id": {
-  "status": "node"
- },
- "PUT /api/lists/:id/cards/:card_id/printing": {
-  "status": "node"
- },
- "PUT /api/lists/:id/cheapest-printings": {
-  "status": "node"
- },
- "PUT /api/lists/order": {
-  "status": "node"
- },
- "PUT /api/marketplace/accounts": {
-  "status": "node"
- },
- "PUT /api/moxfield/decks/:publicId": {
-  "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
-  "status": "verified",
-  "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
-  "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
- },
- "PUT /api/settings": {
-  "status": "node"
- }
+  "DELETE /api/admin/users/:id": {
+    "status": "node"
+  },
+  "DELETE /api/auth/api-key": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_ok (known key 401s on the opposite server after revoke) + authr_apikey_delete_no_token"
+  },
+  "DELETE /api/card-art/:cardId": {
+    "status": "node"
+  },
+  "DELETE /api/collection/:id": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::delete_200_404_409; parity.mjs cw_delete_200,cw_delete_missing_404,cw_delete_no_token"
+  },
+  "DELETE /api/decks/:id": {
+    "status": "node"
+  },
+  "DELETE /api/decks/:id/cards/:card_id": {
+    "status": "node"
+  },
+  "DELETE /api/lists/:id": {
+    "status": "node"
+  },
+  "DELETE /api/lists/:id/cards/:card_id": {
+    "status": "node"
+  },
+  "DELETE /api/moxfield/authors/:id": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "DELETE /api/search-history": {
+    "status": "node"
+  },
+  "GET *": {
+    "status": "node"
+  },
+  "GET /api/admin/backups": {
+    "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "listBackups fold: .bak filter, mtime->ISO with Node's ROUND semantics ((ns+500000)/1e6 — V8 Date rounds, truncation showed a 1 ms skew), localeCompare-desc sort. dir string is env-dependent and stripped by parity. Auto-backup timer quiesced on both harness sides (Rust env, Node container /app/auto-backup.disabled flag file + repo env switch)."
+  },
+  "GET /api/admin/backups/:file/download": {
+    "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "path.basename strips traversal first (exactly like Node), then .bak check + existsSync -> 404 {error:Backup not found}; res.download twin = octet-stream + attachment disposition with the basename."
+  },
+  "GET /api/admin/catalogs": {
+    "status": "node"
+  },
+  "GET /api/admin/catalogs/languages": {
+    "module": "scrybox-server::catalog_read (lib.rs GET /api/admin/catalogs/languages)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (catalog_languages_admin_ladder_and_shape, catalog_languages_method_mismatch_proxies); parity.mjs catalog_langs_ok/catalog_langs_game_pokemon/catalog_langs_no_token/catalog_langs_member/catalog_langs_apikey"
+  },
+  "GET /api/admin/catalogs/progress": {
+    "status": "node"
+  },
+  "GET /api/admin/models": {
+    "status": "node"
+  },
+  "GET /api/admin/users": {
+    "status": "node"
+  },
+  "GET /api/auth/config": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::config_reports_flags_with_weak_etag; parity.mjs authr_config"
+  },
+  "GET /api/auth/me": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::me_requires_token_and_serialises_req_user; parity.mjs authr_me_no_token/bad_token/ok"
+  },
+  "GET /api/auth/oidc/callback": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/oidc_e2e.rs::full_oidc_ladder; parity.mjs authr_oidc_callback_disabled"
+  },
+  "GET /api/auth/oidc/login": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/oidc_e2e.rs::full_oidc_ladder (stub HS256 IdP, PKCE/nonce/tamper legs); parity.mjs authr_oidc_login_disabled"
+  },
+  "GET /api/card-art/:cardId.png": {
+    "module": "scrybox-server::card_art (lib.rs GET /api/card-art/{cardId}, .png suffix enforced)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (png_serves_user_layer_over_bundled, png_404_unknown_invalid_ids_and_proxies_other_paths); parity.mjs card_art_png_ok/card_art_png_404/card_art_png_bad_shape"
+  },
+  "GET /api/card-art/index": {
+    "module": "scrybox-server::card_art (lib.rs GET /api/card-art/index)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (index_folds_layers_sorted_deduped, index_absent_dirs_answer_empty); parity.mjs card_art_index"
+  },
+  "GET /api/cards/:id/decks": {
+    "status": "node"
+  },
+  "GET /api/cards/:id/oracle": {
+    "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (oracle_cached_row_paths, oracle_legacy_row_fetch_backfills_rules_columns, oracle_fetch_404_and_error_ladder); parity.mjs cards_oracle_ok/cards_oracle_404/cards_oracle_no_token"
+  },
+  "GET /api/cards/:id/oracle-tags": {
+    "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle-tags)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (oracle_tags_direct_inherited_and_via, oracle_tags_no_gen_no_oracle_and_fallback, oracle_tags_auth_gate_and_proxy); parity.mjs cards_oracle_tags_ok/cards_oracle_tags_fallback/cards_oracle_tags_404_shape/cards_oracle_tags_no_token"
+  },
+  "GET /api/cards/:id/price-history": {
+    "status": "node"
+  },
+  "GET /api/cardscan/status": {
+    "status": "node"
+  },
+  "GET /api/collection": {
+    "module": "scrybox-server::collection (lib.rs GET /api/collection)",
+    "status": "verified",
+    "tests": "tests/collection.rs (21); parity.mjs collection_page100 + collection_full_27MB + EXTRA_COLLECTION x10"
+  },
+  "GET /api/collection/cardlist": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::cardlist_plain_exact,cardlist_detailed_exact,cardlist_empty_is_empty_string,cardlist_422_when_unresolved,cardlist_401_no_token; parity.mjs cw_cardlist_plain,detailed,no_token"
+  },
+  "GET /api/decks": {
+    "status": "node"
+  },
+  "GET /api/decks/:id": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/combos": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/locations": {
+    "status": "node"
+  },
+  "GET /api/decks/:id/synergy": {
+    "status": "node"
+  },
+  "GET /api/export": {
+    "status": "node"
+  },
+  "GET /api/health": {
+    "module": "scrybox-server::health (lib.rs GET /api/health)",
+    "status": "verified",
+    "tests": "tests/health.rs (4); parity.mjs health"
+  },
+  "GET /api/lists": {
+    "status": "node"
+  },
+  "GET /api/lists/:id": {
+    "status": "node"
+  },
+  "GET /api/lists/:id/cardlist": {
+    "status": "node"
+  },
+  "GET /api/lists/card-matches": {
+    "status": "node"
+  },
+  "GET /api/manabox-sync/runs": {
+    "module": "scrybox-server::manabox (lib.rs POST /api/manabox-sync/preview under RUST_ROUTES=manabox_backup; engine manabox.rs = utils/manaboxSync.js + routes/manaboxSync.js twin, bulk leg on unit-1 st.scry + card_cache)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "No requireAdmin on this router (only the global authenticateToken): member sessions preview/apply their OWN collection; API-key POSTs 403 read-only. 40mb parser runs AFTER the auth gate (server.js mount order); non-JSON bodies leave req.body undefined -> String(undefined) one-cell CSV -> 400 The file is empty."
+  },
+  "GET /api/manabox-sync/runs/:id/report": {
+    "module": "scrybox-server::manabox (lib.rs POST /api/manabox-sync/preview under RUST_ROUTES=manabox_backup; engine manabox.rs = utils/manaboxSync.js + routes/manaboxSync.js twin, bulk leg on unit-1 st.scry + card_cache)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "No requireAdmin on this router (only the global authenticateToken): member sessions preview/apply their OWN collection; API-key POSTs 403 read-only. 40mb parser runs AFTER the auth gate (server.js mount order); non-JSON bodies leave req.body undefined -> String(undefined) one-cell CSV -> 400 The file is empty."
+  },
+  "GET /api/marketplace/accounts": {
+    "status": "node"
+  },
+  "GET /api/marketplace/recent/:source": {
+    "status": "node"
+  },
+  "GET /api/moxfield": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "GET /api/precons": {
+    "status": "node"
+  },
+  "GET /api/rules": {
+    "status": "node"
+  },
+  "GET /api/rules/keywords": {
+    "status": "node"
+  },
+  "GET /api/scan-sets": {
+    "module": "scrybox-server::catalog_read (lib.rs GET /api/scan-sets)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (scan_sets_counts_and_gates, scan_sets_missing_langs_or_model_proxies); parity.mjs scan_sets_ok/scan_sets_lang_ja/scan_sets_lang_es/scan_sets_no_token"
+  },
+  "GET /api/search": {
+    "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
+    "status": "verified",
+    "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
+  },
+  "GET /api/search-history": {
+    "status": "node"
+  },
+  "GET /api/secret-lair": {
+    "status": "node"
+  },
+  "GET /api/secret-lair/preview": {
+    "status": "node"
+  },
+  "GET /api/sets": {
+    "module": "scrybox-server::sets (lib.rs GET /api/sets)",
+    "status": "verified",
+    "tests": "tests/sets_route.rs (3); parity.mjs sets_flat/sets_tree/sets_lang_de/sets_empty_query/sets_no_token/sets_bad_token"
+  },
+  "GET /api/settings": {
+    "status": "node"
+  },
+  "GET /api/settings/version": {
+    "status": "node"
+  },
+  "GET /api/shared/:share_token": {
+    "status": "node"
+  },
+  "GET /api/stats": {
+    "module": "scrybox-server::stats (+stats_sql; lib.rs GET /api/stats)",
+    "status": "verified",
+    "tests": "tests/stats.rs (15); parity.mjs stats + stats_post_write (5 s SWR per owner ruling)"
+  },
+  "GET /api/stats/commander-of-the-day": {
+    "status": "node"
+  },
+  "GET /api/stats/history": {
+    "status": "node"
+  },
+  "GET /api/stats/networth": {
+    "status": "node"
+  },
+  "GET /api/stats/top-mover": {
+    "status": "node"
+  },
+  "GET /api/suggest": {
+    "status": "node"
+  },
+  "GET /models/cornelius.onnx": {
+    "status": "node"
+  },
+  "POST /api/admin/backups": {
+    "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "VACUUM INTO snapshot (byte-deterministic on a quiet DB — asserted), name <base>.<ISO [:.] -> ->.bak> via basename strip .db, prune listBackups().slice(KEEP_LAST) with JS slice semantics; BACKUP_KEEP_LAST parseInt||10 (cargo reads env per call, Node pins at module load — harness sets it before boot)."
+  },
+  "POST /api/admin/catalogs/build": {
+    "status": "node"
+  },
+  "POST /api/admin/catalogs/stop": {
+    "status": "node"
+  },
+  "POST /api/admin/models/download": {
+    "status": "node"
+  },
+  "POST /api/admin/seed-cards": {
+    "status": "node"
+  },
+  "POST /api/admin/users": {
+    "status": "node"
+  },
+  "POST /api/auth/api-key": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_post_ok (bnd_+48hex shape; fresh key GET-works + POST-403 + persisted, verified on the opposite server) + authr_apikey_post_no_token"
+  },
+  "POST /api/auth/bootstrap": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::bootstrap_creates_owner_and_adopts_orphans; parity.mjs authr_bootstrap_users_exist/short_pw + parity-auth-ephemeral.mjs bootstrap_201/session_cross_read/again_409 (throwaway empty-DB pair)"
+  },
+  "POST /api/auth/login": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::login_success_legacy_and_parser_quirks + rate_limit_shared_bucket_per_ip; parity.mjs authr_login_ok (200 + token shape + fresh session cross-server read as rusttest_parity) + authr_login_missing_fields/wrong"
+  },
+  "POST /api/auth/logout": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_logout_ok (seeded session; revoked row 401s on the opposite server) + authr_logout_no_token"
+  },
+  "POST /api/auth/register": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled + parity-auth-ephemeral.mjs register_201/duplicate_400/short_pw_400/cross_login (throwaway ALLOW_REGISTRATION=true pair)"
+  },
+  "POST /api/card-art/:cardId": {
+    "status": "node"
+  },
+  "POST /api/cards/highlight": {
+    "status": "node"
+  },
+  "POST /api/cards/role-tags": {
+    "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/role-tags)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (role_tags_groups_by_card, role_tags_validation_and_ready_false); parity.mjs cards_role_tags_ok/cards_role_tags_missing_slugs/cards_role_tags_too_many_ids/cards_role_tags_no_token"
+  },
+  "POST /api/cards/tag-stats": {
+    "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/tag-stats)",
+    "status": "verified",
+    "tests": "tests/cards_tags_route.rs (tag_stats_filters_ranks_and_caps, tag_stats_null_label_falls_back_to_slug); parity.mjs cards_tag_stats_ok/cards_tag_stats_empty_ids/cards_tag_stats_no_token"
+  },
+  "POST /api/cardscan/cards": {
+    "status": "node"
+  },
+  "POST /api/cardscan/choices": {
+    "status": "node"
+  },
+  "POST /api/cardscan/detect": {
+    "status": "node"
+  },
+  "POST /api/cardscan/frame": {
+    "status": "node"
+  },
+  "POST /api/cardscan/scan": {
+    "status": "node"
+  },
+  "POST /api/cardscan/telemetry": {
+    "status": "node"
+  },
+  "POST /api/collection": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group — with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::add_* (15 incl. defaults, quantity rows vs stack, price-history dedupe, coercion edge cases, localized card_id + recordPrice, CHECK-violation 500, cache-miss forwards, GET-fallback both ways); parity.mjs ca_add_* (10: gates, 400s, successes verified by cross-side read-back per owner ruling iter-21, unknown-card 404, bad-condition 500)"
+  },
+  "POST /api/collection/bulk": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::bulk_* (10 incl. delete/trade/condition/printing, purchase_split weighted+equal, add_to_deck matrix, checked-out 409s, ownership rejections); parity.mjs cw_bulk_*/cw_split_* (15: gates, validation 400s, deck 400/404/409 pre-write branches, successes verified by cross-side read-back per owner ruling iter-21; entry_ids contract)"
+  },
+  "POST /api/collection/bulk-add": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds) ; any card_id absent from card_cache (or localized miss) forwards the WHOLE request to Node — Node reports per-card results so partial-native execution would change the response",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::bulk_add_* (7 incl. message arithmetic (xN each), per-entry overrides, mixed report shape with key-set assertions, all-fail 500, cache-miss whole-request forward); parity.mjs ca_bulk_add_* (7: gates, validation 400s, 250-cap, successes verified by cross-side read-back per owner ruling iter-21)"
+  },
+  "POST /api/decks": {
+    "status": "node"
+  },
+  "POST /api/decks/:id/cards": {
+    "status": "node"
+  },
+  "POST /api/decks/:id/register-collection": {
+    "status": "node"
+  },
+  "POST /api/export": {
+    "status": "node"
+  },
+  "POST /api/import": {
+    "status": "node"
+  },
+  "POST /api/limited/analyze": {
+    "status": "node"
+  },
+  "POST /api/lists": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards/bulk": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/cards/bulk-remove": {
+    "status": "node"
+  },
+  "POST /api/lists/:id/remove-from-collection": {
+    "status": "node"
+  },
+  "POST /api/manabox-sync/apply": {
+    "module": "scrybox-server::manabox (lib.rs POST /api/manabox-sync/preview under RUST_ROUTES=manabox_backup; engine manabox.rs = utils/manaboxSync.js + routes/manaboxSync.js twin, bulk leg on unit-1 st.scry + card_cache)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "Single withTransaction twin (Tx in collection_writes): removes/redates/adds list rows, creates/updates card_lists, stores the manabox_sync_runs row; expectBefore guard answers 409 BEFORE any write. Full write path is cargo-fixture-only (apply_writes_everything covers remove/redate/add/lists/run-row/idempotent re-run); live parity covers the pre-write 409 + empty arms."
+  },
+  "POST /api/manabox-sync/preview": {
+    "module": "scrybox-server::manabox (lib.rs POST /api/manabox-sync/preview under RUST_ROUTES=manabox_backup; engine manabox.rs = utils/manaboxSync.js + routes/manaboxSync.js twin, bulk leg on unit-1 st.scry + card_cache)",
+    "status": "verified",
+    "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token",
+    "notes": "No requireAdmin on this router (only the global authenticateToken): member sessions preview/apply their OWN collection; API-key POSTs 403 read-only. 40mb parser runs AFTER the auth gate (server.js mount order); non-JSON bodies leave req.body undefined -> String(undefined) one-cell CSV -> 400 The file is empty."
+  },
+  "POST /api/marketplace/add": {
+    "status": "node"
+  },
+  "POST /api/marketplace/preview": {
+    "status": "node"
+  },
+  "POST /api/moxfield/authors": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "POST /api/moxfield/authors/:id/sync-contents": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "POST /api/moxfield/authors/:id/sync-decklist": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "POST /api/moxfield/decks/:publicId/sync": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "POST /api/precons/import": {
+    "status": "node"
+  },
+  "POST /api/scan-match": {
+    "status": "node"
+  },
+  "POST /api/search": {
+    "status": "node"
+  },
+  "POST /api/search-history": {
+    "status": "node"
+  },
+  "POST /api/secret-lair/add": {
+    "status": "node"
+  },
+  "PUT /api/admin/users/:id": {
+    "status": "node"
+  },
+  "PUT /api/auth/settings": {
+    "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
+    "status": "verified",
+    "tests": "tests/auth.rs::settings_password_share_and_readonly_gating; parity.mjs authr_settings_share_toggle/share_regen/password_change (new pw verifies on the opposite server, old rejected)/pwchange_wrong_401 (no partial write) + authr_settings_no_token"
+  },
+  "PUT /api/collection/:id": {
+    "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes) ; card_id-change to a printing absent from card_cache forwards to Node (Node would hydrate from Scryfall)",
+    "status": "verified",
+    "tests": "tests/collection_writes.rs::put_* (11 incl. printing, quantity grow/shrink copy-row math, trade/notes, allocation 409, api-key 403, 404s, card_id cache-miss forward); parity.mjs cw_put_* (10: gates, 404, bad-printing 400, notes/condition/printing/quantity/trade successes verified by cross-side read-back per owner ruling iter-21)"
+  },
+  "PUT /api/decks/:id": {
+    "status": "node"
+  },
+  "PUT /api/decks/:id/checkout": {
+    "status": "node"
+  },
+  "PUT /api/decks/:id/return": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id/cards/:card_id/printing": {
+    "status": "node"
+  },
+  "PUT /api/lists/:id/cheapest-printings": {
+    "status": "node"
+  },
+  "PUT /api/lists/order": {
+    "status": "node"
+  },
+  "PUT /api/marketplace/accounts": {
+    "status": "node"
+  },
+  "PUT /api/moxfield/decks/:publicId": {
+    "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
+    "status": "verified",
+    "tests": "tests/moxfield_sync.rs (19: add_author_full_flow, decklist_sync_retires_gone_decks_and_conflicts_on_checked_out, content_sync_pulls_only_changed_stamps, content_sync_missing_summary_retires_and_failures_stamp_last_error, forced_pull_untracked_and_already_built_skip, enable_disable_roundtrip_and_checked_out_conflict, remove_author_cascades_mirrors, scheduler_tick_due_order, scheduler_tick_failure_stamps_author_last_error, payload_pure_folds, routes_auth_ladder_and_status_shape, routes_delete_author_and_forced_sync_shapes, ...) + parity.mjs mox_status/mox_status_no_token/mox_add_author_missing/mox_add_author_nonstring/mox_delete_missing/mox_deck_put_missing/mox_deck_sync_missing",
+    "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
+  },
+  "PUT /api/settings": {
+    "status": "node"
+  }
 }

@@ -370,7 +370,16 @@ db.initDb()
     }, 1000 * 60 * 60 * 24);
 
     // Periodic auto-backup (BACKUP_INTERVAL_HOURS, default 24; 0 disables)
-    require('./backup').startAutoBackup();
+    //
+    // Lane B: when the Rust server owns the admin backup routes it also owns
+    // the timer — the test container runs with SCRYBOX_DISABLE_AUTO_BACKUP=true
+    // so the snapshot job never runs twice against the shared DB copy (same
+    // pattern as SCRYBOX_DISABLE_MOXFIELD_SCHEDULER).
+    if (process.env.SCRYBOX_DISABLE_AUTO_BACKUP === 'true') {
+      console.log('Auto-backup timer disabled (SCRYBOX_DISABLE_AUTO_BACKUP) — Rust job owns it.');
+    } else {
+      require('./backup').startAutoBackup();
+    }
 
     // Moxfield sync: the 20-second tick polls each tracked author's deck list
     // (slow interval) and checks every tracked deck's contents for changes

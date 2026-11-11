@@ -27,6 +27,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
+pub mod backup;
 pub mod card_cache;
 pub mod card_norm;
 pub mod card_art;
@@ -39,6 +40,7 @@ pub mod collection;
 pub mod collection_writes;
 pub mod db;
 pub mod health;
+pub mod manabox;
 pub mod mfx_payload;
 pub mod moxfield;
 pub mod moxfield_api;
@@ -402,6 +404,29 @@ pub fn app(state: AppState) -> Router {
             .route("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
             .route("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
             .route("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
+    } else {
+        router
+    };
+    // Lane B unit 3b: ManaBox sync + backup job, both under
+    // RUST_ROUTES=manabox_backup. Node's twin auto-backup timer is switched
+    // off with SCRYBOX_DISABLE_AUTO_BACKUP (server.js); the parity harness
+    // sets it on both instances so the shared DB copy stays quiescent.
+    let router = if state.owns("manabox_backup") {
+        let backup_off = std::env::var("SCRYBOX_DISABLE_AUTO_BACKUP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if backup_off {
+            tracing::info!("Auto-backup disabled (SCRYBOX_DISABLE_AUTO_BACKUP) — no timer runs on this instance");
+        } else {
+            backup::spawn_auto_backup(&state);
+        }
+        router
+            .route("/api/manabox-sync/preview", any(manabox::handle_preview))
+            .route("/api/manabox-sync/apply", any(manabox::handle_apply))
+            .route("/api/manabox-sync/runs", any(manabox::handle_runs))
+            .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
+            .route("/api/admin/backups", any(backup::handle_backups_collection))
+            .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
     } else {
         router
     };
