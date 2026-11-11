@@ -537,7 +537,7 @@ fn get_deck_requirements(conn: &Connection, deck_ids: &[i64]) -> Result<Vec<Map<
 }
 
 pub(crate) struct CheapestPrinting {
-    card_id: Value,
+    pub(crate) card_id: Value,
     price: f64,
 }
 

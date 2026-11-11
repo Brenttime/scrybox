@@ -326,7 +326,7 @@ fn qty_value(digits: &str) -> SqlValue {
 }
 
 /// JS-Number-as-INTEGER binding probe: an exact i64-representable integer.
-fn exact_int(v: f64) -> Option<i64> {
+pub(crate) fn exact_int(v: f64) -> Option<i64> {
     if v.fract() == 0.0 && v.abs() <= 9.223372036854776e18 {
         let i = v as i64;
         if i as f64 == v {
@@ -583,7 +583,7 @@ fn clean_icon(v: Option<&Value>) -> SqlValue {
 
 /// node-sqlite3 binding of a raw JSON value (decks_writes twin — live-
 /// pinned: bool -> INTEGER 1/0, objects/arrays -> '[object Object]').
-fn js_bind(v: &Value) -> SqlValue {
+pub(crate) fn js_bind(v: &Value) -> SqlValue {
     match v {
         Value::Null => SqlValue::Null,
         Value::Bool(b) => SqlValue::Integer(if *b { 1 } else { 0 }),

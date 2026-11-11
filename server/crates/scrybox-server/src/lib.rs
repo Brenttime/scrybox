@@ -41,6 +41,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod lists_body_writes;
 pub mod lists_reads;
 pub mod lists_writes;
 pub mod health;
@@ -487,6 +488,22 @@ pub fn app(state: AppState) -> Router {
             // The /:id dispatcher answers PUT/DELETE natively here; its GET
             // leg self-checks lists_reads and proxies when that group is off.
             .route("/api/lists/{id}", any(lists_reads::route_entry))
+    } else {
+        router
+    };
+    // Lane A iter-33: card-list CARD-BODY writes (add card, bulk add/remove,
+    // remove-from-collection, cheapest-printings, change printing, remove
+    // card) ride the same `lists_writes` kill switch. Handlers self-check the
+    // group and the method, forwarding anything else to Node (never 405).
+    let router = if state.owns("lists_writes") {
+        router
+            .route("/api/lists/{id}/cards", any(lists_body_writes::handle_add_card))
+            .route("/api/lists/{id}/cards/bulk", any(lists_body_writes::handle_bulk_add))
+            .route("/api/lists/{id}/cards/bulk-remove", any(lists_body_writes::handle_bulk_remove))
+            .route("/api/lists/{id}/remove-from-collection", any(lists_body_writes::handle_remove_from_collection))
+            .route("/api/lists/{id}/cheapest-printings", any(lists_body_writes::handle_cheapest_printings))
+            .route("/api/lists/{id}/cards/{card_id}/printing", any(lists_body_writes::handle_printing))
+            .route("/api/lists/{id}/cards/{card_id}", any(lists_body_writes::handle_remove_card))
     } else {
         router
     };

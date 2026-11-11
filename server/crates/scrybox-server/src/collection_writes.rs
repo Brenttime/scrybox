@@ -404,7 +404,7 @@ impl Drop for Tx<'_> {
 
 /// logicalInventoryStatus(database, userId, cardId) — collectionHelpers.js,
 /// with sqlCardKey/sqlIsBasicLand expanded as in cardIdentity.js.
-fn logical_inventory_status(
+pub(crate) fn logical_inventory_status(
     conn: &Connection,
     user_id: i64,
     card_id: &Value,

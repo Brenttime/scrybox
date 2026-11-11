@@ -442,6 +442,8 @@ async fn kill_switch_and_shape_guards() {
         assert_eq!(h.get("x-node").unwrap(), "1", "{m} {p}");
     }
     // Writes on, reads OFF: GETs must proxy (native GET only with lists_reads).
+    // LANE-A iter-33: the card-body write shapes below moved from proxy to
+    // native with lists_body_writes (see tests/lists_body_writes.rs).
     let r = router_for(seeded_db(dir.path(), "w-only.db"), &["lists_writes"], &format!("http://{upstream}"));
     for (m, p) in [
         ("GET", "/api/lists"),
@@ -450,13 +452,19 @@ async fn kill_switch_and_shape_guards() {
         ("GET", "/api/lists/card-matches?q=sol"),
         ("PATCH", "/api/lists/201"),
         ("POST", "/api/lists/201"),
-        ("POST", "/api/lists/201/cards"),
-        ("PUT", "/api/lists/201/cheapest-printings"),
-        ("DELETE", "/api/lists/201/cards/z-alpha"),
         ("POST", "/api/lists/order"),
     ] {
         let (_s, h, _) = request(&r, m, p, &JSON_CT, Some("{}")).await;
         assert_eq!(h.get("x-node").unwrap(), "1", "{m} {p} must proxy, never 405/404 here");
+    }
+    // Card-body writes are native as soon as lists_writes is on.
+    for (m, p) in [
+        ("POST", "/api/lists/201/cards"),
+        ("PUT", "/api/lists/201/cheapest-printings"),
+        ("DELETE", "/api/lists/201/cards/z-alpha"),
+    ] {
+        let (_s, h, _) = request(&r, m, p, &JSON_CT, Some("{}")).await;
+        assert!(h.get("x-node").is_none(), "{m} {p} must be native under lists_writes");
     }
     // Both on: GET answers natively (no x-node), unowned sub-paths still proxy.
     let r = router_for(
@@ -468,5 +476,5 @@ async fn kill_switch_and_shape_guards() {
     assert_eq!(s, StatusCode::OK);
     assert!(h.get("x-node").is_none(), "GET collection must be native when both groups on");
     let (_s, h, _) = request(&r, "PUT", "/api/lists/201/cheapest-printings", &JSON_CT, Some("{}")).await;
-    assert_eq!(h.get("x-node").unwrap(), "1");
+    assert!(h.get("x-node").is_none(), "cheapest-printings is native under lists_writes");
 }
