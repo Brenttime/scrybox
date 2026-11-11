@@ -186,7 +186,7 @@ const FIXED_KEY = 'bnd_' + 'f'.repeat(48);
 const SESSION_EXP = '2030-01-01 00:00:00';
 const hashPw = (pw, salt) => `${PBKDF2_ITER}:${salt}:${crypto.pbkdf2Sync(pw, salt, PBKDF2_ITER, 64, 'sha512').toString('hex')}`;
 const PW_HASH0 = hashPw(PW_OLD, SALT0);
-function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { fn(d); } finally { d.close(); } }
+function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { return fn(d); } finally { d.close(); } }
 function resetParityUser() {
   dbWrite((d) => {
     const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
@@ -1249,6 +1249,170 @@ async function etagParity(c) {
   });
   // HEAD: Rust proxies (port owns GET only); Express answers HEAD natively.
   cases.push({ name: 'shrd_head', path: `/api/shared/${SHARE_T0}`, headers: {}, method: 'HEAD', setup: () => { shrdPrep({}); }, teardown: shrdTeardown });
+
+  // ===== decks_writes (iter 28): PUT /api/decks/:id, DELETE /api/decks/:id,
+  // DELETE /api/decks/:id/cards/:card_id. Fixed ids (like shrdPrep) so both
+  // side-runs see identical starting rows; teardown clears them. =====
+  const DK_DUP = 'rusttest-dk-dup-emh'; // second printing of Emergency Medical Hologram
+  function dkUid(d) {
+    const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+    const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+    if (!s) throw new Error('parity: bench session not found for deck cases');
+    return Number(s.user_id);
+  }
+  function dkClear(d) {
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM deck_maybe_cards WHERE deck_id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931001 AND 931004').run();
+    d.prepare('DELETE FROM card_cache WHERE id = ?').run(DK_DUP);
+  }
+  function dkPrep() {
+    dbWrite((d) => {
+      dkClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for foreign-deck case');
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931001, uid, 'DK Seed One', 'seed one', 0, '2026-01-01 00:00:00');
+      ins.run(931002, uid, 'DK Checked Out', 'seed co', 1, '2026-01-01 00:00:00');
+      ins.run(931003, other.id, 'DK Foreign', 'fd', 0, '2026-01-01 00:00:00');
+      ins.run(931004, uid, 'DK Empty', '', 0, '2026-01-01 00:00:00');
+      d.prepare('INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend,price_normal,price_holofoil,price_estimated) VALUES (?,?,?,?,?,?,0,0,0)')
+        .run(DK_DUP, 'Emergency Medical Hologram', '["Artifact"]', '[]', 'Rare', 0.2);
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931001, CW_CARD, 2);
+      dc.run(931001, DK_DUP, 1);
+      dc.run(931002, CW_CARD, 1);
+      d.prepare('INSERT INTO deck_maybe_cards (deck_id,card_id,quantity) VALUES (?,?,?)').run(931001, CW_CARD, 1);
+    });
+  }
+  function dkTeardown() { dbWrite((d) => dkClear(d)); }
+  const dkDbCounts = () => dbWrite((d) => ({
+    dc: d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931001').get().n,
+    dm: d.prepare('SELECT COUNT(*) n FROM deck_maybe_cards WHERE deck_id=931001').get().n,
+    co: d.prepare('SELECT COUNT(*) n FROM decks WHERE id=931002').get().n,
+  }));
+  // NOTE: all dk cases set etagReplay:false — these are write routes; the
+  // 304 replay of a *read* ETag is pinned by the shared/shrd cases instead.
+  const DK_JSON = { ...authHeaders, 'content-type': 'application/json' };
+  cases.push({
+    name: 'dk_put_200', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"DK Renamed","description":"parity desc"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const seen = { name: g.json?.name, description: g.json?.description };
+      return { ok: g.status === 200 && seen.name === 'DK Renamed' && seen.description === 'parity desc', why: `PUT persisted -> ${JSON.stringify(seen)}`, seen };
+    },
+  });
+  cases.push({
+    name: 'dk_put_missing_404', path: '/api/decks/999999', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"DK Renamed"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_foreign_404', path: '/api/decks/931003', headers: DK_JSON, method: 'PUT',
+    body: '{"name":"Hijacked"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931003', { ...authHeaders, Authorization: '***' });
+      // The foreign deck belongs to another user — even that user's session
+      // is not available here; assert it still carries its original name
+      // through the shared DB (hijack did not persist).
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931003').get());
+      return { ok: !!d0 && d0.name === 'DK Foreign', why: `foreign deck untouched -> ${JSON.stringify(d0)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_put_no_name_400', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_noauth_401', path: '/api/decks/931001', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{"name":"Nope"}', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const c = dkDbCounts();
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931001').get());
+      return { ok: !!d0 && d0.name === 'DK Seed One', why: `noauth left row -> ${JSON.stringify(d0)} ${JSON.stringify(c)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_put_badjson_500', path: '/api/decks/931001', headers: DK_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_put_apikey_403', path: '/api/decks/931001', method: 'PUT', etagReplay: false,
+    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    body: '{"name":"Nope"}',
+    setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); dkPrep(); },
+    teardown: () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)); dkTeardown(); },
+  });
+  cases.push({
+    name: 'dk_delete_200', path: '/api/decks/931001', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const c = dkDbCounts();
+      return { ok: g.status === 404 && c.dc === 0 && c.dm === 0, why: `delete persisted -> HTTP ${g.status}, deck_cards=${c.dc}, maybe=${c.dm}`, seen: { status: g.status, ...c } };
+    },
+  });
+  cases.push({
+    name: 'dk_delete_checked_out_409', path: '/api/decks/931002', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const c = dkDbCounts();
+      const co = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931002').get());
+      return { ok: !!co && co.name === 'DK Checked Out', why: `checked-out deck survived -> ${JSON.stringify(co)} ${JSON.stringify(c)}`, seen: co };
+    },
+  });
+  cases.push({
+    name: 'dk_delete_missing_404', path: '/api/decks/999999', headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_delete_noauth_401', path: '/api/decks/931001', headers: {}, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const d0 = dbWrite((d) => d.prepare('SELECT name FROM decks WHERE id=931001').get());
+      return { ok: !!d0 && d0.name === 'DK Seed One', why: `noauth left deck -> ${JSON.stringify(d0)}`, seen: d0 };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_200', path: `/api/decks/931001/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async (other) => {
+      const g = await apiReq(other, 'GET', '/api/decks/931001', authHeaders);
+      const cards = Array.isArray(g.json?.cards) ? g.json.cards.map((c) => c.name).sort() : null;
+      const maybe = Array.isArray(g.json?.maybeboard) ? g.json.maybeboard.length : null;
+      // Both printings of the logical card (CW_CARD + DK_DUP share the
+      // trimmed-lower name) must be gone; the maybeboard row stays.
+      const ok = g.status === 200 && cards && !cards.includes('Emergency Medical Hologram') && maybe === 1;
+      return { ok, why: `logical-card delete -> HTTP ${g.status}, cards=${JSON.stringify(cards)}, maybe=${maybe}`, seen: { cards, maybe } };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_deck_missing_404', path: `/api/decks/999999/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+  });
+  cases.push({
+    name: 'dk_deletecard_checked_out_409', path: `/api/decks/931002/cards/${CW_CARD}`, headers: authHeaders, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const n = dbWrite((d) => d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931002').get().n);
+      return { ok: n === 1, why: `checked-out deck kept its card (${n})`, seen: { n } };
+    },
+  });
+  cases.push({
+    name: 'dk_deletecard_noauth_401', path: `/api/decks/931001/cards/${CW_CARD}`, headers: {}, method: 'DELETE', etagReplay: false,
+    setup: () => { dkPrep(); }, teardown: dkTeardown,
+    readBack: async () => {
+      const n = dbWrite((d) => d.prepare('SELECT COUNT(*) n FROM deck_cards WHERE deck_id=931001').get().n);
+      return { ok: n === 2, why: `noauth kept both deck_cards rows (${n})`, seen: { n } };
+    },
+  });
 }
 
 

@@ -38,6 +38,7 @@ pub mod oidc;
 pub mod collection;
 pub mod collection_writes;
 pub mod db;
+pub mod decks_writes;
 pub mod health;
 pub mod name_index;
 pub mod scryfall;
@@ -398,6 +399,18 @@ pub fn app(state: AppState) -> Router {
             .route("/api/card-art/{cardId}", any(card_art::handle_png))
             .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
             .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
+    } else {
+        router
+    };
+    // Lane A iter-28: deck META writes only (PUT /api/decks/{id},
+    // DELETE /api/decks/{id}, DELETE /api/decks/{id}/cards/{card_id}).
+    // Reads, POSTs and the checkout/return machinery stay proxied. Shapes
+    // this router does not own (e.g. /api/decks/5/combos) fall through to
+    // the catch-all proxy, never 405 here.
+    let router = if state.owns("decks_writes") {
+        router
+            .route("/api/decks/{id}", any(decks_writes::handle_entry))
+            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
     } else {
         router
     };

@@ -52,7 +52,7 @@ const BASIC_NAMES: &[&str] = &["Plains", "Island", "Swamp", "Mountain", "Forest"
 /// Node's withAllocationLock is a per-process FIFO mutex. Rust mirrors it with
 /// one async mutex around every allocation-guarded section (plus BEGIN
 /// IMMEDIATE for cross-process serialisation against Node's own writes).
-fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
     static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     L.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -62,7 +62,7 @@ fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
 // application/json; charset=utf-8 + the Express default weak body ETag)
 // ---------------------------------------------------------------------------
 
-fn json_response(status: StatusCode, value: &Value) -> Response {
+pub(crate) fn json_response(status: StatusCode, value: &Value) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     (
         status,
@@ -75,7 +75,7 @@ fn json_response(status: StatusCode, value: &Value) -> Response {
         .into_response()
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn json_error(status: StatusCode, msg: &str) -> Response {
     json_response(status, &json!({ "error": msg }))
 }
 
@@ -590,14 +590,14 @@ pub(crate) fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
     }
 }
 
-fn too_large() -> Response {
+pub(crate) fn too_large() -> Response {
     json_error(
         StatusCode::PAYLOAD_TOO_LARGE,
         "Upload too large. Try exporting/importing in smaller batches.",
     )
 }
 
-fn internal_error() -> Response {
+pub(crate) fn internal_error() -> Response {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
 }
 
@@ -605,7 +605,7 @@ fn internal_error() -> Response {
 // Router entries
 // ---------------------------------------------------------------------------
 
-async fn read_parts(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
+pub(crate) async fn read_parts(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
     let (parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default().to_vec();
     (parts, bytes)
@@ -1643,7 +1643,7 @@ fn bulk_add_to_deck(
 
 /// JS falsiness of a body value: `!card_id` — a missing key (undefined),
 /// null, false, 0/NaN and "" are falsy; every array/object is truthy.
-fn js_falsy(v: Option<&Value>) -> bool {
+pub(crate) fn js_falsy(v: Option<&Value>) -> bool {
     match v {
         None => true,
         Some(v) => !truthy(v),

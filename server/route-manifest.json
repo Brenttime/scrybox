@@ -16,10 +16,14 @@
     "tests": "tests/collection_writes.rs::delete_200_404_409; parity.mjs cw_delete_200,cw_delete_missing_404,cw_delete_no_token"
   },
   "DELETE /api/decks/:id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id} DELETE under RUST_ROUTES=decks_writes; withAllocationLock twin + BEGIN IMMEDIATE)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::delete_deck_contract (409 checked-out survives, cross-user/missing 404, deck_cards+deck_maybe_cards removed, deck_list_revision bump); parity.mjs dk_delete_200 (opposite-server 404 + DB row counts), dk_delete_checked_out_409, dk_delete_missing_404, dk_delete_noauth_401"
   },
   "DELETE /api/decks/:id/cards/:card_id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id}/cards/{card_id} DELETE under RUST_ROUTES=decks_writes; logical-card delete via LOWER(TRIM(name)) key)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::delete_card_removes_all_printings_of_logical_card (404/409/200 + both same-name printings leave, unrelated card stays); parity.mjs dk_deletecard_200 (opposite-server deck detail shows both EMH printings gone, maybeboard intact), dk_deletecard_deck_missing_404, dk_deletecard_checked_out_409, dk_deletecard_noauth_401"
   },
   "DELETE /api/lists/:id": {
     "status": "node"
@@ -425,7 +429,9 @@
     "tests": "tests/collection_writes.rs::put_* (11 incl. printing, quantity grow/shrink copy-row math, trade/notes, allocation 409, api-key 403, 404s, card_id cache-miss forward); parity.mjs cw_put_* (10: gates, 404, bad-printing 400, notes/condition/printing/quantity/trade successes verified by cross-side read-back per owner ruling iter-21)"
   },
   "PUT /api/decks/:id": {
-    "status": "node"
+    "module": "scrybox-server::decks_writes (lib.rs /api/decks/{id} PUT under RUST_ROUTES=decks_writes)",
+    "status": "verified",
+    "tests": "tests/decks_writes.rs::put_deck_contract (JS-falsy 400 set, non-object 500, Node-driver binding shapes 42->'42'/true->'1'/{}/[]->'[object Object]', cross-user/missing 404, charset+weak-ETag), auth_gate_and_parse_order (401/403, bad-JSON-500-before-auth), shape_guards_proxy_untouched_never_405; parity.mjs dk_put_200 (opposite-server GET name/description), dk_put_missing_404, dk_put_foreign_404, dk_put_no_name_400, dk_put_noauth_401, dk_put_badjson_500, dk_put_apikey_403"
   },
   "PUT /api/decks/:id/checkout": {
     "status": "node"
