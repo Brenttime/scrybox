@@ -550,6 +550,41 @@ cases.push({ name: 'cards_tag_stats_ok', path: '/api/cards/tag-stats', headers: 
 cases.push({ name: 'cards_tag_stats_empty_ids', path: '/api/cards/tag-stats', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: '{"ids":[]}' });
 cases.push({ name: 'cards_tag_stats_no_token', path: '/api/cards/tag-stats', headers: { ...AUTH_JSON }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS }) });
 
+// Catalog + card-art group (Lane B unit 2b port; RUST_ROUTES=catalog_art).
+// Reads only — the build engine (ONNX/sharp) and the sharp upload stay on
+// Node, so the POST/DELETE card-art shapes below are NOT native proof (the
+// proxy answers them); cargo tests carry the native surface proof, these
+// assert Node answers the same requests identically. scan-sets and
+// catalogs/languages are pure DB+FS folds over the shared snapshot (no
+// timers, no writes): deepDiff is honest. Art fixtures live in
+// data/card-art (created by this iteration; the Node container was
+// restarted after they landed so its process-level ids cache saw them).
+const MEMBER_SESSION = '7d1f4a52e3b0c9d8476155026af3e1b9c8d70246fae9135b0c2d8e4f6a7b1c3d';
+cases.push({ name: 'card_art_index', path: '/api/card-art/index', headers: {}, method: 'GET' });
+cases.push({ name: 'card_art_png_ok', path: '/api/card-art/parity-fixture-a.png', headers: {}, method: 'GET' });
+cases.push({ name: 'card_art_png_404', path: '/api/card-art/parity-no-such-card.png', headers: {}, method: 'GET' });
+cases.push({ name: 'card_art_png_bad_shape', path: '/api/card-art/a..b.png', headers: {}, method: 'GET' });
+cases.push({ name: 'card_art_upload_no_token', path: '/api/card-art/parity-fixture-a', headers: {}, method: 'POST', body: '{}' });
+cases.push({ name: 'scan_sets_ok', path: '/api/scan-sets', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'scan_sets_lang_ja', path: '/api/scan-sets?lang=ja', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'scan_sets_lang_es', path: '/api/scan-sets?lang=Spanish', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'scan_sets_no_token', path: '/api/scan-sets', headers: {}, method: 'GET' });
+cases.push({ name: 'catalog_langs_ok', path: '/api/admin/catalogs/languages', headers: { Authorization: `Bearer ${USER1_TOKEN}` }, method: 'GET' });
+cases.push({ name: 'catalog_langs_game_pokemon', path: '/api/admin/catalogs/languages?game=pokemon', headers: { Authorization: `Bearer ${USER1_TOKEN}` }, method: 'GET' });
+cases.push({ name: 'catalog_langs_no_token', path: '/api/admin/catalogs/languages', headers: {}, method: 'GET' });
+cases.push({ name: 'catalog_langs_member', path: '/api/admin/catalogs/languages', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
+cases.push({
+  name: 'catalog_langs_apikey', path: '/api/admin/catalogs/languages',
+  headers: { Authorization: '***' + 'k'.repeat(59) }, method: 'GET',
+  setup: async () => {
+    dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('k'.repeat(59), 'sparks'));
+    return null;
+  },
+  teardown: async () => {
+    dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run('sparks'));
+  },
+});
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
