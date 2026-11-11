@@ -388,7 +388,9 @@ async fn shared_public_read() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::OK); // case-sensitive: NO-CACHE does NOT match
+    // Live-pinned vs Node :3312: NO-CACHE -> 304 (fresh@0.5.2 regex is
+    // case-sensitive, so the directive does NOT disable the ETag replay).
+    assert_eq!(s, StatusCode::NOT_MODIFIED); // case-sensitive: NO-CACHE does NOT match
     let (s, _, _) = request(
         &r,
         "GET",
