@@ -590,7 +590,9 @@ async fn gzip_served_when_accepted_and_decompressed_matches() {
             .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h[header::CONTENT_ENCODING], "gzip");
-    assert_eq!(h[header::VARY], "Accept-Encoding");
+    // unit-5a stack: User-Agent (COEP mw) + Origin (cors) precede the
+    // compression leg (matches Node instance curl -D output).
+    assert_eq!(h[header::VARY], "User-Agent, Origin, Accept-Encoding");
     // inflate and compare to the oracle bytes.
     let mut d = flate2::read::GzDecoder::new(&body[..]);
     let mut out = Vec::new();

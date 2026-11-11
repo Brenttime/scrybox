@@ -49,6 +49,7 @@ pub mod moxfield;
 pub mod moxfield_api;
 pub mod name_index;
 pub mod scryfall;
+pub mod secheaders;
 pub mod scry_jobs;
 pub mod search;
 pub mod sets;
@@ -514,6 +515,11 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
+    // Lane B unit 5a: security-header stack (COEP/helmet-8/cors twins) over
+    // the NATIVE routes only. Attached before the fallback is registered so
+    // proxied traffic keeps Node's own header output untouched — axum
+    // applies .layer() only to the routes added above it.
+    let router = router.layer(axum::middleware::from_fn(crate::secheaders::guard));
     let router = match state.cfg.static_dir.clone() {
         Some(dir) => {
             // Static hits are served by Rust; misses (API, SPA deep links,
