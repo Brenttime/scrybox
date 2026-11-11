@@ -43,6 +43,7 @@ pub mod decks_writes;
 pub mod decks_reads;
 pub mod health;
 pub mod manabox;
+pub mod migrations;
 pub mod mfx_payload;
 pub mod moxfield;
 pub mod moxfield_api;
@@ -92,7 +93,13 @@ impl Config {
         if !node_upstream.starts_with("http://") {
             return Err("SCRYBOX_NODE_UPSTREAM must be an http:// URL".into());
         }
-        let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR").map(PathBuf::from);
+        let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR")
+            .map(PathBuf::from)
+            // An empty-but-set value must not mount ServeDir: its fallback
+            // never answers non-GET requests, so every POST to a
+            // Rust-unregistered API path would die 405 (allow: GET,HEAD)
+            // instead of reaching the proxy.
+            .filter(|p| !p.as_os_str().is_empty());
         let rust_routes = std::env::var("RUST_ROUTES")
             .unwrap_or_default()
             .split(',')

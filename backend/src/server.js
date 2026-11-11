@@ -252,7 +252,14 @@ app.use(compression());
 
 // Initialize Database on startup
 let dbReady = false;
-db.initDb()
+// Lane B unit 4: the Rust front owns schema init/migrations when the test
+// container sets SCRYBOX_SKIP_DB_INIT=true (src/migrations.rs is the ported
+// twin of db.initDb, gated by RUST_MIGRATIONS + PRAGMA user_version).
+// Production default unchanged: Node still runs initDb().
+const initDbPromise = process.env.SCRYBOX_SKIP_DB_INIT === 'true'
+  ? (console.log('DB init disabled (SCRYBOX_SKIP_DB_INIT) — Rust owns migrations.'), Promise.resolve())
+  : db.initDb();
+initDbPromise
   .then(async () => {
     dbReady = true;
     console.log('Database tables verified/created successfully.');

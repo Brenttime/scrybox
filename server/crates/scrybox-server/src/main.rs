@@ -24,6 +24,48 @@ async fn main() {
         }
     };
     tracing::info!(bind = %cfg.bind, upstream = %cfg.node_upstream, static_dir = ?cfg.static_dir, rust_routes = ?cfg.rust_routes, "scrybox-server P0 starting");
+    // Lane B unit 4: Rust-owned schema baseline + migrations (twin of
+    // backend/src/db.js initDb). Off unless RUST_MIGRATIONS=true; the test
+    // container pairs it with SCRYBOX_SKIP_DB_INIT=true on Node so exactly
+    // one side runs the ladder. Skips via PRAGMA user_version once applied.
+    if std::env::var("RUST_MIGRATIONS").unwrap_or_default() == "true" {
+        match cfg.db_path.clone() {
+            Some(path) => {
+                let opts = scrybox_server::migrations::MigOpts {
+                    admin_password: std::env::var("DEFAULT_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty()),
+                    model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from),
+                    user_art_dir: None,
+                };
+                if opts.model_dir.is_none() {
+                    // Node's cardArt.js sweeps `backend/data/models` when
+                    // CV_MODEL_DIR is unset (path relative to the Node
+                    // sources, unknowable from the Rust front). The scrybox
+                    // image always sets it (Dockerfile ENV); a bare source
+                    // install must too, or the retired-model sweep is lost.
+                    tracing::warn!(
+                        "RUST_MIGRATIONS without CV_MODEL_DIR: retired-model sweep \
+                         skipped (Node default backend/data/models is unreachable \
+                         from the Rust front)"
+                    );
+                }
+                match scrybox_server::migrations::run_boot_migration(&path, &opts) {
+                    Ok(rep) => tracing::info!(
+                        db = %path.display(),
+                        skipped = rep.skipped,
+                        seeded_admin = rep.seeded_admin,
+                        removed_models = rep.removed_models,
+                        removed_art = rep.removed_art,
+                        "Rust migrations complete (RUST_MIGRATIONS=true)"
+                    ),
+                    Err(e) => {
+                        eprintln!("scrybox-server: migrations failed: {e}");
+                        std::process::exit(3);
+                    }
+                }
+            }
+            None => tracing::warn!("RUST_MIGRATIONS set but SCRYBOX_DB_PATH missing; migrations not run"),
+        }
+    }
     // Lane B background jobs (BRIEF-B): RUST_JOBS=scryfall takes the
     // weekly set-sync / hourly price-sweep timers from Node's server.js
     // (which the test container disables via SCRYBOX_DISABLE_SETS_REFRESH /
