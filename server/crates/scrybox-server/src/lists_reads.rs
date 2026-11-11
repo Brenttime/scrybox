@@ -83,8 +83,10 @@ pub async fn handle_card_matches(State(st): State<AppState>, req: Request) -> Re
     let uri = req.uri().clone();
     guard_get(st, req, "lists_reads", move |pool, headers, user| async move {
         // const q = String(req.query.q || '').trim(); if (q.length < 2) return res.json({});
-        let q = query_first(uri.query(), "q").unwrap_or_default().trim().to_string();
-        if q.chars().count() < 2 {
+        let q = qs_string(uri.query(), "q").trim().to_string();
+        // JS string length counts UTF-16 code units — one astral char
+        // (surrogate pair) is length 2 and DOES reach the LIKE query.
+        if q.encode_utf16().count() < 2 {
             return json_read_response(&headers, b"{}".to_vec(), Vec::<(String, String)>::new());
         }
         // const like = `%${q.replace(/[\\%_]/g, ch => `\\${ch}`)}%`
@@ -154,8 +156,8 @@ pub async fn handle_cardlist(Path(id): Path<String>, State(st): State<AppState>,
     guard_get(st, req, "lists_reads", move |pool, headers, user| async move {
         // Node: style = req.query.style === 'detailed' ? 'detailed' : 'plain';
         //       missingOnly = req.query.missing === '1'.
-        let style_detailed = query_first(uri.query(), "style").is_some_and(|v| v == "detailed");
-        let missing_only = query_first(uri.query(), "missing").is_some_and(|v| v == "1");
+        let style_detailed = qs_equals(uri.query(), "style", "detailed");
+        let missing_only = qs_equals(uri.query(), "missing", "1");
         let outcome = tokio::task::spawn_blocking(move || {
             let conn = pool.get().map_err(|e| {
                 tracing::error!(error = %e, "lists_reads: pool");
@@ -180,16 +182,76 @@ pub async fn handle_cardlist(Path(id): Path<String>, State(st): State<AppState>,
 }
 
 // ---------------------------------------------------------------------------
-// Query-string helper (express default 'extended' query parser = qs).
-// Repeated keys keep the first value — documented deviation from qs (which
-// hands an array; `=== 'detailed'` would then be false / String(array) join).
+// Query-string helper — qs (express default 'extended') twin for the three
+// keys this group reads. Live-pinned against the container's own qs:
+//   repeated `key=` -> ARRAY, so `style === 'detailed'` / `missing === '1'`
+//   are FALSE for arrays (a repeated key can never select a mode);
+//   `q[]=v` pushes; scalar+`q[]=` mixes into one array (qs merges);
+//   `q[k]=v` -> object -> String() = '[object Object]' (still searched);
+//   array q stringifies through Array.join(',') before the trim/length gate;
+//   ';' is NOT a delimiter; valueless `key` -> '' (falsy, not '1').
 // ---------------------------------------------------------------------------
 
-fn query_first(query: Option<&str>, key: &str) -> Option<String> {
-    let q = query?;
-    form_urlencoded::parse(q.as_bytes())
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
+#[derive(Debug, PartialEq)]
+enum QsVal {
+    Missing,
+    Scalar(String),
+    Array(Vec<String>),
+    Obj,
+}
+
+fn qs_get(query: Option<&str>, key: &str) -> QsVal {
+    let q = match query {
+        Some(q) => q,
+        None => return QsVal::Missing,
+    };
+    let mut result: Option<QsVal> = None;
+    for (k, v) in form_urlencoded::parse(q.as_bytes()) {
+        // Bracket forms: `key[]` pushes onto the array, any other
+        // `key[...]` makes the value an object.
+        let (base, push) = match k.split_once('[') {
+            None => (k.as_ref(), None),
+            Some((base, rest)) if rest == "]" => (base, Some(true)),
+            Some((base, _)) => {
+                if base == key {
+                    result = Some(QsVal::Obj);
+                }
+                continue;
+            }
+        };
+        if base != key || result == Some(QsVal::Obj) {
+            continue;
+        }
+        let push = push.unwrap_or(false);
+        result = Some(match result.take() {
+            None if push => QsVal::Array(vec![v.into_owned()]),
+            None => QsVal::Scalar(v.into_owned()),
+            Some(QsVal::Scalar(s)) => QsVal::Array(vec![s, v.into_owned()]),
+            Some(QsVal::Array(mut a)) => {
+                a.push(v.into_owned());
+                QsVal::Array(a)
+            }
+            Some(QsVal::Obj) => QsVal::Obj,
+            Some(QsVal::Missing) => QsVal::Missing,
+        });
+    }
+    result.unwrap_or(QsVal::Missing)
+}
+
+/// `String(req.query[key] || '')` — arrays join with commas, objects stringify
+/// to '[object Object]', absent/'' are empty.
+fn qs_string(query: Option<&str>, key: &str) -> String {
+    match qs_get(query, key) {
+        QsVal::Scalar(s) => s,
+        QsVal::Array(v) => v.join(","),
+        QsVal::Obj => "[object Object]".to_string(),
+        QsVal::Missing => String::new(),
+    }
+}
+
+/// `req.query[key] === expected` — never true for arrays or objects.
+fn qs_equals(query: Option<&str>, key: &str, expected: &str) -> bool {
+    matches!(qs_get(query, key), QsVal::Scalar(v) if v == expected)
 }
 
 // ---------------------------------------------------------------------------
@@ -678,15 +740,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn query_first_matches_qs_semantics() {
-        assert_eq!(query_first(Some("style=detailed"), "style").as_deref(), Some("detailed"));
-        assert_eq!(query_first(Some("a=1&missing=1"), "missing").as_deref(), Some("1"));
-        assert_eq!(query_first(Some("a=1"), "style"), None);
-        assert_eq!(query_first(None, "style"), None);
-        // repeated key: first value (documented deviation from qs array).
-        assert_eq!(query_first(Some("style=a&style=b"), "style").as_deref(), Some("a"));
-        // percent-decoded values.
-        assert_eq!(query_first(Some("q=%25a%20b%2B"), "q").as_deref(), Some("%a b+"));
+    fn qs_twin_matches_live_qs_vectors() {
+        // Scalars.
+        assert!(qs_equals(Some("style=detailed"), "style", "detailed"));
+        assert_eq!(qs_string(Some("q=Sol%20Ring"), "q"), "Sol Ring");
+        assert_eq!(qs_string(Some("q=%25a%20b%2B"), "q"), "%a b+");
+        assert_eq!(qs_get(Some("a=1"), "style"), QsVal::Missing);
+        assert_eq!(qs_get(None, "style"), QsVal::Missing);
+        // Valueless key -> '' (falsy, not '1').
+        assert!(!qs_equals(Some("missing"), "missing", "1"));
+        assert_eq!(qs_string(Some("missing=&q=ab"), "q"), "ab");
+        // Repeated key -> ARRAY: === 'detailed'/'1' false, String() joins.
+        assert!(!qs_equals(Some("style=a&style=b"), "style", "detailed"));
+        assert!(!qs_equals(Some("style=detailed&style=x"), "style", "detailed"));
+        assert!(!qs_equals(Some("missing=1&missing=0"), "missing", "1"));
+        assert_eq!(qs_string(Some("q=a&q=b"), "q"), "a,b");
+        // Bracket forms.
+        assert_eq!(qs_string(Some("q[]=Sol%20Ring"), "q"), "Sol Ring");
+        assert_eq!(qs_string(Some("q=a&q[]=b"), "q"), "a,b");
+        assert_eq!(qs_string(Some("q[a]=b"), "q"), "[object Object]");
+        // ';' is NOT a delimiter (whole remainder is the value).
+        assert_eq!(qs_string(Some("q=a;b=c"), "q"), "a;b=c");
     }
 
     #[test]
@@ -711,7 +785,7 @@ mod tests {
         assert_eq!(number_param("1e2"), Some(100));
         assert_eq!(number_param("abc"), None);
         assert_eq!(number_param("12.5"), None);
-        assert_eq!(number_param(""), None);
+        assert_eq!(number_param(""), Some(0), "JS Number('') === 0 (safe integer)");
     }
 
     #[test]

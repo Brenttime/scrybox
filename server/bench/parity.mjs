@@ -899,7 +899,7 @@ async function etagParity(c) {
   // Replay only makes sense for idempotent GETs; write cases are compared by
   // response alone (their ETag is Express's default body tag, not a contract).
   if ((c.method || 'GET') !== 'GET') return [];
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks')) return [];
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks') && !c.path.startsWith('/api/lists')) return [];
   // Sequential on purpose: setup-bearing cases reseed shared DB rows, and
   // two parallel setups would race each other's DELETE/INSERT mid-request
   // (the iter-27 shrd_* replay failures). Same rationale as the write-case
@@ -1844,6 +1844,14 @@ async function etagParity(c) {
     d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-lr-%');
   }
   function lrPrep() {
+    // Same bench-session lookup the deck block uses (dkUid lives inside that
+    // block's scope; this block gets its own copy).
+    const dkUid = (d) => {
+      const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+      const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+      if (!s) throw new Error('parity: bench session not found for list cases');
+      return Number(s.user_id);
+    };
     dbWrite((d) => {
       lrClear(d);
       const uid = dkUid(d);
@@ -1879,7 +1887,9 @@ async function etagParity(c) {
     cases.push({ name, path, headers, method, setup: lrPrep, teardown: lrTeardown });
   lrCase('lr_list_200', '/api/lists');
   lrCase('lr_list_noauth_401', '/api/lists', {});
-  lrCase('lr_matches_200', '/api/lists/card-matches?q=Card');
+  lrCase('lr_matches_200', '/api/lists/card-matches?q=RustTest');
+  lrCase('lr_matches_alpha_200', '/api/lists/card-matches?q=Alpha');
+  lrCase('lr_matches_wild_200', '/api/lists/card-matches?q=LR%20Beta%');
   lrCase('lr_matches_short_200', '/api/lists/card-matches?q=x');
   lrCase('lr_matches_none_200', '/api/lists/card-matches?q=zzzznothing');
   lrCase('lr_matches_meta_200', '/api/lists/card-matches?q=%25a%5Fb');
@@ -1896,6 +1906,15 @@ async function etagParity(c) {
   lrCase('lr_cardlist_foreign_404', '/api/lists/931204/cardlist');
   lrCase('lr_cardlist_broken_422', '/api/lists/931203/cardlist');
   lrCase('lr_cardlist_noauth_401', '/api/lists/931201/cardlist', {});
+  // qs array semantics (live-pinned vs the container's qs): a REPEATED key
+  // never equals the scalar, so style=detailed&style=x renders PLAIN and
+  // missing=1&missing=0 does not filter; bracket q stringifies through
+  // Array.join(',') — first-value-only would match 'RustTest' but the joined
+  // string must answer {}.
+  lrCase('lr_cardlist_style_array_200', '/api/lists/931201/cardlist?style=detailed&style=x');
+  lrCase('lr_cardlist_missing_array_200', '/api/lists/931202/cardlist?missing=1&missing=0');
+  lrCase('lr_matches_qjoin_200', '/api/lists/card-matches?q%5B%5D=RustTest&q%5B%5D=LR%20Alpha');
+  lrCase('lr_matches_qbracket_200', '/api/lists/card-matches?q%5B%5D=RustTest');
   // Dispatcher never 405s: PUT on the /:id shape forwards to Node, which
   // answers its own 404 for a nonexistent id without touching any row.
   cases.push({

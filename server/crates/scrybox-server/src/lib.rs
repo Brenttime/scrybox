@@ -93,7 +93,13 @@ impl Config {
         if !node_upstream.starts_with("http://") {
             return Err("SCRYBOX_NODE_UPSTREAM must be an http:// URL".into());
         }
-        let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR").map(PathBuf::from);
+        // An explicitly-empty SCRYBOX_STATIC_DIR means "no static dir" — the
+        // harness passes SCRYBOX_STATIC_DIR= to disable it. Without the
+        // filter, Some("") mounts ServeDir(""), which answers every POST to
+        // an unregistered path with a bare 405 instead of reaching the proxy.
+        let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         let rust_routes = std::env::var("RUST_ROUTES")
             .unwrap_or_default()
             .split(',')

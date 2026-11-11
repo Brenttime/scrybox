@@ -298,7 +298,8 @@ async fn card_matches_groups_by_list_numeric_key_order() {
     let (s, _, b) = request(&r, "GET", "/api/lists/card-matches?q=Card", &AUTH, None).await;
     assert_eq!(s, StatusCode::OK);
     let v = json_body(&b);
-    assert_eq!(v["201"], json!(["Alpha Card", "Beta Card", "Eur Card"]));
+    assert_eq!(v["201"], json!(["Alpha Card", "Alpha Card ", "Beta Card", "Eur Card"]),
+               "DISTINCT over raw names — the trailing-space printing is its own name");
     assert_eq!(v["202"], json!(["Alpha Card", "Beta Card", "Est Card"]));
     // JS object integer-key order: 201 before 202 (ascending numeric).
     let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
@@ -339,7 +340,7 @@ async fn detail_fold_prices_and_owned_qty() {
     assert_eq!(cards[0]["quantity"], json!(2));
     assert_eq!(cards[0]["id"], json!("z-alpha"), "MIN(card_id) representative");
     assert_eq!(cards[0]["subtypes"], json!(["Creature"]), "parseCardRow JSON columns");
-    assert_eq!(cards[0]["color_identity"], json!(["W"]));
+    assert_eq!(cards[0]["color_identity"], json!([]), "SELECT omits color_identity -> parseCardRow []");
     assert_eq!(cards[0]["owned_qty"], json!(1), "user owns z-alpha-b 1 -> same logical card");
     assert_eq!(cards[1]["name"], json!("Beta Card"));
     assert_eq!(cards[1]["owned_qty"], json!(2));
