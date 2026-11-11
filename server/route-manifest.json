@@ -246,10 +246,14 @@
     "tests": "tests/sets_route.rs (3); parity.mjs sets_flat/sets_tree/sets_lang_de/sets_empty_query/sets_no_token/sets_bad_token"
   },
   "GET /api/settings": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::settings (lib.rs /api/settings + /api/settings/version under RUST_ROUTES=settings; getEffectiveSettings DB+env fold, updateCache 6h twin, arm-ordered autocommit writes)",
+    "tests": "tests/settings.rs::get_settings_body_shape_and_order, effective_settings_env_and_no_row_folds, auth_gates, put_price_arms, put_scan_flags_and_early_400_order, put_moxfield_intervals, put_public_base_url, put_body_parser_order, version_check_gate_and_cache_legs, kill_switch_proxies_everything, other_methods_never_405, parse_int_10_matches_node, is_newer_matches_node, check_gate_requires_single_scalar_one, app_version_pins_backend_package_json; parity.mjs set_get_*,set_version_*,set_put_*"
   },
   "GET /api/settings/version": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::settings (lib.rs /api/settings + /api/settings/version under RUST_ROUTES=settings; getEffectiveSettings DB+env fold, updateCache 6h twin, arm-ordered autocommit writes)",
+    "tests": "tests/settings.rs::get_settings_body_shape_and_order, effective_settings_env_and_no_row_folds, auth_gates, put_price_arms, put_scan_flags_and_early_400_order, put_moxfield_intervals, put_public_base_url, put_body_parser_order, version_check_gate_and_cache_legs, kill_switch_proxies_everything, other_methods_never_405, parse_int_10_matches_node, is_newer_matches_node, check_gate_requires_single_scalar_one, app_version_pins_backend_package_json; parity.mjs set_get_*,set_version_*,set_put_*"
   },
   "GET /api/shared/:share_token": {
     "module": "scrybox-server::shared (lib.rs /api/shared/{token} under RUST_ROUTES=shared; PUBLIC route, Node mounts above the auth gate)",
@@ -546,6 +550,8 @@
     "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
   },
   "PUT /api/settings": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::settings (lib.rs /api/settings + /api/settings/version under RUST_ROUTES=settings; getEffectiveSettings DB+env fold, updateCache 6h twin, arm-ordered autocommit writes)",
+    "tests": "tests/settings.rs::get_settings_body_shape_and_order, effective_settings_env_and_no_row_folds, auth_gates, put_price_arms, put_scan_flags_and_early_400_order, put_moxfield_intervals, put_public_base_url, put_body_parser_order, version_check_gate_and_cache_legs, kill_switch_proxies_everything, other_methods_never_405, parse_int_10_matches_node, is_newer_matches_node, check_gate_requires_single_scalar_one, app_version_pins_backend_package_json; parity.mjs set_get_*,set_version_*,set_put_*"
   }
 }

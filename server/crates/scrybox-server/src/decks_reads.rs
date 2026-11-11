@@ -338,7 +338,7 @@ fn js_decimal(s: &str) -> Option<f64> {
 }
 
 /// JS `String(x)` for values the driver can return.
-fn js_to_string(v: Option<&Value>) -> String {
+pub(crate) fn js_to_string(v: Option<&Value>) -> String {
     match v {
         None | Some(Value::Null) => "null".to_string(),
         Some(Value::Bool(b)) => b.to_string(),

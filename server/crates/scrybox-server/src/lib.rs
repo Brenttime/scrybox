@@ -41,6 +41,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod settings;
 pub mod lists_body_writes;
 pub mod lists_reads;
 pub mod lists_writes;
@@ -460,6 +461,16 @@ pub fn app(state: AppState) -> Router {
             .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
             .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
             .route("/api/decks/{id}/return", any(decks_writes::handle_return))
+    } else {
+        router
+    };
+    // Lane A iter-34: settings group (GET/PUT /api/settings,
+    // GET /api/settings/version) under `settings`. Other methods ride the
+    // catch-all proxy — never 405.
+    let router = if state.owns("settings") {
+        router
+            .route("/api/settings", any(settings::route_settings))
+            .route("/api/settings/version", any(settings::route_version))
     } else {
         router
     };
