@@ -1,0 +1,686 @@
+{
+ "lines": [
+  {
+   "in": "4 Lightning Bolt",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4x Lightning Bolt",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4X Lightning Bolt",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Lightning Bolt",
+   "out": {
+    "qty": 1,
+    "name": "Lightning Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Lightning Bolt (JUD) 124",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "4 Lightning Bolt (jud) 124a/b1",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt (jud) 124a/b1",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "  4   x   Lightning    Bolt  ",
+   "out": {
+    "qty": 4,
+    "name": "Lightning Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "0 Bolt",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "0009 Bolt",
+   "out": {
+    "qty": 9,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "99999999999999999999 Bolt",
+   "out": {
+    "qty": 100000000000000000000,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 x Bolt",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 xtra stuff",
+   "out": {
+    "qty": 4,
+    "name": "xtra stuff",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "x4 Bolt",
+   "out": {
+    "qty": 1,
+    "name": "x4 Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "1x1 Bolt",
+   "out": {
+    "qty": 1,
+    "name": "1x1 Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "12  Bolt",
+   "out": {
+    "qty": 12,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "",
+   "out": null
+  },
+  {
+   "in": "   ",
+   "out": null
+  },
+  {
+   "in": "// hi",
+   "out": null
+  },
+  {
+   "in": "# hi",
+   "out": null
+  },
+  {
+   "in": "#",
+   "out": null
+  },
+  {
+   "in": "//",
+   "out": null
+  },
+  {
+   "in": "Deck",
+   "out": null
+  },
+  {
+   "in": "deck:",
+   "out": null
+  },
+  {
+   "in": "  SIDEBOARD  :  ",
+   "out": null
+  },
+  {
+   "in": "Main Deck:",
+   "out": null
+  },
+  {
+   "in": "maindeck",
+   "out": null
+  },
+  {
+   "in": "main deck",
+   "out": null
+  },
+  {
+   "in": "main  deck",
+   "out": null
+  },
+  {
+   "in": "Maindeck",
+   "out": null
+  },
+  {
+   "in": "Commander: xyz",
+   "out": {
+    "qty": 1,
+    "name": "Commander: xyz",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "commander",
+   "out": null
+  },
+  {
+   "in": "Commanders",
+   "out": null
+  },
+  {
+   "in": "Companion",
+   "out": null
+  },
+  {
+   "in": "Maybeboard",
+   "out": null
+  },
+  {
+   "in": "Tokens",
+   "out": null
+  },
+  {
+   "in": "token",
+   "out": null
+  },
+  {
+   "in": "About",
+   "out": null
+  },
+  {
+   "in": "about:",
+   "out": null
+  },
+  {
+   "in": "DECK",
+   "out": null
+  },
+  {
+   "in": "dEcK : ",
+   "out": null
+  },
+  {
+   "in": "compaİnion",
+   "out": {
+    "qty": 1,
+    "name": "compaİnion",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "compaınion",
+   "out": {
+    "qty": 1,
+    "name": "compaınion",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "ſideboard",
+   "out": {
+    "qty": 1,
+    "name": "ſideboard",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "MAİN DECK",
+   "out": {
+    "qty": 1,
+    "name": "MAİN DECK",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "main deck ",
+   "out": null
+  },
+  {
+   "in": "4 Bolt ",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": " 4 Bolt",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "　Deck",
+   "out": null
+  },
+  {
+   "in": "Ｂolt",
+   "out": {
+    "qty": 1,
+    "name": "Ｂolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Ｂ 4",
+   "out": {
+    "qty": 1,
+    "name": "Ｂ 4",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Bolt (JUD) 124",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "Bolt(JUD) 124",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "Bolt (J) 124",
+   "out": {
+    "qty": 1,
+    "name": "Bolt (J) 124",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Bolt (JUD) 124//5",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(JUD) 124//5",
+    "set": "jud",
+    "number": "124//5"
+   }
+  },
+  {
+   "in": "Bolt (JUD) 124 *x*",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(JUD) 124 *x*",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "Bolt (JUD) 124 *X*",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(JUD) 124 *X*",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "Bolt (VERYLONGSETNAME) 1",
+   "out": {
+    "qty": 1,
+    "name": "Bolt (VERYLONGSETNAME) 1",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Bolt (ABCDEFGHIJKLMNOP) 1",
+   "out": {
+    "qty": 1,
+    "name": "Bolt (ABCDEFGHIJKLMNOP) 1",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Bolt (AB) *F*",
+   "out": {
+    "qty": 1,
+    "name": "Bolt",
+    "setRef": "(AB) *F*",
+    "set": "ab",
+    "number": ""
+   }
+  },
+  {
+   "in": "Bolt (AB) 1 *F* trailing",
+   "out": {
+    "qty": 1,
+    "name": "Bolt (AB) 1 *F* trailing",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "Lightning (A1) Bolt (JUD) 124",
+   "out": {
+    "qty": 1,
+    "name": "Lightning (A1) Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "4 Bolt (AB)//12345678901234567890",
+   "out": {
+    "qty": 4,
+    "name": "Bolt (AB)//12345678901234567890",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 ∞ Bolt",
+   "out": {
+    "qty": 4,
+    "name": "∞ Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Bolt  ",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4  (AB) 1",
+   "out": null
+  },
+  {
+   "in": "(AB) 1",
+   "out": null
+  },
+  {
+   "in": "4 Bolt (ab)*F*",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(ab)*F*",
+    "set": "ab",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Bolt (ab) 1//2 *f*",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(ab) 1//2 *f*",
+    "set": "ab",
+    "number": "1//2"
+   }
+  },
+  {
+   "in": "K deck",
+   "out": {
+    "qty": 1,
+    "name": "K deck",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "deck K",
+   "out": {
+    "qty": 1,
+    "name": "deck K",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Bolt (JUD) 124 ",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "4 Bolt  (JUD) 1",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(JUD) 1",
+    "set": "jud",
+    "number": "1"
+   }
+  },
+  {
+   "in": "4 Bolt (JUD) 124",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(JUD) 124",
+    "set": "jud",
+    "number": "124"
+   }
+  },
+  {
+   "in": "500 Bolt",
+   "out": {
+    "qty": 500,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "2500x Bolt",
+   "out": {
+    "qty": 2500,
+    "name": "Bolt",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Bolt (12) 3",
+   "out": {
+    "qty": 4,
+    "name": "Bolt",
+    "setRef": "(12) 3",
+    "set": "12",
+    "number": "3"
+   }
+  },
+  {
+   "in": "4 Bolt (1) 3",
+   "out": {
+    "qty": 4,
+    "name": "Bolt (1) 3",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  },
+  {
+   "in": "4 Bolt (JUD_) 124",
+   "out": {
+    "qty": 4,
+    "name": "Bolt (JUD_) 124",
+    "setRef": "",
+    "set": "",
+    "number": ""
+   }
+  }
+ ],
+ "text": [
+  {
+   "in": "4 Bolt\nBolt (JUD) 1\n\r\nc\rd\n\n//skip",
+   "out": [
+    {
+     "qty": 4,
+     "name": "Bolt",
+     "setRef": "",
+     "set": "",
+     "number": ""
+    },
+    {
+     "qty": 1,
+     "name": "Bolt",
+     "setRef": "(JUD) 1",
+     "set": "jud",
+     "number": "1"
+    },
+    {
+     "qty": 1,
+     "name": "c d",
+     "setRef": "",
+     "set": "",
+     "number": ""
+    }
+   ]
+  },
+  {
+   "in": "a\r\r\nb",
+   "out": [
+    {
+     "qty": 1,
+     "name": "a",
+     "setRef": "",
+     "set": "",
+     "number": ""
+    },
+    {
+     "qty": 1,
+     "name": "b",
+     "setRef": "",
+     "set": "",
+     "number": ""
+    }
+   ]
+  },
+  {
+   "in": null,
+   "out": []
+  },
+  {
+   "in": "1 x\n2x y (SET) 9",
+   "out": [
+    {
+     "qty": 1,
+     "name": "x",
+     "setRef": "",
+     "set": "",
+     "number": ""
+    },
+    {
+     "qty": 2,
+     "name": "y",
+     "setRef": "(SET) 9",
+     "set": "set",
+     "number": "9"
+    }
+   ]
+  }
+ ]
+}

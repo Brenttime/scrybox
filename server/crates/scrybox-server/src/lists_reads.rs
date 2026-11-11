@@ -115,11 +115,18 @@ pub async fn handle_card_matches(State(st): State<AppState>, req: Request) -> Re
     .await
 }
 
-/// Dispatcher for /api/lists/{id}: only GET is owned this stage; PUT/DELETE
-/// stay fully proxied until the lists WRITE group lands.
+/// Dispatcher for /api/lists/{id}: GET is owned by lists_reads, PUT/DELETE by
+/// lists_writes (iter-32); every other method forwards, so shapes never 405.
 pub async fn route_entry(Path(id): Path<String>, State(st): State<AppState>, req: Request) -> Response {
     if req.method() == Method::GET && st.owns("lists_reads") {
         return handle_detail(Path(id), State(st), req).await;
+    }
+    if st.owns("lists_writes") {
+        match *req.method() {
+            Method::PUT => return crate::lists_writes::handle_update(Path(id), State(st), req).await,
+            Method::DELETE => return crate::lists_writes::handle_delete(Path(id), State(st), req).await,
+            _ => {}
+        }
     }
     crate::proxy(State(st), req).await
 }

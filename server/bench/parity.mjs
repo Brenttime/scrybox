@@ -1915,13 +1915,211 @@ async function etagParity(c) {
   lrCase('lr_cardlist_missing_array_200', '/api/lists/931202/cardlist?missing=1&missing=0');
   lrCase('lr_matches_qjoin_200', '/api/lists/card-matches?q%5B%5D=RustTest&q%5B%5D=LR%20Alpha');
   lrCase('lr_matches_qbracket_200', '/api/lists/card-matches?q%5B%5D=RustTest');
-  // Dispatcher never 405s: PUT on the /:id shape forwards to Node, which
-  // answers its own 404 for a nonexistent id without touching any row.
+  // iter-32: PUT on the /:id shape is NATIVE under lists_writes (the old
+  // proxy-passthrough name is stale); a nonexistent id answers Node's own
+  // 404 shape without touching any row.
   cases.push({
     name: 'lr_put_proxy_404', path: '/api/lists/931299', method: 'PUT',
     headers: { ...authHeaders, 'content-type': 'application/json' },
     body: '{"name":"LR Proxy Pass"}',
     setup: lrPrep, teardown: lrTeardown,
+  });
+}
+
+// ===== LANE-A iter-32: card-list META WRITES (lists_writes.rs under
+// RUST_ROUTES=lists_writes). Own id range 931211..931214, own card rows
+// rusttest-lw-*. Create pins the Node contract (trim, defaults, cleanIcon,
+// qty stacking via the all-cached native path) and the whole-request
+// Scryfall-hydration FORWARD (uncached name: both sides run Node, and Rust
+// must have created NOTHING before forwarding); update pins binding shapes,
+// the accent TypeError-500 twin and changes==0 404; delete pins the
+// cascade-twin (list_cards rows leave with the parent); order pins the
+// Number()-filter survival table with post-filter sort_order indices.
+{
+  const LW_A = 'rusttest-lw-alpha';
+  const LW_NAME_A = 'rusttest LW Alpha';
+  function lwClear(d) {
+    d.prepare('DELETE FROM list_cards WHERE list_id BETWEEN 931211 AND 931214').run();
+    d.prepare('DELETE FROM card_lists WHERE id BETWEEN 931211 AND 931214').run();
+    d.prepare("DELETE FROM card_lists WHERE name IN ('LW Fresh','LW Import','LW Native')").run();
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-lw-%');
+  }
+  function lwPrep() {
+    const uidOf = (d) => {
+      const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+      const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+      if (!s) throw new Error('parity: bench session not found for lw cases');
+      return Number(s.user_id);
+    };
+    dbWrite((d) => {
+      lwClear(d);
+      const uid = uidOf(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for lw cases');
+      d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(LW_A, LW_NAME_A, 'MTG', '["Artifact"]', '[]', 'Common', 'lws', 'LW Set', '7', null, 0.3, 0.3, 0, 0, 0, 0, '[]', 'USD');
+      const list = d.prepare('INSERT INTO card_lists (id,user_id,name,description,accent_color,created_at,source,icon,sort_order) VALUES (?,?,?,?,?,?,?,?,?)');
+      list.run(931211, uid, 'LW Upd', 'u', '#10b981', '2026-01-01 00:00:05', 'web', null, null);
+      list.run(931212, uid, 'LW Order A', 'a', '#10b981', '2026-01-01 00:00:04', 'web', null, null);
+      list.run(931213, other.id, 'LW Foreign', 'f', '#10b981', '2026-01-01 00:00:03', 'web', null, null);
+      list.run(931214, uid, 'LW Del', 'd', '#10b981', '2026-01-01 00:00:02', 'web', null, null);
+      const lc = d.prepare('INSERT INTO list_cards (list_id,card_id,quantity) VALUES (?,?,?)');
+      lc.run(931214, LW_A, 2);
+    });
+  }
+  function lwTeardown() { dbWrite((d) => lwClear(d)); }
+  const lwDb = (sql, ...args) => dbWrite((d) => d.prepare(sql).all(...args));
+  const LW_JSON = { ...authHeaders, 'content-type': 'application/json' };
+  const NOAUTH_JSON = { 'content-type': 'application/json' };
+  cases.push({
+    name: 'lw_create_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"  LW Fresh  "}', etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT name, description, accent_color, icon FROM card_lists WHERE name='LW Fresh'");
+      const want = { name: 'LW Fresh', description: '', accent_color: '#10b981', icon: null };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `create row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // All-cached list_text: the NATIVE path (no forward). Two lines for the
+    // same card stack via ON CONFLICT (2+1=3); the '(lws) 7' setRef tail
+    // must be stripped off the name before the cache lookup; icon garbage
+    // -> NULL; explicit non-# accent -> default.
+    name: 'lw_create_native_listtext_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"LW Native","icon":"Bad Icon!","accent_color":"nope","list_text":"2 rusttest LW Alpha\\nrusttest LW Alpha (lws) 7"}',
+    etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT l.name, l.icon, l.accent_color, lc.card_id, lc.quantity FROM card_lists l JOIN list_cards lc ON lc.list_id = l.id WHERE l.name='LW Native' ORDER BY lc.card_id");
+      const ok = rows.length === 1 && rows[0].card_id === LW_A && rows[0].quantity === 3
+        && rows[0].icon === null && rows[0].accent_color === '#10b981';
+      return { ok, why: `native rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Uncached name -> the hydration leg is Node-side: Rust FORWARDS the
+    // whole request before its INSERT (no partial local write). Both sides
+    // answer with Node's own matched/unmatched fold.
+    name: 'lw_create_uncached_forward_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"LW Import","list_text":"2 rusttest LW Alpha\\nnot-a-real-card-zzq (lws) 9"}',
+    etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT lc.card_id, lc.quantity FROM card_lists l JOIN list_cards lc ON lc.list_id = l.id WHERE l.name='LW Import' ORDER BY lc.card_id");
+      return { ok: rows.length === 1 && rows[0].card_id === LW_A && rows[0].quantity === 2, why: `import rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_no_name_400', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"   "}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      // NOT `name LIKE 'LW %'` — lwPrep seeds four 'LW …' rows, so that
+      // count is never 0. The 400 path must create no blank-named row.
+      const rows = lwDb("SELECT COUNT(*) n FROM card_lists WHERE TRIM(name) = '' OR name = '   '");
+      return { ok: rows[0].n === 0, why: `400 created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_noauth_401', path: '/api/lists', headers: NOAUTH_JSON, method: 'POST',
+    body: '{"name":"LW Nope"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT COUNT(*) n FROM card_lists WHERE name='LW Nope'");
+      return { ok: rows[0].n === 0, why: `noauth created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_badjson_500', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{oops', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_update_200', path: '/api/lists/931211', headers: LW_JSON, method: 'PUT',
+    body: '{"name":" LW Renamed ","description":5,"accent_color":"#0f0","icon":"ab-1"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb('SELECT name, description, accent_color, icon FROM card_lists WHERE id=931211');
+      const want = { name: 'LW Renamed', description: '5', accent_color: '#0f0', icon: 'ab-1' };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `updated row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  // accent_color != null && startsWith('#') sits OUTSIDE the route's
+  // try/catch (backend/src/routes/lists.js:385, before `try {`): a non-string
+  // accent makes the async handler reject with an unhandled TypeError and
+  // Node 22 kills the whole process. Sending that payload at the SHARED
+  // :3312 container takes it down mid-suite, so no non-string accent case can
+  // live here (5, true, {}, [] all crash identically). Rust answers the
+  // route-catch shape (500 'Failed to update list', no write) — the same body
+  // Node would answer if the line sat inside the try; covered by
+  // tests/lists_writes.rs::update_binds_like_node_and_gates (accent 5 -> 500,
+  // accent null -> NULL column). String accents (with/without '#') stay
+  // crash-free and are covered by lw_update_200 + create cases.
+  // Orchestrator-default decision, iter 32.
+  cases.push({
+    name: 'lw_update_foreign_404', path: '/api/lists/931213', headers: LW_JSON, method: 'PUT',
+    body: '{"name":"LW Steal"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT name FROM card_lists WHERE id=931213");
+      return { ok: rows[0].name === 'LW Foreign', why: `foreign row touched -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_update_no_name_400', path: '/api/lists/931211', headers: LW_JSON, method: 'PUT',
+    body: '{"name":""}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_delete_200', path: '/api/lists/931214', headers: LW_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const lists = lwDb('SELECT id FROM card_lists WHERE id=931214');
+      const cards = lwDb('SELECT * FROM list_cards WHERE list_id=931214');
+      return { ok: lists.length === 0 && cards.length === 0, why: `cascade -> lists=${lists.length} cards=${cards.length}`, seen: { lists, cards } };
+    },
+  });
+  cases.push({
+    name: 'lw_delete_missing_404', path: '/api/lists/931299', headers: LW_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    // Number() survival: "931212" string kept, 4.5 dies, null -> 0 KEPT,
+    // {} NaN dies; sort_order = POST-FILTER index (931212 -> 0, 931211 -> 1).
+    name: 'lw_order_200', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{"ids":["931212",4.5,null,{},"931211"]}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      // null -> Number(null)=0 PASSES Number.isInteger, so it survives and
+      // consumes the post-filter index 1 (updating no row): 931212->0,
+      // 0->1 (no match), 931211->2. This pins the survives-and-consumes
+      // semantic; 4.5/{} die pre-index.
+      const rows = lwDb('SELECT id, sort_order FROM card_lists WHERE id IN (931211,931212) ORDER BY sort_order');
+      const ok = rows.length === 2 && rows[0].id === 931212 && rows[0].sort_order === 0 && rows[1].id === 931211 && rows[1].sort_order === 2;
+      return { ok, why: `order -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_order_empty_400', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{"ids":[]}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_order_badjson_500', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_delete_noauth_401', path: '/api/lists/931214', headers: NOAUTH_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb('SELECT id FROM card_lists WHERE id=931214');
+      return { ok: rows.length === 1, why: `noauth deleted the list`, seen: rows };
+    },
   });
 }
 

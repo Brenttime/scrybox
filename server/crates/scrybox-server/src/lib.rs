@@ -42,6 +42,7 @@ pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
 pub mod lists_reads;
+pub mod lists_writes;
 pub mod health;
 pub mod manabox;
 pub mod mfx_payload;
@@ -466,11 +467,26 @@ pub fn app(state: AppState) -> Router {
     // /api/lists/{id} dispatcher answers GET natively and forwards every
     // other method, so shapes are never 405'd here.
     let router = if state.owns("lists_reads") {
-        router
-            .route("/api/lists", any(lists_reads::handle_collection))
+        let router = router
             .route("/api/lists/card-matches", any(lists_reads::handle_card_matches))
             .route("/api/lists/{id}", any(lists_reads::route_entry))
-            .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist))
+            .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist));
+        if state.owns("lists_writes") {
+            // iter-32: /api/lists POST + /order are native under lists_writes;
+            // the collection dispatcher keeps GET with lists_reads.
+            router
+                .route("/api/lists", any(lists_writes::route_collection))
+                .route("/api/lists/order", any(lists_writes::handle_order))
+        } else {
+            router.route("/api/lists", any(lists_reads::handle_collection))
+        }
+    } else if state.owns("lists_writes") {
+        router
+            .route("/api/lists", any(lists_writes::route_collection))
+            .route("/api/lists/order", any(lists_writes::handle_order))
+            // The /:id dispatcher answers PUT/DELETE natively here; its GET
+            // leg self-checks lists_reads and proxies when that group is off.
+            .route("/api/lists/{id}", any(lists_reads::route_entry))
     } else {
         router
     };

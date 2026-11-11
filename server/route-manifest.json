@@ -26,7 +26,9 @@
     "tests": "tests/decks_writes.rs::delete_card_removes_all_printings_of_logical_card (404/409/200 + both same-name printings leave, unrelated card stays); parity.mjs dk_deletecard_200 (opposite-server deck detail shows both EMH printings gone, maybeboard intact), dk_deletecard_deck_missing_404, dk_deletecard_checked_out_409, dk_deletecard_noauth_401"
   },
   "DELETE /api/lists/:id": {
-    "status": "node"
+    "module": "scrybox-server::lists_writes (route_entry dispatcher under RUST_ROUTES=lists_writes; parse-before-auth express.json twin, transactional list_cards removal twin for Node FK behaviour)",
+    "status": "verified",
+    "tests": "tests/lists_writes.rs::delete_cascades_list_cards_twin; parity.mjs lw_delete_* (3 cases)"
   },
   "DELETE /api/lists/:id/cards/:card_id": {
     "status": "node"
@@ -169,7 +171,7 @@
   },
   "GET /api/lists/:id": {
     "status": "verified",
-    "module": "scrybox-server::lists_reads (lib.rs /api/lists/{id} GET dispatcher under RUST_ROUTES=lists_reads; requested/owned CTE fold, per-row currentPrintValues, parseCardRow; never-405: writes proxy)",
+    "module": "scrybox-server::lists_reads (lib.rs /api/lists/{id} GET dispatcher under RUST_ROUTES=lists_reads; requested/owned CTE fold, per-row currentPrintValues, parseCardRow; PUT/DELETE native under lists_writes, other methods proxy)",
     "tests": "tests/lists_reads.rs::detail_fold_prices_and_owned_qty, detail_estimated_and_errors, writes_on_owned_shapes_never_405; parity.mjs lr_detail_* (6 cases), lr_put_proxy_404"
   },
   "GET /api/lists/:id/cardlist": {
@@ -401,7 +403,9 @@
     "status": "node"
   },
   "POST /api/lists": {
-    "status": "node"
+    "module": "scrybox-server::lists_writes (lib.rs /api/lists POST under RUST_ROUTES=lists_writes; parseListLine/parseListText twins Node-oracle-pinned, findCachedCard fold, cleanIcon, qty stack, whole-request forward before any local write when a line is unresolved)",
+    "status": "verified",
+    "tests": "tests/lists_writes.rs::parse_list_line_matches_node_oracle, parse_list_text_matches_node_oracle, create_basic_cached_defaults_and_stacking, create_errors_auth_and_parse_order; parity.mjs lw_create_* (5 cases)"
   },
   "POST /api/lists/:id/cards": {
     "status": "node"
@@ -503,7 +507,9 @@
     "tests": "tests/decks_writes.rs::checkout_contract (return section: 200 clears checked_out/checked_out_at, idempotent second return 200, foreign/missing 404); parity.mjs dk2_return_200 (opposite-server flags cleared), dk2_return_missing_404, dk2_return_noauth_401 (keeps deck checked out)"
   },
   "PUT /api/lists/:id": {
-    "status": "node"
+    "module": "scrybox-server::lists_writes (route_entry dispatcher under RUST_ROUTES=lists_writes; raw-shape bindings incl. description falsy-but-not-null, accent TypeError-500 twin, changes==0 -> 404, parse-before-auth)",
+    "status": "verified",
+    "tests": "tests/lists_writes.rs::update_binds_like_node_and_gates (incl. accent non-string -> 500 twin; parity case dropped iter-32 — that payload crashes the shared Node container, lists.js:385 sits outside the route try/catch); parity.mjs lw_update_* (3 cases), lr_put_proxy_404 (native since iter-32)"
   },
   "PUT /api/lists/:id/cards/:card_id/printing": {
     "status": "node"
@@ -512,7 +518,9 @@
     "status": "node"
   },
   "PUT /api/lists/order": {
-    "status": "node"
+    "module": "scrybox-server::lists_writes (lib.rs /api/lists/order PUT under RUST_ROUTES=lists_writes; Number() survival filter, post-filter sort_order index, 1-1000 gate)",
+    "status": "verified",
+    "tests": "tests/lists_writes.rs::order_number_filter_and_index; parity.mjs lw_order_* (3 cases)"
   },
   "PUT /api/marketplace/accounts": {
     "status": "node"
