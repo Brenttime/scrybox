@@ -29,6 +29,7 @@ pub mod auth_routes;
 pub mod auth_support;
 pub mod card_cache;
 pub mod card_norm;
+pub mod cards_tags;
 pub mod collq;
 pub mod ip_limit;
 pub mod oidc;
@@ -326,6 +327,18 @@ pub fn app(state: AppState) -> Router {
     // Sets route group (Lane B unit 1): native GET /api/sets (flat + tree).
     let router = if state.owns("sets") {
         router.route("/api/sets", any(sets::handle))
+    } else {
+        router
+    };
+    // Cards tags group (Lane B unit 2a): Tagger oracle views. Methods/paths
+    // the port does not own proxy to Node untouched, so Express still
+    // authors everything else under /api/cards (e.g. /cards/highlight).
+    let router = if state.owns("cards_tags") {
+        router
+            .route("/api/cards/{id}/oracle", any(cards_tags::handle_oracle))
+            .route("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
+            .route("/api/cards/role-tags", any(cards_tags::handle_role_tags))
+            .route("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
     } else {
         router
     };

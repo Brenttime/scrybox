@@ -523,6 +523,33 @@ cases.push({ name: 'sets_empty_query', path: '/api/sets?', headers: authHeaders,
 cases.push({ name: 'sets_no_token', path: '/api/sets', headers: {}, method: 'GET' });
 cases.push({ name: 'sets_bad_token', path: '/api/sets', headers: { Authorization: '***' }, method: 'GET' });
 
+// Cards tags group (Lane B unit 2a port: oracle views; RUST_ROUTES=cards_tags).
+// Fling has oracle_text cached, so the GET hits the card_cache columns on both
+// sides with NO Scryfall leg (a legacy row would page live Scryfall and write
+// back — cargo tests cover that leg with a mock, not parity). `no-card` is a
+// non-mtg id absent from the cache: Node's getOracleText answers 404 from the
+// row check alone, deterministic on both sides. The tag views read the active
+// generation 71 closure tables in the shared DB; role/tag-stats bodies are
+// pure query folds — no writes, no timers — so plain deepDiff is honest.
+const TAGGED_CARD = 'mtg-12e4f93c-6daf-458e-aa5a-26844c54bfdd'; // 46 direct tags
+const CACHED_RULES_CARD = 'mtg-cb28fe03-8269-41de-b766-42c3421aeaef'; // Fling
+const ROLE_TAG_IDS = ['mtg-0001c639-8bd0-426f-89cb-4ca61f3cc054', 'mtg-000499a4-3f39-4d25-a2a2-b2f014e30754', 'mtg-0005c844-787c-4f0c-8d25-85cec151642b', 'mtg-000e2f80-7667-4a8b-91c2-359121d44ebb', 'mtg-00108a1c-e620-4124-9b31-3bb3ff2a0407', 'mtg-00127acd-a284-4bc8-bdfa-895914e3cd49'];
+const ROLE_TAG_SLUGS = ['draw', 'card-advantage', 'burst-draw', 'synergy-exile-cast', 'definitely-not-a-real-tag'];
+cases.push({ name: 'cards_oracle_ok', path: `/api/cards/${CACHED_RULES_CARD}/oracle`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cards_oracle_404', path: '/api/cards/no-card/oracle', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cards_oracle_no_token', path: `/api/cards/${CACHED_RULES_CARD}/oracle`, headers: {}, method: 'GET' });
+cases.push({ name: 'cards_oracle_tags_ok', path: `/api/cards/${TAGGED_CARD}/oracle-tags`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cards_oracle_tags_fallback', path: `/api/cards/${TAGGED_CARD}/oracle-tags?oracle_id=mtg-17b429bd-d7da-45f5-988b-7eed0d3efeaa`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cards_oracle_tags_404_shape', path: '/api/cards/no-card/oracle-tags', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'cards_oracle_tags_no_token', path: `/api/cards/${TAGGED_CARD}/oracle-tags`, headers: {}, method: 'GET' });
+cases.push({ name: 'cards_role_tags_ok', path: '/api/cards/role-tags', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS, slugs: ROLE_TAG_SLUGS }) });
+cases.push({ name: 'cards_role_tags_missing_slugs', path: '/api/cards/role-tags', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS }) });
+cases.push({ name: 'cards_role_tags_too_many_ids', path: '/api/cards/role-tags', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: JSON.stringify({ ids: Array.from({ length: 1001 }, (_, i) => `mtg-x${i}`), slugs: ROLE_TAG_SLUGS }) });
+cases.push({ name: 'cards_role_tags_no_token', path: '/api/cards/role-tags', headers: { ...AUTH_JSON }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS, slugs: ROLE_TAG_SLUGS }) });
+cases.push({ name: 'cards_tag_stats_ok', path: '/api/cards/tag-stats', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS }) });
+cases.push({ name: 'cards_tag_stats_empty_ids', path: '/api/cards/tag-stats', headers: { ...AUTH_JSON, ...authHeaders }, method: 'POST', body: '{"ids":[]}' });
+cases.push({ name: 'cards_tag_stats_no_token', path: '/api/cards/tag-stats', headers: { ...AUTH_JSON }, method: 'POST', body: JSON.stringify({ ids: ROLE_TAG_IDS }) });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
