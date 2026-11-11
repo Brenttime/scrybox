@@ -133,7 +133,7 @@ fn active_generation(conn: &rusqlite::Connection) -> Result<Option<i64>, String>
     }
 }
 
-async fn read_body(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
+pub(crate) async fn read_body(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
     let (parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await

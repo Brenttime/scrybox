@@ -27,6 +27,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
+pub mod backup;
 pub mod card_cache;
 pub mod card_norm;
 pub mod card_art;
@@ -42,6 +43,10 @@ pub mod decks_writes;
 pub mod decks_reads;
 pub mod lists_reads;
 pub mod health;
+pub mod manabox;
+pub mod mfx_payload;
+pub mod moxfield;
+pub mod moxfield_api;
 pub mod name_index;
 pub mod scryfall;
 pub mod scry_jobs;
@@ -136,6 +141,11 @@ pub struct AppState {
     /// Shared Scryfall client (Lane B): rate-limited queue + 404 breaker.
     /// One per process so the queue is global, like Node's module state.
     pub scry: Arc<scryfall::Scry>,
+    /// Moxfield API client (Lane B unit 3): execs curl/curl-impersonate,
+    /// GET only. `from_env` at boot (MOXFIELD_API_BASE / MOXFIELD_CURL_BIN /
+    /// curl-impersonate probe), like Node's require-time constants; tests
+    /// point it at a mock by setting the field.
+    pub mfx: Arc<crate::moxfield_api::MfxApi>,
     /// cardSets.js getScryfallSets memo (tree=1 folds, 6 h TTL).
     pub scryfall_sets: sets::ScryfallSetsMemo,
     /// authLimiter twin (middleware/auth.js): one fixed window per client IP
@@ -175,7 +185,7 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -455,6 +465,60 @@ pub fn app(state: AppState) -> Router {
             .route("/api/lists/card-matches", any(lists_reads::handle_card_matches))
             .route("/api/lists/{id}", any(lists_reads::route_entry))
             .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist))
+    } else {
+        router
+    };
+    // Lane B unit 3a: Moxfield sync — status, author CRUD, forced syncs,
+    // per-deck enable switch, all under RUST_ROUTES=moxfield. The 20-second
+    // scheduler + boot catch-up ride the same gate (Node's twin is disabled
+    // with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER, server.js).
+    let router = if state.owns("moxfield") {
+        // Scheduler twin of Node's server.js kill switch: the harness runs
+        // the test instance with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1 (and
+        // the Node container's flag file marks its tick off) so the shared
+        // DB copy stays quiescent for parity — the tick/boot-catch-up
+        // semantics are proven by cargo tests, like the sets/price jobs are
+        // by the jobs binary + DB-diff. Flip this env off (and remove the
+        // container flag file) to hand the live tick to Rust.
+        let sched_off = std::env::var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if sched_off {
+            tracing::info!("Moxfield scheduler disabled (SCRYBOX_DISABLE_MOXFIELD_SCHEDULER) — no tick runs on this instance");
+        } else {
+            moxfield::spawn_scheduler(&state);
+        }
+        router
+            .route("/api/moxfield", any(moxfield::handle_status))
+            .route("/api/moxfield/authors", any(moxfield::handle_add_author))
+            .route("/api/moxfield/authors/{id}", any(moxfield::handle_delete_author))
+            .route("/api/moxfield/authors/{id}/sync-decklist", any(moxfield::handle_sync_decklist))
+            .route("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
+            .route("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
+            .route("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
+    } else {
+        router
+    };
+    // Lane B unit 3b: ManaBox sync + backup job, both under
+    // RUST_ROUTES=manabox_backup. Node's twin auto-backup timer is switched
+    // off with SCRYBOX_DISABLE_AUTO_BACKUP (server.js); the parity harness
+    // sets it on both instances so the shared DB copy stays quiescent.
+    let router = if state.owns("manabox_backup") {
+        let backup_off = std::env::var("SCRYBOX_DISABLE_AUTO_BACKUP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if backup_off {
+            tracing::info!("Auto-backup disabled (SCRYBOX_DISABLE_AUTO_BACKUP) — no timer runs on this instance");
+        } else {
+            backup::spawn_auto_backup(&state);
+        }
+        router
+            .route("/api/manabox-sync/preview", any(manabox::handle_preview))
+            .route("/api/manabox-sync/apply", any(manabox::handle_apply))
+            .route("/api/manabox-sync/runs", any(manabox::handle_runs))
+            .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
+            .route("/api/admin/backups", any(backup::handle_backups_collection))
+            .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
     } else {
         router
     };

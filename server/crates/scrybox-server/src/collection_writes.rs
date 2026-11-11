@@ -373,22 +373,22 @@ fn get_i64(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<i
 /// additionally needs a real write transaction so the multi-statement
 /// allocate/read-check-write sequences are atomic and serialise against
 /// Node's own writes on the shared WAL file.
-struct Tx<'a> {
+pub(crate) struct Tx<'a> {
     conn: &'a Connection,
     done: bool,
 }
 
 impl<'a> Tx<'a> {
-    fn begin(conn: &'a Connection) -> Result<Self, WriteError> {
+    pub(crate) fn begin(conn: &'a Connection) -> Result<Self, WriteError> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         Ok(Self { conn, done: false })
     }
-    fn commit(&mut self) -> Result<(), WriteError> {
+    pub(crate) fn commit(&mut self) -> Result<(), WriteError> {
         self.done = true;
         self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
-    fn rollback(&mut self) {
+    pub(crate) fn rollback(&mut self) {
         if !self.done {
             let _ = self.conn.execute_batch("ROLLBACK");
             self.done = true;

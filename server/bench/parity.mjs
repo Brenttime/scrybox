@@ -585,6 +585,59 @@ cases.push({
   },
 });
 
+// --- Moxfield parity (Lane B unit3a) -----------------------------------------
+// The status route is the deep fold (authors + their tracked decks + interval
+// settings from app_settings) over the shared DB copy; the scenario token
+// owns the real moxfield_authors row so the fold is exercised, not empty.
+// Scheduler ticks are quiesced on BOTH sides (Rust
+// SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container flag file), so the
+// stamps stay stable between the two reads. Remaining cases cover the auth
+// ladder and the validation/404 arms — none mutate the DB.
+cases.push({ name: 'mox_status', path: '/api/moxfield', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mox_status_no_token', path: '/api/moxfield', headers: {}, method: 'GET' });
+cases.push({ name: 'mox_add_author_missing', path: '/api/moxfield/authors', headers: authHeaders, method: 'POST', body: '{}' });
+cases.push({ name: 'mox_add_author_nonstring', path: '/api/moxfield/authors', headers: authHeaders, method: 'POST', body: JSON.stringify({ author: 123 }) });
+cases.push({ name: 'mox_delete_missing', path: '/api/moxfield/authors/999999', headers: authHeaders, method: 'DELETE' });
+cases.push({ name: 'mox_deck_put_missing', path: '/api/moxfield/decks/no-such-public-id', headers: authHeaders, method: 'PUT', body: '{"enabled":true}' });
+cases.push({ name: 'mox_deck_sync_missing', path: '/api/moxfield/decks/no-such-public-id/sync', headers: authHeaders, method: 'POST' });
+
+// --- ManaBox sync + backups parity (Lane B unit3b) ---------------------------
+// preview is the deep fold (CSV parse + identity check + planCollection +
+// planLists + summary + markdown report) over the shared DB copy with the
+// fixture card already cached (no Scryfall leg fires). The report's
+// wall-clock header line is scrubbed; every other byte of body must agree.
+// Apply is exercised ONLY through the pre-write 409 arm (expectBefore guard
+// rejects before any write) — the full write path is non-idempotent across
+// the two sides and stays cargo-fixture-only (tests/manabox_sync.rs), per the
+// collection_writes precedent. Admin backup GET lists the same host
+// directory on both sides (container bind-mounts data/); the env-dependent
+// `dir` string is stripped, the listing itself is compared.
+const MB_HDR = 'Binder Name,Binder Type,Name,Set code,Collector number,Foil,Quantity,Scryfall ID,Condition,Language,Added';
+const MB_UUID = 'dda6f965-cbdf-4dbc-b0b1-00c27e32f5f2'; // parity fixture card (cached, set trk #15)
+const MB_CSV = [
+  MB_HDR,
+  `SyncTest,binder,Emergency Medical Hologram,trk,15,normal,1,${MB_UUID},mint,en,2024-01-02T03:04:05.000Z`,
+  `SyncTestList,list,Emergency Medical Hologram,trk,15,normal,1,${MB_UUID},mint,en,2024-01-01T00:00:00.000Z`,
+  `SyncTest,binder,Whatever,trk,15,metal,1,${MB_UUID},mint,en,`,
+].join('\n') + '\n';
+const MB_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const MB_TS = ['^# ManaBox sync [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC', '# ManaBox sync TS UTC'];
+cases.push({ name: 'mb_preview_ok', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV, fileName: 'parity.csv' }), scrub: [['$.report', MB_TS[0], MB_TS[1]]] });
+cases.push({ name: 'mb_preview_empty', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'mb_preview_not_export', path: '/api/manabox-sync/preview', headers: MB_JSON, method: 'POST', body: JSON.stringify({ csv: 'Name,Quantity\nx,2\n' }) });
+cases.push({ name: 'mb_preview_no_token', path: '/api/manabox-sync/preview', headers: { 'content-type': 'application/json' }, method: 'POST', body: JSON.stringify({ csv: MB_CSV }) });
+cases.push({ name: 'mb_preview_member', path: '/api/manabox-sync/preview', headers: { ...MB_JSON, Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV }), scrub: [['$.report', MB_TS[0], MB_TS[1]]] });
+cases.push({ name: 'mb_apply_stale_409', path: '/api/manabox-sync/apply', headers: MB_JSON, method: 'POST',
+  body: JSON.stringify({ csv: MB_CSV, expectBefore: 999999 }) });
+cases.push({ name: 'mb_apply_empty', path: '/api/manabox-sync/apply', headers: MB_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'mb_runs_empty', path: '/api/manabox-sync/runs', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mb_report_missing', path: '/api/manabox-sync/runs/999999/report', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'mb_backups_list', path: '/api/admin/backups', headers: authHeaders, method: 'GET', strip: ['$.dir'] });
+cases.push({ name: 'mb_backups_list_member', path: '/api/admin/backups', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
+cases.push({ name: 'mb_backups_list_no_token', path: '/api/admin/backups', headers: {}, method: 'GET' });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
@@ -763,6 +816,23 @@ function stripPaths(obj, paths) {
   return clone;
 }
 
+/// Like stripPaths but REWRITES string leaves at `$.a.b` paths
+/// ([[path, regexSource, replacement], ...]). Used by manabox preview: the
+/// report's `# ManaBox sync <ISO minute> UTC` header is wall-clock by design,
+/// everything else in the report is a pure fold and must match byte for byte.
+function scrubStrings(obj, scrubs) {
+  if (!scrubs || !obj || typeof obj !== 'object') return obj;
+  const clone = structuredClone(obj);
+  for (const [p, re, rep] of scrubs) {
+    const parts = p.replace(/^\$\.?/, '').split('.');
+    let cur = clone;
+    for (let i = 0; i < parts.length - 1 && cur; i++) cur = cur[parts[i]];
+    const leaf = parts[parts.length - 1];
+    if (cur && typeof cur[leaf] === 'string') cur[leaf] = cur[leaf].replace(new RegExp(re, 'g'), rep);
+  }
+  return clone;
+}
+
 function compareCase(c, r, n) {
   const diffs = [];
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
@@ -771,7 +841,7 @@ function compareCase(c, r, n) {
   if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
     if (r.json === undefined || n.json === undefined) diffs.push('one side non-JSON body');
-    else deepDiff(stripPaths(r.json, c.strip), stripPaths(n.json, c.strip), '$', diffs);
+    else deepDiff(scrubStrings(stripPaths(r.json, c.strip), c.scrub), scrubStrings(stripPaths(n.json, c.strip), c.scrub), '$', diffs);
   } else if (r.body !== n.body) {
     diffs.push(`body ${fmt(r.body)} vs ${fmt(n.body)}`);
   }
@@ -1749,6 +1819,91 @@ async function etagParity(c) {
   // (No /combos parity case: it fetches the public Spellbook API — body is
   // upstream-flaky. The never-swallow guard is pinned by the path test
   // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
+}
+
+// --- iter 31: card-list READS (Lane A port: GET /api/lists,
+// /api/lists/card-matches, /api/lists/:id, /api/lists/:id/cardlist;
+// RUST_ROUTES=lists_reads). Own id range 931201..931204, own card rows
+// rusttest-lr-* (drClear/cwClear ranges never touch them). The collection
+// body pins totals + minimum-value fold; card-matches pins the {} short-q
+// gate, LIKE escaping and numeric-ascending key order; detail pins the
+// logical-card fold (MIN(card_id) rep), owned_qty, current-vs-minimum
+// totals, parseCardRow columns; cardlist pins plain/detailed/missing=1 text
+// and the text ETag. Writes stay proxied — lr_put_proxy_404 proves the
+// /:id dispatcher forwards instead of 405 (Node-side 404 on a dead id, no
+// mutation either side).
+{
+  const LR = {
+    alpha: 'rusttest-lr-alpha', alphaB: 'rusttest-lr-alpha-b',
+    beta: 'rusttest-lr-beta', est: 'rusttest-lr-est', eur: 'rusttest-lr-eur',
+  };
+  function lrClear(d) {
+    d.prepare('DELETE FROM list_cards WHERE list_id BETWEEN 931201 AND 931204').run();
+    d.prepare('DELETE FROM card_lists WHERE id BETWEEN 931201 AND 931204').run();
+    d.prepare('DELETE FROM collection WHERE card_id LIKE ?').run('rusttest-lr-%');
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-lr-%');
+  }
+  function lrPrep() {
+    dbWrite((d) => {
+      lrClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for lr cases');
+      const card = d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      card.run(LR.alpha, 'RustTest LR Alpha', 'MTG', '["White"]', '["Creature"]', 'Rare', 'lrs', 'LR Set', '1', 'img/lr-a', 1, 1, 0, 0, 0, 2, '["W"]', 'USD');
+      card.run(LR.alphaB, 'RustTest LR Alpha ', 'MTG', '["White"]', '["Creature"]', 'Rare', 'lrb', 'LR Set B', '2', 'img/lr-ab', 0.2, 0.2, 0, 0, 0, 2, '["W"]', 'USD');
+      card.run(LR.beta, 'RustTest LR Beta', 'MTG', '["Blue"]', '["Instant"]', 'Common', 'lrp', 'LR Promos', '42', null, 0.5, 0.5, 0, 0, 0, 1, '["U"]', 'USD');
+      card.run(LR.est, 'RustTest LR Est', 'MTG', '[]', '["Artifact"]', 'Common', 'lrs', 'LR Set', '7', null, 4, 4, 0, 0, 1, 0, '[]', 'USD');
+      card.run(LR.eur, 'RustTest LR Eur', 'MTG', '[]', '["Artifact"]', 'Common', 'lrs', 'LR Set', '8', null, 9, 9, 0, 0, 0, 0, '[]', 'EUR');
+      const list = d.prepare('INSERT INTO card_lists (id,user_id,name,description,accent_color,created_at,source,icon,sort_order) VALUES (?,?,?,?,?,?,?,?,?)');
+      list.run(931201, uid, 'LR Wishlist', 'w', '#10b981', '2026-01-01 00:00:05', 'web', null, null);
+      list.run(931202, uid, 'LR Owned Fold', 'o', '#10b981', '2026-01-01 00:00:04', 'web', null, 0);
+      list.run(931203, uid, 'LR Broken', 'b', '#10b981', '2026-01-01 00:00:03', 'web', null, null);
+      list.run(931204, other.id, 'LR Foreign', 'f', '#10b981', '2026-01-01 00:00:02', 'web', null, null);
+      const lc = d.prepare('INSERT INTO list_cards (list_id,card_id,quantity) VALUES (?,?,?)');
+      lc.run(931201, LR.alpha, 1);
+      lc.run(931201, LR.alphaB, 1);
+      lc.run(931201, LR.beta, 2);
+      lc.run(931201, LR.eur, 1);
+      lc.run(931202, LR.alpha, 4);
+      lc.run(931202, LR.beta, 2);
+      lc.run(931202, LR.est, 1);
+      lc.run(931203, 'rusttest-lr-nope', 1);
+      const col = d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)');
+      col.run(LR.beta, 2, uid);
+      col.run(LR.alphaB, 1, uid);
+    });
+  }
+  function lrTeardown() { dbWrite((d) => lrClear(d)); }
+  const lrCase = (name, path, headers = authHeaders, method = 'GET') =>
+    cases.push({ name, path, headers, method, setup: lrPrep, teardown: lrTeardown });
+  lrCase('lr_list_200', '/api/lists');
+  lrCase('lr_list_noauth_401', '/api/lists', {});
+  lrCase('lr_matches_200', '/api/lists/card-matches?q=Card');
+  lrCase('lr_matches_short_200', '/api/lists/card-matches?q=x');
+  lrCase('lr_matches_none_200', '/api/lists/card-matches?q=zzzznothing');
+  lrCase('lr_matches_meta_200', '/api/lists/card-matches?q=%25a%5Fb');
+  lrCase('lr_matches_noauth_401', '/api/lists/card-matches?q=Card', {});
+  lrCase('lr_detail_200', '/api/lists/931201');
+  lrCase('lr_detail_owned_200', '/api/lists/931202');
+  lrCase('lr_detail_foreign_404', '/api/lists/931204');
+  lrCase('lr_detail_nan_404', '/api/lists/abc');
+  lrCase('lr_detail_broken_422', '/api/lists/931203');
+  lrCase('lr_detail_noauth_401', '/api/lists/931201', {});
+  lrCase('lr_cardlist_200', '/api/lists/931201/cardlist');
+  lrCase('lr_cardlist_detailed_200', '/api/lists/931201/cardlist?style=detailed');
+  lrCase('lr_cardlist_missing_200', '/api/lists/931202/cardlist?missing=1');
+  lrCase('lr_cardlist_foreign_404', '/api/lists/931204/cardlist');
+  lrCase('lr_cardlist_broken_422', '/api/lists/931203/cardlist');
+  lrCase('lr_cardlist_noauth_401', '/api/lists/931201/cardlist', {});
+  // Dispatcher never 405s: PUT on the /:id shape forwards to Node, which
+  // answers its own 404 for a nonexistent id without touching any row.
+  cases.push({
+    name: 'lr_put_proxy_404', path: '/api/lists/931299', method: 'PUT',
+    headers: { ...authHeaders, 'content-type': 'application/json' },
+    body: '{"name":"LR Proxy Pass"}',
+    setup: lrPrep, teardown: lrTeardown,
+  });
 }
 
 
