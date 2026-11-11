@@ -1,0 +1,127 @@
+S|index|idx_card_cache_logical_key|CREATE INDEX idx_card_cache_logical_key ON card_cache(LOWER(TRIM(COALESCE(name, ''))))
+S|index|idx_card_cache_oracle_id|CREATE INDEX idx_card_cache_oracle_id ON card_cache(oracle_id)
+S|index|idx_card_cache_set_num|CREATE INDEX idx_card_cache_set_num ON card_cache(set_id, number)
+S|index|idx_collection_card_user|CREATE INDEX idx_collection_card_user ON collection(card_id, user_id)
+S|index|idx_collection_user_added|CREATE INDEX idx_collection_user_added\n    ON collection(user_id, added_at DESC, id DESC)
+S|index|idx_deck_cards_checkout|CREATE INDEX idx_deck_cards_checkout ON deck_cards(deck_id, checked_out)
+S|index|idx_decks_user_mfx_public_id|CREATE UNIQUE INDEX idx_decks_user_mfx_public_id\n    ON decks(user_id, moxfield_public_id) WHERE moxfield_public_id IS NOT NULL
+S|index|idx_mfx_author_user|CREATE INDEX idx_mfx_author_user ON moxfield_authors(user_id)
+S|index|idx_mfx_deck_author|CREATE INDEX idx_mfx_deck_author ON moxfield_decks(author_id)
+S|index|idx_oracle_tag_alias_lookup|CREATE INDEX idx_oracle_tag_alias_lookup\n    ON oracle_tag_aliases(generation_id, alias, tag_id)
+S|index|idx_oracle_tag_assignment_oracle|CREATE INDEX idx_oracle_tag_assignment_oracle\n    ON oracle_tag_assignments(generation_id, oracle_id, tag_id)
+S|index|idx_oracle_tag_one_active|CREATE UNIQUE INDEX idx_oracle_tag_one_active\n    ON oracle_tag_generations(active) WHERE active = 1
+S|index|idx_users_api_key|CREATE UNIQUE INDEX idx_users_api_key ON users(api_key) WHERE api_key IS NOT NULL
+S|index|idx_users_oidc_sub|CREATE UNIQUE INDEX idx_users_oidc_sub ON users(oidc_sub) WHERE oidc_sub IS NOT NULL
+S|index|sqlite_autoindex_card_cache_1|\N
+S|index|sqlite_autoindex_collection_query_cache_1|\N
+S|index|sqlite_autoindex_deck_cards_1|\N
+S|index|sqlite_autoindex_deck_maybe_cards_1|\N
+S|index|sqlite_autoindex_list_cards_1|\N
+S|index|sqlite_autoindex_moxfield_authors_1|\N
+S|index|sqlite_autoindex_moxfield_decks_1|\N
+S|index|sqlite_autoindex_oracle_tag_aliases_1|\N
+S|index|sqlite_autoindex_oracle_tag_assignments_1|\N
+S|index|sqlite_autoindex_oracle_tag_closure_1|\N
+S|index|sqlite_autoindex_oracle_tag_edges_1|\N
+S|index|sqlite_autoindex_oracle_tags_1|\N
+S|index|sqlite_autoindex_price_history_1|\N
+S|index|sqlite_autoindex_sessions_1|\N
+S|index|sqlite_autoindex_set_data_gaps_1|\N
+S|index|sqlite_autoindex_sets_1|\N
+S|index|sqlite_autoindex_tcg_imported_orders_1|\N
+S|index|sqlite_autoindex_users_1|\N
+S|index|sqlite_autoindex_users_2|\N
+S|table|app_settings|CREATE TABLE app_settings (\n      id INTEGER PRIMARY KEY CHECK (id = 1),\n      public_base_url TEXT DEFAULT '',\n      oracle_tags_checked_at INTEGER,\n      oracle_id_backfill_completed_at INTEGER\n    , mtg_prices_swept_at DATETIME, price_refresh_days INTEGER NOT NULL DEFAULT 1, allow_member_set_builds INTEGER NOT NULL DEFAULT 0, scan_exclude_tokens INTEGER NOT NULL DEFAULT 0, scan_exclude_art_cards INTEGER NOT NULL DEFAULT 0, scan_exclude_jumpstart INTEGER NOT NULL DEFAULT 0, scan_exclude_promos INTEGER NOT NULL DEFAULT 0, setup_complete INTEGER NOT NULL DEFAULT 0, moxfield_decklist_interval_min INTEGER NOT NULL DEFAULT 60, moxfield_content_interval_min INTEGER NOT NULL DEFAULT 1)
+S|table|card_cache|CREATE TABLE card_cache (\n      id TEXT PRIMARY KEY,\n      oracle_id TEXT,\n      scryfall_search_eligible INTEGER CHECK(scryfall_search_eligible IN (0, 1)),\n      name TEXT NOT NULL,\n      supertype TEXT,\n      subtypes TEXT,\n      types TEXT,\n      rarity TEXT,\n      set_id TEXT,\n      set_name TEXT,\n      number TEXT,\n      image_url TEXT,\n      price_trend REAL,\n      price_normal REAL,\n      price_holofoil REAL,\n      price_etched REAL,\n      price_currency TEXT DEFAULT 'USD',\n      price_source TEXT,\n      price_estimated INTEGER NOT NULL DEFAULT 0,\n      cmc REAL,\n      color_identity TEXT,\n      language TEXT DEFAULT 'English',\n      printed_name TEXT,\n      tcgplayer_product_id INTEGER,\n      last_updated DATETIME DEFAULT CURRENT_TIMESTAMP\n    , tcgplayer_url TEXT, cardmarket_url TEXT, oracle_text TEXT, oracle_faces TEXT)
+S|table|card_lists|CREATE TABLE card_lists (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      user_id INTEGER NOT NULL,\n      name TEXT NOT NULL,\n      description TEXT,\n      accent_color TEXT DEFAULT '#10b981',\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP, source TEXT, icon TEXT, sort_order INTEGER,\n      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE\n    )
+S|table|collection|CREATE TABLE collection (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      card_id TEXT NOT NULL,\n      quantity INTEGER DEFAULT 1,\n      condition TEXT CHECK(condition IN ('Near Mint', 'Lightly Played', 'Moderately Played', 'Heavily Played', 'Damaged')) DEFAULT 'Near Mint',\n      printing TEXT CHECK(printing IN ('Normal', 'Holofoil')) DEFAULT 'Normal',\n      language TEXT DEFAULT 'English',\n      purchase_price REAL,\n      favorite INTEGER DEFAULT 0,\n      is_trade INTEGER DEFAULT 0,\n      added_at DATETIME DEFAULT CURRENT_TIMESTAMP, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, notes TEXT DEFAULT '', source TEXT, is_proxy INTEGER DEFAULT 0,\n      FOREIGN KEY(card_id) REFERENCES card_cache(id)\n    )
+S|table|collection_query_cache|CREATE TABLE collection_query_cache (\n      query TEXT NOT NULL,\n      lang TEXT NOT NULL DEFAULT '',\n      names TEXT NOT NULL,\n      upstream_total INTEGER,\n      fetched_count INTEGER NOT NULL DEFAULT 0,\n      complete INTEGER NOT NULL DEFAULT 1,\n      resolved_at INTEGER NOT NULL,\n      expires_at INTEGER NOT NULL,\n      PRIMARY KEY (query, lang)\n    )
+S|table|collection_read_revision|CREATE TABLE collection_read_revision (\n      id INTEGER PRIMARY KEY CHECK(id = 1),\n      revision INTEGER NOT NULL DEFAULT 0\n    )
+S|table|collection_snapshot|CREATE TABLE collection_snapshot (\n      id INTEGER PRIMARY KEY CHECK(id = 1),\n      revision INTEGER NOT NULL DEFAULT 0\n    )
+S|table|deck_cards|CREATE TABLE deck_cards (\n      deck_id INTEGER NOT NULL,\n      card_id TEXT NOT NULL,\n      quantity INTEGER DEFAULT 1,\n      checked_out INTEGER DEFAULT 0, is_commander INTEGER NOT NULL DEFAULT 0,\n      PRIMARY KEY(deck_id, card_id),\n      FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE\n    )
+S|table|deck_list_revision|CREATE TABLE deck_list_revision (\n      id INTEGER PRIMARY KEY CHECK(id = 1),\n      revision INTEGER NOT NULL DEFAULT 0\n    )
+S|table|deck_maybe_cards|CREATE TABLE deck_maybe_cards (\n      deck_id INTEGER NOT NULL,\n      card_id TEXT NOT NULL,\n      quantity INTEGER DEFAULT 1,\n      PRIMARY KEY(deck_id, card_id),\n      FOREIGN KEY(deck_id) REFERENCES decks(id) ON DELETE CASCADE\n    )
+S|table|decks|CREATE TABLE decks (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      user_id INTEGER NOT NULL,\n      name TEXT NOT NULL,\n      description TEXT,\n      checked_out INTEGER DEFAULT 0,\n      checked_out_at DATETIME,\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      source TEXT DEFAULT 'manual',\n      moxfield_public_id TEXT, format TEXT DEFAULT 'Standard', category TEXT DEFAULT 'Competitive', accent_color TEXT DEFAULT '#eab308', target_size INTEGER DEFAULT 60,\n      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE\n    )
+S|table|list_cards|CREATE TABLE list_cards (\n      list_id INTEGER NOT NULL,\n      card_id TEXT NOT NULL,\n      quantity INTEGER DEFAULT 1,\n      PRIMARY KEY(list_id, card_id),\n      FOREIGN KEY(list_id) REFERENCES card_lists(id) ON DELETE CASCADE\n    )
+S|table|manabox_sync_runs|CREATE TABLE manabox_sync_runs (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      summary TEXT NOT NULL,\n      report TEXT NOT NULL\n    )
+S|table|moxfield_authors|CREATE TABLE moxfield_authors (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      user_id INTEGER NOT NULL,\n      moxfield_user TEXT NOT NULL,\n      display_name TEXT,\n      profile_image_url TEXT,\n      last_decklist_sync_at DATETIME,\n      last_content_check_at DATETIME,\n      last_error TEXT,\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,\n      UNIQUE(user_id, moxfield_user)\n    )
+S|table|moxfield_decks|CREATE TABLE moxfield_decks (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      author_id INTEGER NOT NULL REFERENCES moxfield_authors(id) ON DELETE CASCADE,\n      public_id TEXT NOT NULL,\n      name TEXT NOT NULL,\n      format TEXT,\n      mainboard_count INTEGER,\n      sideboard_count INTEGER,\n      maybeboard_count INTEGER,\n      commander_count INTEGER,\n      last_updated_at TEXT,\n      last_synced_updated_at TEXT,\n      bindarr_deck_id INTEGER,\n      last_content_sync_at DATETIME,\n      last_error TEXT,\n      enabled INTEGER NOT NULL DEFAULT 1,\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      UNIQUE(author_id, public_id)\n    )
+S|table|oracle_tag_aliases|CREATE TABLE oracle_tag_aliases (\n      generation_id INTEGER NOT NULL,\n      tag_id TEXT NOT NULL,\n      alias TEXT NOT NULL,\n      PRIMARY KEY (generation_id, tag_id, alias),\n      FOREIGN KEY (generation_id, tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE\n    )
+S|table|oracle_tag_assignments|CREATE TABLE oracle_tag_assignments (\n      generation_id INTEGER NOT NULL,\n      tag_id TEXT NOT NULL,\n      oracle_id TEXT NOT NULL,\n      PRIMARY KEY (generation_id, tag_id, oracle_id),\n      FOREIGN KEY (generation_id, tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE\n    )
+S|table|oracle_tag_closure|CREATE TABLE oracle_tag_closure (\n      generation_id INTEGER NOT NULL,\n      ancestor_tag_id TEXT NOT NULL,\n      descendant_tag_id TEXT NOT NULL,\n      PRIMARY KEY (generation_id, ancestor_tag_id, descendant_tag_id),\n      FOREIGN KEY (generation_id, ancestor_tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE,\n      FOREIGN KEY (generation_id, descendant_tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE\n    )
+S|table|oracle_tag_edges|CREATE TABLE oracle_tag_edges (\n      generation_id INTEGER NOT NULL,\n      parent_tag_id TEXT NOT NULL,\n      child_tag_id TEXT NOT NULL,\n      PRIMARY KEY (generation_id, parent_tag_id, child_tag_id),\n      FOREIGN KEY (generation_id, parent_tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE,\n      FOREIGN KEY (generation_id, child_tag_id)\n        REFERENCES oracle_tags(generation_id, tag_id) ON DELETE CASCADE\n    )
+S|table|oracle_tag_generations|CREATE TABLE oracle_tag_generations (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      source_updated_at TEXT NOT NULL,\n      imported_at INTEGER NOT NULL,\n      active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1))\n    )
+S|table|oracle_tags|CREATE TABLE oracle_tags (\n      generation_id INTEGER NOT NULL REFERENCES oracle_tag_generations(id) ON DELETE CASCADE,\n      tag_id TEXT NOT NULL,\n      slug TEXT NOT NULL,\n      label TEXT,\n      description TEXT,\n      PRIMARY KEY (generation_id, tag_id)\n    )
+S|table|price_history|CREATE TABLE price_history (\n      card_id TEXT NOT NULL,\n      price REAL NOT NULL,\n      recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      PRIMARY KEY(card_id, recorded_at)\n    )
+S|table|search_history|CREATE TABLE search_history (\n      user_id INTEGER PRIMARY KEY,\n      data BLOB NOT NULL,\n      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE\n    )
+S|table|sessions|CREATE TABLE sessions (\n      token TEXT PRIMARY KEY,\n      user_id INTEGER NOT NULL,\n      expires_at DATETIME NOT NULL,\n      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE\n    )
+S|table|set_data_gaps|CREATE TABLE set_data_gaps (\n      language TEXT NOT NULL,\n      set_id TEXT NOT NULL,\n      reason TEXT,\n      seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      PRIMARY KEY (language, set_id)\n    )
+S|table|sets|CREATE TABLE sets (\n      id TEXT PRIMARY KEY,\n      name TEXT NOT NULL,\n      series TEXT,\n      printed_total INTEGER,\n      total INTEGER,\n      release_date TEXT,\n      set_code TEXT,\n      symbol_url TEXT,\n      logo_url TEXT\n    )
+S|table|sqlite_sequence|CREATE TABLE sqlite_sequence(name,seq)
+S|table|stats_aux_revision|CREATE TABLE stats_aux_revision (\n      id INTEGER PRIMARY KEY CHECK(id = 1),\n      revision INTEGER NOT NULL DEFAULT 0\n    )
+S|table|tcg_imported_orders|CREATE TABLE tcg_imported_orders (\n      user_id INTEGER NOT NULL,\n      order_number TEXT NOT NULL,\n      imported_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n      PRIMARY KEY (user_id, order_number)\n    )
+S|table|users|CREATE TABLE users (\n      id INTEGER PRIMARY KEY AUTOINCREMENT,\n      username TEXT UNIQUE NOT NULL,\n      password_hash TEXT NOT NULL,\n      role TEXT CHECK(role IN ('admin', 'member')) NOT NULL DEFAULT 'member',\n      share_token TEXT UNIQUE NOT NULL,\n      share_enabled INTEGER DEFAULT 0,\n      oidc_sub TEXT,\n      created_at DATETIME DEFAULT CURRENT_TIMESTAMP\n    , api_key TEXT, manapool_email TEXT, manapool_token TEXT, manapool_enabled INTEGER NOT NULL DEFAULT 0, manapool_saved_at TEXT, tcgplayer_cookies TEXT, tcgplayer_enabled INTEGER NOT NULL DEFAULT 0, tcgplayer_saved_at TEXT)
+S|trigger|collection_read_rev_card_cache_delete|CREATE TRIGGER collection_read_rev_card_cache_delete\n        AFTER DELETE ON card_cache\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_read_rev_card_cache_insert|CREATE TRIGGER collection_read_rev_card_cache_insert\n        AFTER INSERT ON card_cache\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_read_rev_card_cache_update|CREATE TRIGGER collection_read_rev_card_cache_update\n        AFTER UPDATE ON card_cache\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_read_rev_collection_delete|CREATE TRIGGER collection_read_rev_collection_delete\n        AFTER DELETE ON collection\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_read_rev_collection_insert|CREATE TRIGGER collection_read_rev_collection_insert\n        AFTER INSERT ON collection\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_read_rev_collection_update|CREATE TRIGGER collection_read_rev_collection_update\n        AFTER UPDATE ON collection\n        BEGIN UPDATE collection_read_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|collection_snapshot_after_delete|CREATE TRIGGER collection_snapshot_after_delete\n      AFTER DELETE ON collection\n      BEGIN\n        UPDATE collection_snapshot SET revision = revision + 1 WHERE id = 1;\n      END
+S|trigger|collection_snapshot_after_insert|CREATE TRIGGER collection_snapshot_after_insert\n      AFTER INSERT ON collection\n      BEGIN\n        UPDATE collection_snapshot SET revision = revision + 1 WHERE id = 1;\n      END
+S|trigger|collection_snapshot_after_update|CREATE TRIGGER collection_snapshot_after_update\n      AFTER UPDATE ON collection\n      BEGIN\n        UPDATE collection_snapshot SET revision = revision + 1 WHERE id = 1;\n      END
+S|trigger|deck_list_rev_card_cache_delete|CREATE TRIGGER deck_list_rev_card_cache_delete\n      AFTER DELETE ON card_cache\n      BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_card_cache_insert|CREATE TRIGGER deck_list_rev_card_cache_insert\n      AFTER INSERT ON card_cache\n      BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_card_cache_update|CREATE TRIGGER deck_list_rev_card_cache_update\n    AFTER UPDATE ON card_cache\n    WHEN OLD.price_trend IS NOT NEW.price_trend OR OLD.price_normal IS NOT NEW.price_normal\n      OR OLD.price_holofoil IS NOT NEW.price_holofoil OR OLD.price_etched IS NOT NEW.price_etched\n      OR OLD.price_currency IS NOT NEW.price_currency OR OLD.image_url IS NOT NEW.image_url\n      OR OLD.name IS NOT NEW.name OR OLD.oracle_id IS NOT NEW.oracle_id\n      OR OLD.color_identity IS NOT NEW.color_identity OR OLD.subtypes IS NOT NEW.subtypes\n    BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_collection_delete|CREATE TRIGGER deck_list_rev_collection_delete\n        AFTER DELETE ON collection\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_collection_insert|CREATE TRIGGER deck_list_rev_collection_insert\n        AFTER INSERT ON collection\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_collection_update|CREATE TRIGGER deck_list_rev_collection_update\n        AFTER UPDATE ON collection\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_deck_cards_delete|CREATE TRIGGER deck_list_rev_deck_cards_delete\n        AFTER DELETE ON deck_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_deck_cards_insert|CREATE TRIGGER deck_list_rev_deck_cards_insert\n        AFTER INSERT ON deck_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_deck_cards_update|CREATE TRIGGER deck_list_rev_deck_cards_update\n        AFTER UPDATE ON deck_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_decks_delete|CREATE TRIGGER deck_list_rev_decks_delete\n        AFTER DELETE ON decks\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_decks_insert|CREATE TRIGGER deck_list_rev_decks_insert\n        AFTER INSERT ON decks\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_decks_update|CREATE TRIGGER deck_list_rev_decks_update\n        AFTER UPDATE ON decks\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_list_cards_delete|CREATE TRIGGER deck_list_rev_list_cards_delete\n        AFTER DELETE ON list_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_list_cards_insert|CREATE TRIGGER deck_list_rev_list_cards_insert\n        AFTER INSERT ON list_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|deck_list_rev_list_cards_update|CREATE TRIGGER deck_list_rev_list_cards_update\n        AFTER UPDATE ON list_cards\n        BEGIN UPDATE deck_list_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_price_history_delete|CREATE TRIGGER stats_aux_rev_price_history_delete\n        AFTER DELETE ON price_history\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_price_history_insert|CREATE TRIGGER stats_aux_rev_price_history_insert\n        AFTER INSERT ON price_history\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_price_history_update|CREATE TRIGGER stats_aux_rev_price_history_update\n        AFTER UPDATE ON price_history\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_sets_delete|CREATE TRIGGER stats_aux_rev_sets_delete\n        AFTER DELETE ON sets\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_sets_insert|CREATE TRIGGER stats_aux_rev_sets_insert\n        AFTER INSERT ON sets\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+S|trigger|stats_aux_rev_sets_update|CREATE TRIGGER stats_aux_rev_sets_update\n        AFTER UPDATE ON sets\n        BEGIN UPDATE stats_aux_revision SET revision = revision + 1 WHERE id = 1; END
+T|app_settings|id,public_base_url,oracle_tags_checked_at,oracle_id_backfill_completed_at,mtg_prices_swept_at,price_refresh_days,allow_member_set_builds,scan_exclude_tokens,scan_exclude_art_cards,scan_exclude_jumpstart,scan_exclude_promos,setup_complete,moxfield_decklist_interval_min,moxfield_content_interval_min
+R|app_settings|1|1\N\N\N1000000601
+T|card_cache|id,oracle_id,scryfall_search_eligible,name,supertype,subtypes,types,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_currency,price_source,price_estimated,cmc,color_identity,language,printed_name,tcgplayer_product_id,last_updated,tcgplayer_url,cardmarket_url,oracle_text,oracle_faces
+T|card_lists|id,user_id,name,description,accent_color,created_at,source,icon,sort_order
+T|collection|id,card_id,quantity,condition,printing,language,purchase_price,favorite,is_trade,added_at,user_id,notes,source,is_proxy
+T|collection_query_cache|query,lang,names,upstream_total,fetched_count,complete,resolved_at,expires_at
+T|collection_read_revision|id,revision
+R|collection_read_revision|1|10
+T|collection_snapshot|id,revision
+R|collection_snapshot|1|10
+T|deck_cards|deck_id,card_id,quantity,checked_out,is_commander
+T|deck_list_revision|id,revision
+R|deck_list_revision|1|10
+T|deck_maybe_cards|deck_id,card_id,quantity
+T|decks|id,user_id,name,description,checked_out,checked_out_at,created_at,source,moxfield_public_id,format,category,accent_color,target_size
+T|list_cards|list_id,card_id,quantity
+T|manabox_sync_runs|id,user_id,created_at,summary,report
+T|moxfield_authors|id,user_id,moxfield_user,display_name,profile_image_url,last_decklist_sync_at,last_content_check_at,last_error,created_at
+T|moxfield_decks|id,author_id,public_id,name,format,mainboard_count,sideboard_count,maybeboard_count,commander_count,last_updated_at,last_synced_updated_at,bindarr_deck_id,last_content_sync_at,last_error,enabled,created_at
+T|oracle_tag_aliases|generation_id,tag_id,alias
+T|oracle_tag_assignments|generation_id,tag_id,oracle_id
+T|oracle_tag_closure|generation_id,ancestor_tag_id,descendant_tag_id
+T|oracle_tag_edges|generation_id,parent_tag_id,child_tag_id
+T|oracle_tag_generations|id,source_updated_at,imported_at,active
+T|oracle_tags|generation_id,tag_id,slug,label,description
+T|price_history|card_id,price,recorded_at
+T|search_history|user_id,data,updated_at
+T|sessions|token,user_id,expires_at
+T|set_data_gaps|language,set_id,reason,seen_at
+T|sets|id,name,series,printed_total,total,release_date,set_code,symbol_url,logo_url
+T|stats_aux_revision|id,revision
+R|stats_aux_revision|1|10
+T|tcg_imported_orders|user_id,order_number,imported_at
+T|users|id,username,password_hash,role,share_token,share_enabled,oidc_sub,created_at,api_key,manapool_email,manapool_token,manapool_enabled,manapool_saved_at,tcgplayer_cookies,tcgplayer_enabled,tcgplayer_saved_at

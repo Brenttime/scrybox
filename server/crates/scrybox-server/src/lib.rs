@@ -46,6 +46,7 @@ pub mod lists_reads;
 pub mod lists_writes;
 pub mod health;
 pub mod manabox;
+pub mod migrations;
 pub mod mfx_payload;
 pub mod moxfield;
 pub mod moxfield_api;
@@ -95,13 +96,13 @@ impl Config {
         if !node_upstream.starts_with("http://") {
             return Err("SCRYBOX_NODE_UPSTREAM must be an http:// URL".into());
         }
-        // An explicitly-empty SCRYBOX_STATIC_DIR means "no static dir" — the
-        // harness passes SCRYBOX_STATIC_DIR= to disable it. Without the
-        // filter, Some("") mounts ServeDir(""), which answers every POST to
-        // an unregistered path with a bare 405 instead of reaching the proxy.
         let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            // An empty-but-set value must not mount ServeDir: its fallback
+            // never answers non-GET requests, so every POST to a
+            // Rust-unregistered API path would die 405 (allow: GET,HEAD)
+            // instead of reaching the proxy.
+            .filter(|p| !p.as_os_str().is_empty());
         let rust_routes = std::env::var("RUST_ROUTES")
             .unwrap_or_default()
             .split(',')
