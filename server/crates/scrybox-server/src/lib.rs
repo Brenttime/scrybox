@@ -41,6 +41,9 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod lists_body_writes;
+pub mod lists_reads;
+pub mod lists_writes;
 pub mod health;
 pub mod manabox;
 pub mod migrations;
@@ -425,6 +428,87 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
+    // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
+    // `decks_writes`) and deck reads (GET list / detail / locations,
+    // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
+    // shapes, so one dispatcher route owns each: GET goes to decks_reads
+    // when that group is on, POST/PUT/DELETE to decks_writes, and everything
+    // else (or groups that are off) falls through to the catch-all proxy —
+    // never 405 here.
+    let router = if state.owns("decks_reads") {
+        router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") && state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::route_collection))
+    } else if state.owns("decks_reads") {
+        router.route("/api/decks", any(decks_reads::handle_list))
+    } else if state.owns("decks_writes") {
+        router.route("/api/decks", any(decks_writes::handle_create))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") || state.owns("decks_writes") {
+        router.route("/api/decks/{id}", any(decks_reads::route_entry))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_writes") {
+        router
+            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .route("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
+            .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
+            .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
+            .route("/api/decks/{id}/return", any(decks_writes::handle_return))
+    } else {
+        router
+    };
+    // Lane A iter-31: card-list READS (GET /, /card-matches, /:id,
+    // /:id/cardlist) under `lists_reads`. The write routes (POST/PUT/DELETE,
+    // /order, cheapest-printings, printing, bulk*) stay proxied: the
+    // /api/lists/{id} dispatcher answers GET natively and forwards every
+    // other method, so shapes are never 405'd here.
+    let router = if state.owns("lists_reads") {
+        let router = router
+            .route("/api/lists/card-matches", any(lists_reads::handle_card_matches))
+            .route("/api/lists/{id}", any(lists_reads::route_entry))
+            .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist));
+        if state.owns("lists_writes") {
+            // iter-32: /api/lists POST + /order are native under lists_writes;
+            // the collection dispatcher keeps GET with lists_reads.
+            router
+                .route("/api/lists", any(lists_writes::route_collection))
+                .route("/api/lists/order", any(lists_writes::handle_order))
+        } else {
+            router.route("/api/lists", any(lists_reads::handle_collection))
+        }
+    } else if state.owns("lists_writes") {
+        router
+            .route("/api/lists", any(lists_writes::route_collection))
+            .route("/api/lists/order", any(lists_writes::handle_order))
+            // The /:id dispatcher answers PUT/DELETE natively here; its GET
+            // leg self-checks lists_reads and proxies when that group is off.
+            .route("/api/lists/{id}", any(lists_reads::route_entry))
+    } else {
+        router
+    };
+    // Lane A iter-33: card-list CARD-BODY writes (add card, bulk add/remove,
+    // remove-from-collection, cheapest-printings, change printing, remove
+    // card) ride the same `lists_writes` kill switch. Handlers self-check the
+    // group and the method, forwarding anything else to Node (never 405).
+    let router = if state.owns("lists_writes") {
+        router
+            .route("/api/lists/{id}/cards", any(lists_body_writes::handle_add_card))
+            .route("/api/lists/{id}/cards/bulk", any(lists_body_writes::handle_bulk_add))
+            .route("/api/lists/{id}/cards/bulk-remove", any(lists_body_writes::handle_bulk_remove))
+            .route("/api/lists/{id}/remove-from-collection", any(lists_body_writes::handle_remove_from_collection))
+            .route("/api/lists/{id}/cheapest-printings", any(lists_body_writes::handle_cheapest_printings))
+            .route("/api/lists/{id}/cards/{card_id}/printing", any(lists_body_writes::handle_printing))
+            .route("/api/lists/{id}/cards/{card_id}", any(lists_body_writes::handle_remove_card))
+    } else {
+        router
+    };
     // Lane B unit 3a: Moxfield sync — status, author CRUD, forced syncs,
     // per-deck enable switch, all under RUST_ROUTES=moxfield. The 20-second
     // scheduler + boot catch-up ride the same gate (Node's twin is disabled
@@ -476,42 +560,6 @@ pub fn app(state: AppState) -> Router {
             .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
             .route("/api/admin/backups", any(backup::handle_backups_collection))
             .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
-    } else {
-        router
-    };
-    // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
-    // `decks_writes`) and deck reads (GET list / detail / locations,
-    // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
-    // shapes, so one dispatcher route owns each: GET goes to decks_reads
-    // when that group is on, POST/PUT/DELETE to decks_writes, and everything
-    // else (or groups that are off) falls through to the catch-all proxy —
-    // never 405 here.
-    let router = if state.owns("decks_reads") {
-        router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
-    } else {
-        router
-    };
-    let router = if state.owns("decks_reads") && state.owns("decks_writes") {
-        router.route("/api/decks", any(decks_writes::route_collection))
-    } else if state.owns("decks_reads") {
-        router.route("/api/decks", any(decks_reads::handle_list))
-    } else if state.owns("decks_writes") {
-        router.route("/api/decks", any(decks_writes::handle_create))
-    } else {
-        router
-    };
-    let router = if state.owns("decks_reads") || state.owns("decks_writes") {
-        router.route("/api/decks/{id}", any(decks_reads::route_entry))
-    } else {
-        router
-    };
-    let router = if state.owns("decks_writes") {
-        router
-            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
-            .route("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
-            .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
-            .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
-            .route("/api/decks/{id}/return", any(decks_writes::handle_return))
     } else {
         router
     };

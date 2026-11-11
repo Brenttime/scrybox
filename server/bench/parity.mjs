@@ -899,7 +899,7 @@ async function etagParity(c) {
   // Replay only makes sense for idempotent GETs; write cases are compared by
   // response alone (their ETag is Express's default body tag, not a contract).
   if ((c.method || 'GET') !== 'GET') return [];
-  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks')) return [];
+  if (!c.path.startsWith('/api/collection') && !c.path.startsWith('/api/search') && !c.path.startsWith('/api/stats') && !c.path.startsWith('/api/shared') && !c.path.startsWith('/api/decks') && !c.path.startsWith('/api/lists')) return [];
   // Sequential on purpose: setup-bearing cases reseed shared DB rows, and
   // two parallel setups would race each other's DELETE/INSERT mid-request
   // (the iter-27 shrd_* replay failures). Same rationale as the write-case
@@ -1819,6 +1819,540 @@ async function etagParity(c) {
   // (No /combos parity case: it fetches the public Spellbook API — body is
   // upstream-flaky. The never-swallow guard is pinned by the path test
   // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
+}
+
+// --- iter 31: card-list READS (Lane A port: GET /api/lists,
+// /api/lists/card-matches, /api/lists/:id, /api/lists/:id/cardlist;
+// RUST_ROUTES=lists_reads). Own id range 931201..931204, own card rows
+// rusttest-lr-* (drClear/cwClear ranges never touch them). The collection
+// body pins totals + minimum-value fold; card-matches pins the {} short-q
+// gate, LIKE escaping and numeric-ascending key order; detail pins the
+// logical-card fold (MIN(card_id) rep), owned_qty, current-vs-minimum
+// totals, parseCardRow columns; cardlist pins plain/detailed/missing=1 text
+// and the text ETag. Writes stay proxied — lr_put_proxy_404 proves the
+// /:id dispatcher forwards instead of 405 (Node-side 404 on a dead id, no
+// mutation either side).
+{
+  const LR = {
+    alpha: 'rusttest-lr-alpha', alphaB: 'rusttest-lr-alpha-b',
+    beta: 'rusttest-lr-beta', est: 'rusttest-lr-est', eur: 'rusttest-lr-eur',
+  };
+  function lrClear(d) {
+    d.prepare('DELETE FROM list_cards WHERE list_id BETWEEN 931201 AND 931204').run();
+    d.prepare('DELETE FROM card_lists WHERE id BETWEEN 931201 AND 931204').run();
+    d.prepare('DELETE FROM collection WHERE card_id LIKE ?').run('rusttest-lr-%');
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-lr-%');
+  }
+  function lrPrep() {
+    // Same bench-session lookup the deck block uses (dkUid lives inside that
+    // block's scope; this block gets its own copy).
+    const dkUid = (d) => {
+      const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+      const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+      if (!s) throw new Error('parity: bench session not found for list cases');
+      return Number(s.user_id);
+    };
+    dbWrite((d) => {
+      lrClear(d);
+      const uid = dkUid(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for lr cases');
+      const card = d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      card.run(LR.alpha, 'RustTest LR Alpha', 'MTG', '["White"]', '["Creature"]', 'Rare', 'lrs', 'LR Set', '1', 'img/lr-a', 1, 1, 0, 0, 0, 2, '["W"]', 'USD');
+      card.run(LR.alphaB, 'RustTest LR Alpha ', 'MTG', '["White"]', '["Creature"]', 'Rare', 'lrb', 'LR Set B', '2', 'img/lr-ab', 0.2, 0.2, 0, 0, 0, 2, '["W"]', 'USD');
+      card.run(LR.beta, 'RustTest LR Beta', 'MTG', '["Blue"]', '["Instant"]', 'Common', 'lrp', 'LR Promos', '42', null, 0.5, 0.5, 0, 0, 0, 1, '["U"]', 'USD');
+      card.run(LR.est, 'RustTest LR Est', 'MTG', '[]', '["Artifact"]', 'Common', 'lrs', 'LR Set', '7', null, 4, 4, 0, 0, 1, 0, '[]', 'USD');
+      card.run(LR.eur, 'RustTest LR Eur', 'MTG', '[]', '["Artifact"]', 'Common', 'lrs', 'LR Set', '8', null, 9, 9, 0, 0, 0, 0, '[]', 'EUR');
+      const list = d.prepare('INSERT INTO card_lists (id,user_id,name,description,accent_color,created_at,source,icon,sort_order) VALUES (?,?,?,?,?,?,?,?,?)');
+      list.run(931201, uid, 'LR Wishlist', 'w', '#10b981', '2026-01-01 00:00:05', 'web', null, null);
+      list.run(931202, uid, 'LR Owned Fold', 'o', '#10b981', '2026-01-01 00:00:04', 'web', null, 0);
+      list.run(931203, uid, 'LR Broken', 'b', '#10b981', '2026-01-01 00:00:03', 'web', null, null);
+      list.run(931204, other.id, 'LR Foreign', 'f', '#10b981', '2026-01-01 00:00:02', 'web', null, null);
+      const lc = d.prepare('INSERT INTO list_cards (list_id,card_id,quantity) VALUES (?,?,?)');
+      lc.run(931201, LR.alpha, 1);
+      lc.run(931201, LR.alphaB, 1);
+      lc.run(931201, LR.beta, 2);
+      lc.run(931201, LR.eur, 1);
+      lc.run(931202, LR.alpha, 4);
+      lc.run(931202, LR.beta, 2);
+      lc.run(931202, LR.est, 1);
+      lc.run(931203, 'rusttest-lr-nope', 1);
+      const col = d.prepare('INSERT INTO collection (card_id,quantity,user_id) VALUES (?,?,?)');
+      col.run(LR.beta, 2, uid);
+      col.run(LR.alphaB, 1, uid);
+    });
+  }
+  function lrTeardown() { dbWrite((d) => lrClear(d)); }
+  const lrCase = (name, path, headers = authHeaders, method = 'GET') =>
+    cases.push({ name, path, headers, method, setup: lrPrep, teardown: lrTeardown });
+  lrCase('lr_list_200', '/api/lists');
+  lrCase('lr_list_noauth_401', '/api/lists', {});
+  lrCase('lr_matches_200', '/api/lists/card-matches?q=RustTest');
+  lrCase('lr_matches_alpha_200', '/api/lists/card-matches?q=Alpha');
+  lrCase('lr_matches_wild_200', '/api/lists/card-matches?q=LR%20Beta%');
+  lrCase('lr_matches_short_200', '/api/lists/card-matches?q=x');
+  lrCase('lr_matches_none_200', '/api/lists/card-matches?q=zzzznothing');
+  lrCase('lr_matches_meta_200', '/api/lists/card-matches?q=%25a%5Fb');
+  lrCase('lr_matches_noauth_401', '/api/lists/card-matches?q=Card', {});
+  lrCase('lr_detail_200', '/api/lists/931201');
+  lrCase('lr_detail_owned_200', '/api/lists/931202');
+  lrCase('lr_detail_foreign_404', '/api/lists/931204');
+  lrCase('lr_detail_nan_404', '/api/lists/abc');
+  lrCase('lr_detail_broken_422', '/api/lists/931203');
+  lrCase('lr_detail_noauth_401', '/api/lists/931201', {});
+  lrCase('lr_cardlist_200', '/api/lists/931201/cardlist');
+  lrCase('lr_cardlist_detailed_200', '/api/lists/931201/cardlist?style=detailed');
+  lrCase('lr_cardlist_missing_200', '/api/lists/931202/cardlist?missing=1');
+  lrCase('lr_cardlist_foreign_404', '/api/lists/931204/cardlist');
+  lrCase('lr_cardlist_broken_422', '/api/lists/931203/cardlist');
+  lrCase('lr_cardlist_noauth_401', '/api/lists/931201/cardlist', {});
+  // qs array semantics (live-pinned vs the container's qs): a REPEATED key
+  // never equals the scalar, so style=detailed&style=x renders PLAIN and
+  // missing=1&missing=0 does not filter; bracket q stringifies through
+  // Array.join(',') — first-value-only would match 'RustTest' but the joined
+  // string must answer {}.
+  lrCase('lr_cardlist_style_array_200', '/api/lists/931201/cardlist?style=detailed&style=x');
+  lrCase('lr_cardlist_missing_array_200', '/api/lists/931202/cardlist?missing=1&missing=0');
+  lrCase('lr_matches_qjoin_200', '/api/lists/card-matches?q%5B%5D=RustTest&q%5B%5D=LR%20Alpha');
+  lrCase('lr_matches_qbracket_200', '/api/lists/card-matches?q%5B%5D=RustTest');
+  // iter-32: PUT on the /:id shape is NATIVE under lists_writes (the old
+  // proxy-passthrough name is stale); a nonexistent id answers Node's own
+  // 404 shape without touching any row.
+  cases.push({
+    name: 'lr_put_proxy_404', path: '/api/lists/931299', method: 'PUT',
+    headers: { ...authHeaders, 'content-type': 'application/json' },
+    body: '{"name":"LR Proxy Pass"}',
+    setup: lrPrep, teardown: lrTeardown,
+  });
+}
+
+// ===== LANE-A iter-32: card-list META WRITES (lists_writes.rs under
+// RUST_ROUTES=lists_writes). Own id range 931211..931214, own card rows
+// rusttest-lw-*. Create pins the Node contract (trim, defaults, cleanIcon,
+// qty stacking via the all-cached native path) and the whole-request
+// Scryfall-hydration FORWARD (uncached name: both sides run Node, and Rust
+// must have created NOTHING before forwarding); update pins binding shapes,
+// the accent TypeError-500 twin and changes==0 404; delete pins the
+// cascade-twin (list_cards rows leave with the parent); order pins the
+// Number()-filter survival table with post-filter sort_order indices.
+{
+  const LW_A = 'rusttest-lw-alpha';
+  const LW_NAME_A = 'rusttest LW Alpha';
+  function lwClear(d) {
+    d.prepare('DELETE FROM list_cards WHERE list_id BETWEEN 931211 AND 931214').run();
+    d.prepare('DELETE FROM card_lists WHERE id BETWEEN 931211 AND 931214').run();
+    d.prepare("DELETE FROM card_lists WHERE name IN ('LW Fresh','LW Import','LW Native')").run();
+    d.prepare('DELETE FROM card_cache WHERE id LIKE ?').run('rusttest-lw-%');
+  }
+  function lwPrep() {
+    const uidOf = (d) => {
+      const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+      const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+      if (!s) throw new Error('parity: bench session not found for lw cases');
+      return Number(s.user_id);
+    };
+    dbWrite((d) => {
+      lwClear(d);
+      const uid = uidOf(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for lw cases');
+      d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(LW_A, LW_NAME_A, 'MTG', '["Artifact"]', '[]', 'Common', 'lws', 'LW Set', '7', null, 0.3, 0.3, 0, 0, 0, 0, '[]', 'USD');
+      const list = d.prepare('INSERT INTO card_lists (id,user_id,name,description,accent_color,created_at,source,icon,sort_order) VALUES (?,?,?,?,?,?,?,?,?)');
+      list.run(931211, uid, 'LW Upd', 'u', '#10b981', '2026-01-01 00:00:05', 'web', null, null);
+      list.run(931212, uid, 'LW Order A', 'a', '#10b981', '2026-01-01 00:00:04', 'web', null, null);
+      list.run(931213, other.id, 'LW Foreign', 'f', '#10b981', '2026-01-01 00:00:03', 'web', null, null);
+      list.run(931214, uid, 'LW Del', 'd', '#10b981', '2026-01-01 00:00:02', 'web', null, null);
+      const lc = d.prepare('INSERT INTO list_cards (list_id,card_id,quantity) VALUES (?,?,?)');
+      lc.run(931214, LW_A, 2);
+    });
+  }
+  function lwTeardown() { dbWrite((d) => lwClear(d)); }
+  const lwDb = (sql, ...args) => dbWrite((d) => d.prepare(sql).all(...args));
+  const LW_JSON = { ...authHeaders, 'content-type': 'application/json' };
+  const NOAUTH_JSON = { 'content-type': 'application/json' };
+  cases.push({
+    name: 'lw_create_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"  LW Fresh  "}', etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT name, description, accent_color, icon FROM card_lists WHERE name='LW Fresh'");
+      const want = { name: 'LW Fresh', description: '', accent_color: '#10b981', icon: null };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `create row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // All-cached list_text: the NATIVE path (no forward). Two lines for the
+    // same card stack via ON CONFLICT (2+1=3); the '(lws) 7' setRef tail
+    // must be stripped off the name before the cache lookup; icon garbage
+    // -> NULL; explicit non-# accent -> default.
+    name: 'lw_create_native_listtext_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"LW Native","icon":"Bad Icon!","accent_color":"nope","list_text":"2 rusttest LW Alpha\\nrusttest LW Alpha (lws) 7"}',
+    etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT l.name, l.icon, l.accent_color, lc.card_id, lc.quantity FROM card_lists l JOIN list_cards lc ON lc.list_id = l.id WHERE l.name='LW Native' ORDER BY lc.card_id");
+      const ok = rows.length === 1 && rows[0].card_id === LW_A && rows[0].quantity === 3
+        && rows[0].icon === null && rows[0].accent_color === '#10b981';
+      return { ok, why: `native rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    // Uncached name -> the hydration leg is Node-side: Rust FORWARDS the
+    // whole request before its INSERT (no partial local write). Both sides
+    // answer with Node's own matched/unmatched fold.
+    name: 'lw_create_uncached_forward_201', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"LW Import","list_text":"2 rusttest LW Alpha\\nnot-a-real-card-zzq (lws) 9"}',
+    etagReplay: false, strip: ['id'],
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT lc.card_id, lc.quantity FROM card_lists l JOIN list_cards lc ON lc.list_id = l.id WHERE l.name='LW Import' ORDER BY lc.card_id");
+      return { ok: rows.length === 1 && rows[0].card_id === LW_A && rows[0].quantity === 2, why: `import rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_no_name_400', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{"name":"   "}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      // NOT `name LIKE 'LW %'` — lwPrep seeds four 'LW …' rows, so that
+      // count is never 0. The 400 path must create no blank-named row.
+      const rows = lwDb("SELECT COUNT(*) n FROM card_lists WHERE TRIM(name) = '' OR name = '   '");
+      return { ok: rows[0].n === 0, why: `400 created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_noauth_401', path: '/api/lists', headers: NOAUTH_JSON, method: 'POST',
+    body: '{"name":"LW Nope"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT COUNT(*) n FROM card_lists WHERE name='LW Nope'");
+      return { ok: rows[0].n === 0, why: `noauth created no row (${rows[0].n})`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_create_badjson_500', path: '/api/lists', headers: LW_JSON, method: 'POST',
+    body: '{oops', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_update_200', path: '/api/lists/931211', headers: LW_JSON, method: 'PUT',
+    body: '{"name":" LW Renamed ","description":5,"accent_color":"#0f0","icon":"ab-1"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb('SELECT name, description, accent_color, icon FROM card_lists WHERE id=931211');
+      const want = { name: 'LW Renamed', description: '5', accent_color: '#0f0', icon: 'ab-1' };
+      return { ok: rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(want), why: `updated row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  // accent_color != null && startsWith('#') sits OUTSIDE the route's
+  // try/catch (backend/src/routes/lists.js:385, before `try {`): a non-string
+  // accent makes the async handler reject with an unhandled TypeError and
+  // Node 22 kills the whole process. Sending that payload at the SHARED
+  // :3312 container takes it down mid-suite, so no non-string accent case can
+  // live here (5, true, {}, [] all crash identically). Rust answers the
+  // route-catch shape (500 'Failed to update list', no write) — the same body
+  // Node would answer if the line sat inside the try; covered by
+  // tests/lists_writes.rs::update_binds_like_node_and_gates (accent 5 -> 500,
+  // accent null -> NULL column). String accents (with/without '#') stay
+  // crash-free and are covered by lw_update_200 + create cases.
+  // Orchestrator-default decision, iter 32.
+  cases.push({
+    name: 'lw_update_foreign_404', path: '/api/lists/931213', headers: LW_JSON, method: 'PUT',
+    body: '{"name":"LW Steal"}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb("SELECT name FROM card_lists WHERE id=931213");
+      return { ok: rows[0].name === 'LW Foreign', why: `foreign row touched -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_update_no_name_400', path: '/api/lists/931211', headers: LW_JSON, method: 'PUT',
+    body: '{"name":""}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_delete_200', path: '/api/lists/931214', headers: LW_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const lists = lwDb('SELECT id FROM card_lists WHERE id=931214');
+      const cards = lwDb('SELECT * FROM list_cards WHERE list_id=931214');
+      return { ok: lists.length === 0 && cards.length === 0, why: `cascade -> lists=${lists.length} cards=${cards.length}`, seen: { lists, cards } };
+    },
+  });
+  cases.push({
+    name: 'lw_delete_missing_404', path: '/api/lists/931299', headers: LW_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    // Number() survival: "931212" string kept, 4.5 dies, null -> 0 KEPT,
+    // {} NaN dies; sort_order = POST-FILTER index (931212 -> 0, 931211 -> 1).
+    name: 'lw_order_200', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{"ids":["931212",4.5,null,{},"931211"]}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      // null -> Number(null)=0 PASSES Number.isInteger, so it survives and
+      // consumes the post-filter index 1 (updating no row): 931212->0,
+      // 0->1 (no match), 931211->2. This pins the survives-and-consumes
+      // semantic; 4.5/{} die pre-index.
+      const rows = lwDb('SELECT id, sort_order FROM card_lists WHERE id IN (931211,931212) ORDER BY sort_order');
+      const ok = rows.length === 2 && rows[0].id === 931212 && rows[0].sort_order === 0 && rows[1].id === 931211 && rows[1].sort_order === 2;
+      return { ok, why: `order -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lw_order_empty_400', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{"ids":[]}', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_order_badjson_500', path: '/api/lists/order', headers: LW_JSON, method: 'PUT',
+    body: '{oops', etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+  });
+  cases.push({
+    name: 'lw_delete_noauth_401', path: '/api/lists/931214', headers: NOAUTH_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lwPrep, teardown: lwTeardown,
+    readBack: async () => {
+      const rows = lwDb('SELECT id FROM card_lists WHERE id=931214');
+      return { ok: rows.length === 1, why: `noauth deleted the list`, seen: rows };
+    },
+  });
+}
+
+// --- LANE-A iteration 33: card-list CARD-BODY writes (lists_body_writes) -----
+// The seven /api/lists/:id card-body write routes from backend/src/routes/lists.js
+// (add SET+fold, bulk add INCREMENT, bulk remove, remove-from-collection,
+// cheapest-printings, change printing, remove card). Two cached printings of
+// one logical card (cardKey = LOWER(TRIM(name)), cardIdentity.js) drive the
+// fold/merge/move semantics; a foreign user's list and a noauth probe pin the
+// gates. Hydration-miss forwards are cargo-pinned (tests/lists_body_writes.rs)
+// — parity cannot pin them because getCardById hits the real provider.
+{
+  const LB_A = 'rusttest-lb-a', LB_A2 = 'rusttest-lb-a2', LB_B = 'rusttest-lb-b', LB_C = 'rusttest-lb-c';
+  const LB_NAME_A = 'LB Alpha', LB_NAME_B = 'LB Beta', LB_NAME_C = 'LB Gamma';
+  const LB_CARDS = [LB_A, LB_A2, LB_B, LB_C];
+  const LB_LISTS = [931311, 931312, 931313, 931314];
+  const LB_COLL = [931401, 931402];
+  function lbClear(d) {
+    d.prepare('DELETE FROM list_cards WHERE list_id IN (?,?,?,?,?)').run(...LB_LISTS);
+    d.prepare('DELETE FROM card_lists WHERE id IN (?,?,?,?,?)').run(...LB_LISTS);
+    // Delete collection rows BY CARD_ID, not by fixed id: the
+    // remove-from-collection partial-take path splits a stack into a second
+    // row with a fresh autoincrement id, and a card_cache DELETE under FK
+    // would then abort on the surviving child (iter-33 flake).
+    d.prepare('DELETE FROM collection WHERE card_id IN (?,?,?,?)').run(...LB_CARDS);
+    d.prepare('DELETE FROM card_cache WHERE id IN (?,?,?,?)').run(...LB_CARDS);
+    d.prepare('DELETE FROM collection WHERE id IN (?,?)').run(...LB_COLL);
+  }
+  function lbPrep() {
+    const uidOf = (d) => {
+      const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+      const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+      if (!s) throw new Error('parity: bench session not found for lb cases');
+      return Number(s.user_id);
+    };
+    dbWrite((d) => {
+      lbClear(d);
+      const uid = uidOf(d);
+      const other = d.prepare('SELECT id FROM users WHERE id != ? ORDER BY id LIMIT 1').get(uid);
+      if (!other) throw new Error('parity: no second user for lb cases');
+      const card = d.prepare('INSERT INTO card_cache (id,name,supertype,types,subtypes,rarity,set_id,set_name,number,image_url,price_trend,price_normal,price_holofoil,price_etched,price_estimated,cmc,color_identity,price_currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      // LB_A / LB_A2: same game card (same name), different printings; the
+      // 'a2' printing is the cheap one (normal 0.2 vs 5).
+      card.run(LB_A, LB_NAME_A, 'MTG', '["Artifact"]', '[]', 'Common', 'lbs', 'LB Set', '1', null, 0, 5, 0, 0, 0, 0, '[]', 'USD');
+      card.run(LB_A2, LB_NAME_A, 'MTG', '["Artifact"]', '[]', 'Common', 'lbq', 'LB Promos', '2', null, 0, 0.2, 0, 0, 0, 0, '[]', 'USD');
+      // LB_B: already-cheapest single printing (trend 0.5) for the skip path.
+      card.run(LB_B, LB_NAME_B, 'MTG', '["Instant"]', '[]', 'Common', 'lbs', 'LB Set', '3', null, 0.5, 0, 0, 0, 0, 1, '[]', 'USD');
+      // LB_C: cached, starts off every list.
+      card.run(LB_C, LB_NAME_C, 'MTG', '["Land"]', '[]', 'Common', 'lbq', 'LB Promos', '4', null, 0, 0.4, 0, 0, 0, 0, '[]', 'USD');
+      const list = d.prepare('INSERT INTO card_lists (id,user_id,name,description,accent_color,created_at,source,icon,sort_order) VALUES (?,?,?,?,?,?,?,?,?)');
+      list.run(931311, uid, 'LB Body', 'b', '#10b981', '2026-01-01 00:00:05', 'web', null, null);
+      list.run(931312, uid, 'LB Sweep', 's', '#10b981', '2026-01-01 00:00:04', 'web', null, null);
+      list.run(931313, other.id, 'LB Foreign', 'f', '#10b981', '2026-01-01 00:00:03', 'web', null, null);
+      list.run(931314, uid, 'LB RFC', 'r', '#10b981', '2026-01-01 00:00:02', 'web', null, null);
+      const lc = d.prepare('INSERT INTO list_cards (list_id,card_id,quantity) VALUES (?,?,?)');
+      lc.run(931311, LB_A, 1);
+      lc.run(931311, LB_B, 2);
+      lc.run(931312, LB_A, 1);
+      lc.run(931312, LB_A2, 3);
+      lc.run(931312, LB_B, 2);
+      lc.run(931314, LB_A, 1);
+      lc.run(931314, LB_B, 2);
+      // Owned pile for remove-from-collection: two equivalent printings so
+      // the exact-first/newest-first ordering and per-key budget both bite.
+      const coll = d.prepare('INSERT INTO collection (id, card_id, quantity, condition, printing, language, added_at, is_trade, user_id, is_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      coll.run(931401, LB_A, 2, 'Near Mint', 'Normal', 'English', '2026-01-03 10:00:00', 0, uid, 0);
+      coll.run(931402, LB_A2, 1, 'Near Mint', 'Holofoil', 'English', '2026-01-02 10:00:00', 0, uid, 0);
+    });
+  }
+  function lbTeardown() { dbWrite((d) => lbClear(d)); }
+  const lbDb = (sql, ...args) => dbWrite((d) => d.prepare(sql).all(...args));
+  const lbRows = (list) => lbDb('SELECT card_id, quantity FROM list_cards WHERE list_id = ? ORDER BY card_id', list)
+    .map((r) => [String(r.card_id), Number(r.quantity)]);
+  const LB_JSON = { ...authHeaders, 'content-type': 'application/json' };
+  const LB_NOAUTH = { 'content-type': 'application/json' };
+
+  cases.push({
+    name: 'lb_add_setfold_200', path: '/api/lists/931311/cards', headers: LB_JSON, method: 'POST',
+    body: `{"card_id":"${LB_A2}","quantity":"2x"}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // Node: equivalent row (ORDER BY (lc.card_id = ?) DESC, lc.card_id) picks
+    // the EXISTING LB_A row; SET semantics put quantity 2 there, no new row.
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 2], [LB_B, 2]]);
+      return { ok, why: `set-fold rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_add_new_clamp_200', path: '/api/lists/931311/cards', headers: LB_JSON, method: 'POST',
+    body: `{"card_id":"${LB_C}","quantity":0}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // parseInt(0)||1 -> 1: a fresh key inserts at quantity 1.
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 1], [LB_B, 2], [LB_C, 1]]);
+      return { ok, why: `clamp-insert rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_add_no_cardid_400', path: '/api/lists/931311/cards', headers: LB_JSON, method: 'POST',
+    body: '{}', etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 1], [LB_B, 2]]);
+      return { ok, why: `400 mutated the list -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_add_foreign_404', path: '/api/lists/931313/cards', headers: LB_JSON, method: 'POST',
+    body: `{"card_id":"${LB_C}"}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931313);
+      return { ok: rows.length === 0, why: `foreign list gained rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_add_noauth_401', path: '/api/lists/931311/cards', headers: LB_NOAUTH, method: 'POST',
+    body: `{"card_id":"${LB_C}"}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 1], [LB_B, 2]]);
+      return { ok, why: `noauth added a row -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_bulk_add_200', path: '/api/lists/931311/cards/bulk', headers: LB_JSON, method: 'POST',
+    body: `{"cards":[{"card_id":"${LB_B}","quantity":3},{"card_id":"${LB_A2}","quantity":"2x"},{"quantity":5},{"card_id":"${LB_C}"}]}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // INCREMENT semantics: LB_B 2+3=5, the equivalent LB_A row +2, LB_C new 1,
+    // falsy card_id skipped; added = 3+2+1 = 6, failed [].
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 3], [LB_B, 5], [LB_C, 1]]);
+      return { ok, why: `bulk-add rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_bulk_add_empty_400', path: '/api/lists/931311/cards/bulk', headers: LB_JSON, method: 'POST',
+    body: '{"cards":[]}', etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+  });
+  cases.push({
+    name: 'lb_bulk_remove_200', path: '/api/lists/931311/cards/bulk-remove', headers: LB_JSON, method: 'POST',
+    body: `{"cards":[{"card_id":"${LB_A2}","quantity":1},{"card_id":"${LB_B}","quantity":1},{"card_id":"${LB_C}"}]}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // LB_A equivalent row qty1 -> DELETE (+1); LB_B 2>1 -> UPDATE to 1 (+1);
+    // LB_C absent -> silent. removed 2, no failed array.
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_B, 1]]);
+      return { ok, why: `bulk-remove rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_rfc_dryrun_200', path: '/api/lists/931314/remove-from-collection', headers: LB_JSON, method: 'POST',
+    body: '{"dry_run":true}', etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbDb('SELECT id, quantity FROM collection WHERE id IN (931401,931402) ORDER BY id')
+        .map((r) => [Number(r.id), Number(r.quantity)]);
+      const ok = JSON.stringify(rows) === JSON.stringify([[931401, 2], [931402, 1]]);
+      return { ok, why: `dry_run mutated the collection -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_rfc_real_200', path: '/api/lists/931314/remove-from-collection', headers: LB_JSON, method: 'POST',
+    body: '{"dry_run":false}', etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // LB_A demand 1: exact printing first (931401) -> 2 becomes 1.
+    // LB_B demand 2, owned 0 -> short, untouched.
+    readBack: async () => {
+      const rows = lbDb('SELECT id, quantity FROM collection WHERE id IN (931401,931402) ORDER BY id')
+        .map((r) => [Number(r.id), Number(r.quantity)]);
+      const ok = JSON.stringify(rows) === JSON.stringify([[931401, 1], [931402, 1]]);
+      return { ok, why: `rfc rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_cheap_200', path: '/api/lists/931311/cheapest-printings', headers: LB_JSON, method: 'PUT',
+    body: '{}', etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // LB_A -> LB_A2 (0.2 vs 5); LB_B already the sole cheapest row -> skip.
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A2, 1], [LB_B, 2]]);
+      return { ok, why: `cheapest rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_printing_200', path: `/api/lists/931311/cards/${LB_A}/printing`, headers: LB_JSON, method: 'PUT',
+    body: `{"card_id":"${LB_A2}"}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A2, 1], [LB_B, 2]]);
+      return { ok, why: `printing rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_printing_other_card_400', path: `/api/lists/931311/cards/${LB_A}/printing`, headers: LB_JSON, method: 'PUT',
+    body: `{"card_id":"${LB_B}"}`, etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931311);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_A, 1], [LB_B, 2]]);
+      return { ok, why: `rejected printing still mutated -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_remove_sweep_200', path: `/api/lists/931312/cards/${LB_A}`, headers: LB_JSON, method: 'DELETE',
+    etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    // The equivalent sweep deletes LB_A AND LB_A2 (same game card), LB_B stays.
+    readBack: async () => {
+      const rows = lbRows(931312);
+      const ok = JSON.stringify(rows) === JSON.stringify([[LB_B, 2]]);
+      return { ok, why: `sweep rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
+  cases.push({
+    name: 'lb_remove_noauth_401', path: `/api/lists/931312/cards/${LB_A}`, headers: LB_NOAUTH, method: 'DELETE',
+    etagReplay: false,
+    setup: lbPrep, teardown: lbTeardown,
+    readBack: async () => {
+      const rows = lbRows(931312);
+      const ok = rows.length === 3;
+      return { ok, why: `noauth deleted rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+  });
 }
 
 
