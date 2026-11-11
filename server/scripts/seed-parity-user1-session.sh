@@ -5,7 +5,7 @@
 # Run this if the DB copy is refreshed from prod and parity starts failing
 # stats_user1 with 401 on the Rust side and Node side alike.
 set -e
-DB="$(cd "$(dirname "$0")/../.." && pwd)/data/bindarr.db"
+DB="$(cd "$(dirname "$0")/../../.." && pwd)/data/bindarr.db"
 node -e '
 const { DatabaseSync } = require("node:sqlite");
 const db = new DatabaseSync(process.argv[1]);

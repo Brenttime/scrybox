@@ -78,8 +78,8 @@ impl HealthCache {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Test/ops hook: retune before the prober is spawned (the ticker reads
-    /// the tick once at spawn; the TTL is consulted per request).
+    /// Test/ops hook: retune the prober/TTL at any time (the ticker re-reads
+    /// the tick each cycle; the TTL is consulted per request).
     pub fn set_intervals(&self, tick: Duration, ttl: Duration) {
         *self.tick.lock().unwrap() = tick;
         *self.ttl.lock().unwrap() = ttl;
@@ -187,10 +187,15 @@ pub fn spawn_prober(st: &AppState) {
     }
     let st = st.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(st.health_cache.tick_dur());
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Sleep BEFORE each probe and read the tick per cycle. The old
+        // `interval(tick_dur())` captured the tick at task-start — racing
+        // any set_intervals() retune (tests park the tick after app()
+        // spawns this) — and its immediate first tick let a background
+        // probe land mid-burst (cached_burst_hits_node_once counted 2).
+        // Boot warmup loses at most one tick; the first request probes
+        // live either way (empty cache), so nothing observable regresses.
         loop {
-            tick.tick().await;
+            tokio::time::sleep(st.health_cache.tick_dur()).await;
             // Failures clear the cache inside probe(); serving then falls
             // back to the live path on its own.
             let _ = probe(&st, true).await;

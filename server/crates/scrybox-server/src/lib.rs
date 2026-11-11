@@ -39,6 +39,7 @@ pub mod search;
 pub mod sidecar;
 pub mod stats;
 mod stats_sql;
+pub mod stats_subs;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -300,6 +301,21 @@ pub fn app(state: AppState) -> Router {
         // which is the point — the bounded-staleness tests exercise it.
         stats::spawn_refresher(&state);
         router.route("/api/stats", any(stats::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("stats_subs") {
+        // GET /api/stats/history, /api/stats/networth, /api/stats/top-mover
+        // (iter 25). commander-of-the-day stays on Node (Scryfall leg is
+        // Lane B surface — forwarding it whole-request would not make it
+        // native). Exact paths only: '/api/stats/' trailing-slash variants
+        // keep Express's loose-match answer through the proxy, same policy
+        // as the /stats mount, and mounting these never changes what
+        // /api/stats itself resolves to — the groups stay independent.
+        router
+            .route("/api/stats/history", any(stats_subs::handle_history))
+            .route("/api/stats/networth", any(stats_subs::handle_networth))
+            .route("/api/stats/top-mover", any(stats_subs::handle_top_mover))
     } else {
         router
     };

@@ -747,6 +747,14 @@ async function etagParity(c) {
       diffs.push(`byte-identical bodies, different tags: rust=${r.etag} node=${n.etag}`);
     }
   }
+  // Cases whose body is RANDOM BY DESIGN (e.g. /stats/networth: cached()'s
+  // onHit restamps asOf = new Date().toISOString() on EVERY response, hit or
+  // miss, so the Express body-derived ETag differs per request and a client
+  // can never observe a matching If-None-Match — 304 is unreachable by
+  // construction on BOTH sides). `etagReplay: false` opts those out of the
+  // self-replay probe; the ETag-presence checks above still run, and the
+  // response's shape is pinned by a dedicated readBack case instead.
+  if (c.etagReplay === false) return diffs;
   for (const [name, base, first] of [['rust', RUST, r], ['node', NODE, n]]) {
     if (!first.etag) continue;
     const again = await rawGet(base, c.path, { ...c.headers, 'if-none-match': first.etag });
@@ -837,6 +845,54 @@ async function etagParity(c) {
     { name: 'ca_bulk_add_all_fail_500', path: '/api/collection/bulk-add', headers: CW_JSON, method: 'POST',
       body: JSON.stringify({ card_ids: [{}, {}] }) },
   );
+
+// --- stats-subs group cases (iter 25: GET /api/stats/history,
+// /api/stats/networth, /api/stats/top-mover; RUST_ROUTES=stats_subs). Pure
+// cached reads — no writes, no readBack needed. asOf is random-by-design on
+// EVERY networth response (Node's cached() onHit restamps it per request,
+// hit or miss — routes/stats.js onHit), so it is stripped from body equality
+// like the auth tokens AND its per-request ETag can never replay to 304 on
+// either side: those cases set etagReplay:false (shape pinned by
+// ss_networth_asof_shape instead). history/top-mover keep ETag/304 replay
+// through etagParity (/api/stats* prefix). ---
+{
+  const sub = (name, path, extra = {}) =>
+    cases.push({ name, path, headers: authHeaders, method: 'GET', ...extra });
+  sub('ss_history_30d', '/api/stats/history?period=30d');
+  sub('ss_history_7d', '/api/stats/history?period=7d');
+  sub('ss_history_1y', '/api/stats/history?period=1y');
+  sub('ss_history_5y', '/api/stats/history?period=5y');
+  sub('ss_history_default', '/api/stats/history');
+  sub('ss_history_empty', '/api/stats/history?period=');
+  sub('ss_history_unknown', '/api/stats/history?period=xyz');
+  sub('ss_history_dup', '/api/stats/history?period=7d&period=1y');
+  sub('ss_history_encoded', '/api/stats/history?period=7%64');
+  sub('ss_networth', '/api/stats/networth', { strip: ['$.asOf'], etagReplay: false });
+  sub('ss_topmover', '/api/stats/top-mover');
+  // Second user: per-user bodies (and the empty-collection {card:null} /
+  // zero-totals paths) — session seeded by scripts/seed-parity-user1-session.sh.
+  const u1 = { Authorization: `Bearer ${USER1_TOKEN}` };
+  sub('ss_history_7d_user1', '/api/stats/history?period=7d', { headers: u1 });
+  sub('ss_networth_user1', '/api/stats/networth', { headers: u1, strip: ['$.asOf'], etagReplay: false });
+  sub('ss_topmover_user1', '/api/stats/top-mover', { headers: u1 });
+  // asOf shape (fresh-stamp contract): each side's own asOf must be exact
+  // ISO-8601 UTC with ms (new Date().toISOString() shape); the value itself
+  // is random-by-design (restamped per request) and stripped from equality.
+  cases.push({
+    name: 'ss_networth_asof_shape', path: '/api/stats/networth', headers: authHeaders, method: 'GET',
+    strip: ['$.asOf'], etagReplay: false,
+    readBack: async (_other, _ctx, resp) => ({
+      ok: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(resp?.json?.asOf || '')),
+      why: `asOf not toISOString-shaped: ${resp?.json?.asOf}`,
+      seen: { shape: 'iso-ms' },
+    }),
+  });
+  // HEAD on a sub-route: Express router.get answers HEAD; Rust proxies it.
+  // Byte-comparison of the two answers is still the contract.
+  cases.push({ name: 'ss_networth_head', path: '/api/stats/networth', headers: authHeaders, method: 'HEAD' });
+  // POST is not routed in Express — 404 either side through the proxy.
+  cases.push({ name: 'ss_history_post', path: '/api/stats/history', headers: authHeaders, method: 'POST', body: '{}' });
+}
 
 // --- run ---------------------------------------------------------------------
 
