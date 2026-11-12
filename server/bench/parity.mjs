@@ -811,6 +811,155 @@ cases.push({ name: 'pc_import_overrides', path: '/api/precons/import', headers: 
   },
   teardown: async () => { pcClean(PC_NAME_B); } });
 
+// --- iter 37: secret_lair group (Lane A port: GET /api/secret-lair,
+// GET /api/secret-lair/preview, POST /api/secret-lair/add; RUST_ROUTES=secret_lair)
+// Search reads ride the SAME shared mirror data/precons.json the precons
+// group pinned (<24 h → zero upstream hits, identical DeckList on both
+// sides). Needle 'box of rocks' scores exactly the A Box of Rocks base + its
+// FoilEdition twin (slot fold by trimmed-lowercased NAME, /foiledition/i on
+// the NAME — distinct from the fileName test in resolveFoilFileName); q=the
+// exercises the rank ladder + localeCompare ties over a large match set.
+// preview/add fetch the MTGJSON deck file through the SHARED data/precons/
+// cache; Scryfall bulk is live (same lane as pc_import). The collection
+// writes land in the shared DB and are deleted by card id in teardown;
+// owned counts compare server-vs-server over the same table, so ordering is
+// not a divergence source.
+const SL_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const SL_BASE = 'ABoxOfRocks_SLD';
+const SL_FOIL = 'ABoxOfRocksFoilEdition_SLD';
+const SL_NOTWIN = 'AlienAuroras_SLD';
+async function slDeckIds(fileName) {
+  const r = await fetch(`https://mtgjson.com/api/v5/decks/${encodeURIComponent(fileName)}.json`);
+  const j = await r.json();
+  const rows = [...(j?.data?.mainBoard || []), ...(j?.data?.commander || [])];
+  return rows
+    .map((c) => c?.identifiers?.scryfallId)
+    .filter(Boolean)
+    .map((id) => `mtg-${id}`);
+}
+function slClean(_base, ids) {
+  dbWrite((d) => {
+    const del = d.prepare('DELETE FROM collection WHERE card_id = ?');
+    for (const id of (ids || [])) del.run(id);
+    return (ids || []).length;
+  });
+}
+cases.push({ name: 'sl_search_no_token', path: '/api/secret-lair?q=rocks', headers: {}, method: 'GET' });
+cases.push({ name: 'sl_search_empty_q', path: '/api/secret-lair?q=', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_rocks', path: '/api/secret-lair?q=box%20of%20rocks', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_the_rank', path: '/api/secret-lair?q=the', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_limit3', path: '/api/secret-lair?q=the&limit=3', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_limit_bad', path: '/api/secret-lair?q=the&limit=abc', headers: authHeaders, method: 'GET' });
+// qs twin on the new keys: repeated q joins; q[0] is an array slot;
+// foil arriving as an ARRAY never === '1' (false), fileName array → String().
+cases.push({ name: 'sl_search_join_q', path: '/api/secret-lair?q=rocks&q=box', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_arr0_q', path: '/api/secret-lair?q%5B0%5D=rocks', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_no_token', path: `/api/secret-lair/preview?fileName=${SL_BASE}`, headers: {}, method: 'GET' });
+cases.push({ name: 'sl_preview_missing_file', path: '/api/secret-lair/preview', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_blank_file', path: '/api/secret-lair/preview?fileName=%20', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_ok', path: `/api/secret-lair/preview?fileName=${SL_BASE}`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_twin', path: `/api/secret-lair/preview?fileName=${SL_BASE}&foil=1`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_passthrough', path: `/api/secret-lair/preview?fileName=${SL_FOIL}&foil=true`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_missing_422', path: `/api/secret-lair/preview?fileName=${SL_NOTWIN}&foil=1`, headers: authHeaders, method: 'GET' });
+// unknown fileName passes the twin lookup untouched; the deck fetch answers
+// honestly with the axios-status-carrying message.
+cases.push({ name: 'sl_preview_missing_deck', path: '/api/secret-lair/preview?fileName=NoSuchDeckXYZ', headers: authHeaders, method: 'GET' });
+// fileName arriving as an array → String(['A','B']) === 'A,B' → cleaned to
+// 'AB' → deck 404 (pins the String() coercion, not a 400).
+cases.push({ name: 'sl_preview_arr_file', path: '/api/secret-lair/preview?fileName%5B0%5D=A&fileName%5B1%5D=B', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_add_no_token', path: '/api/secret-lair/add', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+cases.push({ name: 'sl_add_missing_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'sl_add_blank_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":"   "}' });
+cases.push({ name: 'sl_add_bad_json', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":' });
+cases.push({ name: 'sl_add_nonstring_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":42}' });
+// add guard ORDER: fileName required answers BEFORE the foil twin lookup
+// (blank fileName + foil:true still the plain 400).
+cases.push({ name: 'sl_add_blank_file_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":"","foil":true}' });
+// happy add: 5 SLD card types through the live Scryfall bulk, collection
+// rows verified in the shared DB (same rows read by BOTH sides — the
+// response itself carries the counts).
+cases.push({ name: 'sl_add_ok', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, condition: 'Near Mint' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing, language, condition FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal'
+        && r.condition === 'Near Mint' && r.quantity >= 1),
+      why: `collection rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// foil=true strict form swaps the twin; copies '2x' is the Number()-vs-
+// parseInt trap: Number('2x') is NaN → || 1 → mult 1, so every quantity
+// stays at the product's own count (1). The response fileName is the twin,
+// resolvedFoil true.
+cases.push({ name: 'sl_add_copies_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_FOIL) } }),
+  body: JSON.stringify({ fileName: SL_BASE, foil: true, copies: '2x' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal' && r.quantity === 1),
+      why: `foil/copy rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// copies '2' IS a clean Number → mult 2 → every quantity doubles (2x1).
+cases.push({ name: 'sl_add_copies_numeric', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, copies: '2' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal' && r.quantity === 2),
+      why: `numeric-copy rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// printingMode 'Foil' hits the whitelist after toLowerCase → EVERY row is
+// forced Holofoil even though the deck rows are isFoil-blind.
+cases.push({ name: 'sl_add_printing_mode_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, printingMode: 'Foil' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Holofoil'),
+      why: `mode-forced rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// Off-list condition is rewritten to 'Near Mint' by the util's own whitelist.
+cases.push({ name: 'sl_add_condition_whitelist', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, condition: 'Like New' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, condition FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.condition === 'Near Mint'),
+      why: `grade-rewritten rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// body.foil === '1' (string) is NOT a strict-=== form → base product.
+cases.push({ name: 'sl_add_foil_strict_string', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, foil: '1' }),
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// no FoilEdition twin → the route-level 422 {error} before any deck fetch.
+cases.push({ name: 'sl_add_foil_missing_422', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  body: JSON.stringify({ fileName: SL_NOTWIN, foil: true }) });
+// unknown subpath + other method never 405 from Rust: handlers self-check
+// and forward; Node's router answers either way.
+cases.push({ name: 'sl_unknown_subpath', path: '/api/secret-lair/nope', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_put_method', path: '/api/secret-lair', headers: SL_JSON, method: 'PUT', body: '{}' });
+
 // --- rules group (iter-36: GET /api/rules, /api/rules/keywords; RUST_ROUTES=rules)
 // `mem` is PER PROCESS in the Node twin: once each server has built, its
 // fetched stamp is its own (like two Node processes would). '$.fetched' is

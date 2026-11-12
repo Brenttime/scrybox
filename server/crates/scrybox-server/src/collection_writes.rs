@@ -1674,7 +1674,7 @@ fn lang_input(v: Option<&Value>) -> Option<String> {
 /// only caller-visible AddCardError the native path can reach (both throws
 /// in addCardToCollection are 400; the 404 requires the Scryfall fetch,
 /// which is a `Forward` here).
-enum AddPlan {
+pub(crate) enum AddPlan {
     Ready {
         card_id: SqlValue,
         count: i64,
@@ -1693,7 +1693,7 @@ enum AddPlan {
 /// Pure-read twin of addCardToCollection's pre-insert block (hydration is a
 /// no-op since v3). Node-strict order: card_id → printing → cache lookup →
 /// printingInLanguage → quantity/stack/pricing defaults.
-fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, WriteError> {
+pub(crate) fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, WriteError> {
     let card_id_v = merged.get("card_id");
     if js_falsy(card_id_v) {
         return Ok(AddPlan::Reject("card_id is required".into()));
@@ -1830,7 +1830,7 @@ pub(crate) fn record_price(conn: &Connection, card_id: &SqlValue, price: &Value)
 /// copy, matching Node's sequential INSERTs) and records the price, in one
 /// BEGIN IMMEDIATE transaction so the revision triggers fire on commit like
 /// every other native write group.
-fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Result<(i64, Vec<i64>), WriteError> {
+pub(crate) fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Result<(i64, Vec<i64>), WriteError> {
     let AddPlan::Ready { card_id, count, stack, condition, printing, language, purchase_price, is_trade, price } = plan else {
         return Ok((0, Vec::new()));
     };

@@ -58,6 +58,7 @@ pub mod scryfall;
 pub mod secheaders;
 pub mod scry_jobs;
 pub mod search;
+pub mod secret_lair;
 pub mod sets;
 pub mod sidecar;
 pub mod stats;
@@ -527,6 +528,18 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/rules", any(rules::route_rules))
             .route("/api/rules/keywords", any(rules::route_keywords))
+    } else {
+        router
+    };
+    // Lane A iter-37: secret_lair group (GET /api/secret-lair,
+    // GET /api/secret-lair/preview, POST /api/secret-lair/add) under
+    // `secret_lair`. Handlers self-check group+method and forward anything
+    // else — never 405/404 locally.
+    let router = if state.owns("secret_lair") {
+        router
+            .route("/api/secret-lair", any(secret_lair::route_search))
+            .route("/api/secret-lair/preview", any(secret_lair::route_preview))
+            .route("/api/secret-lair/add", any(secret_lair::route_add))
     } else {
         router
     };

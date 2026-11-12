@@ -269,8 +269,14 @@ pub(crate) fn qs_string(query: Option<&str>, key: &str) -> String {
 }
 
 /// `req.query[key] === expected` — never true for arrays or objects.
-fn qs_equals(query: Option<&str>, key: &str, expected: &str) -> bool {
+pub(crate) fn qs_equals(query: Option<&str>, key: &str, expected: &str) -> bool {
     matches!(qs_get(query, key), QsVal::Scalar(v) if v == expected)
+}
+
+/// `key in req.query` — distinguishes an absent key (undefined) from an
+/// empty-string value, which Number()/truthiness disagree about.
+pub(crate) fn qs_has(query: Option<&str>, key: &str) -> bool {
+    !matches!(qs_get(query, key), QsVal::Missing)
 }
 
 // ---------------------------------------------------------------------------
