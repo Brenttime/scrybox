@@ -2528,6 +2528,29 @@ async function etagParity(c) {
   });
 }
 
+// --- Lane B unit 5b: the static trio ---------------------------------------
+// Header-level byte parity (file ETag form, Cache-Control classes, Vary
+// merges, CSP-trio strip, finalhandler page, 301 twin) is pinned live
+// (:3312-vs-:3320 header dumps) and by cargo tests (lib + static_assets_route);
+// the battery asserts status/content-type/body equality on every arm —
+// including the oddballs: serve-static fallthrough:false miss answers the
+// generic-error 500 twin, dotfiles:deny likewise, non-GET on the static
+// mounts answers send's 405 (Allow GET, HEAD; CL 0) or, for app.get-only
+// routes, the finalhandler default 404. File names are the live content-
+// hashed pins under data/models/client-scan (shared volume, both stacks).
+cases.push({ name: 'sa_manifest', path: '/scan-assets/manifest.json', headers: {}, method: 'GET' });
+cases.push({ name: 'sa_dict', path: '/scan-assets/rec-dict.f7aa897ca828.txt', headers: {}, method: 'GET' });
+cases.push({ name: 'sa_gz_head', path: '/scan-assets/scan-index.3c89ac0fafc6.json.gz', headers: {}, method: 'HEAD' });
+cases.push({ name: 'sa_missing_500', path: '/scan-assets/no-such-file.json', headers: {}, method: 'GET' });
+cases.push({ name: 'sa_dotfile_500', path: '/scan-assets/.hidden', headers: {}, method: 'GET' });
+cases.push({ name: 'sa_post_405', path: '/scan-assets/manifest.json', headers: {}, method: 'POST', body: '{}' });
+cases.push({ name: 'md_model_head', path: '/models/cornelius.onnx', headers: {}, method: 'HEAD' });
+cases.push({ name: 'md_model_post_404', path: '/models/cornelius.onnx', headers: {}, method: 'POST' });
+cases.push({ name: 'pt_bare_301', path: '/scryfall-portal', headers: {}, method: 'GET' });
+cases.push({ name: 'pt_index', path: '/scryfall-portal/', headers: {}, method: 'GET' });
+cases.push({ name: 'pt_head_405', path: '/scryfall-portal/', headers: {}, method: 'HEAD' });
+cases.push({ name: 'pt_post_404', path: '/scryfall-portal/', headers: {}, method: 'POST' });
+
 
 // --- run ---------------------------------------------------------------------
 

@@ -94,6 +94,29 @@ impl HealthCache {
     }
 
     fn store(&self, status: StatusCode, headers: HeaderMap, body: Bytes) {
+        // Per-request header classes must NOT be cached. The health cache is
+        // shared across all requests (and refreshed by a prober with a bare
+        // client UA), so a captured Cross-Origin-Embedder-Policy is frozen to
+        // whichever UA produced it — a Safari client would be replayed
+        // `credentialless` where Node answers `require-corp`, and a captured
+        // Access-Control-Allow-Origin would leak onto Origin-less replays
+        // where Node sends none. secheaders::guard recomputes exactly these
+        // per request (existing-wins only sees what survives this filter);
+        // every OTHER header of Node's health reply (helmet set, x-app-name,
+        // content-type, etag, vary tokens…) is UA/Origin-invariant and
+        // replays byte-faithfully.
+        const PER_REQUEST: [&str; 3] = [
+            "cross-origin-embedder-policy",
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+        ];
+        let headers: HeaderMap = headers
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let name = name.filter(|n| !PER_REQUEST.contains(&n.as_str()))?;
+                Some((name, value))
+            })
+            .collect();
         *self.entry.lock().unwrap() = Some(Cached { status, headers, body, at: Instant::now() });
     }
 
@@ -235,6 +258,33 @@ mod store_tests {
         let res = c.fresh().unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers().get("x-app-name").unwrap(), "Scrybox");
+    }
+
+    /// iter-2 live catch: the cache is shared across all UAs/Origins and the
+    /// prober refreshes it with a bare client UA, so the per-request header
+    /// classes (COEP, ACAO, ACAC) must be dropped at store time and left to
+    /// secheaders::guard to recompute — otherwise a Safari client got the
+    /// prober's `credentialless` replayed where Node answers `require-corp`.
+    #[test]
+    fn store_strips_per_request_headers_keeps_the_rest() {
+        let c = HealthCache::new(true, Duration::from_secs(60), Duration::from_secs(60));
+        let mut h = HeaderMap::new();
+        h.insert("cross-origin-embedder-policy", "credentialless".parse().unwrap());
+        h.insert("access-control-allow-origin", "http://localhost:5173".parse().unwrap());
+        h.insert("access-control-allow-credentials", "true".parse().unwrap());
+        h.insert("cross-origin-opener-policy", "same-origin".parse().unwrap());
+        h.insert("vary", "User-Agent, Origin, Accept-Encoding".parse().unwrap());
+        h.insert("x-app-name", "Scrybox".parse().unwrap());
+        h.insert("etag", "W/\"f-x\"".parse().unwrap());
+        c.store(StatusCode::OK, h, Bytes::from_static(b"x"));
+        let res = c.fresh().unwrap();
+        for dropped in ["cross-origin-embedder-policy", "access-control-allow-origin", "access-control-allow-credentials"] {
+            assert!(res.headers().get(dropped).is_none(), "{dropped} must not be cached");
+        }
+        assert_eq!(res.headers()["cross-origin-opener-policy"], "same-origin");
+        assert_eq!(res.headers()["vary"], "User-Agent, Origin, Accept-Encoding");
+        assert_eq!(res.headers()["x-app-name"], "Scrybox");
+        assert_eq!(res.headers()["etag"], "W/\"f-x\"");
     }
 
     #[test]

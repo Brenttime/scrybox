@@ -164,7 +164,9 @@ async fn sets_flat_list_byte_shape_and_headers() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-encoding"], "gzip");
-    assert_eq!(res.headers()["vary"], "Accept-Encoding");
+    // unit-5a stack: COEP mw adds User-Agent, cors adds Origin, compression
+    // appends Accept-Encoding (matches the Node instance's curl -D output).
+    assert_eq!(res.headers()["vary"], "User-Agent, Origin, Accept-Encoding");
     let gz = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     // Decodes (i.e. is valid gzip) and holds all 42 sets.
     use flate2::read::GzDecoder;

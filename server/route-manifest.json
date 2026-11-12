@@ -289,7 +289,10 @@
     "status": "node"
   },
   "GET /models/cornelius.onnx": {
-    "status": "node"
+    "module": "scrybox-server::static_assets (lib.rs GET/HEAD /models/cornelius.onnx under RUST_ROUTES=static_assets; static_assets.rs = sendFile twin with 30-day immutable CC; non-GET => finalhandler default 404, missing file => 404 empty)",
+    "status": "verified",
+    "tests": "tests/static_assets_route.rs (model_route_serves_30d_and_non_get_reaches_finalhandler) + lib static_assets tests (serve_etag_conditional_pair, finalhandler_* pins); parity.mjs md_model_head/md_model_post_404; live :3312-vs-:3320 header+body diff (3185226 B byte-identical)",
+    "notes": "Covers the sibling /scan-assets/* + /scryfall-portal[/…] arms (same module; manifest.json no-cache vs hashed immutable, fallthrough:false miss = 500 {\"error\":\"Internal server error\"} twin, dotfiles:deny any-dot-segment, portal 301 twin + CSP-trio strip + 502 twin) — not node-routes.py keys (non-/api mounts), recorded here for the unit-5 trio."
   },
   "POST /api/admin/backups": {
     "module": "scrybox-server::backup (lib.rs GET /api/admin/backups under RUST_ROUTES=manabox_backup; backup.rs = backup.js twin, timer gated by SCRYBOX_DISABLE_AUTO_BACKUP + Node twin switch in server.js)",

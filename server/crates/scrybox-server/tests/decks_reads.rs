@@ -301,7 +301,12 @@ async fn list_gzip_when_accepted() {
     let (s, h, b) = request(&r, "GET", "/api/decks", &gz, None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h.get(header::CONTENT_ENCODING).unwrap(), "gzip");
-    assert_eq!(h.get(header::VARY).unwrap(), "Accept-Encoding");
+    // unit-5a security-header stack: the COEP middleware adds Vary User-Agent
+    // and cors adds Origin ahead of compression's Accept-Encoding — oracle
+    // is the Node instance (curl -D shows "User-Agent, Origin,
+    // Accept-Encoding"). Header order/value parity is owned by
+    // secheaders.rs tests; here we pin the compression leg only.
+    assert_eq!(h.get(header::VARY).unwrap(), "User-Agent, Origin, Accept-Encoding");
     // body must be real gzip: decode and compare to the identity response.
     let mut d = flate2::read::GzDecoder::new(&b[..]);
     use std::io::Read;

@@ -413,7 +413,7 @@ fn parse_trade_query(query: &str) -> bool {
 /// decodeURIComponent for path/query components ('+' -> space only in
 /// query context; path segments keep literal '+'). `None` on invalid
 /// percent-sequences (Express throws -> 500).
-fn percent_decode(s: &[u8]) -> Option<String> {
+pub(crate) fn percent_decode(s: &[u8]) -> Option<String> {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
