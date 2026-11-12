@@ -32,6 +32,12 @@ libc = "0.2"
 # (ASCII printable, Latin accents, CJK, emoji); see PROGRESS.md iter-29.
 icu_collator = { version = "2.4", features = ["compiled_data"] }
 icu_locale = "2"
+# rules.rs (iter-36): the CR/keyword parsers are literal ports of six JS
+# regexes incl. lazy quantifiers and counted classes — hand-rolling a
+# leftmost-first simulator for those was the one place a scan twin would
+# have been more dangerous than the engine. regex-automata/regex-syntax are
+# already in Cargo.lock (tracing-subscriber); this only adds the facade.
+regex = "1"
 
 # Server crate must unwind, not abort (plan section 9: a panic in one request
 # must not take the whole front door down).

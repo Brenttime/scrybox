@@ -410,10 +410,18 @@ fn portal_upstream_base() -> String {
 
 /// server.js rewriteText's two regexes as byte scans (the patterns are pure
 /// ASCII; UTF-8 continuation bytes can never match an ASCII needle).
+///
+/// Unmatched bytes are copied as UTF-8 slices, NOT pushed as latin1 chars:
+/// Node's regexes run on the decoded JS string, so every byte outside a match
+/// round-trips verbatim (a multibyte em-dash must stay E2 80 94 — pushing
+/// `b as char` would double-encode it to C3 A2 C2 80 C2 94). Every break
+/// position (i, q) sits on an ASCII needle byte, so slices are always on char
+/// boundaries.
 pub fn rewrite_text(body: &str) -> String {
     let b = body.as_bytes();
     let mut out = String::with_capacity(body.len() + 64);
     let mut i = 0usize;
+    let mut seg = 0usize; // start of the not-yet-copied run
     while i < b.len() {
         // /(href|src)="\/(?!\/)/g -> $1="/scryfall-portal/
         let href = i + 5 <= b.len() && &b[i..i + 5] == b"href=";
@@ -424,11 +432,12 @@ pub fn rewrite_text(body: &str) -> String {
                 // Node's replacement builds `$1="/scryfall-portal/` from
                 // scratch (PORTAL_PREFIX itself supplies the leading '/');
                 // the match's trailing '/' is consumed.
-                out.push_str(&body[i..q]);
+                out.push_str(&body[seg..q]);
                 out.push('"');
                 out.push_str(PORTAL_PREFIX);
                 out.push('/');
                 i = q + 2;
+                seg = i;
                 continue;
             }
         }
@@ -452,16 +461,18 @@ pub fn rewrite_text(body: &str) -> String {
             if let Some(n) = n {
                 // Node's replacement `$1${PORTAL_PREFIX}$2` from scratch;
                 // $2 already starts with its '/'.
-                out.push(b[i] as char);
+                out.push_str(&body[seg..i]);
+                out.push_str(&body[i..i + 1]); // the quote (ASCII, needle-guaranteed)
                 out.push_str(PORTAL_PREFIX);
                 out.push_str(&body[i + 1..i + 2 + n]);
                 i = i + 2 + n;
+                seg = i;
                 continue;
             }
         }
-        out.push(b[i] as char);
         i += 1;
     }
+    out.push_str(&body[seg..]);
     out
 }
 
@@ -606,6 +617,9 @@ pub async fn handle_portal(State(st): State<AppState>, req: Request) -> Response
         if ct_str.to_ascii_lowercase().contains("charset") { "" } else { "; charset=utf-8" }
     );
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct_out).unwrap());
+    // Node's res.send wire order: Content-Type, Content-Length, ETag. Stamp CL
+    // explicitly (same value hyper would auto-derive) so the line order matches.
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body_str.len().to_string()).unwrap());
     if let Ok(v) = HeaderValue::from_str(&body_etag(body_str.as_bytes())) {
         headers.insert(header::ETAG, v);
     }
@@ -749,6 +763,21 @@ mod tests {
         assert_eq!(big.headers()[header::VARY], "Accept-Encoding");
         let onx = serve(d.path(), "/model.onnx", Method::GET, Some(("accept-encoding", "gzip".into())));
         assert!(onx.headers().get(header::CONTENT_ENCODING).is_none(), "octet-stream never gzips");
+    }
+
+    #[test]
+    fn rewrite_text_preserves_multibyte_utf8() {
+        // Node's rewriteText regexes run on the DECODED string: bytes outside
+        // a match round-trip verbatim. The byte-scan twin once pushed unmatched
+        // bytes `as char` (latin1), double-encoding the sidecar index's em-dash
+        // (E2 80 94 -> C3 A2 C2 80 C2 94) — this pins that regression.
+        let src = "<title>Scryfall Local \u{2014} Magic: The Gathering</title> \u{4e2d}\u{6587} \u{1F525} href=\"/sets\"";
+        let got = rewrite_text(src);
+        assert_eq!(
+            got,
+            "<title>Scryfall Local \u{2014} Magic: The Gathering</title> \u{4e2d}\u{6587} \u{1F525} href=\"/scryfall-portal/sets\""
+        );
+        assert_eq!(&got.as_bytes()[22..25], &[0xE2, 0x80, 0x94]); // "<title>Scryfall Local " = 22 B
     }
 
     #[test]
