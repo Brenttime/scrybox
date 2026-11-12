@@ -28,6 +28,7 @@ pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
 pub mod backup;
+pub mod cards_meta;
 pub mod card_cache;
 pub mod card_norm;
 pub mod card_art;
@@ -551,6 +552,21 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/export", any(export::route_export).post(export::route_export_post))
             .route("/api/import", any(export::route_import))
+    } else {
+        router
+    };
+    // Lane A iter-39: cards-meta group (stats.js card routes + the
+    // collection.js suggest) under `cards_meta`: POST /api/cards/highlight,
+    // GET /api/cards/{id}/decks, GET /api/cards/{id}/price-history,
+    // GET /api/stats/commander-of-the-day, GET /api/suggest.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("cards_meta") {
+        router
+            .route("/api/cards/highlight", any(cards_meta::handle_highlight))
+            .route("/api/cards/{id}/decks", any(cards_meta::handle_card_decks))
+            .route("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
+            .route("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
+            .route("/api/suggest", any(cards_meta::handle_suggest))
     } else {
         router
     };

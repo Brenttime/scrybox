@@ -2855,6 +2855,79 @@ cases.push({ name: 'pt_post_404', path: '/scryfall-portal/', headers: {}, method
   cases.push({ name: 'ex_import_badjson_str', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":"zzz"}' });
   cases.push({ name: 'ex_import_printing_str_null', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":[{"game":"mtg","name":"X","printing":"null"}]}' });
   cases.push({ name: 'ex_import_noauth', path: '/api/import', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}', etagReplay: false });
+  // ===== cards_meta (iter 39): POST /api/cards/highlight,
+  // GET /api/cards/:id/decks, GET /api/cards/:id/price-history,
+  // GET /api/stats/commander-of-the-day, GET /api/suggest under
+  // RUST_ROUTES=cards_meta. Fixed ids; setup reseeds per side-run. =====
+  const CM_PH = 'rusttest-cm-ph';
+  const CM_PH_BAD = 'rusttest-cm-ph-bad';
+  const CM_DUP = 'rusttest-cm-dup-emh';
+  const CM_PLAIN = 'rusttest-cm-plain';
+  function cmUid(d) {
+    const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+    const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+    if (!s) throw new Error('parity: bench session not found for cards_meta cases');
+    return Number(s.user_id);
+  }
+  function cmClear(d) {
+    d.prepare('DELETE FROM price_history WHERE card_id IN (?,?)').run(CM_PH, CM_PH_BAD);
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931101 AND 931103').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931101 AND 931103').run();
+    d.prepare('DELETE FROM card_cache WHERE id IN (?,?)').run(CM_DUP, CM_PLAIN);
+  }
+  function cmPrep() {
+    dbWrite((d) => {
+      cmClear(d);
+      const uid = cmUid(d);
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931101, uid, 'CM Checked One', '', 1, '2026-01-01 00:00:00');
+      ins.run(931102, uid, 'CM Not Checked', '', 0, '2026-01-01 00:00:00');
+      d.prepare("INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend) VALUES (?,?,?,?,'Rare',0.2)")
+        .run(CM_DUP, 'Emergency Medical Hologram', '["Artifact"]', '[]');
+      d.prepare("INSERT INTO card_cache (id,supertype,name,types,subtypes,rarity,price_trend) VALUES (?,?,?,?,?, 'Common',0.1)")
+        .run(CM_PLAIN, 'Land', 'Plains', '["Land"]', '["Basic","Plains"]');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931101, CW_CARD, 2);
+      dc.run(931101, CM_DUP, 1);
+      dc.run(931101, CM_PLAIN, 4);
+      dc.run(931102, CW_CARD, 7);
+      const ph = d.prepare('INSERT INTO price_history (card_id,price,recorded_at) VALUES (?,?,?)');
+      ph.run(CM_PH, 1.0, '2020-01-01 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-01 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-02 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-03 00:00:00');
+      ph.run(CM_PH, 3.0, '2026-01-04 00:00:00');
+      ph.run(CM_PH_BAD, 2.5, 'bad-date');
+    });
+  }
+  function cmTeardown() { dbWrite((d) => cmClear(d)); }
+  cases.push({ name: 'cm_decks_hit', path: `/api/cards/${CW_CARD}/decks`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_decks_basic', path: `/api/cards/${CM_PLAIN}/decks`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_all', path: `/api/cards/${CM_PH}/price-history?range=x`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_default', path: `/api/cards/${CM_PH}/price-history`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_bad500', path: `/api/cards/${CM_PH_BAD}/price-history?range=x`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_ctor', path: `/api/cards/${CM_PH}/price-history?range=constructor`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_proto', path: `/api/cards/${CM_PH}/price-history?range=__proto__`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_noauth', path: `/api/cards/${CM_PH}/price-history`, headers: {} });
+  cases.push({ name: 'cm_hl_ok', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'goblin', names: ['Goblin Racketeer', 'Island', 'goblin racketeer', ''] }) });
+  cases.push({ name: 'cm_hl_val', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'goblin' }) });
+  cases.push({ name: 'cm_hl_grammar', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'is:land', names: ['Island'] }) });
+  cases.push({ name: 'cm_hl_badjson', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: '{oops' });
+  cases.push({ name: 'cm_hl_text', path: '/api/cards/highlight', headers: { ...authHeaders, 'content-type': 'text/plain' }, method: 'POST', etagReplay: false,
+    body: 'q=goblin' });
+  cases.push({ name: 'cm_hl_noauth', path: '/api/cards/highlight', headers: { 'content-type': 'application/json' }, method: 'POST', etagReplay: false,
+    body: '{}' });
+  cases.push({ name: 'cm_sug', path: '/api/suggest?q=lig', headers: authHeaders });
+  cases.push({ name: 'cm_sug_upper', path: '/api/suggest?q=Goblin', headers: authHeaders });
+  cases.push({ name: 'cm_sug_short', path: '/api/suggest?q=a', headers: authHeaders });
+  cases.push({ name: 'cm_sug_noauth', path: '/api/suggest?q=lig', headers: {} });
+  cases.push({ name: 'cm_cotd', path: '/api/stats/commander-of-the-day?day=2026-11-12', headers: authHeaders });
+  cases.push({ name: 'cm_cotd_arr', path: '/api/stats/commander-of-the-day?day[]=x', headers: authHeaders });
+
 }
 
 
