@@ -3173,15 +3173,25 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
   cases.push({ name: 'mp_accounts_noauth', path: '/api/marketplace/accounts', headers: {}, method: 'GET' });
   cases.push({ name: 'mp_accounts_badtoken', path: '/api/marketplace/accounts', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)) }, method: 'GET' });
 
+  // savedAt is new Date().toISOString() stamped by the WRITING server at PUT
+  // time (Node: marketplaceOrders.js accountView/save; Rust: marketplace.rs
+  // twin). Each side stamps its own wall clock, so the two bodies can never
+  // agree on it byte-for-byte — scrub it like the manabox sync header
+  // (scrubStrings precedent). Its SHAPE is still pinned: it must be a string
+  // on both sides (the scrub only rewrites strings) and readBack gates on
+  // typeof savedAt === 'string' before the row is accepted.
   cases.push({ name: 'mp_put_save_ok', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
     body: JSON.stringify({ manapool: { email: ' fresh.probe@example.com ', token: 'freshProbeTok9999', enabled: true } }),
+    scrub: [['$.accounts.manapool.savedAt', '.*', '<wallclock>']],
     setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1', { configured: false }); },
     readBack: async (other) => {
       const r = await mpGet(other);
       const v = mpView(r.json);
-      return v && v.configured === true && v.enabled === true && v.email === 'fr••••••••@example.com' && v.token === 'fre\u{2026}9999 (17 chars)' && typeof v.savedAt === 'string'
-        ? { ok: true, why: 'saved credential visible masked on the other server', seen: v }
-        : { ok: false, why: `saved credential missing/wrong on other server: ${r.status} ${fmt(r.json)}`, seen: v };
+      if (!v || v.configured !== true || v.enabled !== true || v.email !== 'fr••••••••@example.com' || v.token !== 'fre\u{2026}9999 (17 chars)' || typeof v.savedAt !== 'string') {
+        return { ok: false, why: `saved credential missing/wrong on other server: ${r.status} ${fmt(r.json)}`, seen: v };
+      }
+      const { savedAt, ...persisted } = v; // wall-clock: gated above, excluded from the cross-side fold
+      return { ok: true, why: 'saved credential visible masked on the other server', seen: persisted };
     },
     teardown: async () => { mpPurge(); } });
   cases.push({ name: 'mp_put_clear_ok', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',

@@ -221,12 +221,12 @@
     "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token"
   },
   "GET /api/marketplace/accounts": {
-    "status": "rust",
+    "status": "verified",
     "module": "marketplace",
     "tests": "crates/scrybox-server/tests/marketplace.rs"
   },
   "GET /api/marketplace/recent/:source": {
-    "status": "rust",
+    "status": "verified",
     "module": "marketplace",
     "tests": "crates/scrybox-server/tests/marketplace.rs"
   },
@@ -619,7 +619,7 @@
     "tests": "tests/lists_writes.rs::order_number_filter_and_index; parity.mjs lw_order_* (3 cases)"
   },
   "PUT /api/marketplace/accounts": {
-    "status": "rust",
+    "status": "verified",
     "module": "marketplace",
     "tests": "crates/scrybox-server/tests/marketplace.rs"
   },
