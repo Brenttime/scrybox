@@ -38,7 +38,7 @@ use axum::{
 };
 use bytes::Bytes;
 use rusqlite::{Connection, Row};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     auth, collq,
@@ -91,6 +91,32 @@ pub(crate) fn to_name(input: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 // Query parsing (express req.query semantics for this route)
 // ---------------------------------------------------------------------------
+
+/// The `scope=collection` field-filter leg (`cardSearchSql.collectionQuery`,
+/// reached from `runSearch` line 732): pure SQL over the user's OWN rows —
+/// no Scryfall, no sidecar, no language filter (an owner sees every language
+/// they own). An empty result IS the answer: Node returns `[]`, it never
+/// falls through to an API. Prints/lang are inert on this leg (Node's
+/// allPrints branch is gated `scope !== 'collection'`); `image` is not — the
+/// route cvScan-ranks the rows after the search, so that stays on Node.
+#[derive(Clone, Debug)]
+pub struct CollectionOwned {
+    pub user_id: i64,
+    pub name: String,
+    pub number: String,
+    pub set: String,
+    pub page: i64,
+    pub limit: i64,
+}
+
+impl CollectionOwned {
+    fn cache_key(&self) -> String {
+        format!(
+            "o|{}|{}|{}|{}|{}|{}",
+            self.user_id, self.name, self.number, self.set, self.page, self.limit
+        )
+    }
+}
 
 /// The normalized parameters the native path consumes. `PartialEq`/`Hash` via
 /// the manual `cache_key`.
@@ -157,6 +183,8 @@ pub enum Plan {
     Native(SearchQuery),
     /// Collection-scope free-text `q` leg (collq.rs).
     CollectionQ(Arc<collq::CollectionQ>),
+    /// Collection-scope field-filter leg (this file, collection_owned_sql).
+    CollectionOwned(Box<CollectionOwned>),
     Proxy,
 }
 
@@ -210,7 +238,32 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
     // Destructure default only fires when the key is absent; `scope=` (empty)
     // stays '' and is neither collection nor internet — same as Node.
     let scope = first("scope").unwrap_or_else(|| "database".to_string());
-    if scope == "collection" || scope == "internet" {
+    if scope == "collection" {
+        // F8-TC5: the field-filter collection leg. Node answers it with ONE
+        // pure-SQL cardSearchSql.collectionQuery (runSearch line 732): owned
+        // rows joined across every language the user owns them in, with
+        // owned_qty from the logical-key SUM. No Scryfall, no sidecar, no
+        // lang filter, and empty rows are the answer (not a fall-through).
+        // `image` still gets cvScan ranking in the ROUTE after the search
+        // (routes/collection.js), so that stays on Node.
+        if first("image").map(|s| !s.is_empty()).unwrap_or(false) {
+            return Plan::Proxy;
+        }
+        // Route-level parse; maxLimit stays 250 (2000 belongs to the q path).
+        let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+        let page = if page == 0 { 1 } else { page }.max(1);
+        let limit = first("limit").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+        let limit = if limit == 0 { 60 } else { limit }.clamp(1, 250);
+        return Plan::CollectionOwned(Box::new(CollectionOwned {
+            user_id,
+            name: first("name").unwrap_or_default().trim().to_string(),
+            number: clean_number(first("number").as_deref().unwrap_or("")),
+            set: first("set").unwrap_or_default(),
+            page,
+            limit,
+        }));
+    }
+    if scope == "internet" {
         return Plan::Proxy;
     }
     if first("prints").as_deref() == Some("1") {
@@ -581,6 +634,162 @@ fn local_cache_query(p: &SearchQuery, candidates_json: Option<&str>) -> (String,
     (sql, params)
 }
 
+// ---------------------------------------------------------------------------
+// collectionQuery (cardSearchSql.js) — the scope=collection field-filter leg
+// ---------------------------------------------------------------------------
+
+/// JS `\s` exactly (regex-crate `\s` also matches U+0085, JS's does not, and
+/// JS's includes U+FEFF, Unicode White_Space does not).
+const JS_WS_CLASS: &str = r"[\t\n\x0b\x0c\r\x20\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}]";
+
+fn number_re() -> &'static regex::Regex {
+    static R: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    R.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)^#?([A-Z0-9★-]+)(?:{JS_WS_CLASS}*/{JS_WS_CLASS}*)?$"
+        ))
+        .ok()
+    })
+    .as_ref()
+    .unwrap()
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `cardSearchSql.numberClause` — same accept regex (JS `/i`), the same
+/// leading-zero strip, and the same OR-list of exact / cleaned / stripped /
+/// CAST-numeric terms. Operates on the already-normalized number (runSearch's
+/// clean_number ran first), so its own `String(number || '').trim()` is the
+/// no-op it is in JS.
+fn number_clause(column: &str, number: &str) -> Option<(String, Vec<String>)> {
+    let exact = number.trim().to_string();
+    if exact.is_empty() {
+        return None;
+    }
+    let clean = number_re()
+        .captures(&exact)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| exact.clone());
+    let stripped = clean.trim_start_matches('0').to_string();
+    let mut terms = vec![format!("{column} = ?")];
+    let mut params = vec![exact.clone()];
+    if clean != exact {
+        terms.push(format!("{column} = ?"));
+        params.push(clean.clone());
+    }
+    if stripped != clean && !stripped.is_empty() && stripped != exact {
+        terms.push(format!("{column} = ?"));
+        params.push(stripped);
+    }
+    if all_digits(&clean) || all_digits(&exact) {
+        terms.push(format!("CAST({column} AS INTEGER) = CAST(? AS INTEGER)"));
+        params.push(clean);
+    }
+    Some((format!("({})", terms.join(" OR ")), params))
+}
+
+/// `cardSearchSql.collectionQuery` — same SQL text, same filter order
+/// (name, number, sets) and parameter order. `sqlCardKey('owned_cc')` is
+/// expanded inline (`LOWER(TRIM(COALESCE(owned_cc.name, '')))`), mirroring
+/// the JS helper call.
+fn collection_owned_sql(o: &CollectionOwned) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value as Sql;
+    let mut filters: Vec<(String, Vec<String>)> = Vec::new();
+    // nameClause('owned.', name)
+    if !o.name.is_empty() {
+        let like = format!("%{}%", o.name);
+        filters.push((
+            "(owned.name LIKE ? OR owned.printed_name LIKE ?)".to_string(),
+            vec![like.clone(), like],
+        ));
+    }
+    // numberClause('owned.number', number)
+    if let Some((clause, params)) = number_clause("owned.number", &o.number) {
+        filters.push((clause, params));
+    }
+    // parseSetList + setSqlFilter(setList, 'owned')
+    let set_list: Vec<String> =
+        o.set.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if !set_list.is_empty() {
+        let inner = set_list
+            .iter()
+            .map(|_| "(owned.set_name LIKE ? OR owned.set_id = ?)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let params = set_list.iter().flat_map(|s| [format!("%{s}%"), s.clone()]).collect();
+        filters.push((format!("({inner})"), params));
+    }
+    let matching_filter = if filters.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " FILTER (WHERE {})",
+            filters.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join(" AND ")
+        )
+    };
+    let sql = format!("
+    WITH owned_rows AS (
+      SELECT
+        c.card_id,
+        c.quantity,
+        LOWER(TRIM(COALESCE(owned_cc.name, ''))) AS card_key,
+        owned_cc.name,
+        owned_cc.printed_name,
+        owned_cc.number,
+        owned_cc.set_name,
+        owned_cc.set_id
+      FROM collection c
+      JOIN card_cache owned_cc ON c.card_id = owned_cc.id
+      WHERE c.user_id = ? AND c.quantity > 0
+    ),
+    logical_owned AS (
+      SELECT
+        card_key,
+        SUM(quantity) AS owned_qty,
+        json_group_array(DISTINCT card_id){matching_filter} AS matching_card_ids
+      FROM owned_rows owned
+      GROUP BY card_key
+    ),
+    matched AS (
+      SELECT owned_printing.value AS card_id, logical_owned.owned_qty
+      FROM logical_owned
+      JOIN json_each(logical_owned.matching_card_ids) owned_printing
+      ORDER BY owned_printing.value
+      LIMIT ? OFFSET ?
+    )
+    SELECT cc.*, matched.owned_qty
+    FROM matched
+    JOIN card_cache cc ON matched.card_id = cc.id
+    ORDER BY matched.card_id
+  ");
+    let mut params = vec![Sql::Integer(o.user_id)];
+    params.extend(filters.iter().flat_map(|(_, p)| p.iter()).map(|p| Sql::Text(p.clone())));
+    params.push(Sql::Integer(o.limit));
+    params.push(Sql::Integer((o.page - 1).saturating_mul(o.limit)));
+    (sql, params)
+}
+
+/// One collection-leg build: run the query, shape rows with the parseCardRow
+/// twin. Node wraps the WHOLE route in try/catch → any SQL error is a 500
+/// 'Search failed' (the collection branch returns before runSearch's
+/// live-path try, so there is no fall-through to swallow it).
+fn build_owned_body(pool: &DbPool, o: &CollectionOwned) -> Result<Vec<u8>, String> {
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let (sql, params) = collection_owned_sql(o);
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params.iter()))
+        .map_err(|e| format!("collection query: {e}"))?;
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        out.push(Value::Object(row_to_object(row)?));
+    }
+    serde_json::to_vec(&out).map_err(|e| e.to_string())
+}
+
 /// Raw rows → the `parseCardRow` object shape: every column in table order
 /// (`SELECT *`, so the statement's own column list is the contract), with
 /// the JSON array columns parsed; a missing array column is appended, which
@@ -689,7 +898,12 @@ fn attach_owned_qty(conn: &Connection, cards: &mut [Value], user_id: i64) -> Res
 /// to `Ok(None)` because `runSearch` swallows it into an empty result and
 /// falls through to the live path; only post-cache (attachOwnedQty/serialize)
 /// errors mirror Node's 500, surfaced as `Err`.
-fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuery) -> Result<Option<(Vec<u8>, Option<u64>)>, String> {
+fn build_body(
+    pool: &DbPool,
+    idx: &NameIndex,
+    owned: &OwnedCache,
+    p: &SearchQuery,
+) -> Result<Option<(Vec<u8>, Option<u64>, Vec<Value>)>, String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
     // Pin one read transaction over probe + card query + owned attach: WAL
     // fixes every statement's view at the probe, so the revision we compare
@@ -751,6 +965,30 @@ fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuer
     if cards.is_empty() {
         return Ok(None); // Node keeps going: specific/broad Scryfall query.
     }
+    // Stale background refresh (scryfallApi.js queryLocal → stale filter +
+    // floating bulkFetchByIdentifier, CACHE_AGE_LIMIT_MS = 3 days): rows
+    // older than 3 days get re-fetched AFTER the cached answer is served.
+    // Unparseable/NULL last_updated is NaN in Node's comparison → never
+    // stale, hence unwrap_or(false). The identifier rows ride to `handle`,
+    // which spawns the fetch — Node re-fires per request while rows stay
+    // stale; the response cache serves this entry only until the refresh's
+    // card_cache write bumps the revision (trigger) and the entry rebuilds
+    // on fresh rows, which bounds the divergence to the failing-fetch case.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let stale: Vec<Value> = cards
+        .iter()
+        .filter(|c| {
+            c.get("last_updated")
+                .and_then(|v| v.as_str())
+                .and_then(crate::card_cache::parse_sqlite_utc)
+                .map(|at| now_ms - at.timestamp_millis() > 3 * 24 * 60 * 60 * 1000)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     // Owned quantities from the per-rev snapshot when it holds; any
     // deviation (row shape, non-integer SUM, build race) → original SQL.
     let mut attached = false;
@@ -766,7 +1004,87 @@ fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuer
     let body = serde_json::to_vec(&cards).map_err(|e| e.to_string())?;
     // This path never sets meta.total (only the live paths do) → no
     // X-Total-Count header on the native response.
-    Ok(Some((body, None)))
+    Ok(Some((body, None, stale)))
+}
+
+/// `bulkFetchByIdentifier` (scryfallApi.js) as the queryLocal background
+/// refresh uses it: 75-identifier batches POSTed to `/cards/collection`
+/// through the shared Scry client (sidecar swap, paced upstream), then
+/// normalizeCard + cacheCards. Identifier pick mirrors Node: scryfallUuid
+/// → {id}, else set_id+number → {set, collector_number}, else {name}.
+/// `pairs`/`not_found` are unused on this leg and dropped. A transport
+/// failure after the retries is Node's caught error — log (its message
+/// verbatim) and abandon the whole refresh.
+async fn bulk_refresh_stale(st: &AppState, rows: &[Value]) {
+    const COLLECTION_BATCH: usize = 75;
+    let Some(pool) = st.db.as_ref().map(Arc::clone) else { return };
+    let lang_name = to_name(None);
+    for chunk in rows.chunks(COLLECTION_BATCH) {
+        let identifiers: Vec<Value> = chunk
+            .iter()
+            .map(|row| {
+                let id = row
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| row.get("card_id").and_then(|v| v.as_str()));
+                if let Some(uuid) = crate::card_norm::scryfall_uuid(id) {
+                    return json!({ "id": uuid });
+                }
+                let set_id = match row.get("set_id") {
+                    Some(v) if !v.is_null() => crate::mfx_payload::js_to_string(v).to_lowercase(),
+                    _ => String::new(),
+                };
+                let num = match row.get("number") {
+                    Some(v) if !v.is_null() => crate::mfx_payload::js_to_string(v),
+                    _ => String::new(),
+                };
+                if !set_id.is_empty() && !num.is_empty() {
+                    json!({ "set": set_id, "collector_number": num })
+                } else {
+                    json!({ "name": row.get("name").and_then(|v| v.as_str()).unwrap_or("") })
+                }
+            })
+            .collect();
+        let mut body = serde_json::Map::new();
+        body.insert("identifiers".into(), Value::Array(identifiers));
+        let resp = st
+            .scry
+            .post_retried(
+                "/cards/collection",
+                Value::Object(body),
+                &crate::scryfall::ScryOpts::default(),
+                4,
+            )
+            .await;
+        let data = match resp {
+            Ok(Some(v)) => v
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            // Node guards `resp.data` (a non-JSON answer carries no cards for
+            // this batch); a retry-exhausted transport is the caught-error.
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::error!("MTG background refresh failed: {e}");
+                return;
+            }
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let maps: Vec<serde_json::Map<String, Value>> =
+            data.iter().map(|raw| crate::sidecar::normalize_card(raw, &lang_name)).collect();
+        let pool_w = Arc::clone(&pool);
+        let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = pool_w.get().map_err(|e| e.to_string())?;
+            crate::card_cache::cache_normalized_cards(&conn, &maps).map_err(|e| e.to_string())
+        })
+        .await;
+        if let Err(e) = wrote {
+            tracing::error!("MTG background refresh failed: {e:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -793,9 +1111,19 @@ pub struct SearchEntry {
     /// Node source label; cache-path entries are (None, "cache").
     total: Option<u64>,
     source: &'static str,
+    /// False on the collection field-filter leg: Node's route sets NEITHER
+    /// X-Source NOR Access-Control-Expose-Headers there (runSearch leaves
+    /// meta.source unset and meta.total null), so the response carries only
+    /// the Express-default ETag + Content-Type.
+    x_source: bool,
     /// Set only on the collection-scope q leg (collq.rs): switches the
     /// response to the resolveCollectionQuery header contract.
     catalog: Option<CatalogMeta>,
+    /// Cache-path entries built while some rows were >3 days old carry their
+    /// identifier rows so EVERY request served from the entry (hit or miss)
+    /// re-fires the background refresh, matching Node's per-request stale
+    /// filter while the fetch has not yet landed (queryLocal, scryfallApi.js).
+    stale: Arc<Vec<Value>>,
 }
 
 /// Single-flight slot, same shape as the collection/stats caches: every
@@ -981,6 +1309,11 @@ pub async fn handle(
         Plan::CollectionQ(cq) => {
             return with_rl(serve_collq(st, crate::collection_writes::rebuild(parts, &bytes), pool, cq).await);
         }
+        Plan::CollectionOwned(o) => {
+            let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            return with_rl(serve_owned(st, pool, o, inm, ae).await);
+        }
         Plan::Proxy => return to_node(&st, parts, bytes).await,
     };
 
@@ -1009,6 +1342,17 @@ pub async fn handle(
             // request that observed a newer revision never shares a slot
             // built under an older one; the entry itself is still rev-gated
             // in the cache.
+            //
+            // Walk entries are stamped with the revision read AFTER the
+            // build: the 7c leg's card_cache write fires Node's twin
+            // collection_read_rev_* triggers, and stamping the pre-build
+            // rev would make every walk invalidate its own entry (each
+            // repeat request re-walked the sidecar forever — a regression
+            // Node does not have, since Node has no response cache at
+            // all). A write from elsewhere during the build still bumps
+            // the counter past the post-build read, so real invalidation
+            // is preserved. The cache-path branch reads card_cache itself
+            // and keeps the pre-build stamp.
             let cache = Arc::clone(&st.search_cache);
             let slot_key = format!("{key}\u{0}{rev_i}");
             let slot = cache.slot(&slot_key);
@@ -1024,7 +1368,7 @@ pub async fn handle(
                     let build_owned = Arc::clone(&init_st.owned_index);
                     let p2 = init_p.clone();
                     let built = tokio::task::spawn_blocking(move || {
-                        let Some((body, _total)) =
+                        let Some((body, _total, stale)) =
                             build_body(&build_pool, &build_idx, &build_owned, &p2)?
                         else {
                             return Ok::<_, String>(None);
@@ -1032,12 +1376,12 @@ pub async fn handle(
                         let body = bytes::Bytes::from(body);
                         let etag = body_etag(&body);
                         let gz = gzip_bytes(&body);
-                        Ok(Some((body, gz, etag, None, "cache")))
+                        Ok(Some((body, gz, etag, None, "cache", rev_i, stale)))
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("build task panicked: {e}")))?;
 
-                    let (body, gz, etag, total, source) = match built {
+                    let (body, gz, etag, total, source, entry_rev, stale) = match built {
                         Some(v) => v,
                         // The local cache had nothing. Node's next leg is the
                         // sidecar walk; for the branch we port, run it
@@ -1124,7 +1468,16 @@ pub async fn handle(
                             let (body, total, source) = walked;
                             let etag = body_etag(&body);
                             let gz = gzip_bytes(&body);
-                            (body, gz, etag, total, source)
+                            // Post-write rev stamp (see above): re-read AFTER
+                            // our own cacheCards upsert so the entry survives
+                            // its own write; any OTHER write that raced the
+                            // build already pushed the counter higher.
+                            let post_rev = init_pool
+                                .get()
+                                .ok()
+                                .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                                .unwrap_or(rev_i);
+                            (body, gz, etag, total, source, post_rev, Vec::new())
                         }
                     };
                     // Stamp with the POST-build revision: the walk's own
@@ -1141,7 +1494,7 @@ pub async fn handle(
                         .unwrap_or(rev_i);
                     Ok(Ok(Some(init_cache.insert(
                         init_key,
-                        SearchEntry { rev: store_rev, raw: body, gz, etag, total, source, catalog: None },
+                        SearchEntry { rev: store_rev, raw: body, gz, etag, total, source, x_source: true, catalog: None, stale: Arc::new(stale) },
                     ))))
                 })
                 .await;
@@ -1158,6 +1511,17 @@ pub async fn handle(
             }
         }
     };
+
+    // Stale background refresh (queryLocal's floating bulkFetchByIdentifier):
+    // while the entry was built on >3-day-old rows, every served request
+    // re-fires the fetch until the refreshed write bumps the revision and a
+    // fresh entry replaces it. Fire-and-forget, exactly like Node's floating
+    // promise — the cached answer goes out untouched either way.
+    if st.stale_refresh && !entry.stale.is_empty() {
+        let st_bg = st.clone();
+        let rows = Arc::clone(&entry.stale);
+        tokio::spawn(async move { bulk_refresh_stale(&st_bg, &rows).await });
+    }
 
     // Express's default body ETag on res.json(cards): a matching conditional
     // GET replays as an empty 304, with the headers set before send().
@@ -1207,27 +1571,32 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
             v
         }
     };
-    let expose: &'static str = if entry.catalog.is_some() {
-        "X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source"
+    let expose: Option<&'static str> = if entry.catalog.is_some() {
+        Some("X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source")
+    } else if entry.x_source {
+        Some("X-Total-Count, X-Source")
     } else {
-        "X-Total-Count, X-Source"
+        // Collection field-filter leg: the route set neither header.
+        None
     };
 
     if etag_matches(inm, &tag) {
         let mut b = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, HeaderValue::from_str(&tag).unwrap())
-            .header("x-source", src);
+            .header(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+        if entry.x_source {
+            b = b.header("x-source", src);
+        }
         if let Some((k, v)) = total_hdr {
             b = b.header(k, v);
         }
         for (k, v) in catalog {
             b = b.header(k, v);
         }
-        return b
-            .header("access-control-expose-headers", HeaderValue::from_static(expose))
-            .body(Body::empty())
-            .unwrap();
+        if let Some(expose) = expose {
+            b = b.header("access-control-expose-headers", HeaderValue::from_static(expose));
+        }
+        return b.body(Body::empty()).unwrap();
     }
 
     let use_gzip = wants_encoding(ae, "gzip", entry.raw.len());
@@ -1241,18 +1610,81 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
         b = b.header(header::CONTENT_ENCODING, HeaderValue::from_static(enc))
             .header(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
-    b = b
-        .header(header::ETAG, HeaderValue::from_str(&tag).unwrap())
-        .header("x-source", src);
+    b = b.header(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+    if entry.x_source {
+        b = b.header("x-source", src);
+    }
     if let Some((k, v)) = total_hdr {
         b = b.header(k, v);
     }
     for (k, v) in catalog {
         b = b.header(k, v);
     }
-    b.header("access-control-expose-headers", HeaderValue::from_static(expose))
-        .body(Body::from(body))
-        .unwrap()
+    if let Some(expose) = expose {
+        b = b.header("access-control-expose-headers", HeaderValue::from_static(expose));
+    }
+    b.body(Body::from(body)).unwrap()
+}
+
+/// The collection field-filter leg for one planned request: rev-gated
+/// response cache over (params, revision), one pure-SQL build. Nothing here
+/// ever proxies: Node answers the same query from the same tables, and empty
+/// rows are Node's `[]` too. A SQL failure mirrors Node's route-catch 500
+/// 'Search failed'.
+async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, inm: Option<String>, ae: Option<String>) -> Response {
+    let rev_i = pool
+        .get()
+        .ok()
+        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+        .unwrap_or(-1);
+
+    let key = o.cache_key();
+    if let Some(e) = st.search_cache.get(&key, rev_i) {
+        return respond_entry(&e, inm.as_deref(), ae.as_deref(), None);
+    }
+
+    // Single-flight like the other legs: the stampede on one cold key shares
+    // one query. `Ok(None)` (never produced here) would mean "proxy".
+    let cache = Arc::clone(&st.search_cache);
+    let slot_key = format!("{key}\u{0}{rev_i}");
+    let slot = cache.slot(&slot_key);
+    let init_cache = Arc::clone(&cache);
+    let init_key = key.clone();
+    let build_pool = Arc::clone(&pool);
+    let build_o = (*o).clone();
+    let res: Result<&Result<Option<Arc<SearchEntry>>, String>, String> = slot
+        .get_or_try_init(move || async move {
+            let built = tokio::task::spawn_blocking(move || build_owned_body(&build_pool, &build_o))
+                .await
+                .unwrap_or_else(|e| Err(format!("collection-owned build task panicked: {e}")))?;
+            let body = bytes::Bytes::from(built);
+            let etag = body_etag(&body);
+            let gz = gzip_bytes(&body);
+            Ok(Ok(Some(init_cache.insert(
+                init_key,
+                SearchEntry {
+                    rev: rev_i,
+                    raw: body,
+                    gz,
+                    etag,
+                    total: None,
+                    source: "cache",
+                    x_source: false,
+                    catalog: None,
+                    stale: Arc::new(Vec::new()),
+                },
+            ))))
+        })
+        .await;
+    cache.finish(&slot_key);
+    match res {
+        Ok(Ok(Some(e))) => respond_entry(e, inm.as_deref(), ae.as_deref(), None),
+        Ok(Ok(None)) => unreachable!("collection-owned build never proxies"),
+        Ok(Err(ref e)) | Err(ref e) => {
+            tracing::error!(error = %e, "collection-owned build failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
+        }
+    }
 }
 
 /// The collection-scope q leg for one planned request: rev-gated response
@@ -1321,6 +1753,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
                     etag,
                     total: None,
                     source,
+                    x_source: true,
                     catalog: Some(CatalogMeta {
                         total: built.total_header,
                         complete: built.complete,
@@ -1328,6 +1761,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
                         status,
                         snapshot: built.snapshot,
                     }),
+                    stale: Arc::new(Vec::new()),
                 },
             ))))
         })
