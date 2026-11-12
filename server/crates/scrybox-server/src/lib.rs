@@ -462,15 +462,16 @@ pub fn app(state: AppState) -> Router {
         router
     };
     // Lane B unit 2b: catalog_art = the stateless card-art reads and the
-    // two DB/FS-only catalog views. Mutating card-art routes and the
+    // two DB/FS-only catalog views. Unit 6d: the mutating card-art legs
+    // (POST upload, DELETE) joined them natively via route_card; the
     // build-control routes stay unregistered so the catch-all proxies them.
     let router = if state.owns("catalog_art") {
         router
             .route("/api/card-art/index", any(card_art::handle_index))
             // matchit has no `{param}.png` suffix segments — Node's route is
-            // `/:cardId.png`; the handler enforces the literal suffix and
-            // proxies anything else (Node 404s those too).
-            .route("/api/card-art/{cardId}", any(card_art::handle_png))
+            // `/:cardId.png`; route_card dispatches GET/POST/DELETE on the
+            // decoded id and proxies anything outside the group's shapes.
+            .route("/api/card-art/{cardId}", any(card_art::route_card))
             .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
             .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
     } else {

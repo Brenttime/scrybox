@@ -9,7 +9,9 @@
     "tests": "tests/auth.rs::logout_and_api_key_round_trip; parity.mjs authr_apikey_delete_ok (known key 401s on the opposite server after revoke) + authr_apikey_delete_no_token"
   },
   "DELETE /api/card-art/:cardId": {
-    "status": "node"
+    "module": "scrybox-server::card_art (lib.rs any -> card_art::route_card DELETE leg)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (delete_401_no_token, delete_403_api_key, delete_400_invalid_id, delete_200_removes_file, delete_again_404); bench/cardart-ab.mjs del arms vs :3312"
   },
   "DELETE /api/collection/:id": {
     "module": "scrybox-server::collection_writes (lib.rs routes /api/collection/cardlist, /api/collection/bulk, /api/collection/{id} under RUST_ROUTES=collection_writes)",
@@ -115,7 +117,7 @@
   "GET /api/card-art/:cardId.png": {
     "module": "scrybox-server::card_art (lib.rs GET /api/card-art/{cardId}, .png suffix enforced)",
     "status": "verified",
-    "tests": "tests/catalog_art_route.rs (png_serves_user_layer_over_bundled, png_404_unknown_invalid_ids_and_proxies_other_paths); parity.mjs card_art_png_ok/card_art_png_404/card_art_png_bad_shape"
+    "tests": "tests/catalog_art_route.rs (png_serves_user_layer_over_bundled, png_404_unknown_invalid_ids, png_conditional_304_etag_ims); parity.mjs card_art_*; bench/cardart-ab.mjs (get_png_200/cond_pair send-header set + raw INM/IMS 304s vs :3312)"
   },
   "GET /api/card-art/index": {
     "module": "scrybox-server::card_art (lib.rs GET /api/card-art/index)",
@@ -385,7 +387,9 @@
     "tests": "tests/auth_register.rs::register_success_flow; tests/auth.rs::register_is_disabled_by_default; parity.mjs authr_register_disabled + parity-auth-ephemeral.mjs register_201/duplicate_400/short_pw_400/cross_login (throwaway ALLOW_REGISTRATION=true pair)"
   },
   "POST /api/card-art/:cardId": {
-    "status": "node"
+    "module": "scrybox-server::card_art (lib.rs any -> card_art::route_card POST leg)",
+    "status": "verified",
+    "tests": "tests/catalog_art_route.rs (post_401_no_token, post_403_api_key, post_400_invalid_id, post_404_unknown_card, post_400_unsupported_format, post_500_garbage_base64, post_413_oversize, post_500_scalar_body, post_200_upload_resizes_saves_png, post_200_dataurl, post_200_exif_orientation6); bench/cardart-ab.mjs (post/up arms vs :3312, stored-art decode: dims exact, px-max<=3)"
   },
   "POST /api/cards/highlight": {
     "module": "scrybox-server::cards_meta (lib.rs /api/cards/highlight under RUST_ROUTES=cards_meta; free-text analyze-gate twin with whole-POST replay for grammar/validation, fetchWindow scryPage twin incl 4x429 retry, chunked !\"exact\" queries, DFC front-face matching, engine error ladder 404/400-422/else)",
