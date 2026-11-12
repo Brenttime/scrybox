@@ -78,6 +78,16 @@ fn model_dir() -> Option<PathBuf> {
     }
 }
 
+/// catalog.js / modelAssets MODEL_DIR twin for the build routes.
+pub fn model_dir_pub() -> Option<PathBuf> {
+    model_dir()
+}
+
+/// catalog.js `suffix(lang)` (display-name form).
+pub fn suffix_lang(lang: &str) -> String {
+    suffix(if lang.is_empty() { None } else { Some(lang) })
+}
+
 fn suffix(lang: Option<&str>) -> String {
     match lang {
         None => String::new(),
@@ -832,6 +842,45 @@ struct Det {
     rgb: Vec<u8>,
     detected: bool,
     sharpness: f32,
+}
+
+/// catalog.js `runEmbeddings`: a FRESH milo session per build, same
+/// intra=1/inter=1/sequential config as load_models (verified bit-identical
+/// embeddings, iter-4 pin). Wrapped in a Mutex so `run_session` serves both.
+pub(crate) fn build_milo_session() -> Result<std::sync::Mutex<ort::session::Session>, String> {
+    let dir = model_dir().ok_or("no CV_MODEL_DIR")?;
+    let env = ort_env()?;
+    let mut b = ort::session::Session::builder(env).map_err(|e| e.to_string())?;
+    b = b.with_intra_threads(1).map_err(|e| e.to_string())?;
+    b = b.with_inter_threads(1).map_err(|e| e.to_string())?;
+    b = b.with_parallel_execution(false).map_err(|e| e.to_string())?;
+    let s = b.commit_from_file(dir.join("milo.onnx")).map_err(|e| e.to_string())?;
+    Ok(std::sync::Mutex::new(s))
+}
+
+/// sharp(448-fill).raw() → toTensor → session.run({image}) → embedding.
+pub(crate) fn embed_raw(
+    session: &std::sync::Mutex<ort::session::Session>,
+    rgb: &[u8],
+) -> Result<Vec<f32>, String> {
+    let mut outs = run_session(session, to_tensor(rgb, EMBED_SIZE), EMBED_SIZE, &["embedding"])?;
+    outs.pop().ok_or_else(|| "milo: no embedding output".to_string())
+}
+
+/// cvScan.reload(game, lang) — drop the key the catalog would have been
+/// cached under AND the bare game key (a build can create one from nothing).
+pub fn reload(game: &str, lang: &str) {
+    let dir = match model_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let lang_opt = if lang.is_empty() { None } else { Some(lang) };
+    let use_lang = if has_local(&dir, game, lang_opt) { lang_opt } else { None };
+    let mut map = CATALOGS.lock().unwrap();
+    if let Some(m) = map.as_mut() {
+        m.remove(&catalog_key(game, use_lang));
+        m.remove(game);
+    }
 }
 
 /// useClientCrop: an already-rectified browser crop is resized, not trusted.

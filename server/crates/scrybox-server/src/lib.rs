@@ -29,6 +29,8 @@ pub mod auth_routes;
 pub mod auth_support;
 pub mod backup;
 pub mod card_cache;
+pub mod card_sets;
+pub mod catalog_build;
 pub mod card_norm;
 pub mod cardscan;
 pub mod card_art;
@@ -54,6 +56,7 @@ pub mod migrations;
 pub mod mfx_payload;
 pub mod moxfield;
 pub mod moxfield_api;
+pub mod model_assets;
 pub mod name_index;
 pub mod precons;
 pub mod rules;
@@ -466,6 +469,20 @@ pub fn app(state: AppState) -> Router {
             .route("/api/card-art/{cardId}", any(card_art::handle_png))
             .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
             .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
+    } else {
+        router
+    };
+    // Lane B unit 6c: catalog_build = the admin build-control group +
+    // modelAssets (RUST_ROUTES=catalog_build). The catch-all proxies these
+    // paths while the group is off, so Node keeps its own engine there.
+    let router = if state.owns("catalog_build") {
+        router
+            .route("/api/admin/catalogs", any(catalog_build::handle_catalogs))
+            .route("/api/admin/catalogs/progress", any(catalog_build::handle_catalogs))
+            .route("/api/admin/catalogs/build", any(catalog_build::handle_catalogs))
+            .route("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
+            .route("/api/admin/models", any(model_assets::handle_models))
+            .route("/api/admin/models/download", any(model_assets::handle_models))
     } else {
         router
     };

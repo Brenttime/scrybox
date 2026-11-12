@@ -425,11 +425,10 @@ async fn boot_sets_sync(db: std::path::PathBuf) {
 }
 
 async fn weekly_loop(db: std::path::PathBuf) {
-    // Weekly sets refresh (picks up newly released sets). Node's weekly tick
-    // additionally reloads its in-memory sort cache and auto-updates oracle
-    // catalogs — those halves stay on Node until the catalog unit (BRIEF-B
-    // order #2), so the weekly Node timer is NOT disabled yet; running both
-    // is idempotent (INSERT OR REPLACE of the same /sets rows).
+    // Weekly sets refresh (picks up newly released sets) + the
+    // autoUpdateCatalogs twin (Lane B unit 6c: one behind-catalog build kick
+    // per tick; the Node weekly timer is switched off for this leg with
+    // CATALOG_AUTO_UPDATE=0 on the test container).
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(7 * 24 * 3600)).await;
         let scry = Scry::new(ScryEnv::from_env());
@@ -441,6 +440,11 @@ async fn weekly_loop(db: std::path::PathBuf) {
             }
             Err(e) => tracing::error!("Weekly sets refresh: db open failed: {e}"),
         }
+        crate::catalog_build::auto_update_tick(
+            &db,
+            std::sync::Arc::new(Scry::new(ScryEnv::from_env())),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     }
 }
 

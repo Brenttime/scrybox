@@ -59,6 +59,7 @@ pub async fn scryfall_sets(scry: &Scry, memo: &ScryfallSetsMemo) -> Vec<Value> {
     fetched
 }
 
+#[derive(Clone, Copy)]
 pub struct Exclusions {
     pub tokens: bool,
     pub art_cards: bool,
@@ -66,7 +67,7 @@ pub struct Exclusions {
     pub promos: bool,
 }
 
-fn scan_exclusions(conn: &rusqlite::Connection) -> Exclusions {
+pub(crate) fn scan_exclusions(conn: &rusqlite::Connection) -> Exclusions {
     conn.query_row(
         "SELECT scan_exclude_tokens, scan_exclude_art_cards, scan_exclude_jumpstart, scan_exclude_promos FROM app_settings WHERE id = 1",
         [],
