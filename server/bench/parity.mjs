@@ -3122,6 +3122,129 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
       return { path: `/api/admin/users/${id}` };
     } });
   cases.push({ name: 'au_delete_noauth', path: '/api/admin/users/1', headers: {}, method: 'DELETE' });
+
+  // --- iter-41: MARKETPLACE slice 1 (RUST_ROUTES=marketplace;
+  // GET/PUT /api/marketplace/accounts, GET /api/marketplace/recent/:source;
+  // backend/src/routes/marketplaceOrders.js + utils/marketplaceOrders.js).
+  // The provider legs (list/detail against manapool.com) are excluded from
+  // parity per the moxfield-leg ruling — proven here against the injected
+  // stub client in crates/scrybox-server/tests/marketplace.rs. Parity covers
+  // the masked account view, every PUT arm (clear / enabled-only /
+  // validation order / gates / body-parser-before-auth), and the recent
+  // gates. Probe rows live in the fixed 9314xx block with fixed manapool
+  // values so both sides render the same masked body; write arms read back
+  // on the OPPOSITE server.
+  const MP_UID = 931401, MP_OFF_UID = 931402, MP_NONE_UID = 931403;
+  const MP_TOKV = 'rusttest-mp'.concat('-tok');
+  const MP_HDR = { Authorization: 'Bearer '.concat(MP_TOKV) };
+  const MP_JSONH = { Authorization: 'Bearer '.concat(MP_TOKV), 'content-type': 'application/json' };
+  const MP_SEED_EMAIL = 'mp.probe@example.com';
+  const MP_SEED_TOKEN = 'probeTok1234567';
+  const MP_SEED_SAVED = '2026-01-02T03:04:05.000Z';
+  function mpPurge() {
+    dbWrite((d) => {
+      for (const id of [MP_UID, MP_OFF_UID, MP_NONE_UID]) {
+        d.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM users WHERE id = ?').run(id);
+      }
+    });
+  }
+  // id: probe row. configured=true seeds email/token/savedAt (+enabled),
+  // configured=false leaves the manapool columns NULL.
+  function mpSeed(id, name, { configured = true, enabled = 1 } = {}) {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+      d.prepare('DELETE FROM users WHERE id = ?').run(id);
+      d.prepare('INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, created_at, manapool_email, manapool_token, manapool_enabled, manapool_saved_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)')
+        .run(id, name, '210000:00000000000000000000000000000000:00', 'member', `rusttest-${name}-shr`, '2024-01-01 00:00:00',
+          configured ? MP_SEED_EMAIL : null, configured ? MP_SEED_TOKEN : null, enabled, configured ? MP_SEED_SAVED : null);
+      d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(MP_TOKV, id, SESSION_EXP);
+    });
+  }
+  const mpGet = (base) => apiReq(base, 'GET', '/api/marketplace/accounts', MP_HDR);
+  const mpView = (j) => j && j.manapool ? { configured: j.manapool.configured, enabled: j.manapool.enabled, email: j.manapool.email, token: j.manapool.token, savedAt: j.manapool.savedAt } : null;
+
+  cases.push({ name: 'mp_accounts_ok', path: '/api/marketplace/accounts', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_accounts_unconfigured', path: '/api/marketplace/accounts', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_accounts_noauth', path: '/api/marketplace/accounts', headers: {}, method: 'GET' });
+  cases.push({ name: 'mp_accounts_badtoken', path: '/api/marketplace/accounts', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)) }, method: 'GET' });
+
+  // savedAt is new Date().toISOString() stamped by the WRITING server at PUT
+  // time (Node: marketplaceOrders.js accountView/save; Rust: marketplace.rs
+  // twin). Each side stamps its own wall clock, so the two bodies can never
+  // agree on it byte-for-byte — scrub it like the manabox sync header
+  // (scrubStrings precedent). Its SHAPE is still pinned: it must be a string
+  // on both sides (the scrub only rewrites strings) and readBack gates on
+  // typeof savedAt === 'string' before the row is accepted.
+  cases.push({ name: 'mp_put_save_ok', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
+    body: JSON.stringify({ manapool: { email: ' fresh.probe@example.com ', token: 'freshProbeTok9999', enabled: true } }),
+    scrub: [['$.accounts.manapool.savedAt', '.*', '<wallclock>']],
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1', { configured: false }); },
+    readBack: async (other) => {
+      const r = await mpGet(other);
+      const v = mpView(r.json);
+      if (!v || v.configured !== true || v.enabled !== true || v.email !== 'fr••••••••@example.com' || v.token !== 'fre\u{2026}9999 (17 chars)' || typeof v.savedAt !== 'string') {
+        return { ok: false, why: `saved credential missing/wrong on other server: ${r.status} ${fmt(r.json)}`, seen: v };
+      }
+      const { savedAt, ...persisted } = v; // wall-clock: gated above, excluded from the cross-side fold
+      return { ok: true, why: 'saved credential visible masked on the other server', seen: persisted };
+    },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_clear_ok', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
+    body: JSON.stringify({ manapool: { clear: true } }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    readBack: async (other) => {
+      const r = await mpGet(other);
+      const v = mpView(r.json);
+      return v && v.configured === false && v.enabled === false && v.email === '' && v.savedAt === null
+        ? { ok: true, why: 'clear landed: unconfigured on the other server', seen: v }
+        : { ok: false, why: `clear not persisted on other server: ${r.status} ${fmt(r.json)}`, seen: v };
+    },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_enabled_only', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
+    body: JSON.stringify({ manapool: { enabled: false } }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    readBack: async (other) => {
+      const r = await mpGet(other);
+      const v = mpView(r.json);
+      return v && v.configured === true && v.enabled === false && v.savedAt === MP_SEED_SAVED
+        ? { ok: true, why: 'enabled-only kept the credential and savedAt on the other server', seen: v }
+        : { ok: false, why: `enabled-only changed the credential on other server: ${r.status} ${fmt(r.json)}`, seen: v };
+    },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_nothing', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT', body: '{}',
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_bademail', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
+    body: JSON.stringify({ manapool: { email: 'a@b', token: MP_SEED_TOKEN } }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_token_required', path: '/api/marketplace/accounts', headers: MP_JSONH, method: 'PUT',
+    body: JSON.stringify({ manapool: { email: 'ok@ex.com', token: '  ' } }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_put_noauth', path: '/api/marketplace/accounts', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: JSON.stringify({ manapool: { clear: true } }) });
+  cases.push({ name: 'mp_put_badjson_preauth', path: '/api/marketplace/accounts', headers: { 'content-type': 'application/json' }, method: 'PUT',
+    body: '{oops' });
+  cases.push({ name: 'mp_put_apikey_readonly', path: '/api/marketplace/accounts', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'PUT',
+    body: JSON.stringify({ manapool: { clear: true } }) });
+
+  cases.push({ name: 'mp_recent_noauth', path: '/api/marketplace/recent/bogus', headers: {}, method: 'GET' });
+  cases.push({ name: 'mp_recent_badtoken', path: '/api/marketplace/recent/manapool', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)) }, method: 'GET' });
+  cases.push({ name: 'mp_recent_badsource', path: '/api/marketplace/recent/TCGPlayer', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_recent_nocreds', path: '/api/marketplace/recent/manapool', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_recent_disabled', path: '/api/marketplace/recent/manapool', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
+    teardown: async () => { mpPurge(); } });
 }
 
 
