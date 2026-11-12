@@ -1,0 +1,110 @@
+# =========================================
+# Scrybox — Node-free Rust image (LANE B unit 7)
+#
+# Single binary, glibc Debian. No Node runtime anywhere in the final image
+# (Gate D: "the single-binary Docker image (no Node)"). The Node image stays
+# the parity oracle; this one is what the Rust lane ships.
+#
+# Build via server/docker/build-rust-image.sh — it stages the binary
+# (cargo build --release, offloaded to brain via tools/remote-cargo), the
+# ONNX Runtime dylib and the scryjpeg shim into server/docker/{bin,lib}/
+# first. The frontend bundle is still built in Stage 1 with node:alpine —
+# a build-time tool, gone from the final layers.
+#
+#   docker build -f Dockerfile.rust -t scrybox-rust:local .
+# =========================================
+
+# =========================================
+# Stage 1: Build Frontend Assets (build-time Node only)
+# =========================================
+FROM node:22-alpine AS frontend-builder
+WORKDIR /app/frontend
+
+COPY frontend/package*.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ ./
+# Shared JSON tables imported via ../../../shared/*.json (resolves to /app/shared)
+COPY shared/ /app/shared/
+RUN npm run build
+
+# =========================================
+# Stage 2: Rust single binary + runtime deps
+# =========================================
+FROM debian:12-slim AS production
+# glibc Debian, same reasoning as the Node image (issue #19): the ONNX
+# Runtime dylib and libscryjpeg are glibc-linked. apt installs only what the
+# Node image's equivalent layer had that Node itself did not provide:
+#   gosu            — entrypoint privilege drop (Gate D requirement)
+#   wget            — HEALTHCHECK (slim ships none)
+#   ca-certificates — HTTPS to the card APIs (rustls-native-certs reads this)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gosu wget ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# curl-impersonate v2.1.0 (glibc build), pinned — Gate D requirement, and the
+# Moxfield sync genuinely needs the Chrome ClientHello (Cloudflare JA3).
+# backend/src/moxfieldApi.js and src/moxfield_api.rs both exec
+# /usr/local/bin/curl-impersonate and fall back to plain curl. wget+ca-certs
+# are installed above, so no curl package is pulled for the download.
+RUN wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/releases/download/v2.1.0/curl-impersonate-v2.1.0.x86_64-linux-gnu.tar.gz" \
+  && tar xzf /tmp/ci.tgz -C /usr/local/bin curl-impersonate \
+  && chmod +x /usr/local/bin/curl-impersonate \
+  && rm -f /tmp/ci.tgz \
+  && /usr/local/bin/curl-impersonate --version | head -1
+
+# Staged inputs (see server/docker/build-rust-image.sh):
+#   bin/scrybox-server        — cargo --release, strip=true, ~16 MB
+#   lib/libonnxruntime.so.1   — MIT-licensed ORT dylib the Node image carries
+#                               inside onnxruntime-node; Rust dlopens it via
+#                               ORT_DYLIB_PATH (ort "load-dynamic").
+#   lib/libscryjpeg.so        — mozjpeg-4.1.5 static shim (bit-identical JPEG
+#                               decode for the scan tensor path), SCRYBOX_JPEG_LIB.
+COPY server/docker/bin/scrybox-server /usr/local/bin/scrybox-server
+COPY server/docker/lib/libonnxruntime.so.1 /opt/ort/lib/libonnxruntime.so.1
+COPY server/docker/lib/libscryjpeg.so /opt/lib/libscryjpeg.so
+
+# Layout mirrors the Node image so an existing named volume at /app/database
+# (bindarr.db, models/, ssl/, card-art/) drops in unchanged.
+WORKDIR /app
+# Shared JSON tables at the path the Node image used (/app/shared) — the
+# crate reads them through SCRYBOX_SHARED_DIR.
+COPY shared/ /app/shared/
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+
+# Non-root runtime user. uid 1000 matches the Node image's `node` user so a
+# volume already handed over keeps its ownership; the entrypoint re-chowns
+# anything else, exactly like entrypoint.sh.
+RUN useradd -u 1000 -m -s /bin/sh scrybox \
+  && mkdir -p /app/database \
+  && chown -R scrybox:scrybox /app /opt/ort /opt/lib
+
+ENV PORT=3001 \
+    SCRYBOX_BIND=0.0.0.0:3001 \
+    SCRYBOX_NODE_UPSTREAM= \
+    SCRYBOX_DB_PATH=/app/database/bindarr.db \
+    SCRYBOX_STATIC_DIR=/app/frontend/dist \
+    SCRYBOX_SHARED_DIR=/app/shared \
+    CV_MODEL_DIR=/app/database/models \
+    ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
+    SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
+    HTTPS_PORT=3443 \
+    RUST_ROUTES=* \
+    RUST_MIGRATIONS=true \
+    RUST_JOBS=scryfall
+# The two ONNX models are NOT in the image (AGPL-3.0 vs MIT — operator
+# fetches them into the volume, same policy as the Node image).
+# LOCAL_SCRYFALL_* / SCRYBOX_SIDECAR_URL / SCRYBOX_NODE_UPSTREAM stay unset:
+# the Node-free image has no Node to forward to; unset legs answer their
+# documented no-sidecar arms.
+
+COPY server/docker/entrypoint-rust.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+
+EXPOSE 3001 3443
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+  CMD wget -qO- http://localhost:3001/api/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/usr/local/bin/scrybox-server"]

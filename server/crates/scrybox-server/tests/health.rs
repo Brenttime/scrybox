@@ -201,3 +201,75 @@ async fn kill_switch_probes_every_request() {
     }
     assert!(hits.load(Ordering::SeqCst) >= 5, "disabled cache must probe Node per request");
 }
+
+// ---- LANE B unit 7: Node-free standalone (/api/health answered locally) ----
+
+async fn get_health_full(addr: SocketAddr) -> (StatusCode, String, Vec<(String, String)>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/api/health"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<axum::body::Body>()
+        .request(req)
+        .await
+        .unwrap();
+    let status = res.status();
+    let headers = res
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or_default().to_string()))
+        .collect();
+    let bytes = axum::body::to_bytes(axum::body::Body::new(res.into_body()), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string(), headers)
+}
+
+/// Empty SCRYBOX_NODE_UPSTREAM + a real DB copy: Node's own handler shape —
+/// 200, {"status":"ok"}, X-App-Name, express JSON ETag twin, and NO
+/// upstream/cache machinery involved (prober never spawned; there is no peer).
+#[tokio::test]
+async fn standalone_answers_node_handler_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("bindarr.db");
+    rusqlite::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x)").unwrap();
+
+    let mut cfg = cfg_for(String::new());
+    cfg.db_path = Some(db);
+    let state = AppState::new(cfg);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rust = l.local_addr().unwrap();
+    let router = app(state);
+    tokio::spawn(async move {
+        axum::serve(l, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+    });
+
+    let (s, body, headers) = get_health_full(rust).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "{\"status\":\"ok\"}");
+    let h = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    assert_eq!(h("x-app-name").as_deref(), Some("Scrybox"));
+    assert_eq!(h("etag").as_deref(), Some("W/\"f-VaSQ4oDUiZblZNAEkkN+sX+q3Sg\""));
+    assert_eq!(h("content-type").as_deref(), Some("application/json; charset=utf-8"));
+    assert_eq!(h("content-length").as_deref(), Some("15"));
+}
+
+/// No SCRYBOX_DB_PATH (pool missing) => Node's !dbReady arm, 503
+/// {"status":"db_initializing"} — again with zero upstream traffic possible.
+#[tokio::test]
+async fn standalone_without_db_is_db_initializing() {
+    let cfg = cfg_for(String::new());
+    assert!(cfg.db_path.is_none());
+    let state = AppState::new(cfg);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rust = l.local_addr().unwrap();
+    let router = app(state);
+    tokio::spawn(async move {
+        axum::serve(l, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+    });
+
+    let (s, body, headers) = get_health_full(rust).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, "{\"status\":\"db_initializing\"}");
+    assert!(headers.iter().any(|(n, v)| n == "etag" && v.starts_with("W/\"1c-")));
+}

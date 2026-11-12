@@ -191,7 +191,41 @@ async fn probe(st: &AppState, store: bool) -> Response {
     }
 }
 
+/// Node's own /api/health handler (server.js:411) for the Node-free image:
+/// X-App-Name + SELECT 1 against the read pool. helmet/COEP headers ride the
+/// shared secheaders::guard layer, and the express JSON ETag is the 'etag'
+/// package's content-based weak form (W/"{base64 sha1}"), pinned per body.
+/// Node's dbReady gate maps to "no SCRYBOX_DB_PATH / pool": the boot ladder
+/// runs before listen, so a missing pool is the only uninitialized state.
+fn native_health(st: &AppState) -> Response {
+    let (status, body): (StatusCode, &'static str) = match &st.db {
+        Some(pool) => match pool.get().ok().and_then(|c| c.query_row("SELECT 1", [], |_| Ok(())).ok()) {
+            Some(()) => (StatusCode::OK, "{\"status\":\"ok\"}"),
+            None => (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"db_unavailable\"}"),
+        },
+        None => (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"db_initializing\"}"),
+    };
+    // express etag twin: W/"{bodyLen as hex}-{base64(sha1(body))}" — values
+    // captured from the live Node :3312 /api/health.
+    let etag: &'static str = match body {
+        "{\"status\":\"ok\"}" => "W/\"f-VaSQ4oDUiZblZNAEkkN+sX+q3Sg\"",
+        "{\"status\":\"db_unavailable\"}" => "W/\"1b-SnIv4TQbcNfatKpq+uRY3kDEnnI\"",
+        _ => "W/\"1c-jWxaDve2uVH4xAyM2GutLQRGSJc\"",
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-app-name", "Scrybox".parse().unwrap());
+    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "application/json; charset=utf-8".parse().unwrap(),
+    );
+    (status, headers, body).into_response()
+}
+
 pub async fn handle(State(st): State<AppState>) -> Response {
+    if st.cfg.node_upstream.is_empty() {
+        return native_health(&st);
+    }
     if st.health_cache.is_enabled() {
         if let Some(res) = st.health_cache.fresh() {
             return res;
@@ -205,6 +239,11 @@ pub async fn handle(State(st): State<AppState>) -> Response {
 /// request serving never blocks on Node while the entry is fresh. Spawned
 /// from `app()` next to the route, same as the stats/collection refreshers.
 pub fn spawn_prober(st: &AppState) {
+    // Node-free standalone: /api/health is answered locally; there is no
+    // peer to probe and no cache to keep warm.
+    if st.cfg.node_upstream.is_empty() {
+        return;
+    }
     if !st.health_cache.is_enabled() {
         return;
     }
