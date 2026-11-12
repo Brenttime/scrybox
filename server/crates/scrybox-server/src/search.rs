@@ -38,7 +38,7 @@ use axum::{
 };
 use bytes::Bytes;
 use rusqlite::{Connection, Row};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     auth, collq,
@@ -643,7 +643,12 @@ fn attach_owned_qty(conn: &Connection, cards: &mut [Value], user_id: i64) -> Res
 /// to `Ok(None)` because `runSearch` swallows it into an empty result and
 /// falls through to the live path; only post-cache (attachOwnedQty/serialize)
 /// errors mirror Node's 500, surfaced as `Err`.
-fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuery) -> Result<Option<(Vec<u8>, Option<u64>)>, String> {
+fn build_body(
+    pool: &DbPool,
+    idx: &NameIndex,
+    owned: &OwnedCache,
+    p: &SearchQuery,
+) -> Result<Option<(Vec<u8>, Option<u64>, Vec<Value>)>, String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
     // Pin one read transaction over probe + card query + owned attach: WAL
     // fixes every statement's view at the probe, so the revision we compare
@@ -705,6 +710,30 @@ fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuer
     if cards.is_empty() {
         return Ok(None); // Node keeps going: specific/broad Scryfall query.
     }
+    // Stale background refresh (scryfallApi.js queryLocal → stale filter +
+    // floating bulkFetchByIdentifier, CACHE_AGE_LIMIT_MS = 3 days): rows
+    // older than 3 days get re-fetched AFTER the cached answer is served.
+    // Unparseable/NULL last_updated is NaN in Node's comparison → never
+    // stale, hence unwrap_or(false). The identifier rows ride to `handle`,
+    // which spawns the fetch — Node re-fires per request while rows stay
+    // stale; the response cache serves this entry only until the refresh's
+    // card_cache write bumps the revision (trigger) and the entry rebuilds
+    // on fresh rows, which bounds the divergence to the failing-fetch case.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let stale: Vec<Value> = cards
+        .iter()
+        .filter(|c| {
+            c.get("last_updated")
+                .and_then(|v| v.as_str())
+                .and_then(crate::card_cache::parse_sqlite_utc)
+                .map(|at| now_ms - at.timestamp_millis() > 3 * 24 * 60 * 60 * 1000)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
     // Owned quantities from the per-rev snapshot when it holds; any
     // deviation (row shape, non-integer SUM, build race) → original SQL.
     let mut attached = false;
@@ -720,7 +749,87 @@ fn build_body(pool: &DbPool, idx: &NameIndex, owned: &OwnedCache, p: &SearchQuer
     let body = serde_json::to_vec(&cards).map_err(|e| e.to_string())?;
     // This path never sets meta.total (only the live paths do) → no
     // X-Total-Count header on the native response.
-    Ok(Some((body, None)))
+    Ok(Some((body, None, stale)))
+}
+
+/// `bulkFetchByIdentifier` (scryfallApi.js) as the queryLocal background
+/// refresh uses it: 75-identifier batches POSTed to `/cards/collection`
+/// through the shared Scry client (sidecar swap, paced upstream), then
+/// normalizeCard + cacheCards. Identifier pick mirrors Node: scryfallUuid
+/// → {id}, else set_id+number → {set, collector_number}, else {name}.
+/// `pairs`/`not_found` are unused on this leg and dropped. A transport
+/// failure after the retries is Node's caught error — log (its message
+/// verbatim) and abandon the whole refresh.
+async fn bulk_refresh_stale(st: &AppState, rows: &[Value]) {
+    const COLLECTION_BATCH: usize = 75;
+    let Some(pool) = st.db.as_ref().map(Arc::clone) else { return };
+    let lang_name = to_name(None);
+    for chunk in rows.chunks(COLLECTION_BATCH) {
+        let identifiers: Vec<Value> = chunk
+            .iter()
+            .map(|row| {
+                let id = row
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| row.get("card_id").and_then(|v| v.as_str()));
+                if let Some(uuid) = crate::card_norm::scryfall_uuid(id) {
+                    return json!({ "id": uuid });
+                }
+                let set_id = match row.get("set_id") {
+                    Some(v) if !v.is_null() => crate::mfx_payload::js_to_string(v).to_lowercase(),
+                    _ => String::new(),
+                };
+                let num = match row.get("number") {
+                    Some(v) if !v.is_null() => crate::mfx_payload::js_to_string(v),
+                    _ => String::new(),
+                };
+                if !set_id.is_empty() && !num.is_empty() {
+                    json!({ "set": set_id, "collector_number": num })
+                } else {
+                    json!({ "name": row.get("name").and_then(|v| v.as_str()).unwrap_or("") })
+                }
+            })
+            .collect();
+        let mut body = serde_json::Map::new();
+        body.insert("identifiers".into(), Value::Array(identifiers));
+        let resp = st
+            .scry
+            .post_retried(
+                "/cards/collection",
+                Value::Object(body),
+                &crate::scryfall::ScryOpts::default(),
+                4,
+            )
+            .await;
+        let data = match resp {
+            Ok(Some(v)) => v
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            // Node guards `resp.data` (a non-JSON answer carries no cards for
+            // this batch); a retry-exhausted transport is the caught-error.
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::error!("MTG background refresh failed: {e}");
+                return;
+            }
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let maps: Vec<serde_json::Map<String, Value>> =
+            data.iter().map(|raw| crate::sidecar::normalize_card(raw, &lang_name)).collect();
+        let pool_w = Arc::clone(&pool);
+        let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = pool_w.get().map_err(|e| e.to_string())?;
+            crate::card_cache::cache_normalized_cards(&conn, &maps).map_err(|e| e.to_string())
+        })
+        .await;
+        if let Err(e) = wrote {
+            tracing::error!("MTG background refresh failed: {e:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +864,11 @@ pub struct SearchEntry {
     /// Set only on the collection-scope q leg (collq.rs): switches the
     /// response to the resolveCollectionQuery header contract.
     catalog: Option<CatalogMeta>,
+    /// Cache-path entries built while some rows were >3 days old carry their
+    /// identifier rows so EVERY request served from the entry (hit or miss)
+    /// re-fires the background refresh, matching Node's per-request stale
+    /// filter while the fetch has not yet landed (queryLocal, scryfallApi.js).
+    stale: Arc<Vec<Value>>,
 }
 
 /// Single-flight slot, same shape as the collection/stats caches: every
@@ -946,7 +1060,7 @@ pub async fn handle(
                     let build_owned = Arc::clone(&init_st.owned_index);
                     let p2 = init_p.clone();
                     let built = tokio::task::spawn_blocking(move || {
-                        let Some((body, _total)) =
+                        let Some((body, _total, stale)) =
                             build_body(&build_pool, &build_idx, &build_owned, &p2)?
                         else {
                             return Ok::<_, String>(None);
@@ -954,12 +1068,12 @@ pub async fn handle(
                         let body = bytes::Bytes::from(body);
                         let etag = body_etag(&body);
                         let gz = gzip_bytes(&body);
-                        Ok(Some((body, gz, etag, None, "cache", rev_i)))
+                        Ok(Some((body, gz, etag, None, "cache", rev_i, stale)))
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("build task panicked: {e}")))?;
 
-                    let (body, gz, etag, total, source, entry_rev) = match built {
+                    let (body, gz, etag, total, source, entry_rev, stale) = match built {
                         Some(v) => v,
                         // The local cache had nothing. Node's next leg is the
                         // sidecar walk; for the branch we port, run it
@@ -1055,12 +1169,12 @@ pub async fn handle(
                                 .ok()
                                 .and_then(|c| crate::db::current_revision(&c).ok().flatten())
                                 .unwrap_or(rev_i);
-                            (body, gz, etag, total, source, post_rev)
+                            (body, gz, etag, total, source, post_rev, Vec::new())
                         }
                     };
                     Ok(Ok(Some(init_cache.insert(
                         init_key,
-                        SearchEntry { rev: entry_rev, raw: body, gz, etag, total, source, x_source: true, catalog: None },
+                        SearchEntry { rev: entry_rev, raw: body, gz, etag, total, source, x_source: true, catalog: None, stale: Arc::new(stale) },
                     ))))
                 })
                 .await;
@@ -1077,6 +1191,17 @@ pub async fn handle(
             }
         }
     };
+
+    // Stale background refresh (queryLocal's floating bulkFetchByIdentifier):
+    // while the entry was built on >3-day-old rows, every served request
+    // re-fires the fetch until the refreshed write bumps the revision and a
+    // fresh entry replaces it. Fire-and-forget, exactly like Node's floating
+    // promise — the cached answer goes out untouched either way.
+    if st.stale_refresh && !entry.stale.is_empty() {
+        let st_bg = st.clone();
+        let rows = Arc::clone(&entry.stale);
+        tokio::spawn(async move { bulk_refresh_stale(&st_bg, &rows).await });
+    }
 
     // Express's default body ETag on res.json(cards): a matching conditional
     // GET replays as an empty 304, with the headers set before send().
@@ -1226,6 +1351,7 @@ async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, i
                     source: "cache",
                     x_source: false,
                     catalog: None,
+                    stale: Arc::new(Vec::new()),
                 },
             ))))
         })
@@ -1315,6 +1441,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
                         status,
                         snapshot: built.snapshot,
                     }),
+                    stale: Arc::new(Vec::new()),
                 },
             ))))
         })

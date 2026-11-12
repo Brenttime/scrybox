@@ -138,7 +138,12 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
         db_path: Some(db_path),
         sidecar_url: None,
     };
-    app(AppState::new(cfg))
+    // Keep the suite hermetic: the stale background refresh POSTs to
+    // st.scry's base (api.scryfall.com by default). The dedicated refresh
+    // case re-enables it against a mock Scry.
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    app(st)
 }
 
 async fn get(r: &Router, path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
@@ -475,6 +480,7 @@ fn router_for_idx_owned_sidecar(
         sidecar_url,
     };
     let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
     st.name_index = Arc::new(idx);
     st.owned_index = Arc::new(owned);
     app(st)
@@ -945,7 +951,9 @@ fn sidecar_state(path: PathBuf, upstream: &str, sidecar: &str) -> AppState {
         db_path: Some(path),
         sidecar_url: Some(sidecar.to_string()),
     };
-    AppState::new(cfg)
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    st
 }
 
 async fn burst(r: &Router, url: &str) -> Vec<(StatusCode, HeaderMap, Vec<u8>)> {
@@ -1016,7 +1024,8 @@ async fn concurrent_misses_coalesce_into_one_build() {
         db_path: Some(path),
         sidecar_url: None,
     };
-    let st = AppState::new(cfg);
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
     let cache = Arc::clone(&st.search_cache);
     let r = app(st);
 
@@ -1724,6 +1733,101 @@ async fn search_limiter_blocks_after_300_per_ip_in_window() {
         .unwrap();
     let res = r.oneshot(req).await.unwrap();
     assert_ne!(res.status(), StatusCode::TOO_MANY_REQUESTS, "bucket is per client IP");
+}
+
+// --- stale background refresh (F3-TC8) --------------------------------------
+
+mod mock_scryfall;
+
+/// Node's queryLocal stale leg (scryfallApi.js:756): rows older than
+/// CACHE_AGE_LIMIT_MS (3 days) are answered from cache immediately AND
+/// re-fetched fire-and-forget through bulkFetchByIdentifier → cacheCards.
+/// F3-TC8 drives the same contract over HTTP; this pins the internals: the
+/// batch shape (identifier pick), the cache write, and that fresh rows are
+/// never collected.
+#[tokio::test]
+async fn stale_rows_trigger_background_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_db(dir.path());
+    {
+        let conn = Connection::open(&db).unwrap();
+        // F3-TC8 shape: the Sol Ring printings are 4 days old; cc2 (Plains)
+        // is reset to CURRENT_TIMESTAMP as the never-collected control
+        // (the fixture stamps every row '2026-01-01', which is >3 days ago).
+        conn.execute(
+            "UPDATE card_cache SET last_updated = '2020-01-01T00:00:00.000Z' WHERE id IN ('cc1','cc6','cc7')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE card_cache SET last_updated = CURRENT_TIMESTAMP WHERE id = 'cc2'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (scry_addr, scry) = mock_scryfall::spawn_mock().await;
+    scry.collection_batches.lock().unwrap().push(json!({
+        "object": "list",
+        "data": [mock_scryfall::raw_card("stale1", "Sol Ring", "brc", "160", Some(3.5))],
+        "not_found": []
+    }));
+
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream,
+        static_dir: None,
+        rust_routes: ["search".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(db.clone()),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = true;
+    st.scry = Arc::new(mock_scryfall::scry_for(scry_addr, 0.0));
+    let r = app(st);
+
+    // The cached (stale) rows go out untouched, source cache, no Node hop.
+    let (s, h, body) = get(&r, "/api/search?name=Sol%20Ring", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-source").unwrap(), "cache");
+    assert!(h.get("x-node").is_none());
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 3, "cached answer unchanged by the stale leg (cc1/cc6/cc7; cc-ja is language-filtered)");
+
+    // The background refresh lands: cacheCards wrote the mock's normalized
+    // card (normalizeCard prefixes 'mtg-').
+    let mut landed = false;
+    for _ in 0..100 {
+        let conn = Connection::open(&db).unwrap();
+        landed = conn
+            .query_row("SELECT last_updated FROM card_cache WHERE id = 'mtg-stale1'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .is_ok();
+        if landed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(landed, "background refresh must cacheCards the stale rows");
+
+    let hits = scry.hits_for("POST /cards/collection");
+    assert_eq!(hits.len(), 1, "one batch for ≤75 stale rows");
+    let sent: Value = serde_json::from_str(&hits[0].1).unwrap();
+    let idents = sent["identifiers"].as_array().unwrap();
+    // Identifier pick (bulkFetchByIdentifier): cc1/cc6/cc7 all carry
+    // set_id+number → {set, collector_number} (lowercased), never {name}.
+    assert_eq!(idents.len(), 3, "only the three stale rows are collected");
+    assert!(idents.iter().all(|i| i.get("set").is_some() && i.get("collector_number").is_some()));
+    assert!(idents.iter().any(|i| i["set"] == json!("brc") && i["collector_number"] == json!("160")));
+    assert!(idents.iter().any(|i| i["set"] == json!("lea") && i["collector_number"] == json!("1")));
+
+    // Fresh rows are never collected: the Plains search (cc2, CURRENT_TIMESTAMP)
+    // adds no new batch.
+    let (s, _h, _body) = get(&r, "/api/search?name=Plains", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(scry.hits_for("POST /cards/collection").len(), 1, "fresh rows trigger no refresh");
 }
 
 
