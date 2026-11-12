@@ -233,6 +233,11 @@ struct Inner {
 }
 
 impl Scry {
+    /// The configured upstream base (`SCRYFALL_BASE_URL`).
+    pub fn base_url(&self) -> &str {
+        &self.env.base_url
+    }
+
     pub fn new(env: ScryEnv) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_native_roots()

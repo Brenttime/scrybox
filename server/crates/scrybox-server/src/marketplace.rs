@@ -1998,7 +1998,7 @@ async fn add_fold(
             match plan_add(&conn, &merged) {
                 Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
                 Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
-                Ok(AddPlan::Forward) => {
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
                     return Err(AddErr::Replay);
                 }

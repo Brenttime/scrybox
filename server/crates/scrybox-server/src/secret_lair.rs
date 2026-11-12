@@ -866,7 +866,7 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
                 Ok(AddPlan::Reject(msg)) => {
                     planned.push((index, entry.clone(), Planned::Reject(msg)));
                 }
-                Ok(AddPlan::Forward) => {
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("secret-lair add: hydration-needing card, forwarding to Node");
                     return replay_post(st, &headers, "/api/secret-lair/add", &body_req).await;
                 }

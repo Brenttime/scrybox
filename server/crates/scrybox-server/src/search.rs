@@ -730,6 +730,28 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                             let walked = tokio::task::spawn_blocking(move || -> Result<_, String> {
                                 let mut cards = outcome.cards;
                                 let conn = walk_pool.get().map_err(|e| e.to_string())?;
+                                // Node's runSearch `await cacheCards(cards)`
+                                // (unit 7c): a non-empty walk upserts the
+                                // normalized rows into the shared card_cache
+                                // BEFORE the answer is sent — that write is
+                                // observable (F3-TC2 reads the table right
+                                // after the response) and it is what keeps
+                                // the card findable from the cache leg when
+                                // upstream goes dark (F3-TC3). Same
+                                // cacheNormalizedCards twin every writer
+                                // uses; failure logs and continues, exactly
+                                // like Node's awaited-but-tolerant call.
+                                if outcome.source == "scryfall" {
+                                    let maps: Vec<serde_json::Map<String, Value>> = cards
+                                        .iter()
+                                        .filter_map(|c| c.as_object().cloned())
+                                        .collect();
+                                    if let Err(e) =
+                                        crate::card_cache::cache_normalized_cards(&conn, &maps)
+                                    {
+                                        tracing::error!("search walk cache write failed: {e}");
+                                    }
+                                }
                                 let mut attached = false;
                                 if rev_i >= 0 {
                                     if let Some(map) =
