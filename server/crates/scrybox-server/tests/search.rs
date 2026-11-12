@@ -142,7 +142,16 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
 }
 
 async fn get(r: &Router, path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let mut req = Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(path)
+        // The searchLimiter twin keys by client IP, so `handle` extracts
+        // ConnectInfo — oneshot() calls have no transport, provide it.
+        .extension(axum::extract::connect_info::ConnectInfo(
+            "127.0.0.1:55555".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(Body::empty())
+        .unwrap();
     for (k, v) in headers {
         req.headers_mut().insert(
             header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
@@ -328,7 +337,6 @@ async fn gated_queries_proxy_to_node() {
     for q in [
         "/api/search?q=t%3Acreature%20c%3Ag",          // raw query → parser/sidecar
         "/api/search?scope=collection&q=sol%20ring",   // collection catalog path
-        "/api/search?scope=collection&name=Sol%20Ring", // collection userFilter path
         "/api/search?scope=internet&name=Sol%20Ring",  // internet scope is authoritative
         "/api/search?name=Sol%20Ring&prints=1",        // allPrints walk
         "/api/search?name=Sol%20Ring&image=abc",       // cvScan ranking
@@ -339,6 +347,12 @@ async fn gated_queries_proxy_to_node() {
         assert_eq!(s, StatusCode::OK, "{q}");
         assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "{q} must proxy");
     }
+    // scope=collection + name NO LONGER proxies: it is the native
+    // cardSearchSql.collectionQuery leg (F8-TC5) — see the
+    // collection_scope_* tests below for its contract.
+    let (s, h, _) = get(&r, "/api/search?scope=collection&name=Sol%20Ring", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none(), "collection field-filter must answer natively");
 }
 
 #[tokio::test]
@@ -350,6 +364,9 @@ async fn post_proxies_even_when_owned() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/search")
+        .extension(axum::extract::connect_info::ConnectInfo(
+            "127.0.0.1:55555".parse::<std::net::SocketAddr>().unwrap(),
+        ))
         .header("authorization", "Bearer tok-session")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"name":"Sol Ring"}"#))
@@ -940,6 +957,9 @@ async fn burst(r: &Router, url: &str) -> Vec<(StatusCode, HeaderMap, Vec<u8>)> {
             let req = Request::builder()
                 .method("GET")
                 .uri(u)
+                .extension(axum::extract::connect_info::ConnectInfo(
+                    "127.0.0.1:55555".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .header("authorization", "Bearer tok-session")
                 .body(Body::empty())
                 .unwrap();
@@ -1463,3 +1483,171 @@ async fn collq_dfc_walk_stores_full_and_face_names() {
     let parsed: Vec<String> = serde_json::from_str(&names).unwrap();
     assert_eq!(parsed, vec!["fire // ice", "fire", "ice"], "walk stores full + faces, insertion order");
 }
+
+// --- collection-scope field-filter leg (cardSearchSql.collectionQuery) ---
+
+/// Extra rows the collection leg exercises: a Japanese printing that matches
+/// ONLY via printed_name (the leg must ignore `lang` — owners see every
+/// language they own), a promo pair whose collector numbers both CAST to 0
+/// (the numberClause guard from the #regression), and a zero-quantity row.
+fn owned_extra_db(dir: &std::path::Path) -> PathBuf {
+    let path = seeded_db(dir);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "
+        INSERT INTO collection (id, card_id, quantity, user_id) VALUES (10, 'cc-ja', 2, 1);
+        INSERT INTO collection (id, card_id, quantity, user_id) VALUES (11, 'cc2', 3, 1);
+        INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name, number,
+                                language, price_estimated)
+          VALUES ('cc-promo1', 'Promo X', 'Land', '[]', '[]', 'Common', 'p1', 'Promo One', 'TG12', 'English', 0),
+                 ('cc-promo2', 'Promo X', 'Land', '[]', '[]', 'Common', 'p2', 'Promo Two', 'SV49', 'English', 0);
+        INSERT INTO collection (id, card_id, quantity, user_id) VALUES (12, 'cc-promo1', 1, 1), (13, 'cc-promo2', 1, 1);
+        INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name, number,
+                                language, price_estimated)
+          VALUES ('cc-dead', 'Zerocard', 'Land', '[]', '[]', 'Common', 'p3', 'Zero Set', '1', 'English', 0);
+        INSERT INTO collection (id, card_id, quantity, user_id) VALUES (14, 'cc-dead', 0, 1);
+        INSERT INTO sessions (token, user_id, expires_at) VALUES ('tok-u2', 2, '2099-01-01 00:00:00');
+        ",
+    )
+    .unwrap();
+    path
+}
+
+fn card_ids(body: &Value) -> Vec<String> {
+    body.as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn collection_scope_shape_headers_and_cross_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(owned_extra_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    let (s, h, body) = get_json(&r, "/api/search?scope=collection&name=Sol%20Ring").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        h.get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+        "application/json; charset=utf-8"
+    );
+    // Node's route sets NO X-Source / Access-Control-Expose-Headers /
+    // X-Total-Count on this leg (meta.source unset, meta.total null).
+    assert!(h.get("x-source").is_none(), "collection leg never sets X-Source");
+    assert!(h.get("access-control-expose-headers").is_none());
+    assert!(h.get("x-total-count").is_none());
+    assert!(h.get(header::ETAG).is_some());
+    assert!(h.get("x-node").is_none(), "must not hop to Node");
+
+    // Card id ascending (matched ORDER BY card_id): the Japanese printing
+    // sorts first ('-' 0x2D < '1'), matched via printed_name.
+    assert_eq!(card_ids(&body), ["cc-ja", "cc1", "cc6", "cc7"]);
+    // Column order = card_cache table order + appended owned_qty.
+    let keys: Vec<&String> = body[0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, card_keys());
+    // Logical totals: 'sol ring' group carries 2+1+1; the Japanese row is its
+    // own card_key (ソール・リング) with its own 2.
+    for c in body.as_array().unwrap() {
+        let want = if c["id"] == json!("cc-ja") { 2 } else { 4 };
+        assert_eq!(c["owned_qty"], json!(want), "owned_qty for {}", c["id"]);
+    }
+
+    // ETag replays as 304, WITHOUT the X-Source/expose headers.
+    let etag = h.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let (s304, h304, b304) = get(
+        &r,
+        "/api/search?scope=collection&name=Sol%20Ring",
+        &[("authorization", "Bearer tok-session"), ("if-none-match", etag.as_str())],
+    )
+    .await;
+    assert_eq!(s304, StatusCode::NOT_MODIFIED);
+    assert!(h304.get("x-source").is_none());
+    assert!(h304.get("access-control-expose-headers").is_none());
+    assert!(b304.is_empty());
+}
+
+#[tokio::test]
+async fn collection_scope_number_cast_and_promo_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(owned_extra_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // "002" finds the stored "2" through the numeric CAST term.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&number=002").await;
+    assert_eq!(card_ids(&body), ["cc2"]);
+
+    // The un-anchored-CAST over-match guard: TG12 and SV49 both CAST to 0,
+    // so only exact matching may apply — SV49 must not surface TG12.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&number=SV49").await;
+    assert_eq!(card_ids(&body), ["cc-promo2"]);
+
+    // Route-level number cleaning (# prefix, /b suffix) before numberClause.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&name=Sol%20Ring&number=%23160%2Fbrc").await;
+    assert_eq!(card_ids(&body), ["cc1"]);
+    assert_eq!(body[0]["owned_qty"], json!(4));
+}
+
+#[tokio::test]
+async fn collection_scope_sets_pagination_and_empties() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(owned_extra_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // set=lea: the 'sol ring' logical group collapses to the single printing
+    // IN that set, while owned_qty stays the logical total.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&name=Sol%20Ring&set=lea").await;
+    assert_eq!(card_ids(&body), ["cc6"]);
+    assert_eq!(body[0]["owned_qty"], json!(4));
+
+    // Multi-set "lea, 2ed" (comma + space) spans both printings.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&name=Sol%20Ring&set=lea%2C%202ed").await;
+    assert_eq!(card_ids(&body), ["cc6", "cc7"]);
+
+    // Window over the card_id-ordered rows: page 2 of 2.
+    let (_, _, body) = get_json(&r, "/api/search?scope=collection&name=Sol%20Ring&page=2&limit=2").await;
+    assert_eq!(card_ids(&body), ["cc6", "cc7"]);
+
+    // Zero-quantity ownership is NOT an owned search result — and an empty
+    // answer is served natively (no fall-through to Node, no 502 standalone).
+    let (s, h, body) = get_json(&r, "/api/search?scope=collection&name=Zerocard").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, json!([]));
+    assert!(h.get("x-node").is_none(), "empty must not proxy on this leg");
+
+    // The other user's window is their OWN collection only (user 2 owns cc1 ×5).
+    let (s, _h, body) = get(
+        &r,
+        "/api/search?scope=collection&name=Sol%20Ring",
+        &[("authorization", "Bearer tok-u2")],
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(card_ids(&body), ["cc1"]);
+    assert_eq!(body[0]["owned_qty"], json!(5));
+}
+
+#[tokio::test]
+async fn collection_scope_prints_inert_and_image_proxies() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(owned_extra_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // prints=1 is inert for collection scope (Node's allPrints branch is
+    // gated scope !== 'collection') → still answered natively.
+    let (_, h, _b) = get_json(&r, "/api/search?scope=collection&name=Plains&prints=1").await;
+    assert!(h.get("x-node").is_none(), "prints must not force the proxy here");
+
+    // image is NOT inert: the route cvScan-ranks the rows afterwards, so the
+    // request belongs to Node.
+    let (_, h, _b) = get_json(
+        &r,
+        "/api/search?scope=collection&name=Plains&image=Zm9v",
+    )
+    .await;
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "image must hop to Node");
+}
+
+
