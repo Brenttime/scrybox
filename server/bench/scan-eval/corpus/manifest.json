@@ -1,0 +1,50 @@
+[
+ {
+  "id": "mtg-9f970f79-3051-4ba1-badb-697ef321cbb3",
+  "name": "Cindervines",
+  "set": "rna",
+  "file": "card0.png"
+ },
+ {
+  "id": "mtg-39b35408-3728-4e1b-9f58-b0775df914d6",
+  "name": "Bolt Bend",
+  "set": "war",
+  "file": "card1.png"
+ },
+ {
+  "id": "mtg-066c8f63-52e6-475e-8d27-6ee37e92fc05",
+  "name": "Pako, Arcane Retriever",
+  "set": "c20",
+  "file": "card2.png"
+ },
+ {
+  "id": "mtg-c12cf74d-aad9-41d8-959e-66557c39204d",
+  "name": "Hunter's Insight",
+  "set": "jmp",
+  "file": "card3.png"
+ },
+ {
+  "id": "mtg-368ee4e3-c9eb-4898-99cd-bbe148936f99",
+  "name": "Hamletback Goliath",
+  "set": "jmp",
+  "file": "card4.png"
+ },
+ {
+  "id": "mtg-ac0b24e7-14e7-45ee-b5d8-bdb8674b669c",
+  "name": "Ram Through",
+  "set": "iko",
+  "file": "card5.png"
+ },
+ {
+  "id": "mtg-6221f00b-39dc-423a-bace-1bc15e1e91f7",
+  "name": "Inspiring Call",
+  "set": "znc",
+  "file": "card6.png"
+ },
+ {
+  "id": "mtg-64e72ac3-2b4f-43d8-9708-afe1b67c5d00",
+  "name": "Command Tower",
+  "set": "cmr",
+  "file": "card7.png"
+ }
+]

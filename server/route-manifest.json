@@ -530,7 +530,9 @@
     "tests": "tests/precons.rs::is_precon_whitelist, clean_file_name_strips_foreign_runs, rank_score_ladder_and_sort, kill_switch_off_proxies, auth_gate_401_and_member_ok, q_required_fold, fresh_download_mirror_filter_rank_cap, setlist_failure_is_best_effort, stale_fallback_and_502, import_happy_shape_and_db, import_reprint_fold_by_card_name, import_shape_fallbacks_and_overrides, import_include_commander_gates, import_guard_order_and_guards, import_deck_fetch_errors, import_all_unresolvable_422, import_partial_miss_forwards_whole_request, import_scryfall_client_error_forwards, import_batching_over_75; parity.mjs pc_search_*, pc_import_*, pc_unknown_subpath, pc_put_method"
   },
   "POST /api/scan-match": {
-    "status": "node"
+    "module": "scrybox-server::cvscan (lib.rs POST /api/scan-match under RUST_ROUTES=scan_match; cvScan.js twin: sharp/libvips decode+resize twin, ort cornelius dewarp + milo embed, npz cosine sweep; unparsed-body/ORT-absent arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/scan_match_route.rs (10: 401/validation/503-notBuilt(+500 precedence)/500-set/429 limiter/forward arms) + lib cvscan::tests (11 incl. node_truth_parity_on_eval_corpus, subsample removed after vips-source audit) + npz::tests (3 vs frozen :3312 capture bench/scan-eval/node-truth.json); live A/B :3312-vs-:3320 scan-match-ab.mjs (detected/gate flags equal, top-8 cardIds equal, sims/sharpness/gap <=5e-4)"
   },
   "POST /api/search": {
     "status": "node"

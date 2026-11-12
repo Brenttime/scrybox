@@ -348,7 +348,7 @@ fn ct_is(headers: &HeaderMap, ty: &str) -> bool {
 /// Forward: let Node run the SAME express parser over the untouched stream
 /// — its error body (the entity.too.large rewrite, the strict-mode HTML
 /// SyntaxError page) is authoritative and we must not re-author it.
-fn parse_outer_json(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ()> {
+pub(crate) fn parse_outer_json(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ()> {
     if !ct_is(headers, "application/json") {
         return Ok(Value::Object(Map::new())); // outer skipped; handlers read {}
     }
@@ -645,7 +645,7 @@ fn now_ms() -> u64 {
 /// re-serialised form, NOT the sidecar's original bytes: JSON.stringify
 /// canonicalises numbers (1.0 → 1, 1e3 → 1000), which is what the
 /// js_stringify below reproduces.
-fn res_json(status: StatusCode, v: &Value) -> Response {
+pub(crate) fn res_json(status: StatusCode, v: &Value) -> Response {
     let body = js_stringify(v);
     Response::builder()
         .status(status)

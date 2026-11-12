@@ -38,6 +38,12 @@ icu_locale = "2"
 # have been more dangerous than the engine. regex-automata/regex-syntax are
 # already in Cargo.lock (tracing-subscriber); this only adds the facade.
 regex = "1"
+# Lane B unit 6b (iter 3): cvScan.js twin. ort runs the SAME ONNX Runtime
+# dylib the container's onnxruntime-node loads (ORT_DYLIB_PATH +
+# load-dynamic) with intra=inter=1 — embeddings are bit-identical to Node.
+# image is the sharp/libvips twin (decode, lanczos3 resize, jpeg encode).
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["load-dynamic"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # Server crate must unwind, not abort (plan section 9: a panic in one request
 # must not take the whole front door down).
