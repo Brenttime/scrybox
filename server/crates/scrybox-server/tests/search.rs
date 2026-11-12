@@ -146,6 +146,23 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
     app(st)
 }
 
+/// Like router_for, but pins Scry to a mock — the iter-10 live merge leg
+/// talks to st.scry and must never touch api.scryfall.com from the suite.
+fn router_for_live(db_path: PathBuf, routes: &[&str], upstream: &str, scry: scrybox_server::scryfall::Scry) -> Router {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+        db_path: Some(db_path),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    st.scry = Arc::new(scry);
+    app(st)
+}
+
 async fn get(r: &Router, path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
     let mut req = Request::builder()
         .method("GET")
@@ -319,18 +336,45 @@ async fn cache_invalidated_by_revision_bump() {
 // --- proxy fallback ------------------------------------------------------
 
 #[tokio::test]
-async fn zero_rows_proxies_to_node() {
+async fn zero_rows_live_merge_answers_empty() {
+    // Node's runSearch answers a zero-row field-filter search itself from
+    // the specific/broad/fallback merge — with every leg empty that is
+    // `res.json([])` with X-Source: cache, no proxy hop (iter-10 port).
     let dir = tempfile::tempdir().unwrap();
     let upstream = spawn_fake_node().await;
-    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    let r = router_for_live(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
 
-    // Node would fall through to the live Scryfall/sidecar path — so must Rust.
     let (s, h, body) = get(&r, "/api/search?name=NoCardNamedThis", &auth()).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1");
-    let echo: Value = serde_json::from_slice(&body).unwrap();
-    assert!(echo["pq"].as_str().unwrap().starts_with("/api/search?"));
-    assert_eq!(h.get("x-source").unwrap().to_str().unwrap(), "live");
+    assert_eq!(h.get("x-node"), None, "must NOT have gone through Node");
+    let cards: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(cards.as_array().unwrap().len(), 0);
+    assert_eq!(h.get("x-source").unwrap().to_str().unwrap(), "cache", "empty merge = cache source");
+    assert_eq!(h.get("x-total-count"), None, "no meta on the empty answer");
+    // The broad leg was actually asked, with Node's exact suffix.
+    let asked = ms.hits_for("GET /cards/search").iter().any(|(k, _)| {
+        k.contains("q=NoCardNamedThis%20unique%3Aprints%20-is%3Adigital")
+    });
+    assert!(asked, "broad query must reach the live client");
+}
+
+#[tokio::test]
+async fn zero_rows_upstream_error_proxies() {
+    // Upstream errors stay Node's problem: a search whose merge legs all
+    // fail must proxy verbatim (Node's own catch → next(err)), never a
+    // half-baked native 500.
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    ms.statuses
+        .lock()
+        .unwrap()
+        .insert("GET /cards/search".into(), vec![500]);
+    let r = router_for_live(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+    let (s, h, _b) = get(&r, "/api/search?scope=database&name=ZzqxGone&page=1&limit=20", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "merge failure must proxy to Node");
 }
 
 #[tokio::test]
@@ -342,7 +386,8 @@ async fn gated_queries_proxy_to_node() {
     for q in [
         "/api/search?q=t%3Acreature%20c%3Ag",          // raw query → parser/sidecar
         "/api/search?scope=collection&q=sol%20ring",   // collection catalog path
-        "/api/search?scope=internet&name=Sol%20Ring",  // internet scope is authoritative
+        // scope=internet no longer proxies: the iter-10 live merge leg
+        // answers it natively — see the live_merge_* tests below.
         "/api/search?name=Sol%20Ring&prints=1",        // allPrints walk
         "/api/search?name=Sol%20Ring&image=abc",       // cvScan ranking
         "/api/search?name=a&name=b",                   // qs array shape
@@ -563,7 +608,27 @@ async fn index_serves_rows_written_after_invalidations() {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     let upstream = format!("http://{}", spawn_fake_node().await);
-    let r = router_for_idx(path.clone(), &["search"], &upstream, NameIndex::new());
+    // iter-10: zero-row names now reach the live merge leg — pin it to a
+    // dead mock so "no local rows" keeps the proxy verdict, hermetically.
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    ms.statuses
+        .lock()
+        .unwrap()
+        .insert("GET /cards/search".into(), vec![500]);
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: ["search".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(path.clone()),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    st.name_index = Arc::new(NameIndex::new());
+    st.owned_index = Arc::new(OwnedCache::new());
+    st.scry = Arc::new(mock_scryfall::scry_for(mock, 0.0));
+    let r = app(st);
 
     // Cold: zero rows → proxy, exactly like the plain path.
     let (s, h, _) = get(&r, "/api/search?name=Newthing", &auth()).await;
@@ -886,31 +951,83 @@ async fn sidecar_failure_proxies_to_node() {
     let path = seeded_db(dir.path());
     let upstream = format!("http://{}", spawn_fake_node().await);
     let (sidecar, _seen) = spawn_fake_sidecar().await;
-    let r = sidecar_router(path, &upstream, &sidecar);
+    // Walk fails (boom card) AND the iter-10 live merge fails (scripted
+    // 500) — the request then keeps Node's problem, exactly like Node's
+    // own catch → next(err).
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    ms.statuses
+        .lock()
+        .unwrap()
+        .insert("GET /cards/search".into(), vec![500]);
+    let mut st = sidecar_state(path, &upstream, &sidecar);
+    st.scry = Arc::new(mock_scryfall::scry_for(mock, 0.0));
+    let r = app(st);
 
     let (s, h, _b) = get(&r, "/api/search?scope=database&name=boom%20card&page=1&limit=20", &auth()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h.get("x-node").unwrap(), "1", "must have gone through Node");
 }
 
-/// With search_sidecar off the kill switch, zero-row requests still proxy.
+/// Walk failure alone must NOT sink the request: the merge leg answers
+/// from the live client while the sidecar is down (iter-10 fall-through).
+#[tokio::test]
+async fn sidecar_failure_falls_through_to_live_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (sidecar, _seen) = spawn_fake_sidecar().await;
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [mock_scryfall::raw_card("zboom-a1", "Boom Card Alpha", "zz1", "1", Some(1.0))],
+        "total_cards": 1, "has_more": false,
+    });
+    let mut st = sidecar_state(path, &upstream, &sidecar);
+    st.scry = Arc::new(mock_scryfall::scry_for(mock, 0.0));
+    let r = app(st);
+
+    // Distinct name from the proxy test above: the process-wide rawPageCache
+    // would otherwise serve this merged answer to that one (and vice versa).
+    let (s, h, b) = get(&r, "/api/search?scope=database&name=boom%20card%20alpha&page=1&limit=20", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None, "merge leg answers without Node");
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["id"], json!("mtg-zboom-a1"), "normalizeCard mtg-id prefix");
+    assert_eq!(h.get("x-source").unwrap(), "scryfall");
+}
+
+/// With search_sidecar off the kill switch the walk is skipped, but the
+/// merge leg (iter-10) still answers natively — the sidecar stays untouched.
 #[tokio::test]
 async fn sidecar_kill_switch_proxies() {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     let upstream = format!("http://{}", spawn_fake_node().await);
     let (sidecar, seen) = spawn_fake_sidecar().await;
-    let r = router_for_idx_owned_sidecar(
-        path,
-        &["search"], // no search_sidecar
-        &upstream,
-        NameIndex::new(),
-        OwnedCache::new(),
-        Some(sidecar.clone()),
-    );
-    let (s, h, _b) = get(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20", &auth()).await;
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [mock_scryfall::raw_card("zswitch-1", "Kodama of the West Tree", "neo", "1", Some(1.0))],
+        "total_cards": 1, "has_more": false,
+    });
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: ["search".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(path),
+        sidecar_url: Some(sidecar.clone()),
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    st.name_index = Arc::new(NameIndex::new());
+    st.owned_index = Arc::new(OwnedCache::new());
+    st.scry = Arc::new(mock_scryfall::scry_for(mock, 0.0));
+    let r = app(st);
+    let (s, h, b) = get(&r, "/api/search?scope=database&name=Kodama%20of%20the%20West%20Tree&page=1&limit=20", &auth()).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(h.get("x-node").unwrap(), "1");
+    assert_eq!(h.get("x-node"), None, "merge leg answers without Node");
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1, "merge leg answers the search");
     assert!(seen.lock().unwrap().is_empty(), "sidecar must not be touched");
 }
 
@@ -1828,6 +1945,217 @@ async fn stale_rows_trigger_background_refresh() {
     let (s, _h, _body) = get(&r, "/api/search?name=Plains", &auth()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(scry.hits_for("POST /cards/collection").len(), 1, "fresh rows trigger no refresh");
+}
+
+// --- live specific/broad/fallback merge (iter 10) --------------------------
+//
+// runSearch's merge block (scryfallApi.js:776-881) ported natively: the
+// field-filter legs after queryLocal comes back empty (scope=database) or
+// is skipped (scope=internet). These are the Rust twins of the Node e2e
+// cases F5-TC3 (set+number pin) and F3-TC9 (internet multilingual), plus
+// mergeSearchPrices' cache/upstream price merge.
+
+#[tokio::test]
+async fn live_merge_set_number_pinned_skips_broad() {
+    // F5-TC3 twin: set+number lands on the specific query; the exact hit
+    // (numberPinnedIt) short-circuits the broad leg entirely, X-Total-Count
+    // is the exact count (1), X-Source: scryfall, and the awaited
+    // cacheCards write lands in card_cache.
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [mock_scryfall::raw_card("zz1-232", "Zzland", "zz1", "232", Some(2.5))],
+        "total_cards": 7, "has_more": false,
+    });
+    let r = router_for_live(path.clone(), &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, h, b) = get(&r, "/api/search?set=zz1&number=232", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None);
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    let cards = body.as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], json!("mtg-zz1-232"), "normalizeCard mtg-id prefix");
+    assert_eq!(h.get("x-total-count").unwrap(), "1", "numberPinnedIt → exact count, not total_cards");
+    assert_eq!(h.get("x-source").unwrap(), "scryfall");
+    // Only the specific query went out — the broad leg was skipped.
+    let search_hits = ms.hits_for("GET /cards/search");
+    assert_eq!(search_hits.len(), 1, "broad leg skipped after number-pinned exact");
+    assert!(search_hits[0].0.contains("q=set%3Azz1%20cn%3A232"), "{}", search_hits[0].0);
+    // cacheCards was awaited before the response: the row is queryable.
+    let conn = Connection::open(&path).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM card_cache WHERE id = 'mtg-zz1-232'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "merge response awaited the cache write");
+}
+
+#[tokio::test]
+async fn live_merge_internet_ja_lang_search() {
+    // F3-TC9 twin: scope=internet skips queryLocal and answers from the
+    // merge; a non-English lang feeds langSearch's resolve so the broad
+    // query carries lang:ja + include_multilingual, and the sidecar-shaped
+    // raw card comes back normalizeCard'd (language display name,
+    // printed_name kept, owned_qty attached).
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [{
+            "id": "jp123", "oracle_id": "oj", "name": "Black Lotus",
+            "printed_name": "\u{9ed2}\u{304d}\u{8472}", "lang": "ja",
+            "layout": "normal", "rarity": "uncommon", "type_line": "Artifact",
+            "collector_number": "1", "set": "zzj", "set_name": "Zz Japan",
+            "cmc": 0, "colors": [], "color_identity": [],
+        }],
+        "total_cards": 1, "has_more": false,
+    });
+    let r = router_for_live(path, &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, h, b) = get(&r, "/api/search?scope=internet&name=Black%20Lotus&lang=ja", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None, "internet scope answers natively now");
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    let cards = body.as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], json!("mtg-jp123"));
+    assert_eq!(cards[0]["language"], json!("Japanese"), "langSearch language survives");
+    assert_eq!(cards[0]["printed_name"], json!("\u{9ed2}\u{304d}\u{8472}"));
+    assert_eq!(cards[0]["name"], json!("Black Lotus"), "canonical name kept");
+    assert_eq!(cards[0]["owned_qty"], json!(0), "internet rows get owned_qty too");
+    assert_eq!(h.get("x-source").unwrap(), "scryfall");
+    assert_eq!(h.get("x-total-count").unwrap(), "1", "broad meta total rides through");
+    let search_hits = ms.hits_for("GET /cards/search");
+    assert!(search_hits.iter().any(|(k, _)| k.contains("lang%3Aja") && k.contains("include_multilingual=true")),
+        "ja leg: {:?}", search_hits.iter().map(|(k, _)| k).collect::<Vec<_>>());
+    assert!(search_hits.iter().all(|(k, _)| k.contains("lang%3Aja")),
+        "no English leg for a non-English lang");
+}
+
+#[tokio::test]
+async fn live_merge_first_word_fallback_queried() {
+    // Multi-word name: broad empty → the first-word fallback query goes
+    // out with the same suffix (Node's fallback leg).
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await; // default search: data []
+    let r = router_for_live(path, &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, _h, b) = get(&r, "/api/search?name=Zzadamant%20Will", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(serde_json::from_slice::<Value>(&b).unwrap().as_array().unwrap().len(), 0);
+    let asked: Vec<String> = ms.hits_for("GET /cards/search").into_iter().map(|(k, _)| k).collect();
+    assert!(asked.iter().any(|k| k.contains("q=Zzadamant%20Will%20unique%3Aprints")), "broad asked: {asked:?}");
+    assert!(asked.iter().any(|k| k.contains("q=Zzadamant%20unique%3Aprints")), "fallback asked: {asked:?}");
+}
+
+#[tokio::test]
+async fn live_merge_internet_upstream_dead_serves_local_rows() {
+    // Node's merge catch under scope=internet still answers from the
+    // already-resolved queryLocal rows when it has them — here upstream
+    // is scripted dead, so the cached row must come back, not a proxy hop.
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO card_cache (id, name, language, last_updated) VALUES ('zzq1', 'Zzqx Oracle', 'English', '2026-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+    }
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    ms.statuses
+        .lock()
+        .unwrap()
+        .insert("GET /cards/search".into(), vec![500]);
+    let r = router_for_live(path, &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, h, b) = get(&r, "/api/search?scope=internet&name=Zzqx%20Oracle", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node"), None, "catch answers from local rows, no proxy");
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    let cards = body.as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], json!("zzq1"));
+    assert_eq!(h.get("x-source").unwrap(), "cache");
+}
+
+#[tokio::test]
+async fn live_merge_prices_from_cache_without_upstream() {
+    // mergeSearchPrices twin, cached-quote branch: a sidecar-shaped raw
+    // card (no prices) gets its quote copied from card_cache — zero
+    // /cards/collection traffic.
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO card_cache (id, name, language, price_source, price_normal, last_updated)
+             VALUES ('mtg-zprice1', 'Zprice Card', 'English', 'tcgplayer', 4.5, '2026-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+    }
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [mock_scryfall::raw_card("zprice1", "Zprice Card", "zz1", "1", None)],
+        "total_cards": 1, "has_more": false,
+    });
+    let r = router_for_live(path, &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, _h, b) = get(&r, "/api/search?scope=internet&name=Zprice%20Card", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    let cards = body.as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["price_normal"], json!(4.5), "quote merged from card_cache");
+    assert_eq!(cards[0]["price_source"], json!("tcgplayer"));
+    assert!(ms.hits_for("POST /cards/collection").is_empty(), "cached quote needs no bulk fetch");
+}
+
+#[tokio::test]
+async fn live_merge_prices_never_checked_fetches_upstream() {
+    // mergeSearchPrices twin, never-checked branch: a price-less card with
+    // no card_cache row at all pins an upstream /cards/collection fetch
+    // (upstream: true — TCGplayer quotes do not exist on the sidecar) and
+    // the fresh quote rides the same response.
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let (mock, ms) = mock_scryfall::spawn_mock().await;
+    *ms.search.lock().unwrap() = json!({
+        "data": [mock_scryfall::raw_card("zprice2", "Zprice Two", "zz1", "2", None)],
+        "total_cards": 1, "has_more": false,
+    });
+    *ms.collection_batches.lock().unwrap() = vec![json!({
+        "data": [mock_scryfall::raw_card("zprice2", "Zprice Two", "zz1", "2", Some(3.25))],
+        "not_found": [],
+    })];
+    let r = router_for_live(path, &["search"], &format!("http://{upstream}"), mock_scryfall::scry_for(mock, 0.0));
+
+    let (s, _h, b) = get(&r, "/api/search?scope=internet&name=Zprice%20Two", &auth()).await;
+    assert_eq!(s, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    let cards = body.as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["price_normal"], json!(3.25), "fresh upstream quote merged in");
+    let bulk = ms.hits_for("POST /cards/collection");
+    assert_eq!(bulk.len(), 1, "never-checked card triggered the bulk fetch");
+    let idents: Vec<String> = serde_json::from_str::<Value>(&bulk[0].1)
+        .unwrap()["identifiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| format!("{}:{}", v["set"].as_str().unwrap_or_default(), v["collector_number"].as_str().unwrap_or_default()))
+        .collect();
+    assert!(idents.contains(&"zz1:2".to_string()), "bulk asked by set+number: {idents:?}");
 }
 
 

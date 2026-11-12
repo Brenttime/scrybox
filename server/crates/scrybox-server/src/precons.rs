@@ -562,6 +562,17 @@ pub(crate) struct BulkOut {
 /// via the shared Scry client — NOT the upstream-pinned sweep job): 75-row
 /// batches, byKey Map (last set wins), scryPostRetried's 4 attempts.
 pub(crate) async fn bulk_fetch_by_identifier(st: &AppState, rows: &[Map<String, Value>]) -> Result<BulkOut, String> {
+    bulk_fetch_by_identifier_opts(st, rows, &ScryOpts::default()).await
+}
+
+/// The same twin with caller-chosen ScryOpts — mergeSearchPrices pins
+/// `{upstream: true}` (TCGplayer quotes only exist on the real API; the
+/// sidecar answers price-less).
+pub(crate) async fn bulk_fetch_by_identifier_opts(
+    st: &AppState,
+    rows: &[Map<String, Value>],
+    opts: &ScryOpts,
+) -> Result<BulkOut, String> {
     let mut out = BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 };
     for (ci, chunk) in rows.chunks(75).enumerate() {
         let chunk_start = ci * 75;
@@ -601,7 +612,7 @@ pub(crate) async fn bulk_fetch_by_identifier(st: &AppState, rows: &[Map<String, 
         body.insert("identifiers".into(), Value::Array(identifiers));
         let resp = st
             .scry
-            .post_retried("/cards/collection", Value::Object(body), &ScryOpts::default(), 4)
+            .post_retried("/cards/collection", Value::Object(body), opts, 4)
             .await
             .map_err(|e| e.to_string())?;
         // `(resp.data && resp.data.not_found) || []`

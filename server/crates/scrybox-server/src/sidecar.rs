@@ -537,7 +537,7 @@ async fn try_query(st: &crate::AppState, base: &str, q: &str, lang_name: &str, o
 /// exact quirk that makes the fallback empty for comma names). Returns ''
 /// only for empty/all-space input, which keeps the fallback out (Node's
 /// `if (firstWord && ...)`).
-fn first_word(clean: &str) -> &str {
+pub(crate) fn first_word(clean: &str) -> &str {
     fn is_js_ws(c: char) -> bool {
         matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}' | '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}')
     }
