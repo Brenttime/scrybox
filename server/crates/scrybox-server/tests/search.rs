@@ -14,7 +14,7 @@ use std::{
 use axum::{
     extract::Query,
     body::Body,
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::any,
@@ -142,7 +142,12 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
 }
 
 async fn get(r: &Router, path: &str, headers: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let mut req = Request::builder().method("GET").uri(path).body(Body::empty()).unwrap();
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .extension(ConnectInfo(next_peer()))
+        .body(Body::empty())
+        .unwrap();
     for (k, v) in headers {
         req.headers_mut().insert(
             header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
@@ -161,6 +166,49 @@ fn auth() -> Vec<(&'static str, &'static str)> {
 async fn get_json(r: &Router, path: &str) -> (StatusCode, HeaderMap, Value) {
     let (s, h, b) = get(r, path, &auth()).await;
     (s, h, serde_json::from_slice(&b).unwrap())
+}
+
+/// The handlers take `ConnectInfo` (searchLimiter keys by client IP since
+/// lane-B iter-5's 6e24334); oneshot requests must carry it explicitly
+/// (scan_match_route.rs precedent). A fresh address per request also gives
+/// every request its own process-global searchLimiter bucket, so tests
+/// never race each other's 300/15min window.
+fn next_peer() -> SocketAddr {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SocketAddr::from((
+        std::net::Ipv4Addr::new(10, 199, (n / 250) as u8, (n % 250) as u8 + 1),
+        41000,
+    ))
+}
+
+async fn post(
+    r: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &'static str,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .extension(ConnectInfo(next_peer()))
+        .body(Body::from(body))
+        .unwrap();
+    for (k, v) in headers {
+        req.headers_mut().insert(
+            header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    let res = r.clone().oneshot(req).await.unwrap();
+    let (parts, body) = res.into_parts();
+    (parts.status, parts.headers, axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec())
+}
+
+fn json_ct() -> Vec<(&'static str, &'static str)> {
+    let mut h = auth();
+    h.push(("content-type", "application/json"));
+    h
 }
 
 // --- native path ---------------------------------------------------------
@@ -341,25 +389,309 @@ async fn gated_queries_proxy_to_node() {
     }
 }
 
+// --- POST /api/search (bigJson + {...query, ...body} merge) ---------------
+
 #[tokio::test]
-async fn post_proxies_even_when_owned() {
+async fn post_body_name_served_natively() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = spawn_fake_node().await;
     let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
 
+    let (s, h, body) = post(&r, "/api/search", &json_ct(), r#"{"name":"Sol Ring"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-source").unwrap().to_str().unwrap(), "cache");
+    assert!(h.get("x-node").is_none(), "must not hop to Node");
+    assert!(h.get(header::ETAG).is_some(), "res.json sets the body ETag on POST too");
+    assert_eq!(h.get("ratelimit-limit").unwrap().to_str().unwrap(), "300");
+    let cards = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(cards.as_array().unwrap().len(), 3);
+    // Byte-identical to the GET serving the same merged params (shared cache).
+    let (_, _, gbody) = get(&r, "/api/search?name=Sol%20Ring", &auth()).await;
+    assert_eq!(body, gbody);
+}
+
+#[tokio::test]
+async fn post_body_overrides_query_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // Body wins over the query for the same key (spread order).
+    let (s, h, body) = post(
+        &r,
+        "/api/search?name=__definitely_no_such_card__&limit=1&page=1",
+        &json_ct(),
+        r#"{"name":"Sol Ring"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap().as_array().unwrap().len(), 1);
+
+    // A body property also neutralises repeated query keys (spread replaces
+    // the whole key, qs array shape never reaches the handler).
+    let (s, h, body) = post(&r, "/api/search?name=a&name=b", &json_ct(), r#"{"name":"Sol Ring"}"#)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap().as_array().unwrap().len(), 3);
+
+    // Without the body override the duplicate stays exotic → proxy.
+    let req_dup = post(&r, "/api/search?name=a&name=b", &json_ct(), "{}").await;
+    assert_eq!(req_dup.1.get("x-node").unwrap().to_str().unwrap(), "1");
+}
+
+#[tokio::test]
+async fn post_gated_bodies_proxy_with_body_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    for (body, why) in [
+        (r#"{"q":"sol ring"}"#, "q-leg pinned to GET"),
+        (r#"{"name":"Sol Ring","scope":"collection"}"#, "collection scope"),
+        (r#"{"name":"Sol Ring","scope":"internet"}"#, "internet scope"),
+        (r#"{"name":"Sol Ring","prints":"1"}"#, "allPrints walk"),
+        (r#"{"name":"Sol Ring","image":"abc"}"#, "cvScan ranking leg"),
+        (r#"{"name":{"a":1}}"#, "object on stringified key"),
+        (r#"{"name":"Sol Ring","limit":[5]}"#, "array on parseInt key"),
+        (r#"{"name":"Sol Ring","lang":{"a":1}}"#, "object on lang"),
+    ] {
+        let (s, h, echo) = post(&r, "/api/search", &json_ct(), body).await;
+        assert_eq!(s, StatusCode::OK, "{why}");
+        assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "{why} must proxy");
+        // The consumed body must arrive at Node byte-exact.
+        let e: Value = serde_json::from_slice(&echo).unwrap();
+        assert_eq!(e["body"].as_str().unwrap(), body, "{why} body must survive rebuild");
+    }
+}
+
+#[tokio::test]
+async fn post_content_type_and_body_shape_ladder() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // Non-JSON content-type: body-parser SKIPS the body (no keys, no size
+    // check) — the query alone drives the native answer.
+    let (s, h, body) = post(
+        &r,
+        "/api/search?name=Sol%20Ring",
+        &[("authorization", "Bearer tok-session"), ("content-type", "text/plain")],
+        "not json at all",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap().as_array().unwrap().len(), 3);
+
+    // No content-type at all, empty body: same merge ({} contributes keys).
+    let (s, h, _) = post(&r, "/api/search?name=Sol%20Ring", &auth(), "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+
+    // application/json body {} and [] contribute no named keys.
+    for body in ["{}", "[]"] {
+        let (s, h, body_) = post(&r, "/api/search?name=Sol%20Ring", &json_ct(), body).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert!(h.get("x-node").is_none(), "{body} must stay native");
+        assert_eq!(serde_json::from_slice::<Value>(&body_).unwrap().as_array().unwrap().len(), 3);
+    }
+
+    // +json suffix mimes are parsed too (type-is 'json').
+    let (s, _, _) = post(
+        &r,
+        "/api/search",
+        &[("authorization", "Bearer tok-session"), ("content-type", "application/vnd.api+json")],
+        r#"{"name":"NoCardNamedThis"}"#,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "zero-row +json body proxies to Node untouched");
+}
+
+#[tokio::test]
+async fn post_malformed_json_answers_global_500() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // entity.parse.failed AND strict-mode scalars → global handler 500.
+    for body in ["{oops", "5", "null", "\"a string\"", "  "] {
+        let (s, _, b) = post(&r, "/api/search", &json_ct(), body).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            json!({ "error": "Internal server error" })
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_auth_gate_before_body_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // authenticateToken (server.js:454) runs before bigJson (462): a garbage
+    // body must never outrun the 401/403.
+    let (s, _, b) = post(&r, "/api/search", &[("content-type", "application/json")], "{oops").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap(),
+        json!({ "error": "Access denied. No token provided." })
+    );
+
+    // API keys are GET-only reads → 403 before any parse.
+    let (s, _, b) = post(
+        &r,
+        "/api/search",
+        &[("authorization", "Bearer tok-api"), ("content-type", "application/json")],
+        "not-even-close",
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap(),
+        json!({ "error": "API keys are read-only. Use a login session for this request." })
+    );
+
+    // A valid session + malformed body reaches the parse → 500, NOT the
+    // proxy (and Node's rate bucket is only advanced by requests that pass
+    // the parser — parse failure never reaches searchLimiter, so there is
+    // deliberately no limiter-header assertion here: the shared in-process
+    // bucket is shared across all tests in this binary).
+    let (s, h, _) = post(&r, "/api/search", &json_ct(), "{oops").await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(h.get("ratelimit-limit").is_none(), "limiter never saw this request");
+    // And the limiter headers on a good request prove it ran after parse.
+    let (s, h, _) = post(&r, "/api/search", &json_ct(), r#"{"name":"Sol Ring"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("ratelimit-limit").unwrap().to_str().unwrap(), "300");
+}
+
+#[tokio::test]
+async fn post_too_large_body_answers_413() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    let big = format!(r#"{{"name":"{}"}}"#, "x".repeat(16 * 1024 * 1024));
     let req = Request::builder()
         .method("POST")
         .uri("/api/search")
         .header("authorization", "Bearer tok-session")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"name":"Sol Ring"}"#))
+        .extension(ConnectInfo(next_peer()))
+        .body(Body::from(big))
         .unwrap();
     let res = r.clone().oneshot(req).await.unwrap();
     let (parts, body) = res.into_parts();
-    assert_eq!(parts.status, StatusCode::OK);
-    assert_eq!(parts.headers.get("x-node").unwrap().to_str().unwrap(), "1");
-    let echo: Value = serde_json::from_slice(&axum::body::to_bytes(body, usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(echo["body"].as_str().unwrap(), r#"{"name":"Sol Ring"}"#);
+    assert_eq!(parts.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&axum::body::to_bytes(body, usize::MAX).await.unwrap())
+            .unwrap(),
+        json!({ "error": "Upload too large. Try exporting/importing in smaller batches." })
+    );
+
+    // A NON-JSON content-type body of the same size is SKIPPED, not 413'd
+    // (body-parser type check precedes the limit check).
+    let (s, h, body) = post(
+        &r,
+        "/api/search?name=Sol%20Ring",
+        &[("authorization", "Bearer tok-session"), ("content-type", "text/plain")],
+        Box::leak("x".repeat(16 * 1024 * 1024).into_boxed_str()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none(), "query-only native answer");
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap().as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn post_number_and_falsy_coercions() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    // Numbers stringify JS-style before the parseInt digit scan: 2 → page 2,
+    // 1.5 → parseInt("1.5") = 1, falsy 0 → ||-default.
+    let (_, _, a) = post(&r, "/api/search", &json_ct(), r#"{"name":"Sol Ring","page":2,"limit":1}"#).await;
+    let (_, _, b) = get(&r, "/api/search?name=Sol%20Ring&page=2&limit=1", &auth()).await;
+    assert_eq!(a, b, "number page/limit must match the query-string window");
+    let (_, _, c) = post(&r, "/api/search", &json_ct(), r#"{"name":"Sol Ring","page":1.5,"limit":0}"#).await;
+    let (_, _, d) = get(&r, "/api/search?name=Sol%20Ring", &auth()).await;
+    assert_eq!(c, d, "1.5 → 1 and 0 → 60 defaults");
+
+    // Falsy body values never open the `if (x)` gates: number:null,
+    // set:false, lang:0 all behave exactly like an absent key.
+    let (_, _, e) = post(
+        &r,
+        "/api/search",
+        &json_ct(),
+        r#"{"name":"Sol Ring","number":null,"set":false,"lang":0}"#,
+    )
+    .await;
+    assert_eq!(e, d);
+
+    // Truthy number on a LIKE key: name:5 → '%5%' — Node-gated identically
+    // (String(5) param). Assert the gate stays native, shape may be empty.
+    let (s, h, _) = post(&r, "/api/search", &json_ct(), r#"{"name":5,"number":true}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    // Zero rows → build path proxies (walkable false for number shapes).
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1");
+}
+
+#[tokio::test]
+async fn post_never_replays_304_but_gets_the_same_etag() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    let (_, gh, _) = get(&r, "/api/search?name=Sol%20Ring", &auth()).await;
+    let etag = gh.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+
+    let mut hs = json_ct();
+    hs.push(("if-none-match", Box::leak(etag.clone().into_boxed_str())));
+    let (s, h, body) = post(&r, "/api/search?name=Sol%20Ring", &hs, "{}").await;
+    assert_eq!(s, StatusCode::OK, "conditional revalidation is GET/HEAD-only");
+    assert_eq!(h.get(header::ETAG).unwrap().to_str().unwrap(), etag);
+    assert!(!body.is_empty());
+
+    // The GET twin DOES replay 304 with the same tag.
+    let (s, _, _) = get(&r, "/api/search?name=Sol%20Ring", &[("authorization", "Bearer tok-session"), ("if-none-match", etag.as_str())]).await;
+    assert_eq!(s, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn post_kill_switch_off_proxies_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &[], &format!("http://{upstream}"));
+
+    let (s, h, echo) = post(&r, "/api/search", &json_ct(), r#"{"name":"Sol Ring"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1");
+    let e: Value = serde_json::from_slice(&echo).unwrap();
+    assert_eq!(e["body"].as_str().unwrap(), r#"{"name":"Sol Ring"}"#);
+}
+
+#[tokio::test]
+async fn post_other_methods_still_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    for m in ["PUT", "DELETE", "PATCH", "HEAD"] {
+        let req = Request::builder()
+            .method(m)
+            .uri("/api/search")
+            .header("authorization", "Bearer tok-session")
+            .extension(ConnectInfo(next_peer()))
+            .body(Body::empty())
+            .unwrap();
+        let res = r.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.headers().get("x-node").unwrap().to_str().unwrap(), "1", "{m}");
+    }
 }
 
 #[tokio::test]
@@ -941,6 +1273,7 @@ async fn burst(r: &Router, url: &str) -> Vec<(StatusCode, HeaderMap, Vec<u8>)> {
                 .method("GET")
                 .uri(u)
                 .header("authorization", "Bearer tok-session")
+                .extension(ConnectInfo(next_peer()))
                 .body(Body::empty())
                 .unwrap();
             let res = r.oneshot(req).await.unwrap();

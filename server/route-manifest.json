@@ -265,7 +265,7 @@
   "GET /api/search": {
     "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
     "status": "verified",
-    "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
+    "tests": "tests/search.rs (44, GET legs + POST suite); parity.mjs EXTRA_SEARCH x16"
   },
   "GET /api/search-history": {
     "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
@@ -571,7 +571,9 @@
     "tests": "cargo tests/scan_match_route.rs (10: 401/validation/503-notBuilt(+500 precedence)/500-set/429 limiter/forward arms) + lib cvscan::tests (11 incl. node_truth_parity_on_eval_corpus, subsample removed after vips-source audit) + npz::tests (3 vs frozen :3312 capture bench/scan-eval/node-truth.json); live A/B :3312-vs-:3320 scan-match-ab.mjs (detected/gate flags equal, top-8 cardIds equal, sims/sharpness/gap <=5e-4)"
   },
   "POST /api/search": {
-    "status": "node"
+    "module": "scrybox-server::search (lib.rs any(/api/search) under the search group; bigJson 15mb twin + { ...query, ...body } merge gate, shares the GET native cache/ETag legs; rate-limit after auth+parse, no 304 replay on POST)",
+    "status": "staged",
+    "tests": "tests/search.rs post_* x8 (native body serve byte-identical to GET twin, body-overrides-query, falsy/number coercions, content-type ladder, 413, 500-before-limiter, no-304-replay, auth-before-parse); parity cases PENDING"
   },
   "POST /api/search-history": {
     "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",

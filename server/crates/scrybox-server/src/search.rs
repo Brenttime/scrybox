@@ -33,7 +33,7 @@ use tokio::sync::OnceCell;
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -243,6 +243,261 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
             && clean_number(first("number").as_deref().unwrap_or("")).is_empty()
             && first("set").unwrap_or_default().is_empty()
             && to_name(first("lang").as_deref()) == "English",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/search — bigJson twin + the `{ ...req.query, ...req.body }` merge
+// ---------------------------------------------------------------------------
+
+/// body-parser limit for `express.json({ limit: '15mb' })` (bytes npm: mb =
+/// 1024^2). server.js:204/462.
+const BIG_JSON_LIMIT: usize = 15 * 1024 * 1024;
+
+/// body-parser `type` check for express.json's default 'json': the mime must
+/// be application/json or an application/*+json suffix; anything else makes
+/// the parser skip the body entirely (req.body stays undefined — the route's
+/// `|| {}` turns that into no keys).
+fn body_parser_is_json(ct: Option<&HeaderValue>) -> bool {
+    ct.and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            main == "application/json"
+                || (main.starts_with("application/") && main.ends_with("+json"))
+        })
+        .unwrap_or(false)
+}
+
+/// Outcome of the bigJson parse, pre-gate (order mirrors body-parser:
+/// content-type first — a non-JSON 200 MB body is SKIPPED, not 413'd).
+enum BigBody {
+    /// Some(map) = JSON object properties (spread into the query);
+    /// None = parser skipped / empty / array body — contributes no keys.
+    Parsed(Option<serde_json::Map<String, Value>>),
+    /// entity.parse.failed (incl. strict-mode scalars) → global 500.
+    Invalid,
+    /// entity.too.large → global 413.
+    TooLarge,
+}
+
+fn parse_big_json(headers: &HeaderMap, bytes: &[u8]) -> BigBody {
+    if !body_parser_is_json(headers.get(header::CONTENT_TYPE)) {
+        return BigBody::Parsed(None);
+    }
+    if bytes.len() > BIG_JSON_LIMIT {
+        return BigBody::TooLarge;
+    }
+    if bytes.is_empty() {
+        // body-parser hands back undefined for an empty body; the route's
+        // `|| {}` makes that identical to {}.
+        return BigBody::Parsed(Some(serde_json::Map::new()));
+    }
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(m)) => BigBody::Parsed(Some(m)),
+        // strict:true allows arrays; spreading one yields only numeric keys,
+        // and searchCards reads none — same as no body.
+        Ok(Value::Array(_)) => BigBody::Parsed(Some(serde_json::Map::new())),
+        // scalars (incl. null) violate strict mode → SyntaxError → global 500.
+        _ => BigBody::Invalid,
+    }
+}
+
+/// `String(n)` for JSON numbers, JS-faithful on the shapes the native gate
+/// can consume. Returns None for values deliberately left to Node
+/// (0/NaN-as-falsy callers check truthiness first; |n| >= 1e21 switches to
+/// JS exponential notation we do not model).
+fn js_number_to_string(n: &serde_json::Number) -> Option<Option<String>> {
+    if let Some(i) = n.as_i64() {
+        return Some(Some(i.to_string()));
+    }
+    let f = n.as_f64()?;
+    if f.is_nan() || f == 0.0 {
+        return Some(None); // falsy → String() never gates a clause
+    }
+    if !f.is_finite() {
+        return Some(Some("Infinity".to_string())); // parseInt → NaN → defaults
+    }
+    if f.abs() >= 1e21 {
+        return None; // "1e+21" exponential form — exotic, leave to Node
+    }
+    if f.fract() == 0.0 {
+        return Some(Some(format!("{}", f as i64)));
+    }
+    Some(Some(format!("{f}"))) // shortest round-trip, same as JS
+}
+
+/// Merge lookup for POST: a JSON-object body property wins over the FIRST
+/// query value for the key (`{...query, ...body}`), otherwise the qs
+/// first-value rule applies. Returns Err for value shapes deliberately left
+/// to Node (arrays/objects on stringified keys, |n| >= 1e21).
+enum Merged<'a> {
+    Query(&'a str),
+    Str(String),
+    /// falsy JSON value (null / false / 0 / NaN) — JS-gated keys treat it
+    /// exactly like an absent/empty one.
+    Falsy,
+    Exotic,
+}
+
+/// JS-semantics gate for the searchCards field-filter path:
+/// `if (value)` truthiness plus the `String(value)` SQL parameter.
+/// Returns the parameter string ('' = no clause). Err = exotic shape.
+fn merged_param(m: Option<Merged<'_>>) -> Result<String, ()> {
+    match m {
+        None => Ok(String::new()),
+        Some(Merged::Query(s)) => Ok(s.to_string()),
+        Some(Merged::Str(s)) => Ok(s),
+        // falsy (null/false/0/NaN) or absent: `if (x)` gate never opens, and
+        // the query-string empty case is gated by the caller's is_empty().
+        Some(Merged::Falsy) => Ok(String::new()),
+        Some(Merged::Exotic) => Err(()),
+    }
+}
+
+/// Decide whether Rust may answer a POST, mirroring `searchCards`'
+/// `query = { ...req.query, ...req.body }` merge on top of the GET gate.
+/// Deliberate exclusions (proxy): a non-blank `q` — the collq/sidecar q-leg
+/// twin is pinned for GET only; `image` strings (cvScan ranking lives in
+/// Node); `prints=1`; collection/internet scopes; duplicate query keys the
+/// body does not override; and exotic body shapes (arrays/objects, huge
+/// floats) on the stringified keys.
+pub fn plan_post(
+    user_id: i64,
+    raw_query: Option<&str>,
+    body: Option<&serde_json::Map<String, Value>>,
+) -> Plan {
+    let pairs: Vec<(String, String)> = raw_query
+        .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    let bq = |k: &str| body.and_then(|b| b.get(k));
+    let qq = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+    let mv = |k: &str| -> Option<Merged<'_>> {
+        match bq(k) {
+            Some(Value::String(s)) => Some(Merged::Str(s.clone())),
+            Some(Value::Null) | Some(Value::Bool(false)) => Some(Merged::Falsy),
+            Some(Value::Bool(true)) => Some(Merged::Str("true".to_string())),
+            Some(v @ Value::Number(_)) => {
+                match js_number_to_string(v.as_number().unwrap()) {
+                    Some(Some(s)) => Some(Merged::Str(s)),
+                    Some(None) => Some(Merged::Falsy),
+                    None => Some(Merged::Exotic),
+                }
+            }
+            Some(_) => Some(Merged::Exotic), // array / object
+            None => qq(k).map(Merged::Query),
+        }
+    };
+    for k in ["name", "number", "set", "q", "scope", "lang", "prints", "image", "page", "limit"] {
+        // A body property replaces the whole key, so repeated query keys
+        // stop mattering once the body defines it (the spread wins).
+        if pairs.iter().filter(|(kk, _)| kk == k).count() > 1 && bq(k).is_none() {
+            return Plan::Proxy;
+        }
+    }
+
+    // q: `typeof query.q === 'string' ? query.q.trim() : ''`. A non-blank q
+    // sends Node down the parser/sidecar path — pinned to GET, so proxy.
+    match mv("q") {
+        Some(Merged::Str(s)) if !s.trim().is_empty() => return Plan::Proxy,
+        Some(Merged::Query(s)) if !s.trim().is_empty() => return Plan::Proxy,
+        _ => {}
+    }
+
+    // scope: only the raw === 'collection' / 'internet' comparisons gate;
+    // any other value (non-strings included) behaves like 'database'.
+    let scope_is = |t: &str| match bq("scope") {
+        Some(Value::String(s)) => s == t,
+        Some(_) => false,
+        None => qq("scope") == Some(t),
+    };
+    if scope_is("collection") || scope_is("internet") {
+        return Plan::Proxy;
+    }
+    let prints_is_1 = match bq("prints") {
+        Some(Value::String(s)) => s == "1",
+        Some(_) => false,
+        None => qq("prints") == Some("1"),
+    };
+    if prints_is_1 {
+        return Plan::Proxy;
+    }
+    // image: `image && typeof image === 'string' && image.length > 0`.
+    let image_leg = match bq("image") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => false,
+        None => qq("image").map(|s| !s.is_empty()).unwrap_or(false),
+    };
+    if image_leg {
+        return Plan::Proxy;
+    }
+
+    // Stringified-with-truthiness-gate keys: name/number/set go through the
+    // `if (x)` gate then the String() SQL parameter; exotic shapes proxy.
+
+    // page = Math.max(1, parseInt(page, 10) || 1); limit = min(250, max(1,
+    // parseInt(limit, 10) || 60)) — parseInt is ToString-first, so numbers
+    // stringify exactly like JS before the digit scan.
+    let pi = |k: &str| -> Option<Option<i64>> {
+        match mv(k) {
+            None => Some(None), // absent key: parseInt(undefined) → NaN → ||-default
+            Some(Merged::Query(s)) => Some(js_parse_int(s)),
+            Some(Merged::Str(s)) => Some(js_parse_int(&s)),
+            Some(Merged::Falsy) => Some(None), // parseInt("null"/"false"/"0"…) gates to ||-default
+            Some(Merged::Exotic) => None,      // parseInt([5]) etc. — exotic
+        }
+    };
+    let page = match pi("page") {
+        Some(v) => v.unwrap_or(0),
+        None => return Plan::Proxy,
+    };
+    let page = if page == 0 { 1 } else { page }.max(1);
+    let limit = match pi("limit") {
+        Some(v) => v.unwrap_or(0),
+        None => return Plan::Proxy,
+    };
+    let limit = if limit == 0 { 60 } else { limit }.clamp(1, 250);
+
+    let name = match merged_param(mv("name")) {
+        Ok(s) => s,
+        Err(()) => return Plan::Proxy,
+    };
+    let number_raw = match merged_param(mv("number")) {
+        Ok(s) => s,
+        Err(()) => return Plan::Proxy,
+    };
+    let set = match merged_param(mv("set")) {
+        Ok(s) => s,
+        Err(()) => return Plan::Proxy,
+    };
+    // languages.resolve(): falsy → DEFAULT; else String(input).trim().lower.
+    let lang_name = match mv("lang") {
+        None => to_name(None),
+        Some(Merged::Falsy) => to_name(None),
+        Some(Merged::Query(s)) => to_name(Some(s)),
+        Some(Merged::Str(s)) => to_name(Some(&s)),
+        Some(Merged::Exotic) => return Plan::Proxy,
+    };
+
+    // Walk leg: strings only (numbers stringify into a LIKE param but Node's
+    // sidecar leg for them is unproven — conservative: never walk those).
+    let all_strings = ["name", "number", "set", "lang"]
+        .iter()
+        .all(|k| matches!(mv(k), None | Some(Merged::Query(_)) | Some(Merged::Str(_)) | Some(Merged::Falsy)));
+    let walkable = all_strings
+        && !name.trim().is_empty()
+        && clean_number(&number_raw).is_empty()
+        && set.is_empty()
+        && lang_name == "English";
+
+    Plan::Native(SearchQuery {
+        user_id,
+        name: name.trim().to_string(),
+        number: clean_number(&number_raw),
+        set,
+        lang_name,
+        page,
+        limit,
+        walkable,
     })
 }
 
@@ -620,22 +875,65 @@ pub async fn handle(
     cc: ConnectInfo<std::net::SocketAddr>,
     req: Request,
 ) -> Response {
-    // Only GET has a native path; POST /api/search reads a scan image body.
-    if method != Method::GET {
+    // GET and POST share the native path (Node mounts the same searchCards
+    // on both, collection.js:233-234; POST is how the scanner client carries
+    // its JSON body). Every other method proxies verbatim — Express's
+    // router.post/router.get would not match either, and Node answers.
+    let is_post = method == Method::POST;
+    if method != Method::GET && !is_post {
         return crate::proxy(State(st.clone()), req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
     };
-    let headers = req.headers();
-    let uri = req.uri().clone();
+    // Express runs authenticateToken (server.js:454) BEFORE bigJson parses
+    // the body on /api/search (server.js:462): the 401/403 arms must not
+    // depend on body validity, and a malformed body must not reach the
+    // limiter. POST bytes are buffered here (read_parts/rebuild precedent
+    // from collection_writes) but only INTERPRETED after auth; every proxy
+    // leg below re-attaches the original bytes untouched.
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default().to_vec();
+    let headers = parts.headers.clone();
+    let uri = parts.uri.clone();
+    let to_node = |st: &AppState, parts: axum::http::request::Parts, bytes: Vec<u8>| {
+        let st = st.clone();
+        async move {
+            crate::proxy(State(st), crate::collection_writes::rebuild(parts, &bytes)).await
+        }
+    };
 
     // authenticateToken runs before the route in Node; same 401/403 bodies.
-    // µs-cached SQLite, inline on the worker (iter 6).
-    let token = auth::bearer_token(headers).map(|s| s.to_string());
-    let user = match auth::authenticate(&pool, token.as_deref(), true) {
+    // µs-cached SQLite, inline on the worker (iter 6). API keys are GET-only
+    // reads (authenticate's is_get), so a POST with an api key gets Node's
+    // 403 before any body parse — same as Node's gate.
+    let token = auth::bearer_token(&headers).map(|s| s.to_string());
+    let user = match auth::authenticate(&pool, token.as_deref(), !is_post) {
         Ok(u) => u,
         Err(res) => return res,
+    };
+
+    // express.json({limit:'15mb'}) twin (bigJson, server.js:204/462). Parse
+    // failures answer the GLOBAL handler's 500 (server.js:634-642: only
+    // entity.too.large gets a bespoke body; everything else — including
+    // strict-mode SyntaxError — logs and 500s), and happen BEFORE the
+    // limiter counts the request.
+    let body_map: Option<serde_json::Map<String, Value>> = if is_post {
+        match parse_big_json(&headers, &bytes) {
+            BigBody::Parsed(m) => m,
+            BigBody::Invalid => {
+                tracing::error!("search: invalid JSON body (express.json strict)");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+            }
+            BigBody::TooLarge => {
+                return json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Upload too large. Try exporting/importing in smaller batches.",
+                )
+            }
+        }
+    } else {
+        None
     };
 
     // searchLimiter (middleware/auth.js:86, mounted ahead of searchCards on
@@ -643,7 +941,7 @@ pub async fn handle(
     // hit exactly once per authenticated request so it advances in lockstep
     // with the Node limiter's bucket (which counts every request, including
     // the ones Rust re-serves through the proxy).
-    let rl_key = ip_limit::client_ip_key(Some(cc.0.ip()), headers, &st.trust_proxy);
+    let rl_key = ip_limit::client_ip_key(Some(cc.0.ip()), &headers, &st.trust_proxy);
     let rl = crate::cvscan::search_limiter().hit(&rl_key, crate::cvscan::now_ms());
     let with_rl = |res: Response| -> Response {
         let mut res = res;
@@ -674,15 +972,25 @@ pub async fn handle(
     }
 
     let raw_query = uri.query().map(|s| s.to_string());
-    let p = match plan(user.id, raw_query.as_deref()) {
+    let p = match if is_post {
+        plan_post(user.id, raw_query.as_deref(), body_map.as_ref())
+    } else {
+        plan(user.id, raw_query.as_deref())
+    } {
         Plan::Native(p) => p,
         Plan::CollectionQ(cq) => {
-            return with_rl(serve_collq(st, req, pool, cq).await);
+            return with_rl(serve_collq(st, crate::collection_writes::rebuild(parts, &bytes), pool, cq).await);
         }
-        Plan::Proxy => return crate::proxy(State(st.clone()), req).await,
+        Plan::Proxy => return to_node(&st, parts, bytes).await,
     };
 
-    let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    // Express's res.json sets the body ETag on POST too, but conditional
+    // revalidation only applies to GET/HEAD — a POST never replays as 304.
+    let inm = if is_post {
+        None
+    } else {
+        headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    };
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
     let rev = pool
@@ -819,9 +1127,21 @@ pub async fn handle(
                             (body, gz, etag, total, source)
                         }
                     };
+                    // Stamp with the POST-build revision: the walk's own
+                    // cacheCards upserts bump the (unconditional, db.js:1252)
+                    // collection_read_revision mid-build, and stamping with
+                    // the pre-build rev_i would self-invalidate the entry —
+                    // every later request would re-walk. Anything written by
+                    // someone else before this read still invalidates as
+                    // intended; the build itself performed no other writes.
+                    let store_rev = init_pool
+                        .get()
+                        .ok()
+                        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                        .unwrap_or(rev_i);
                     Ok(Ok(Some(init_cache.insert(
                         init_key,
-                        SearchEntry { rev: rev_i, raw: body, gz, etag, total, source, catalog: None },
+                        SearchEntry { rev: store_rev, raw: body, gz, etag, total, source, catalog: None },
                     ))))
                 })
                 .await;
@@ -830,7 +1150,7 @@ pub async fn handle(
             // error, outer Ok wraps the stored Result.
             match res {
                 Ok(Ok(Some(e))) => e.clone(),
-                Ok(Ok(None)) => return crate::proxy(State(st.clone()), req).await,
+                Ok(Ok(None)) => return to_node(&st, parts.clone(), bytes.clone()).await,
                 Ok(Err(ref e)) | Err(ref e) => {
                     tracing::error!(error = %e, "search build failed");
                     return with_rl(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"));

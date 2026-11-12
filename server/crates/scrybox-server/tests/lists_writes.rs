@@ -199,21 +199,31 @@ async fn create_basic_cached_defaults_and_stacking() {
     let db = seeded_db(dir.path(), "create.db");
     let upstream = spawn_fake_node().await;
     let r = router_for(db.clone(), &["lists_writes"], &format!("http://{upstream}"));
+    // 'not-a-real-card-xyz' is uncached. LANE-B unit 7c (603d9e1) replaced
+    // the iter-32 whole-request forward with Node's own leg: the batched
+    // `/cards/collection` hydration runs natively; a name the resolve cannot
+    // land simply reports as `unmatched` — the list is still created (Node
+    // routes/lists.js:96+). The Scryfall base is pinned to the fake Node
+    // listener (echo answers carry no `data` → zero cards, the caught-error
+    // path's twin), so the leg never leaves the box.
+    std::env::set_var("SCRYFALL_BASE_URL", format!("http://{upstream}"));
     let body = json!({
         "name": "  Buylist  ",
         "list_text": "2 Alpha Card\n3 Alpha Card\n1 Beta Card (lrp) 42\nnot-a-real-card-xyz"
     });
-    // 'not-a-real-card-xyz' is uncached -> the WHOLE request must forward
-    // and no row may be created locally.
     let (s, h, b) = request(&r, "POST", "/api/lists", &JSON_CT, Some(&body.to_string())).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(h.get("x-node").unwrap(), "1");
-    assert_eq!(json_body(&b)["body"], body.to_string(), "forwarded body must be verbatim");
+    std::env::remove_var("SCRYFALL_BASE_URL");
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(h.get("x-node").is_none(), "hydration-miss no longer forwards (unit 7c)");
+    let j = json_body(&b);
+    assert_eq!(j["matched"], 3, "the three cached lines matched");
+    assert_eq!(j["unmatched"], json!(["not-a-real-card-xyz"]));
+    assert_eq!(j["lines"], 4);
     let conn = open(&db);
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM card_lists WHERE name='Buylist'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n, 0, "forwarded create must not insert locally");
+    assert_eq!(n, 1, "the row is created with the unmatched line reported");
 
     // All-cached variant answers natively with the Node contract.
     let body = json!({
