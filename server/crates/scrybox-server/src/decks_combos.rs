@@ -54,7 +54,6 @@ use axum::extract::Request;
 use serde_json::{Map, Value};
 
 use crate::auth::{authenticate, bearer_token};
-use crate::cards_meta::edhrec_slug;
 use crate::collection_writes::{
     internal_error, json_error, node_exact, parse_body, read_parts, too_large, BodyOutcome,
 };
@@ -357,6 +356,64 @@ fn front_face(n: &str) -> &str {
     n.split(" // ").next().unwrap_or("")
 }
 
+/// `commanderSlug` (utils/edhrecSynergy.js) — ported locally rather than
+/// reusing the cards_meta `edhrec_slug` twin: that table maps U+0131
+/// (`ı`) to `"i"`, but JS `normalize('NFD')` leaves U+0131 undecomposed
+/// (no canonical decomposition), so Node's commanderSlug keeps it
+/// non-alphanumeric ("Tıbir Tamı" -> "t-bir-tam", pinned from node). The
+/// cards_meta entry is a pre-existing lane-B twin deviation (its own
+/// vectors never covered U+0131) — flagged for lane B, not touched here.
+pub fn commander_slug(name: &str) -> String {
+    let first = name.split(" // ").next().unwrap_or("");
+    let lowered = first.to_lowercase();
+    let stripped: String = lowered
+        .chars()
+        .flat_map(nfd_decompose_small)
+        .filter(|c| !('\u{0300}'..='\u{036f}').contains(c))
+        .collect();
+    // replace(/['’]/g, '') drops quotes outright; replace(/[^a-z0-9\s]/g,
+    // ' ') turns every other non-alnum into a space; then \s+ collapse +
+    // trim + ' ' -> '-'.
+    let spaced: String = stripped
+        .chars()
+        .filter(|c| *c != '\'' && *c != '\u{2019}')
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    spaced.split_whitespace().collect::<Vec<_>>().join("-")
+}
+
+/// Minimal NFD for the letters card names actually carry. Everything
+/// without a canonical decomposition (U+0131, U+00D7/÷, symbols) passes
+/// through unchanged, exactly like JS normalize('NFD').
+fn nfd_decompose_small(c: char) -> Vec<char> {
+    let t: &[(char, &str)] = &[
+        ('\u{c0}', "A\u{300}"), ('\u{c1}', "A\u{301}"), ('\u{c2}', "A\u{302}"), ('\u{c3}', "A\u{303}"),
+        ('\u{c4}', "A\u{308}"), ('\u{c5}', "A\u{30a}"), ('\u{c7}', "C\u{327}"), ('\u{c8}', "E\u{300}"),
+        ('\u{c9}', "E\u{301}"), ('\u{ca}', "E\u{302}"), ('\u{cb}', "E\u{308}"), ('\u{cc}', "I\u{300}"),
+        ('\u{cd}', "I\u{301}"), ('\u{ce}', "I\u{302}"), ('\u{cf}', "I\u{308}"), ('\u{d1}', "N\u{303}"),
+        ('\u{d2}', "O\u{300}"), ('\u{d3}', "O\u{301}"), ('\u{d4}', "O\u{302}"), ('\u{d5}', "O\u{303}"),
+        ('\u{d6}', "O\u{308}"), ('\u{d9}', "U\u{300}"), ('\u{da}', "U\u{301}"), ('\u{db}', "U\u{302}"),
+        ('\u{dc}', "U\u{308}"), ('\u{dd}', "Y\u{301}"), ('\u{e0}', "a\u{300}"), ('\u{e1}', "a\u{301}"),
+        ('\u{e2}', "a\u{302}"), ('\u{e3}', "a\u{303}"), ('\u{e4}', "a\u{308}"), ('\u{e5}', "a\u{30a}"),
+        ('\u{e7}', "c\u{327}"), ('\u{e8}', "e\u{300}"), ('\u{e9}', "e\u{301}"), ('\u{ea}', "e\u{302}"),
+        ('\u{eb}', "e\u{308}"), ('\u{ec}', "i\u{300}"), ('\u{ed}', "i\u{301}"), ('\u{ee}', "i\u{302}"),
+        ('\u{ef}', "i\u{308}"), ('\u{f1}', "n\u{303}"), ('\u{f2}', "o\u{300}"), ('\u{f3}', "o\u{301}"),
+        ('\u{f4}', "o\u{302}"), ('\u{f5}', "o\u{303}"), ('\u{f6}', "o\u{308}"), ('\u{f9}', "u\u{300}"),
+        ('\u{fa}', "u\u{301}"), ('\u{fb}', "u\u{302}"), ('\u{fc}', "u\u{308}"), ('\u{fd}', "y\u{301}"),
+        ('\u{ff}', "y\u{308}"), ('\u{130}', "I\u{307}"),
+    ];
+    match t.iter().find(|(k, _)| *k == c) {
+        Some((_, s)) => s.chars().collect(),
+        None => vec![c],
+    }
+}
+
 fn js_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
@@ -552,11 +609,11 @@ pub async fn handle_synergy(Path(id): Path<String>, State(st): State<AppState>, 
     // first commander's own page.
     let mut slugs: Vec<String> = Vec::new();
     if names.len() > 1 {
-        let mut parts: Vec<String> = names.iter().map(|n| edhrec_slug(n)).collect();
+        let mut parts: Vec<String> = names.iter().map(|n| commander_slug(n)).collect();
         parts.sort();
         slugs.push(parts.join("-"));
     }
-    slugs.push(edhrec_slug(&names[0]));
+    slugs.push(commander_slug(&names[0]));
     for slug in slugs {
         // if (!slug) continue;
         if slug.is_empty() {
@@ -974,22 +1031,23 @@ mod tests {
     }
 
     #[test]
-    fn commanderslug_reuses_cards_meta_twin_and_matches_node_vectors() {
+    fn commanderslug_matches_node_vectors() {
         // Vectors pinned from node: require('backend/src/utils/edhrecSynergy').commanderSlug
-        assert_eq!(edhrec_slug("Atraxa, Praetors' Voice"), "atraxa-praetors-voice");
-        assert_eq!(edhrec_slug("K'rrik, Son of Andan"), "krrik-son-of-andan");
-        assert_eq!(edhrec_slug("Èterka, Weathered Explorer"), "eterka-weathered-explorer");
-        assert_eq!(edhrec_slug("A // B"), "a");
-        assert_eq!(edhrec_slug("!!!"), "");
+        // (incl. the U+0131 case that the cards_meta twin would fail).
+        assert_eq!(commander_slug("Atraxa, Praetors' Voice"), "atraxa-praetors-voice");
+        assert_eq!(commander_slug("K'rrik, Son of Andan"), "krrik-son-of-andan");
+        assert_eq!(commander_slug("Èterka, Weathered Explorer"), "eterka-weathered-explorer");
+        assert_eq!(commander_slug("A // B"), "a");
+        assert_eq!(commander_slug("!!!"), "");
         // Vectors pinned from `node -e commanderSlug(...)` (iter-5 diff of
         // utils/edhrecSynergy.js commanderSlug vs the cards_meta twin).
-        assert_eq!(edhrec_slug("Atraxa, Praetors\u{2019} Voice"), "atraxa-praetors-voice");
-        assert_eq!(edhrec_slug("Jodah, Archmage \u{c6}ther\u{2122}"), "jodah-archmage-ther");
-        assert_eq!(edhrec_slug("T\u{131}bir Tam\u{131}"), "t-bir-tam");
-        assert_eq!(edhrec_slug("Mox \u{b1} Diamond"), "mox-diamond");
-        assert_eq!(edhrec_slug("Nashi, Moon\u{2019}s Bargain"), "nashi-moons-bargain");
-        assert_eq!(edhrec_slug("  spaces  here  "), "spaces-here");
-        assert_eq!(edhrec_slug(""), "");
+        assert_eq!(commander_slug("Atraxa, Praetors\u{2019} Voice"), "atraxa-praetors-voice");
+        assert_eq!(commander_slug("Jodah, Archmage \u{c6}ther\u{2122}"), "jodah-archmage-ther");
+        assert_eq!(commander_slug("T\u{131}bir Tam\u{131}"), "t-bir-tam");
+        assert_eq!(commander_slug("Mox \u{b1} Diamond"), "mox-diamond");
+        assert_eq!(commander_slug("Nashi, Moon\u{2019}s Bargain"), "nashi-moons-bargain");
+        assert_eq!(commander_slug("  spaces  here  "), "spaces-here");
+        assert_eq!(commander_slug(""), "");
     }
 
     #[test]
