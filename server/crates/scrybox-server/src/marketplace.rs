@@ -120,7 +120,7 @@ pub trait MpHttp: Send + Sync {
 
 type MpClient = Client<HttpsConnector<HttpConnector>, String>;
 
-fn mp_client() -> &'static MpClient {
+pub(crate) fn mp_client() -> &'static MpClient {
     static CLIENT: OnceLock<MpClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let https = HttpsConnectorBuilder::new()

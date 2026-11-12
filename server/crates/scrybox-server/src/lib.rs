@@ -47,6 +47,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod decks_combos;
 pub mod export;
 pub mod npz;
 pub mod settings;
@@ -208,6 +209,18 @@ pub struct AppState {
     /// (deck_list_revision, built body bytes). Per process like Node's
     /// module-level Map; per AppState in tests keeps fixtures isolated.
     pub deck_list_cache: Arc<std::sync::Mutex<std::collections::HashMap<i64, (i64, Vec<u8>)>>>,
+    /// Spellbook/EDHREC client (decks_combos fetch twin). Trait-typed so
+    /// route tests inject a stub, exactly like `mp_http` (provider-leg
+    /// ruling: URLs are Node module constants, so the real legs are
+    /// excluded from parity and stub-proven in unit tests instead).
+    pub deck_http: Arc<dyn decks_combos::DecksProviders>,
+    /// routes/decks.js `edhrecMem` Map twin: slug -> { t, cards } (bounded
+    /// twin, MEM_CACHE_CAP). Per process like Node's module-level Map; per
+    /// AppState in tests keeps fixtures isolated.
+    pub edhrec_mem: Arc<std::sync::Mutex<std::collections::HashMap<String, decks_combos::EdhrecEntry>>>,
+    /// EDHREC_CACHE_DIR; default dirname(DB)/edhrec-cache — the same shared
+    /// bind-mounted database volume precons_index_path uses.
+    pub edhrec_cache_dir: Option<std::path::PathBuf>,
     /// preconData.js `indexFile` — the shared MTGJSON mirror
     /// (dirname(DB)/precons.json), the SAME file the Node container reads
     /// through its /app/database bind mount. Tests point it at a temp dir.
@@ -263,7 +276,11 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::rules::default_cache_path(cfg.db_path.as_ref()));
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), stale_refresh: !std::env::var("SCRYBOX_DISABLE_STALE_REFRESH").map(|v| v == "true" || v == "1").unwrap_or(false), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
+        let edhrec_cache_dir = std::env::var_os("EDHREC_CACHE_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| precons_index_path.parent().map(|d| d.join("edhrec-cache")));
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), stale_refresh: !std::env::var("SCRYBOX_DISABLE_STALE_REFRESH").map(|v| v == "true" || v == "1").unwrap_or(false), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), deck_http: std::sync::Arc::new(crate::decks_combos::RealDecksProviders), edhrec_mem: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), edhrec_cache_dir, precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -584,6 +601,16 @@ pub fn app(state: AppState) -> Router {
     // never 405 here.
     let router = if state.owns("decks_reads") {
         router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
+        router
+    };
+    // Lane A iter-5: provider-read pair (Commander Spellbook combos proxy +
+    // EDHREC synergy map) under the `decks_combos` name. Off -> the catch-all
+    // proxies both untouched.
+    let router = if state.owns("decks_combos") {
+        router
+            .route("/api/decks/{id}/combos", any(decks_combos::handle_combos))
+            .route("/api/decks/{id}/synergy", any(decks_combos::handle_synergy))
     } else {
         router
     };

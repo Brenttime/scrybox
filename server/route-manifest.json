@@ -170,7 +170,9 @@
     "tests": "tests/decks_reads.rs::detail_shape_prices_and_printing_swap (display-printing current_printing_value, dlc<cur<cheap key order), detail_404_foreign_and_422_unresolved; parity.mjs dr_detail_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/combos": {
-    "status": "node"
+    "module": "scrybox-server::decks_combos (lib.rs /api/decks/{id}/combos GET under RUST_ROUTES=decks_combos; Spellbook find-my-combos proxy, route-catch 502 arms, trimCombo key-order/||/?? twins, front-face inDeck fallback)",
+    "status": "verified",
+    "tests": "crates/scrybox-server/src/decks_combos.rs unit tests (parseFloat/round/trim/sort/slug/mem-cap) + tests/decks_combos.rs::combos_ok_byte_exact_body_request_and_trim,combos_502_arms,combos_empty_rows_short_circuits_without_provider,combos_non_object_results_fold_to_empty; parity.mjs dc_combos_noauth_401/foreign_404/missing_404/empty_rows_200. Provider leg excluded per the provider-leg ruling (SPELLBOOK_URL is a Node module constant, no env override; real-leg arms stub-proven via AppState.deck_http)"
   },
   "GET /api/decks/:id/locations": {
     "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id}/locations GET under RUST_ROUTES=decks_reads; coverage CTE: available=owned-locked, missing=required-available, own-deck-locked exclusion, missing-DESC sort)",
@@ -178,7 +180,9 @@
     "tests": "tests/decks_reads.rs::locations_coverage_math_and_sort (negative-available math pinned live: owned2-locked3 -> missing 4), locations_ignores_other_users_locked_decks, locations_404_and_422; parity.mjs dr_locations_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/synergy": {
-    "status": "node"
+    "module": "scrybox-server::decks_combos (lib.rs /api/decks/{id}/synergy GET under RUST_ROUTES=decks_combos; EDHREC commander-page map, threshold-0.35 trim, partner-pair slug ladder, 24h mem+built-in-cap + disk cache with stale fallback and 404/403 negative memo)",
+    "status": "verified",
+    "tests": "crates/scrybox-server/src/decks_combos.rs unit tests (synergy_cards filter/round/sort, query_commander qs/slice rules) + tests/decks_combos.rs::synergy_no_commander_no_hint_early_return,synergy_hint_ok_slug_encoding_and_cards,synergy_404_memo_and_fallthrough,synergy_partner_pair_slug_ladder,synergy_disk_fresh_short_circuits_and_stale_falls_back,synergy_net_fail_without_disk_is_502,synergy_write_through_on_success; parity.mjs dc_synergy_noauth_401/foreign_404/no_commander_200/empty_deck_200. Provider leg excluded per the provider-leg ruling (EDHREC_URL is a Node module constant; real-leg arms stub-proven via AppState.deck_http)"
   },
   "GET /api/export": {
     "module": "scrybox-server::export (lib.rs /api/export + /api/import under RUST_ROUTES=export; byte-attachment CSV/JSON twin incl. Content-Disposition + Express body ETag/304, resolveCardPrice proxy-first twin, csvMappers once-mapped strategies, all-or-nothing validation loop, shared bulk_fetch_by_identifier + cache_normalized_cards legs, whole-request forwards)",
@@ -261,7 +265,7 @@
   "GET /api/search": {
     "module": "scrybox-server::search (+collq, name_index, sidecar walk; lib.rs GET /api/search)",
     "status": "verified",
-    "tests": "tests/search.rs (34); parity.mjs EXTRA_SEARCH x16"
+    "tests": "tests/search.rs (44, GET legs + POST suite); parity.mjs EXTRA_SEARCH x16"
   },
   "GET /api/search-history": {
     "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",
@@ -521,10 +525,16 @@
     "tests": "tests/manabox_sync.rs (csv_parser_rfc4180_quirks, parse_export_errors_and_maps, identity_mismatch_arms, plan_collection_fold, plan_lists_arms, js_number_semantics, db_js_ddl_matches_fixture, preview_auth_ladder_and_errors, preview_plan_and_report, preview_identity_and_list_rejects, apply_writes_everything, apply_expect_before_and_include_lists, runs_and_report_routes, backup_create_list_prune_and_vacuum_determinism); parity.mjs mb_preview_ok/mb_preview_empty/mb_preview_not_export/mb_preview_no_token/mb_preview_member/mb_apply_stale_409/mb_apply_empty/mb_runs_empty/mb_report_missing/mb_backups_list/mb_backups_list_member/mb_backups_list_no_token"
   },
   "POST /api/marketplace/add": {
-    "status": "node"
+    "module": "scrybox-server::marketplace (lib.rs /api/marketplace* under RUST_ROUTES=marketplace; engine marketplace.rs route_add leg)",
+    "notes": "orderFromRequest gate ladder native (source -> order_number -> row -> creds/enabled), body-parser-before-auth convention (badjson 500 / oversize 413 precede auth), authenticate GET-only API keys, no admin gate. Provider fetch leg (fetchManapoolOrder -> manapool.com) excluded from parity per the moxfield-leg ruling: Node reads MANAPOOL_API_BASE once at module load and lane A never recreates the scrybox-rusttest-node container, so both servers cannot be aimed at one stub; provider arms (fetch status/shape, parse arms incl. observedKeys, previewOrder resolution via precons::bulk_fetch_by_identifier, addOrderToCollection -> collection_writes plan_add/execute_add fold + price-history side effects) are stub-proven in tests/marketplace.rs against the injected AppState.mp_http (RealHttp hyper twin of httpGet). Row-404 arm unreachable via HTTP (auth sessions JOIN users) — unit-only, DB-race arm.",
+    "status": "verified",
+    "tests": "tests/marketplace.rs (add_ok_files_stacks_with_copies_and_prices, add_printing_mode_and_language_override, add_nothing_to_add_message, add_numeric_scryfall_id_is_the_node_typeerror, parse_and_price_folds_units, unregistered_methods_and_preview_add_proxy); parity.mjs mp_add_noauth/mp_add_badtoken/mp_add_apikey_readonly/mp_add_badjson_preauth/mp_add_badsource/mp_add_bad_ordernum/mp_add_nocreds/mp_add_disabled"
   },
   "POST /api/marketplace/preview": {
-    "status": "node"
+    "module": "scrybox-server::marketplace (lib.rs /api/marketplace* under RUST_ROUTES=marketplace; engine marketplace.rs route_preview leg)",
+    "notes": "orderFromRequest gate ladder native (source -> order_number -> row -> creds/enabled), body-parser-before-auth convention (badjson 500 / oversize 413 precede auth), authenticate GET-only API keys, no admin gate. Provider fetch leg (fetchManapoolOrder -> manapool.com) excluded from parity per the moxfield-leg ruling: Node reads MANAPOOL_API_BASE once at module load and lane A never recreates the scrybox-rusttest-node container, so both servers cannot be aimed at one stub; provider arms (fetch status/shape, parse arms incl. observedKeys, previewOrder card-resolution fold — card_cache/identities/collection joins, include_extras sealed/junk fold) are stub-proven in tests/marketplace.rs against the injected AppState.mp_http (RealHttp hyper twin of httpGet). Row-404 arm unreachable via HTTP (auth sessions JOIN users) — unit-only, DB-race arm. Route-catch 500 (resolution failure) and fetch/parse err.status?:502 shapes pinned.",
+    "status": "verified",
+    "tests": "tests/marketplace.rs (preview_body_parser_runs_before_auth, preview_gate_order_no_network, preview_provider_error_arms, preview_ok_byte_exact_with_owned_and_extras, preview_include_extras_keeps_lines_in_parsed, preview_early_answer_omits_totals_when_no_lines, unregistered_methods_and_preview_add_proxy); parity.mjs mp_preview_noauth/mp_preview_badtoken/mp_preview_apikey_readonly/mp_preview_badjson_preauth/mp_preview_empty_body/mp_preview_badsource/mp_preview_no_ordernum/mp_preview_bad_ordernum/mp_preview_nocreds/mp_preview_disabled"
   },
   "POST /api/moxfield/authors": {
     "module": "scrybox-server::moxfield (lib.rs /api/moxfield* under RUST_ROUTES=moxfield; engine moxfield.rs, client moxfield_api.rs (curl-impersonate twin), folds mfx_payload.rs)",
@@ -561,7 +571,9 @@
     "tests": "cargo tests/scan_match_route.rs (10: 401/validation/503-notBuilt(+500 precedence)/500-set/429 limiter/forward arms) + lib cvscan::tests (11 incl. node_truth_parity_on_eval_corpus, subsample removed after vips-source audit) + npz::tests (3 vs frozen :3312 capture bench/scan-eval/node-truth.json); live A/B :3312-vs-:3320 scan-match-ab.mjs (detected/gate flags equal, top-8 cardIds equal, sims/sharpness/gap <=5e-4)"
   },
   "POST /api/search": {
-    "status": "node"
+    "module": "scrybox-server::search (lib.rs any(/api/search) under the search group; bigJson 15mb twin + { ...query, ...body } merge gate, shares the GET native cache/ETag legs; rate-limit after auth+parse, no 304 replay on POST; truthy non-string name/number/set forward whole-request — Node's runSearch `(x||'').trim()` TypeError answers its own 500; falsy 0/-0 gate to '' and never stringify into a LIKE param)",
+    "status": "verified",
+    "tests": "tests/search.rs post_* x11 (native body serve byte-identical to GET twin, body-overrides-query, gated-bodies forward with body preserved, falsy/number coercions incl. truthy-non-string forward ladder + -0 falsy, content-type ladder, 413, 500-before-limiter, no-304-replay, auth-before-parse, kill-switch, other-methods); parity.mjs ps_post_name, ps_post_merge_body_wins, ps_post_merge_body_limit, ps_post_number_numeric, ps_post_number_hash_str, ps_post_set_upper, ps_post_falsy_gates, ps_post_falsy_zero_names, ps_post_page_numeric, ps_post_plain_empty, ps_post_text_ct_skipped, ps_post_malformed_json, ps_post_exotic_page, ps_post_array_name, ps_post_dup_qs_name, ps_post_no_token, ps_post_apikey_403, ps_post_no304"
   },
   "POST /api/search-history": {
     "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",

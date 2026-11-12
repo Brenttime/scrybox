@@ -112,6 +112,57 @@ for (const [i, p] of EXTRA_COLLECTION.entries()) {
 for (const [i, p] of EXTRA_SEARCH.entries()) {
   cases.push({ name: `search${i + 1}_${p.slice('/api/search'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
+// --- POST /api/search (iter-47 slice) -----------------------------------------
+// Node mounts the GET/POST pair (collection.js:233-234) and POST carries the
+// query through { ...req.query, ...req.body } (collection.js:81) after
+// authenticateToken and the app-level bigJson parse, searchLimiter in
+// between. Native arms are name/number/set/page/limit (JS-truthy gates +
+// String() coercion); q/image/exotic shapes ride a whole-request forward.
+// deepDiff compares bodies incl. key order, so the merge order and the
+// res.json ETag both assert against Node, not eyeballed. POST must NEVER
+// replay 304 (conditional revalidation is GET/HEAD) even on an ETag hit.
+const PS_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const psPost = (name, path, body, headers = PS_JSON, extra = {}) =>
+  cases.push({ name, path: path ?? '/api/search', headers, method: 'POST', body, ...extra });
+psPost('ps_post_name', undefined, JSON.stringify({ name: 'Sol Ring' }));
+psPost('ps_post_merge_body_wins', '/api/search?name=Black%20Lotus&limit=5', JSON.stringify({ name: 'Sol Ring' }));
+psPost('ps_post_merge_body_limit', '/api/search?limit=5', JSON.stringify({ name: 'Sol Ring', limit: '10' }));
+psPost('ps_post_number_numeric', undefined, JSON.stringify({ name: 'Sol Ring', number: 160 }));
+psPost('ps_post_number_hash_str', undefined, JSON.stringify({ name: 'Sol Ring', number: '#160/brc' }));
+psPost('ps_post_set_upper', undefined, JSON.stringify({ name: 'Sol Ring', set: 'BRC' }));
+psPost('ps_post_falsy_gates', undefined, JSON.stringify({ name: 'Sol Ring', number: '', set: '', page: 0, limit: 0 }));
+// 0/-0/false/null are JS-FALSY: runSearch's `(x || '')` gates them to ''
+// (probed: {"name":0} answers the no-name browse). Rust must not stringify
+// them into LIKE params.
+psPost('ps_post_falsy_zero_names', undefined, JSON.stringify({ name: 0, number: -0, set: false, lang: 0 }));
+psPost('ps_post_page_numeric', undefined, JSON.stringify({ name: 'Lightning', page: 2, limit: 10 }));
+psPost('ps_post_plain_empty', undefined, undefined);
+psPost('ps_post_text_ct_skipped', undefined, 'name=Sol Ring', { ...authHeaders, 'content-type': 'text/plain' });
+psPost('ps_post_malformed_json', undefined, '{"name":');
+psPost('ps_post_exotic_page', undefined, JSON.stringify({ name: 'Sol Ring', page: { x: 1 } }));
+psPost('ps_post_array_name', undefined, JSON.stringify({ name: ['Sol Ring'] }));
+psPost('ps_post_dup_qs_name', '/api/search?name=aa&name=Sol%20Ring', undefined);
+psPost('ps_post_no_token', undefined, JSON.stringify({ name: 'Sol Ring' }), { 'content-type': 'application/json' });
+// API key on POST: keys are GET-only, the gate answers 403 (is_get=false)
+// BEFORE the limiter consumes a bucket. shx_post_apikey_403 precedent.
+cases.push({
+  name: 'ps_post_apikey_403', path: '/api/search',
+  headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+  method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
+  setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
+  teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
+});
+// ETag hit on POST: the GET twin's ETag must NOT replay as 304 — both sides
+// answer the full 200 body (Express conditional revalidation is GET/HEAD).
+cases.push({
+  name: 'ps_post_no304', path: '/api/search',
+  headers: PS_JSON, method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
+  setup: async (base) => {
+    const r = await fetch(base + '/api/search?name=Sol%20Ring', { headers: { ...authHeaders, 'cache-control': 'no-cache' } });
+    const etag = r.headers.get('etag');
+    return { headers: { ...PS_JSON, ...(etag ? { 'if-none-match': etag } : {}) } };
+  },
+});
 for (const [i, p] of EXTRA_STATS.entries()) {
   cases.push({ name: `stats${i + 1}_${p.slice('/api/stats'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
@@ -2165,9 +2216,28 @@ async function etagParity(c) {
   drCase('dr_locations_foreign_404', '/api/decks/931105/locations');
   drCase('dr_locations_broken_422', '/api/decks/931104/locations');
   drCase('dr_locations_noauth_401', '/api/decks/931102/locations', {});
-  // (No /combos parity case: it fetches the public Spellbook API — body is
-  // upstream-flaky. The never-swallow guard is pinned by the path test
-  // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
+  // Lane-A iter-5 decks_combos (Spellbook combos + EDHREC synergy). The
+  // provider legs are EXCLUDED per the provider-leg ruling (Spellbook and
+  // EDHREC URLs are Node module constants, no env override; the harness
+  // never recreates the Node container, so a stub-aim of both servers is
+  // impossible). Every arm that answers BEFORE a provider fetch is pinned
+  // here: auth, parse-before-auth, 404s, the empty-rows and no-commander
+  // 200 shapes (931104's card id misses the card_cache JOIN -> the combos
+  // early return; 931102 has no is_commander rows -> the synergy null).
+  // The provider arms themselves are stub-proven in
+  // crates/scrybox-server/tests/decks_combos.rs via AppState.deck_http.
+  cases.push({ name: 'dc_combos_noauth_401', path: '/api/decks/931101/combos', headers: {}, method: 'GET', setup: drPrep, teardown: drTeardown });
+  // (No badjson-preauth case here: undici forbids GET bodies — the
+  // express.json-before-auth 500 arm is pinned by tests/decks_combos.rs::
+  // auth_gate_and_parse_before_auth on the Rust side and the identical
+  // Node source order was live-pinned in iter-28.)
+  cases.push({ name: 'dc_combos_foreign_404', path: '/api/decks/931105/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_combos_missing_404', path: '/api/decks/999999/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_combos_empty_rows_200', path: '/api/decks/931104/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_noauth_401', path: '/api/decks/931101/synergy', headers: {}, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_foreign_404', path: '/api/decks/931105/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_no_commander_200', path: '/api/decks/931102/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_empty_deck_200', path: '/api/decks/931104/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
 }
 
 // --- iter 31: card-list READS (Lane A port: GET /api/lists,
@@ -3243,6 +3313,77 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
     setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
     teardown: async () => { mpPurge(); } });
   cases.push({ name: 'mp_recent_disabled', path: '/api/marketplace/recent/manapool', headers: MP_HDR, method: 'GET',
+    setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
+    teardown: async () => { mpPurge(); } });
+
+  // --- iter-4 (lane A): MARKETPLACE slice 2 — POST /preview + POST /add
+  // (RUST_ROUTES=marketplace; routes/marketplaceOrders.js orderFromRequest
+  // gate ladder). The provider fetch leg (fetchManapoolOrder against
+  // manapool.com) is excluded from parity per the moxfield-leg ruling —
+  // Node reads MANAPOOL_API_BASE once at module load and lane A must not
+  // recreate the Node container, so both sides cannot be aimed at a stub.
+  // Provider arms (fetch error status/shape, parse arms, previewOrder/
+  // addOrderToCollection resolution + DB writes) are stub-proven in
+  // crates/scrybox-server/tests/marketplace.rs (injected mp_http). Parity
+  // covers every pre-fetch arm, byte-for-byte, on both servers: auth,
+  // body-parser-before-auth, API-key GET-only, and the orderFromRequest
+  // ladder source -> order_number -> creds (the row-404 arm is unreachable
+  // through auth's sessions JOIN users on either server — DB-race only).
+  const MP_ORDER_BODY = (extra) => JSON.stringify({ source: 'ManaPool', order_number: 'MP-12345', ...extra });
+  cases.push({ name: 'mp_preview_noauth', path: '/api/marketplace/preview', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_badtoken', path: '/api/marketplace/preview', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_apikey_readonly', path: '/api/marketplace/preview', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_badjson_preauth', path: '/api/marketplace/preview', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{oops' });
+  cases.push({ name: 'mp_preview_empty_body', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST', body: '{}',
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_badsource', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'TCGPlayer', order_number: 'MP-12345' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_no_ordernum', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_bad_ordernum', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'bad number!' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_nocreds', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_disabled', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
+    setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
+    teardown: async () => { mpPurge(); } });
+
+  cases.push({ name: 'mp_add_noauth', path: '/api/marketplace/add', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_badtoken', path: '/api/marketplace/add', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_apikey_readonly', path: '/api/marketplace/add', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_badjson_preauth', path: '/api/marketplace/add', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{oops' });
+  cases.push({ name: 'mp_add_badsource', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'ebay', order_number: 'MP-12345' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_bad_ordernum', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'x'.repeat(65) }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_nocreds', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'MP-12345', condition: 'NM', printing_mode: 'auto', language: 'English', copies: 1 }),
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_disabled', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
     setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
     teardown: async () => { mpPurge(); } });
 }
