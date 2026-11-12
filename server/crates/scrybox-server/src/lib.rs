@@ -53,6 +53,7 @@ pub mod lists_reads;
 pub mod lists_writes;
 pub mod health;
 pub mod manabox;
+pub mod marketplace;
 pub mod migrations;
 pub mod mfx_payload;
 pub mod moxfield;
@@ -171,6 +172,10 @@ pub struct AppState {
     pub mfx: Arc<crate::moxfield_api::MfxApi>,
     /// cardSets.js getScryfallSets memo (tree=1 folds, 6 h TTL).
     pub scryfall_sets: sets::ScryfallSetsMemo,
+    /// ManaPool order client (marketplace.rs httpGet twin). Trait-typed so
+    /// route tests inject a stub, exactly like the Node unit tests inject
+    /// `httpGet` into utils/marketplaceOrders.
+    pub mp_http: Arc<dyn marketplace::MpHttp>,
     /// authLimiter twin (middleware/auth.js): one fixed window per client IP
     /// shared by login/register/bootstrap/api-key/settings.
     pub auth_limiter: Arc<ip_limit::FixedWindowLimiter>,
@@ -240,7 +245,7 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::rules::default_cache_path(cfg.db_path.as_ref()));
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -585,6 +590,18 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/admin/users", any(admin_users::route_users))
             .route("/api/admin/users/{id}", any(admin_users::route_user))
+    } else {
+        router
+    };
+    // Lane A iter-41: MARKETPLACE slice 1 (GET/PUT /api/marketplace/accounts,
+    // GET /api/marketplace/recent/:source) under `marketplace`. POST
+    // /preview and POST /add (orderFromRequest + parseOrderPayload + the
+    // bulkAddToCollection core) are slice 2 and stay proxied; unmatched
+    // methods ride the catch-all proxy, never a local 404/405.
+    let router = if state.owns("marketplace") {
+        router
+            .route("/api/marketplace/accounts", any(marketplace::route_accounts))
+            .route("/api/marketplace/recent/{source}", any(marketplace::route_recent))
     } else {
         router
     };
