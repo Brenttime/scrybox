@@ -128,7 +128,9 @@
     "status": "node"
   },
   "GET /api/cardscan/status": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "GET /api/collection": {
     "module": "scrybox-server::collection (lib.rs GET /api/collection)",
@@ -364,22 +366,34 @@
     "tests": "tests/cards_tags_route.rs (tag_stats_filters_ranks_and_caps, tag_stats_null_label_falls_back_to_slug); parity.mjs cards_tag_stats_ok/cards_tag_stats_empty_ids/cards_tag_stats_no_token"
   },
   "POST /api/cardscan/cards": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/cardscan/choices": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/cardscan/detect": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/cardscan/frame": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/cardscan/scan": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/cardscan/telemetry": {
-    "status": "node"
+    "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
+    "status": "verified",
+    "tests": "cargo tests/cardscan_route.rs (22) + tests/cardscan_sidecar_down.rs (2) + lib cardscan::tests (5); live A/B :3312-vs-:3320 cardscan-ab.mjs x30 probes byte-equal (headers, ETags incl. gzip leg, 422/502/503 arms, conditional-GET pair)"
   },
   "POST /api/collection": {
     "module": "scrybox-server::collection_writes (lib.rs routes /api/collection POST + /api/collection/bulk-add under RUST_ROUTES=collection_adds; GET on the same path stays with the collection group \u2014 with that group off, the MethodRouter falls through to the Node proxy) ; cache misses and localized-printing misses forward untouched to Node (Node hydrates from Scryfall)",
