@@ -1,0 +1,4 @@
+# Staged image inputs — rebuilt by build-rust-image.sh every run; never
+# commit the ~55 MB of binaries.
+bin/
+lib/

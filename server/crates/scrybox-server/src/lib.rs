@@ -110,7 +110,14 @@ impl Config {
             .unwrap_or_else(|_| "http://127.0.0.1:3002".into())
             .trim_end_matches('/')
             .to_string();
-        if !node_upstream.starts_with("http://") {
+        // Lane B unit 7: an EXPLICITLY EMPTY upstream declares a Node-free
+        // deployment (the scrybox-rust image). Unported routes then answer
+        // 502 (there is nothing to proxy to), and /api/health is answered
+        // locally with Node's own handler shape instead of probing a peer
+        // that does not exist. Unset still means the classic test-lane
+        // default :3002.
+        let standalone = std::env::var("SCRYBOX_NODE_UPSTREAM").map(|v| v.trim().is_empty()).unwrap_or(false);
+        if !standalone && !node_upstream.starts_with("http://") {
             return Err("SCRYBOX_NODE_UPSTREAM must be an http:// URL".into());
         }
         let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR")
