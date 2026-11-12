@@ -31,6 +31,7 @@ pub mod backup;
 pub mod cards_meta;
 pub mod card_cache;
 pub mod card_norm;
+pub mod cardscan;
 pub mod card_art;
 pub mod cards_tags;
 pub mod catalog_read;
@@ -68,7 +69,9 @@ mod stats_sql;
 pub mod stats_subs;
 pub mod search_history;
 pub mod shared;
+pub mod spa;
 pub mod static_assets;
+pub mod tls;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]
@@ -676,6 +679,10 @@ pub fn app(state: AppState) -> Router {
     let router = if state.owns("static_assets") {
         router
             .route("/scan-assets", any(static_assets::handle_scan_assets))
+            // Explicit trailing-slash exacts: matchit's catch-all does NOT
+            // match an empty tail, and under static_spa the SPA wildcard
+            // would otherwise swallow these (live :3312-vs-:3320 diff).
+            .route("/scan-assets/", any(static_assets::handle_scan_assets))
             .route("/scan-assets/{*rest}", any(static_assets::handle_scan_assets))
             .route("/models/cornelius.onnx", any(static_assets::handle_model))
     } else {
@@ -686,7 +693,43 @@ pub fn app(state: AppState) -> Router {
     {
         router
             .route("/scryfall-portal", any(static_assets::handle_portal))
+            .route("/scryfall-portal/", any(static_assets::handle_portal))
             .route("/scryfall-portal/{*rest}", any(static_assets::handle_portal))
+    } else {
+        router
+    };
+    // Lane B unit 5c: the SPA mount itself (see spa.rs). Registered as a
+    // WILDCARD ROUTE, not the fallback: Node's catch-all sits behind every
+    // API router, so unmatched /api/* must still reach the router-level
+    // proxy below — the gate is Node's exact `req.path.startsWith('/api')`,
+    // so even '/apifoo' proxies (on Node it next()s to finalhandler). Kill-
+    // switch group `static_spa`; without a build dir the group is inert
+    // (Node serves the SPA, exactly like a dist-less Node install).
+    let router = if state.owns("static_spa") && state.cfg.static_dir.is_some() {
+        router
+            .route("/", any(spa::handle))
+            .route("/{*rest}", any(spa::handle))
+    } else {
+        router
+    };
+    // Lane B unit 6a: cardscan sidecar-proxy group (see cardscan.rs). All
+    // eleven router.js routes; unowned methods/paths fall through to the
+    // router-level proxy, so a kill-switched group is invisible. Merged as a
+    // sub-router so the compression() twin wraps ONLY this group's replies
+    // (axum .layer covers every route registered on that Router at the
+    // time — a direct .layer here would also buffer other lanes' bodies).
+    let router = if state.owns("cardscan") {
+        let cs = axum::Router::new()
+            .route("/api/cardscan/status", any(cardscan::handle_status))
+            .route("/api/cardscan/detect", any(cardscan::handle_detect))
+            .route("/api/cardscan/frame", any(cardscan::handle_frame))
+            .route("/api/cardscan/choices", any(cardscan::handle_choices))
+            .route("/api/cardscan/cards", any(cardscan::handle_cards))
+            .route("/api/cardscan/telemetry", any(cardscan::handle_telemetry))
+            .route("/api/cardscan", any(cardscan::handle_scan))
+            .route("/api/cardscan/scan", any(cardscan::handle_scan))
+            .layer(axum::middleware::from_fn(cardscan::compress));
+        router.merge(cs)
     } else {
         router
     };

@@ -106,6 +106,59 @@ async fn scan_assets_serve_hit_is_native_with_twin_headers() {
 }
 
 #[tokio::test]
+async fn scan_assets_directory_arms_redirect_and_500() {
+    // serve-static redirect:true twins (live :3312 pins): an existing
+    // directory without the trailing slash 301s to path + '/' (send's
+    // Redirecting document, CT/CL/CSP/Location order), and WITH the slash
+    // index:false makes it an ENOENT => the generic-500 arm.
+    let d = scan_tree();
+    let res = router_for(&["static_assets"], Some(d.path().to_path_buf()))
+        .oneshot(Request::get("/scan-assets").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers()[header::LOCATION], "/scan-assets/");
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "text/html; charset=UTF-8");
+    assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'");
+    let ks: Vec<String> = res.headers().keys().map(|k| k.as_str().to_string()).collect();
+    // Handler arms after the guard's twin class: CT, CL, CSP, Location.
+    assert_eq!(&ks[ks.len() - 4..], ["content-type", "content-length", "content-security-policy", "location"]);
+    let (_, body) = text(res).await;
+    assert!(body.starts_with("<!DOCTYPE html>"), "{body}");
+    assert!(body.contains("Redirecting to /scan-assets/"), "{body}");
+
+    let res = router_for(&["static_assets"], Some(d.path().to_path_buf()))
+        .oneshot(Request::get("/scan-assets/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (_, body) = text(res).await;
+    assert_eq!(body, "{\"error\":\"Internal server error\"}");
+
+    // subdirectory form: /sub (no slash) 301s too; a dot-directory still
+    // trips dotfiles:deny => 500, never a 301.
+    std::fs::create_dir_all(d.path().join("client-scan").join("sub")).unwrap();
+    std::fs::create_dir_all(d.path().join("client-scan").join(".hid")).unwrap();
+    let res = router_for(&["static_assets"], Some(d.path().to_path_buf()))
+        .oneshot(Request::get("/scan-assets/sub").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers()[header::LOCATION], "/scan-assets/sub/");
+    let res = router_for(&["static_assets"], Some(d.path().to_path_buf()))
+        .oneshot(Request::get("/scan-assets/.hid").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // POST on the bare mount stays the send 405 methodError, not a 301.
+    let res = router_for(&["static_assets"], Some(d.path().to_path_buf()))
+        .oneshot(Request::post("/scan-assets").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn scan_assets_miss_is_500_arm_dotfile_denied_and_post_405() {
     let d = scan_tree();
     let st = Some(d.path().to_path_buf());
@@ -210,6 +263,10 @@ async fn spawn_sidecar() -> SocketAddr {
     let html = "<a href=\"/sets.html\"><script src=\"/app.js\"></script> <img src=\"/card.png\"></a>";
     let router = Router::new()
         .route(
+            "/",
+            axum::routing::get(|| async move { ([(header::CONTENT_TYPE, "text/html")], "root-index").into_response() }),
+        )
+        .route(
             "/index.html",
             axum::routing::get(move || async move {
                 ([(header::CONTENT_TYPE, "text/html")], html).into_response()
@@ -277,6 +334,20 @@ async fn portal_suite_all_arms_against_mock_sidecar() {
     let (res, body) = text(res).await;
     assert_eq!(body, "Moved Permanently. Redirecting to /scryfall-portal/");
     assert!(res.headers().get(header::ETAG).is_none());
+
+    // Trailing-slash-only tail: express's app.get('/scryfall-portal/*')
+    // matches an EMPTY star tail; matchit's catch-all does not, so under
+    // static_spa the SPA wildcard used to swallow this exact path (found by
+    // the live :3312-vs-:3320 diff — parity pt_index). Pinned by an explicit
+    // "/scryfall-portal/" exact registration; must reach the sidecar's '/'.
+    let res = r
+        .clone()
+        .oneshot(Request::get("/scryfall-portal/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let (_, body) = text(res).await;
+    assert_eq!(body, "root-index");
 
     // Buffered text (html): CT copied + charset appended, rewrite, weak etag,
     // CSP/CSP-RO/COEP trio stripped for proxied content only.
