@@ -3245,6 +3245,77 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
   cases.push({ name: 'mp_recent_disabled', path: '/api/marketplace/recent/manapool', headers: MP_HDR, method: 'GET',
     setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
     teardown: async () => { mpPurge(); } });
+
+  // --- iter-4 (lane A): MARKETPLACE slice 2 — POST /preview + POST /add
+  // (RUST_ROUTES=marketplace; routes/marketplaceOrders.js orderFromRequest
+  // gate ladder). The provider fetch leg (fetchManapoolOrder against
+  // manapool.com) is excluded from parity per the moxfield-leg ruling —
+  // Node reads MANAPOOL_API_BASE once at module load and lane A must not
+  // recreate the Node container, so both sides cannot be aimed at a stub.
+  // Provider arms (fetch error status/shape, parse arms, previewOrder/
+  // addOrderToCollection resolution + DB writes) are stub-proven in
+  // crates/scrybox-server/tests/marketplace.rs (injected mp_http). Parity
+  // covers every pre-fetch arm, byte-for-byte, on both servers: auth,
+  // body-parser-before-auth, API-key GET-only, and the orderFromRequest
+  // ladder source -> order_number -> creds (the row-404 arm is unreachable
+  // through auth's sessions JOIN users on either server — DB-race only).
+  const MP_ORDER_BODY = (extra) => JSON.stringify({ source: 'ManaPool', order_number: 'MP-12345', ...extra });
+  cases.push({ name: 'mp_preview_noauth', path: '/api/marketplace/preview', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_badtoken', path: '/api/marketplace/preview', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_apikey_readonly', path: '/api/marketplace/preview', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_preview_badjson_preauth', path: '/api/marketplace/preview', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{oops' });
+  cases.push({ name: 'mp_preview_empty_body', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST', body: '{}',
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_badsource', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'TCGPlayer', order_number: 'MP-12345' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_no_ordernum', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_bad_ordernum', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'bad number!' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_nocreds', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_preview_disabled', path: '/api/marketplace/preview', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
+    setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
+    teardown: async () => { mpPurge(); } });
+
+  cases.push({ name: 'mp_add_noauth', path: '/api/marketplace/add', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_badtoken', path: '/api/marketplace/add', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_apikey_readonly', path: '/api/marketplace/add', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'POST',
+    body: MP_ORDER_BODY() });
+  cases.push({ name: 'mp_add_badjson_preauth', path: '/api/marketplace/add', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: '{oops' });
+  cases.push({ name: 'mp_add_badsource', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'ebay', order_number: 'MP-12345' }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_bad_ordernum', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'x'.repeat(65) }),
+    setup: async () => { mpSeed(MP_UID, 'rusttest_mp_1'); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_nocreds', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: JSON.stringify({ source: 'manapool', order_number: 'MP-12345', condition: 'NM', printing_mode: 'auto', language: 'English', copies: 1 }),
+    setup: async () => { mpSeed(MP_NONE_UID, 'rusttest_mp_none', { configured: false }); },
+    teardown: async () => { mpPurge(); } });
+  cases.push({ name: 'mp_add_disabled', path: '/api/marketplace/add', headers: MP_JSONH, method: 'POST',
+    body: MP_ORDER_BODY(),
+    setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
+    teardown: async () => { mpPurge(); } });
 }
 
 
