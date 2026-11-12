@@ -619,6 +619,8 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/marketplace/accounts", any(marketplace::route_accounts))
             .route("/api/marketplace/recent/{source}", any(marketplace::route_recent))
+            .route("/api/marketplace/preview", any(marketplace::route_preview))
+            .route("/api/marketplace/add", any(marketplace::route_add))
     } else {
         router
     };
