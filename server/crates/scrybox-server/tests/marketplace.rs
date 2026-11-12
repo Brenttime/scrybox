@@ -509,11 +509,14 @@ async fn recent_guard_arms() {
 #[tokio::test]
 async fn unregistered_methods_and_preview_add_proxy() {
     let f = build(StubHttp::new(vec![]));
-    // POST /preview and /add are slice 2: they ride the catch-all proxy
-    // (dead upstream → 502), never a local 404/405.
+    // preview/add are native for POST (slice 2); every OTHER method on
+    // them still rides the catch-all proxy (dead upstream → 502), never a
+    // local 404/405. Unregistered shapes on accounts/recent proxy too.
     for (m, p) in [
-        ("POST", "/api/marketplace/preview"),
-        ("POST", "/api/marketplace/add"),
+        ("GET", "/api/marketplace/preview"),
+        ("PUT", "/api/marketplace/preview"),
+        ("GET", "/api/marketplace/add"),
+        ("DELETE", "/api/marketplace/add"),
         ("POST", "/api/marketplace/accounts"),
         ("DELETE", "/api/marketplace/accounts"),
         ("POST", "/api/marketplace/recent/manapool"),
@@ -522,6 +525,12 @@ async fn unregistered_methods_and_preview_add_proxy() {
         let (st2, b2) = rq(&f, m, p, &[], None).await;
         assert_eq!(st, 502, "{m} {p} must proxy, never 404/405; got {st} / {st2} body2={b2}");
     }
+    // A POST without a token hits the NATIVE auth gate (401), not the proxy.
+    let (st, _b) =
+        rq(&f, "POST", "/api/marketplace/preview", &json_ct(), Some("{}")).await;
+    assert_eq!(st, 401);
+    let (st, _b) = rq(&f, "POST", "/api/marketplace/add", &json_ct(), Some("{}")).await;
+    assert_eq!(st, 401);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,4 +585,488 @@ async fn human_number_resolves_uuid_through_list() {
     let urls = stub.urls();
     assert_eq!(urls.len(), 2);
     assert!(urls[1].ends_with(&format!("/buyer/orders/{UUID_A}")));
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — POST /api/marketplace/preview and /api/marketplace/add
+// ---------------------------------------------------------------------------
+
+#[path = "./mock_scryfall.rs"]
+mod mock_scryfall;
+
+use mock_scryfall::raw_card;
+
+async fn build_scry(stub: Arc<StubHttp>) -> (Fix, Arc<mock_scryfall::MockState>) {
+    stub_base_once();
+    let dir = std::env::temp_dir().join(format!(
+        "scrybox-mp2-it-{}",
+        scrybox_server::auth_support::uuid_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("bindarr.db"), []).unwrap();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: "http://127.0.0.1:1".to_string(),
+        static_dir: None,
+        rust_routes: ["marketplace".to_string()].into_iter().collect(),
+        db_path: Some(dir.join("bindarr.db")),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.mp_http = stub;
+    let pool = st.db.clone().unwrap();
+    pool.get().unwrap().execute_batch(auth_common::schema_fixture()).unwrap();
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO users (username, password_hash, role, share_token, manapool_email, manapool_token, manapool_enabled, manapool_saved_at, api_key)
+             VALUES ('mpmember','h','member','sh-mp','player@example.com','abcdefghij',1,'2026-01-02T03:04:05.000Z','bnd_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'),
+                    ('mpother','h','member','sh-mp2',NULL,NULL,0,NULL,NULL);
+             INSERT INTO sessions (token, user_id, expires_at)
+             VALUES ('tok-mp-member-1',1,'2030-01-01 00:00:00'),
+                    ('tok-mp-other-1',2,'2030-01-01 00:00:00');",
+        )
+        .unwrap();
+    let (addr, scry) = mock_scryfall::spawn_mock().await;
+    st.scry = Arc::new(mock_scryfall::scry_for(addr, 0.0));
+    (Fix { router: scrybox_server::app(st), pool }, scry)
+}
+
+/// A member's collection stack (card_cache row first — the FK).
+fn seed_owned(pool: &scrybox_server::db::DbPool, card_id: &str, user: i64, qty: i64) {
+    let conn = pool.get().unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO card_cache (id, name) VALUES (?1, 'seeded')",
+        rusqlite::params![card_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO collection (card_id, quantity, user_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![card_id, qty, user],
+    )
+    .unwrap();
+}
+
+/// ManaPool detail body: header + 2 card lines + 1 sealed + 1 junk.
+fn card_detail() -> Value {
+    json!({ "order": {
+        "number": "MP-9",
+        "placedAt": "2026-01-05T10:00:00.000Z",
+        "currency": "USD",
+        "total_cents": 950,
+        "items": [
+            { "product": { "single": { "name": "Card A", "set": "10E", "number": "1", "scryfallId": "aaa" } },
+              "quantity": 2, "unit_price_cents": 150 },
+            { "product": { "single": { "name": "Card B", "set": "M19", "number": "9" } },
+              "quantity": 1, "unit_price_cents": 2500 },
+            { "product": { "sealed": { "name": "Draft Booster Box", "product_type": "bundle" } }, "quantity": 1 },
+            { "quantity": 3 }
+        ]
+    } })
+}
+
+fn card_batches() -> Vec<Value> {
+    vec![json!({
+        "data": [raw_card("aaa", "Card A", "10e", "1", Some(1.5)),
+                 raw_card("ccc", "Card B", "m19", "9", Some(25.0))],
+        "not_found": []
+    })]
+}
+
+fn mp_post_body(number: &str, extra: Option<&str>) -> String {
+    let e = extra.map(|s| format!(",{s}")).unwrap_or_default();
+    format!("{{\"source\":\"manapool\",\"order_number\":\"{number}\"{e}}}")
+}
+
+async fn post(f: &Fix, path: &str, tok: &'static str, body: &str) -> (axum::http::StatusCode, String) {
+    let h = auth_common::merge(&bearer(tok), &json_ct());
+    rq(f, "POST", path, &h, Some(body)).await
+}
+
+#[tokio::test]
+async fn preview_body_parser_runs_before_auth() {
+    // express.json is mounted before authenticate: malformed JSON with NO
+    // token answers the generic 500 (never 401), and an oversize body 413s
+    // without ever reaching the credential lookup.
+    let f = build(StubHttp::new(vec![]));
+    let (st, body) = rq(&f, "POST", "/api/marketplace/preview", &json_ct(), Some("{")).await;
+    assert_eq!(st, 500);
+    assert!(body.contains("Internal server error"), "{body}");
+    let h = auth_common::merge(&bearer(MEMBER_TOK), &json_ct());
+    let (st, _b) = rq(
+        &f,
+        "POST",
+        "/api/marketplace/add",
+        &h,
+        Some(&format!("{{\"x\":\"{}\"}}", "y".repeat(2 * 1024 * 1024))),
+    )
+    .await;
+    assert_eq!(st, 413);
+}
+
+#[tokio::test]
+async fn preview_gate_order_no_network() {
+    let stub = StubHttp::new(vec![]);
+    let f = build(stub.clone());
+    // no token -> 401 (auth before the source gate).
+    let (st, _) = rq(&f, "POST", "/api/marketplace/preview", &json_ct(), Some("{}")).await;
+    assert_eq!(st, 401);
+    // API keys are GET-only on this router.
+    let (st, _) =
+        post(&f, "/api/marketplace/preview", KEY, &mp_post_body("MP-1", None)).await;
+    assert_eq!(st, 403);
+    // source gate first, then shape, then credentials.
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, "{\"source\":\"tcgplayer\",\"order_number\":\"MP-1\"}").await;
+    assert_eq!(st, 400);
+    assert_eq!(b, json!({ "error": "source must be one of: manapool" }).to_string());
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, "{\"source\":\"manapool\"}").await;
+    assert_eq!(st, 400);
+    assert_eq!(b, json!({ "error": "order_number is required" }).to_string());
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, "{\"source\":\"manapool\",\"order_number\":\"#12\"}").await;
+    assert_eq!(st, 400);
+    assert_eq!(b, json!({ "error": "order_number is required" }).to_string());
+    // Disabled/absent credentials -> the not-configured arm.
+    let (st, b) = post(&f, "/api/marketplace/preview", OTHER_TOK, &mp_post_body("MP-1", None)).await;
+    assert_eq!(st, 400);
+    assert_eq!(b, json!({ "error": "ManaPool is not configured or is turned off" }).to_string());
+    assert!(stub.urls().is_empty(), "no provider call before the gates pass");
+}
+
+#[tokio::test]
+async fn preview_provider_error_arms() {
+    // 401 -> the saved-credentials message, status echoed.
+    let stub = StubHttp::new(vec![(401, json!({}))]);
+    let f = build(stub.clone());
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 401);
+    assert_eq!(b, json!({ "error": marketplace::MP_UNAUTH_MESSAGE }).to_string());
+    // 404 (human number: list leg first, then the id-less detail).
+    let stub = StubHttp::new(vec![
+        (200, list_body(vec![row("MP-99", "2026-01-01T00:00:00Z", None)])),
+        (404, json!({ "message": "gone" })),
+    ]);
+    let f = build(stub.clone());
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body("MP-77", None)).await;
+    assert_eq!(st, 404);
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ManaPool has no order MP-77 for this account."),
+        "{b}"
+    );
+    // 422 from parseOrderPayload carries observedKeys.
+    let stub = StubHttp::new(vec![(200, json!({ "foo": 1, "bar": "x" }))]);
+    let f = build(stub);
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 422);
+    assert_eq!(
+        b,
+        json!({ "error": "The order response did not include any usable line items.",
+                "observedKeys": ["foo", "bar"] })
+            .to_string()
+    );
+}
+
+#[tokio::test]
+async fn preview_ok_byte_exact_with_owned_and_extras() {
+    let stub = StubHttp::new(vec![(200, card_detail())]);
+    let (f, scry) = build_scry(stub.clone()).await;
+    *scry.collection_batches.lock().unwrap() = card_batches();
+    seed_owned(&f.pool, "mtg-aaa", 1, 3);
+    seed_owned(&f.pool, "mtg-ccc", 2, 9); // other user — must not leak
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        b,
+        json!({
+            "number": "MP-9",
+            "placedAt": "2026-01-05T10:00:00.000Z",
+            "status": null,
+            "currency": "USD",
+            "total_cents": 950,
+            "lines": [
+                { "name": "Card A", "set_code": "10e", "number": "1", "scryfall_id": "aaa",
+                  "tcgplayer_product_id": null, "quantity": 2, "price_cents": 150,
+                  "is_foil": false, "condition": "Near Mint", "year": null,
+                  "sealed": false, "junk": false },
+                { "name": "Card B", "set_code": "m19", "number": "9", "scryfall_id": null,
+                  "tcgplayer_product_id": null, "quantity": 1, "price_cents": 2500,
+                  "is_foil": false, "condition": "Near Mint", "year": null,
+                  "sealed": false, "junk": false }
+            ],
+            "lineCount": 2,
+            "cards": [
+                { "card_id": "mtg-aaa", "name": "Card A",
+                  "image_url": "https://cards.example/aaa.png", "set_code": "10e",
+                  "number": "1", "quantity": 2, "is_foil": false, "condition": "Near Mint",
+                  "price_cents": 150, "matched": true, "owned": 3 },
+                { "card_id": "mtg-ccc", "name": "Card B",
+                  "image_url": "https://cards.example/ccc.png", "set_code": "m19",
+                  "number": "9", "quantity": 1, "is_foil": false, "condition": "Near Mint",
+                  "price_cents": 2500, "matched": true, "owned": 0 }
+            ],
+            "totalListed": 4,
+            "totalCopies": 3,
+            "resolvedCount": 2,
+            "unresolved": 0,
+            "extras": 2,
+            "sealedCount": 2,
+            "extrasIncluded": false,
+            "price_cents": 2800
+        })
+        .to_string()
+    );
+    // One provider detail call (UUID skips the list leg), one resolver batch.
+    assert_eq!(stub.urls().len(), 1);
+    assert_eq!(scry.hits_for("POST /cards/collection").len(), 1);
+    // Non-UUID scryfall ids drop to the set/number identifier arm; the
+    // _line back-pointer never leaves Rust.
+    let body = &scry.hits_for("POST /cards/collection")[0].1;
+    assert!(body.contains("\"set\":\"10e\"") && !body.contains("_line"), "{body}");
+    assert!(!body.contains("aaa") && !body.contains("ccc"), "{body}");
+}
+
+#[tokio::test]
+async fn preview_include_extras_keeps_lines_in_parsed() {
+    let stub = StubHttp::new(vec![(200, card_detail())]);
+    let (f, scry) = build_scry(stub).await;
+    *scry.collection_batches.lock().unwrap() = card_batches();
+    let (st, b) = post(
+        &f,
+        "/api/marketplace/preview",
+        MEMBER_TOK,
+        &mp_post_body(UUID_A, Some("\"include_extras\":true")),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["lineCount"], 4);
+    assert_eq!(v["extrasIncluded"], true);
+    assert_eq!(v["extras"], 2);
+    assert_eq!(v["totalListed"], 4);
+    // Sealed/junk never reach the resolver or the cards fold.
+    assert_eq!(v["resolvedCount"], 2);
+    assert_eq!(v["cards"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn preview_early_answer_omits_totals_when_no_lines() {
+    // A sealed-only order: orderLines yields nothing, and Node's early
+    // return deliberately omits totalCopies / extrasIncluded / price_cents.
+    let order = json!({ "order": { "number": "MP-1", "items": [
+        { "product": { "sealed": { "name": "Draft Booster Box", "product_type": "bundle" } }, "quantity": 1 }
+    ] } });
+    let stub = StubHttp::new(vec![(200, order)]);
+    let (f, scry) = build_scry(stub).await;
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        b,
+        json!({ "number": "MP-1", "placedAt": null, "status": null, "currency": null,
+                "total_cents": null, "lines": [], "lineCount": 0,
+                "cards": [], "totalListed": 0, "resolvedCount": 0, "unresolved": 0,
+                "extras": 0, "sealedCount": 0 })
+            .to_string()
+    );
+    assert_eq!(scry.hits_for("POST /cards/collection").len(), 0);
+}
+
+#[tokio::test]
+async fn add_ok_files_stacks_with_copies_and_prices() {
+    let stub = StubHttp::new(vec![(200, card_detail())]);
+    let (f, scry) = build_scry(stub).await;
+    *scry.collection_batches.lock().unwrap() = card_batches();
+    let (st, b) = post(
+        &f,
+        "/api/marketplace/add",
+        MEMBER_TOK,
+        &mp_post_body(UUID_A, Some("\"copies\":2")),
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        b,
+        json!({
+            "order": { "number": "MP-9", "lineCount": 2 },
+            "added": 6,
+            "resolved": 2,
+            "totalListed": 4,
+            "unresolved": 0,
+            "failed": [],
+            "message": "Added 6 cards from order MP-9."
+        })
+        .to_string()
+    );
+    let conn = f.pool.get().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT card_id, quantity, condition, printing, purchase_price, language
+               FROM collection ORDER BY id",
+        )
+        .unwrap();
+    let rows: Vec<(String, i64, String, String, f64, String)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    // copies=2 doubles each line's quantity; per-line mapCondition grade
+    // always beats the body-level condition (mapCondition never returns a
+    // non-whitelist value); stackable collapses each card into one row;
+    // prices ride from unit_price_cents / 100 through toFixed(2).
+    assert_eq!(
+        rows,
+        vec![
+            ("mtg-aaa".into(), 4, "Near Mint".into(), "Normal".into(), 1.5, "English".into()),
+            ("mtg-ccc".into(), 2, "Near Mint".into(), "Normal".into(), 25.0, "English".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn add_printing_mode_and_language_override() {
+    let stub = StubHttp::new(vec![(200, card_detail())]);
+    let (f, scry) = build_scry(stub).await;
+    *scry.collection_batches.lock().unwrap() = card_batches();
+    // Localized printings for the German pass (plan_add's printingInLanguage
+    // leg). Node files these under the LOCALIZED card_id while qtyById stays
+    // keyed by the requested id — the Map misses and each row counts a
+    // single copy. Faithful quirk, pinned here.
+    f.pool.get().unwrap().execute_batch(
+        "INSERT INTO card_cache (id, name, set_id, number, language) VALUES
+            ('aaa-de','Karte A','10e','1','German'),
+            ('ccc-de','Karte B','m19','9','German');",
+    )
+    .unwrap();
+    let (st, b) = post(
+        &f,
+        "/api/marketplace/add",
+        MEMBER_TOK,
+        &mp_post_body(UUID_A, Some("\"printing_mode\":\"foil\",\"language\":\"German\"")),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["added"], 2, "localized filing counts 1 copy per row (Node qtyById miss): {b}");
+    assert_eq!(v["message"], "Added 2 cards from order MP-9.");
+    let conn = f.pool.get().unwrap();
+    let rows: Vec<(String, i64, String, String)> = conn
+        .prepare("SELECT card_id, quantity, printing, language FROM collection ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("aaa-de".into(), 2, "Holofoil".into(), "German".into()),
+            ("ccc-de".into(), 1, "Holofoil".into(), "German".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn add_nothing_to_add_message() {
+    let order = json!({ "order": { "number": "MP-1", "items": [
+        { "product": { "sealed": { "name": "Draft Booster Box", "product_type": "bundle" } }, "quantity": 1 },
+        { "quantity": 2 }
+    ] } });
+    let stub = StubHttp::new(vec![(200, order)]);
+    let (f, scry) = build_scry(stub).await;
+    let (st, b) = post(&f, "/api/marketplace/add", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        b,
+        json!({
+            "order": { "number": "MP-1", "lineCount": 0 },
+            "added": 0,
+            "resolved": 0,
+            "totalListed": 0,
+            "unresolved": 0,
+            "failed": [],
+            "message": "Nothing to add \u{2014} no cards in the order resolved to catalogue cards."
+        })
+        .to_string()
+    );
+    assert_eq!(scry.hits_for("POST /cards/collection").len(), 0);
+    let n: i64 =
+        f.pool.get().unwrap().query_row("SELECT COUNT(*) FROM collection", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn add_numeric_scryfall_id_is_the_node_typeerror() {
+    // addOrderToCollection's key builder calls .toLowerCase() straight on a
+    // truthy scryfall_id — a NUMBER id throws in V8; Node's route catch
+    // answers 500 with the raw TypeError message. previewOrder wraps
+    // String() first and keeps working.
+    let order = json!({ "order": { "number": "MP-1", "currency": "USD", "items": [
+        { "product": { "single": { "name": "Card A", "set": "10E", "number": "1", "scryfallId": 123 } },
+          "quantity": 1, "unit_price_cents": 150 }
+    ] } });
+    let stub = StubHttp::new(vec![(200, order.clone()), (200, order)]);
+    let (f, scry) = build_scry(stub).await;
+    *scry.collection_batches.lock().unwrap() =
+        vec![json!({ "data": [raw_card("123", "Card A", "10e", "1", Some(1.5))], "not_found": [] })];
+    let (st, b) = post(&f, "/api/marketplace/add", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 500);
+    assert_eq!(
+        b,
+        json!({ "error": "l.scryfall_id.toLowerCase is not a function" }).to_string()
+    );
+    // The throw happens BEFORE the resolver is touched.
+    assert_eq!(scry.hits_for("POST /cards/collection").len(), 0);
+    // Preview rides String(scryfall_id) and resolves fine.
+    let (st, b) = post(&f, "/api/marketplace/preview", MEMBER_TOK, &mp_post_body(UUID_A, None)).await;
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["cards"][0]["card_id"], "mtg-123");
+    assert_eq!(v["resolvedCount"], 1);
+}
+
+#[tokio::test]
+async fn parse_and_price_folds_units() {
+    // toFixed(2) rounds half away from zero on the exact double (0.125 ->
+    // "0.13"); {:.2} would give 0.12 and the stored REAL would diverge.
+    assert_eq!(marketplace::js_tofixed2_number(12.5 / 100.0), 0.13);
+    assert_eq!(marketplace::js_tofixed2_number(150.0 / 100.0), 1.5);
+    assert_eq!(marketplace::js_tofixed2_number(2500.0 / 100.0), 25.0);
+    assert!(marketplace::js_tofixed2_number(f64::NAN).is_nan());
+
+    // parseOrderPayload: direct body, wantNumber fallback, payment fallback.
+    let body = json!({
+        "items": [ { "product": { "single": { "name": "X" } }, "quantity": 1 } ],
+        "payment": { "total_cents": 4200 }
+    });
+    let p = marketplace::parse_order_payload(&body, "  MP-3 ", false).unwrap();
+    assert_eq!(p.number, json!("MP-3"));
+    assert_eq!(p.total_cents, json!(4200));
+    assert_eq!(p.placed_at, Value::Null);
+    assert_eq!(p.currency, Value::Null);
+    assert_eq!(p.lines.lines.len(), 1);
+    // list form picks by orderNumberMatches, else head when want is blank.
+    let list = json!({ "orders": [
+        { "orderNumber": "ORDER-4", "items": [ { "product": { "single": { "name": "Y" } } } ] },
+        { "orderNumber": "5", "items": [ { "product": { "single": { "name": "Z" } } } ] }
+    ] });
+    let p = marketplace::parse_order_payload(&list, "#4", false).unwrap();
+    assert_eq!(p.number, json!("ORDER-4"));
+    let p = marketplace::parse_order_payload(&list, "", false).unwrap();
+    assert_eq!(p.number, json!("ORDER-4"));
+    // no order found -> 422 + observedKeys.
+    let e = marketplace::parse_order_payload(&json!({ "orders": [] }), "MP-1", false)
+        .unwrap_err();
+    assert_eq!(e.status, Some(422));
+    assert_eq!(e.observed_keys.unwrap(), vec![Value::String("orders".into())]);
 }

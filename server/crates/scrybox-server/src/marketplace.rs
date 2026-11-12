@@ -5,9 +5,12 @@
 //!   PUT  /api/marketplace/accounts        -> save/clear one provider's credentials
 //!   GET  /api/marketplace/recent/:source  -> picker list (ManaPool)
 //!
-//! POST /preview and POST /add are slice 2 of this group (orderFromRequest +
-//! parseOrderPayload + the shared bulkAddToCollection core). They are NOT
-//! registered here — the catch-all proxy answers them exactly like Node.
+//! POST /preview and POST /add (slice 2, iter-43): orderFromRequest (source
+//! → shape → row → creds gate → provider fetch → parseOrderPayload) then
+//! previewOrder / addOrderToCollection on shared legs (precons bulk
+//! resolver, card_cache, collection_writes plan_add/execute_add). Scryfall
+//! leg, cacheCards DB failure and plan_add `Forward` replay the WHOLE POST
+//! to Node — the proxied answers are exact, nothing local was written.
 //!
 //! Middleware order mirrored from server.js (:475 mount): express.json above
 //! the router (malformed-JSON PUT answers the generic 500 / oversize the 413
@@ -39,13 +42,15 @@
 //!   math, matching V8. `stampOf` ordering uses the shared root icu collator
 //!   (Node localeCompare); Array#sort is stable on both sides.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use hyper::header::{ACCEPT, USER_AGENT};
@@ -55,13 +60,17 @@ use hyper_util::client::legacy::Client;
 use rusqlite::types::Value as SqlValue;
 use serde_json::{json, Map, Value};
 
+use crate::card_cache::cache_normalized_cards;
 use crate::collection_writes::{
-    internal_error, js_falsy, js_to_string, json_error, json_response, parse_body, read_parts,
-    too_large, BodyOutcome,
+    execute_add, internal_error, js_falsy, js_to_string, json_error, json_response, parse_body,
+    plan_add, read_parts, too_large, AddPlan, BodyOutcome,
 };
+use crate::db::DbPool;
 use crate::decks_reads::{js_number, js_trim, root_collator, rows_map};
+use crate::precons::bulk_fetch_by_identifier;
 use crate::search::js_parse_int;
 use crate::settings::authenticate;
+use crate::stats;
 use crate::AppState;
 
 const USER_AGENT_NAME: &str = "Scrybox";
@@ -675,6 +684,7 @@ fn map_condition_fb(raw: Option<&Value>, fallback: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone, Debug)]
 pub struct OrderLine {
     pub name: String,
     pub set_code: Value,
@@ -690,10 +700,15 @@ pub struct OrderLine {
     pub junk: bool,
 }
 
+#[derive(Debug)]
 pub struct OrderLines {
     pub lines: Vec<OrderLine>,
     pub card_copies: f64,
     pub card_lines: usize,
+    /// `out.__extras` — every sealed and every junk line, counted whether the
+    /// line was kept (includeExtras) or dropped. The preview/add totals read
+    /// it as `Number(lines.__extras || 0)`.
+    pub extras: usize,
 }
 
 impl OrderLine {
@@ -739,12 +754,16 @@ pub fn order_lines(raw: &Value, include_extras: bool) -> OrderLines {
         lines = manapool_nested_items(&src);
     }
     let mut out: Vec<OrderLine> = Vec::new();
+    let mut extras: usize = 0;
     for item in lines.iter() {
         let (prod, _ctx) = each_product_lines(item);
         let sealed_line =
             is_sealed_line(&prod, item) || is_manapool_sealed(item.get("product"));
-        if sealed_line && !include_extras {
-            continue;
+        if sealed_line {
+            extras += 1;
+            if !include_extras {
+                continue;
+            }
         }
         let name = js_trim(
             &pick(Some(&prod), &["name", "cardName", "title"])
@@ -800,6 +819,7 @@ pub fn order_lines(raw: &Value, include_extras: bool) -> OrderLines {
             && !(tcg_raw.is_some() && tcg_digits)
         {
             junk_line = true;
+            extras += 1;
             if !include_extras {
                 continue;
             }
@@ -863,7 +883,7 @@ pub fn order_lines(raw: &Value, include_extras: bool) -> OrderLines {
         }
     });
     let card_lines = out.iter().filter(|l| !l.sealed && !l.junk).count();
-    OrderLines { lines: out, card_copies, card_lines }
+    OrderLines { lines: out, card_copies, card_lines, extras }
 }
 
 fn stamp_of(row: &Value) -> String {
@@ -1350,4 +1370,914 @@ async fn handle_recent(State(st): State<AppState>, source: String, req: Request)
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — POST /api/marketplace/preview and POST /api/marketplace/add
+// (routes/marketplaceOrders.js orderFromRequest/preview/add + the
+// utils/marketplaceOrders.js parseOrderPayload / previewOrder /
+// addOrderToCollection twins).
+//
+// Middleware order mirrors slice 1: express.json answers badjson 500 /
+// oversize 413 BEFORE auth; authenticate (API keys GET-only → 403 here)
+// then the handler arms. Node's global invalidateOnWrite bumps the stats
+// generation for every authenticated non-GET after auth, so the twin calls
+// stats::on_proxied_write once auth passed — before the arm checks, exactly
+// like the middleware, and regardless of how the handler answers.
+//
+// Provider legs: the Scryfall bulk resolver, cacheCards and plan_add
+// `Forward` all replay the WHOLE untouched POST to Node while nothing local
+// has been written (precons/secret-lair policy) — Node owns the axios
+// message shapes and the mid-add hydration path.
+// ---------------------------------------------------------------------------
+
+const MP_SOURCES: [&str; 1] = ["manapool"];
+/// utils VALID_CONDITIONS — the add path's OWN grade whitelist (the per-line
+/// grade must pass it too, else the order-level default wins).
+const MP_VALID_CONDITIONS: [&str; 5] = [
+    "Near Mint",
+    "Lightly Played",
+    "Moderately Played",
+    "Heavily Played",
+    "Damaged",
+];
+const MP_NO_USABLE_LINES_MSG: &str =
+    "The order response did not include any usable line items.";
+const MP_NOT_CONNECTED_MSG: &str = "ManaPool is not configured or is turned off";
+
+/// parseOrderPayload output (key order = the Node object literal).
+#[derive(Debug)]
+pub struct ParsedOrder {
+    pub number: Value,
+    pub placed_at: Value,
+    pub status: Value,
+    pub currency: Value,
+    pub total_cents: Value,
+    pub lines: OrderLines,
+}
+
+impl ParsedOrder {
+    /// The `{ ...out.parsed }` half of the preview response (and the
+    /// `order:{number,lineCount}` pick for add).
+    fn to_json(&self) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("number".into(), self.number.clone());
+        m.insert("placedAt".into(), self.placed_at.clone());
+        m.insert("status".into(), self.status.clone());
+        m.insert("currency".into(), self.currency.clone());
+        m.insert("total_cents".into(), self.total_cents.clone());
+        m.insert(
+            "lines".into(),
+            Value::Array(self.lines.lines.iter().map(|l| l.to_json()).collect()),
+        );
+        m.insert("lineCount".into(), json!(self.lines.lines.len() as i64));
+        m
+    }
+}
+
+/// parseOrderPayload twin. Error = the 422 'no usable line items' throw
+/// (status + observedKeys ride on MpError exactly like the unit tests read
+/// err.status / err.observedKeys).
+pub fn parse_order_payload(
+    body: &Value,
+    want_number: &str,
+    include_extras: bool,
+) -> Result<ParsedOrder, MpError> {
+    let list = order_array(body);
+    // direct: a plain object carrying a NON-EMPTY line array under any
+    // LINE_KEYS name (no every-object gate here — orderLines applies that).
+    let direct = body.is_object()
+        && LINE_KEYS.iter().any(|k| matches!(body.get(k), Some(Value::Array(a)) if !a.is_empty()));
+    let mut order: Option<Value> = None;
+    if direct {
+        order = Some(body.clone());
+    } else if body.is_object() {
+        // body.order && typeof body.order === 'object' — arrays are objects.
+        if let Some(o) = body.get("order") {
+            if !o.is_null() && (o.is_object() || o.is_array()) {
+                order = Some(o.clone());
+            }
+        }
+    }
+    if order.is_none() && !list.is_empty() {
+        let num = js_trim(want_number);
+        order = list
+            .iter()
+            .find(|o| order_number_matches(o, num))
+            .cloned()
+            .or_else(|| if num.is_empty() { list.first().cloned() } else { None });
+    }
+    let Some(order) = order else {
+        return Err(MpError {
+            status: Some(422),
+            message: MP_NO_USABLE_LINES_MSG.to_string(),
+            list_unavailable: false,
+            observed_keys: Some(body_keys(body)),
+        });
+    };
+    let lines = order_lines(&order, include_extras);
+    // number: String(pick(order, [...]) ?? wantNumber ?? '').trim() || null
+    let number_s = js_trim(
+        &pick(Some(&order), &["number", "orderNumber", "order_number", "id", "orderId"])
+            .map(|v| js_to_string(Some(&v)))
+            .unwrap_or_else(|| want_number.to_string()),
+    )
+    .to_string();
+    let falsy_pick = |names: &[&str]| -> Value {
+        pick(Some(&order), names).filter(|v| !js_falsy(Some(v))).unwrap_or(Value::Null)
+    };
+    let placed_at =
+        falsy_pick(&["created", "createdAt", "created_at", "date", "placedAt", "orderDate"]);
+    let status =
+        falsy_pick(&["status", "orderStatus", "fulfillmentStatus", "fulfillment_status"]);
+    let currency = falsy_pick(&["currency", "currencySymbol"]);
+    let total_cents = pick(Some(&order), &["total_cents", "totalCents", "total", "orderTotal"])
+        .or_else(|| {
+            order
+                .get("payment")
+                .and_then(|p| pick(Some(p), &["total_cents", "subtotal_cents"]))
+        })
+        .unwrap_or(Value::Null);
+    Ok(ParsedOrder {
+        number: if number_s.is_empty() { Value::Null } else { Value::String(number_s) },
+        placed_at,
+        status,
+        currency,
+        total_cents,
+        lines,
+    })
+}
+
+/// The card-line uniq fold shared by previewOrder and addOrderToCollection:
+/// sealed/junk lines never enter, first cardKey wins, dups ADD quantity.
+/// The add path's key builder calls `.toLowerCase()` directly on a truthy
+/// scryfall_id — a NUMBER id is a V8 TypeError in Node (500 through the
+/// route catch); the message is returned in `Err` so the route can replay
+/// byte-exactly. previewOrder wraps String() first and never hits it.
+fn build_uniq(lines: &OrderLines, add_path: bool) -> Result<Vec<OrderLine>, String> {
+    let mut uniq: Vec<OrderLine> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    for l in &lines.lines {
+        if l.sealed || l.junk {
+            continue;
+        }
+        let key = if !js_falsy(Some(&l.scryfall_id)) {
+            if add_path && !l.scryfall_id.is_string() {
+                return Err("l.scryfall_id.toLowerCase is not a function".to_string());
+            }
+            format!("i:{}", js_to_string(Some(&l.scryfall_id)).to_lowercase())
+        } else {
+            format!(
+                "n:{}|{}|{}|{}",
+                l.name.to_lowercase(),
+                to_str_or_empty(Some(&l.set_code)).to_lowercase(),
+                to_str_or_empty(Some(&l.number)).to_lowercase(),
+                if l.is_foil { "f" } else { "n" }
+            )
+        };
+        match keys.iter().position(|k| *k == key) {
+            Some(i) => uniq[i].quantity += l.quantity,
+            None => {
+                keys.push(key);
+                uniq.push(l.clone());
+            }
+        }
+    }
+    Ok(uniq)
+}
+
+/// The bulkFetchByIdentifier request rows (the _line back-pointer stays in
+/// Rust as the uniq index the resolver echoes back through pairs.0).
+fn bulk_rows(uniq: &[OrderLine]) -> Vec<Map<String, Value>> {
+    uniq.iter()
+        .map(|l| {
+            let mut m = Map::new();
+            if !js_falsy(Some(&l.scryfall_id)) {
+                m.insert("id".into(), l.scryfall_id.clone());
+            }
+            if !js_falsy(Some(&l.set_code)) {
+                m.insert("set_id".into(), l.set_code.clone());
+            }
+            if !js_falsy(Some(&l.number)) {
+                m.insert("number".into(), l.number.clone());
+            }
+            if !l.name.is_empty() {
+                m.insert("name".into(), Value::String(l.name.clone()));
+            }
+            m
+        })
+        .collect()
+}
+
+fn blank_line() -> OrderLine {
+    // `(p.row && p.row._line) || {}` — unreachable here (pairs indexes always
+    // hit uniq) but the fold shape must not panic if the resolver drifts.
+    OrderLine {
+        name: String::new(),
+        set_code: Value::Null,
+        number: Value::Null,
+        scryfall_id: Value::Null,
+        tcgplayer_product_id: Value::Null,
+        quantity: 0.0,
+        price_cents: Value::Null,
+        is_foil: false,
+        condition: String::new(),
+        year: Value::Null,
+        sealed: false,
+        junk: false,
+    }
+}
+
+fn js_num_truthy(x: f64) -> Value {
+    if js_falsy(Some(&Value::from(x))) {
+        js_num_json(1.0)
+    } else {
+        js_num_json(x)
+    }
+}
+
+/// JS `v || undefined` on a Value: falsy (null, '', 0, false) reads nothing.
+fn val_or_none(v: &Value) -> Option<Value> {
+    if js_falsy(Some(v)) {
+        None
+    } else {
+        Some(v.clone())
+    }
+}
+
+/// previewOrder twin. Err(()) = replay the whole POST to Node (scryfall
+/// client failure, cacheCards DB failure, or the owned-counts DB failure).
+/// The connection is opened only AFTER the scryfall await (rusqlite guards
+/// are not Send — same discipline the slice-1 handlers follow).
+async fn preview_fold(
+    st: &AppState,
+    pool: &DbPool,
+    user_id: i64,
+    lines: &OrderLines,
+    include_extras: bool,
+) -> Result<Map<String, Value>, ()> {
+    let mut m = Map::new();
+    if lines.lines.is_empty() {
+        // Node's early answer — deliberately MISSING totalCopies,
+        // extrasIncluded and price_cents (the object literal stops at
+        // sealedCount; the route spread never adds them back).
+        m.insert("cards".into(), json!([]));
+        m.insert("totalListed".into(), json!(0));
+        m.insert("resolvedCount".into(), json!(0));
+        m.insert("unresolved".into(), json!(0));
+        m.insert("extras".into(), json!(0));
+        m.insert("sealedCount".into(), json!(0));
+        return Ok(m);
+    }
+    let uniq = build_uniq(lines, false).map_err(|_| ())?;
+    let rows = bulk_rows(&uniq);
+    let bulk = if rows.is_empty() {
+        crate::precons::BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 }
+    } else {
+        match bulk_fetch_by_identifier(st, &rows).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("marketplace preview: scryfall bulk fetch failed ({e}); forwarding to Node");
+                return Err(());
+            }
+        }
+    };
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::error!("marketplace preview: cannot open connection");
+            return Err(());
+        }
+    };
+    if !bulk.cards.is_empty() {
+        let fresh: Vec<Map<String, Value>> =
+            bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
+        if let Err(e) = cache_normalized_cards(&conn, &fresh) {
+            tracing::error!("marketplace preview: cacheCards failed: {e}; forwarding to Node");
+            return Err(());
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut resolved: Vec<Map<String, Value>> = Vec::new();
+    for (idx, card) in &bulk.pairs {
+        let idv = card.get("id");
+        // if (!card || !card.id || seen.has(card.id)) continue
+        if idv.map(|v| js_falsy(Some(v))).unwrap_or(true) {
+            continue;
+        }
+        if !seen.insert(js_to_string(idv)) {
+            continue;
+        }
+        let def = blank_line();
+        let line = uniq.get(*idx).unwrap_or(&def);
+        let mut r = Map::new();
+        r.insert("card_id".into(), idv.cloned().unwrap_or(Value::Null));
+        r.insert(
+            "name".into(),
+            card.get("name")
+                .filter(|v| !js_falsy(Some(v)))
+                .cloned()
+                .or_else(|| {
+                    if line.name.is_empty() {
+                        None
+                    } else {
+                        Some(Value::String(line.name.clone()))
+                    }
+                })
+                .unwrap_or_else(|| Value::String(String::new())),
+        );
+        r.insert(
+            "image_url".into(),
+            card.get("image_url").filter(|v| !js_falsy(Some(v))).cloned().unwrap_or(Value::Null),
+        );
+        r.insert(
+            "set_code".into(),
+            card
+                .get("set_id")
+                .and_then(val_or_none)
+                .or_else(|| val_or_none(&line.set_code))
+                .unwrap_or(Value::Null),
+        );
+        r.insert(
+            "number".into(),
+            match card.get("number") {
+                Some(v) if !v.is_null() => Value::String(js_to_string(Some(v))),
+                _ => val_or_none(&line.number).unwrap_or(Value::Null),
+            },
+        );
+        r.insert("quantity".into(), js_num_truthy(line.quantity));
+        r.insert("is_foil".into(), json!(line.is_foil));
+        r.insert(
+            "condition".into(),
+            if line.condition.is_empty() {
+                Value::Null
+            } else {
+                Value::String(line.condition.clone())
+            },
+        );
+        r.insert(
+            "price_cents".into(),
+            if line.price_cents.is_null() { Value::Null } else { line.price_cents.clone() },
+        );
+        r.insert("matched".into(), json!(true));
+        resolved.push(r);
+    }
+    let resolved_count = resolved.len();
+    // ownedCountForCards: SUM(quantity) grouped per card_id, THIS user only;
+    // case-insensitive key Map, Number(qty) || 0.
+    if user_id != 0 && !resolved.is_empty() {
+        let ids: Vec<String> = resolved
+            .iter()
+            .map(|r| r.get("card_id").cloned().unwrap_or(Value::Null))
+            .filter(|v| !js_falsy(Some(v)))
+            .map(|v| js_to_string(Some(&v)))
+            .collect();
+        if !ids.is_empty() {
+            let placeholders: Vec<String> =
+                (1..=ids.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT card_id, SUM(quantity) AS qty FROM collection WHERE user_id = ? AND card_id IN ({}) GROUP BY card_id",
+                placeholders.join(",")
+            );
+            let mut params: Vec<SqlValue> = vec![SqlValue::Integer(user_id)];
+            params.extend(ids.iter().map(|s| SqlValue::Text(s.clone())));
+            let owned_rows = match rows_map(&conn, &sql, &params) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("marketplace preview: owned-count query failed: {e}; forwarding to Node");
+                    return Err(());
+                }
+            };
+            let mut owned: Vec<(String, f64)> = Vec::new();
+            for r in owned_rows {
+                let key = js_to_string(r.get("card_id")).to_lowercase();
+                let q = number_or_zero(r.get("qty"));
+                match owned.iter_mut().find(|(k, _)| *k == key) {
+                    Some(slot) => slot.1 = q,
+                    None => owned.push((key, q)),
+                }
+            }
+            for r in resolved.iter_mut() {
+                let key = js_to_string(r.get("card_id")).to_lowercase();
+                let o = owned.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(0.0);
+                r.insert("owned".into(), js_num_json(o));
+            }
+        }
+    }
+    let extras_held = lines.extras as f64;
+    let total_copies: f64 =
+        uniq.iter().fold(0.0, |n, l| n + (if js_falsy(Some(&Value::from(l.quantity))) { 1.0 } else { l.quantity }));
+    let cents: f64 = lines.lines.iter().fold(0.0, |n, l| {
+        if l.price_cents.is_null() {
+            n
+        } else {
+            n + js_number(Some(&l.price_cents))
+                * (if js_falsy(Some(&Value::from(l.quantity))) { 1.0 } else { l.quantity })
+        }
+    });
+    m.insert(
+        "cards".into(),
+        Value::Array(resolved.into_iter().map(Value::Object).collect()),
+    );
+    m.insert("totalListed".into(), js_num_json(uniq.len() as f64 + extras_held));
+    m.insert("totalCopies".into(), js_num_json(total_copies));
+    m.insert("resolvedCount".into(), json!(resolved_count as i64));
+    m.insert("unresolved".into(), json!(bulk.not_found));
+    m.insert("extras".into(), js_num_json(extras_held));
+    m.insert("sealedCount".into(), js_num_json(extras_held));
+    m.insert("extrasIncluded".into(), json!(include_extras));
+    m.insert(
+        "price_cents".into(),
+        if cents == 0.0 || cents.is_nan() { Value::Null } else { js_num_json(cents) },
+    );
+    Ok(m)
+}
+
+/// Number((Number(cents)/100).toFixed(2)) — toFixed rounds HALF-AWAY-FROM-
+/// ZERO on the exact double value; {:.2} is banker's rounding and would
+/// diverge on exact x.xx5 doubles (which DO occur: 12.5 cents = 0.125).
+pub fn js_tofixed2_number(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x >= 0.0 {
+        (x * 100.0 + 0.5).floor() / 100.0
+    } else {
+        -((-x * 100.0 + 0.5).floor() / 100.0)
+    }
+}
+
+#[derive(Clone)]
+struct AddPlanEntry {
+    card_id: Value,
+    quantity: f64,
+    printing: String,
+    purchase_price: Option<f64>,
+    condition: String,
+}
+
+struct AddResult {
+    added: f64,
+    failed: Vec<Value>,
+    resolved: usize,
+    total_listed: f64,
+    unresolved: i64,
+}
+
+enum AddErr {
+    /// Whole-request replay (scryfall leg, cache DB failure, plan Forward).
+    Replay,
+    /// addOrderToCollection threw — route answers status||500 with this
+    /// message (the numeric-scryfall_id TypeError today).
+    Boom(String),
+}
+
+/// addOrderToCollection twin. Groups are filed through the shared
+/// plan_add/execute_add pair exactly like the Secret Lair path, with the
+/// marketplace per-card fields (quantity, purchase_price, condition,
+/// printing) overriding the shared defaults; `added` counts COPIES via the
+/// per-card qty map, not rows.
+async fn add_fold(
+    st: &AppState,
+    pool: &DbPool,
+    user_id: i64,
+    lines: &OrderLines,
+    body: &Map<String, Value>,
+) -> Result<AddResult, AddErr> {
+    if lines.lines.is_empty() {
+        // { added: 0, failed: [], resolved: 0, totalListed: 0, unresolved: 0 }
+        return Ok(AddResult {
+            added: 0.0,
+            failed: Vec::new(),
+            resolved: 0,
+            total_listed: 0.0,
+            unresolved: 0,
+        });
+    }
+    let cond = match body.get("condition") {
+        Some(Value::String(s)) if MP_VALID_CONDITIONS.contains(&s.as_str()) => s.clone(),
+        _ => "Near Mint".to_string(),
+    };
+    let copies_raw = js_number(body.get("copies"));
+    // Number(copies) || 1 — NaN/0 fall to 1, Infinity stays Infinity and
+    // clamps to 500 through Math.min (is_finite would wrongly clamp it to 1).
+    let copies_base = if copies_raw.is_nan() || copies_raw == 0.0 { 1.0 } else { copies_raw };
+    let mult = copies_base.min(500.0).max(1.0);
+    let uniq = build_uniq(lines, true).map_err(AddErr::Boom)?;
+    let rows = bulk_rows(&uniq);
+    let bulk = if rows.is_empty() {
+        crate::precons::BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 }
+    } else {
+        match bulk_fetch_by_identifier(st, &rows).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("marketplace add: scryfall bulk fetch failed ({e}); forwarding to Node");
+                return Err(AddErr::Replay);
+            }
+        }
+    };
+    // rusqlite guards are not Send: open only after the last await point.
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::error!("marketplace add: cannot open connection");
+            return Err(AddErr::Replay);
+        }
+    };
+    if !bulk.cards.is_empty() {
+        let fresh: Vec<Map<String, Value>> =
+            bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
+        if let Err(e) = cache_normalized_cards(&conn, &fresh) {
+            tracing::error!("marketplace add: cacheCards failed: {e}; forwarding to Node");
+            return Err(AddErr::Replay);
+        }
+    }
+    let mode = match body.get("printing_mode") {
+        Some(Value::String(s)) if s == "foil" => "foil",
+        Some(Value::String(s)) if s == "nonfoil" => "nonfoil",
+        _ => "auto",
+    };
+    let language = body.get("language").cloned().unwrap_or_else(|| json!("English"));
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut plan: Vec<AddPlanEntry> = Vec::new();
+    for (idx, card) in &bulk.pairs {
+        let idv = card.get("id");
+        if idv.map(|v| js_falsy(Some(v))).unwrap_or(true) {
+            continue;
+        }
+        if !seen.insert(js_to_string(idv)) {
+            continue;
+        }
+        let def = blank_line();
+        let line = uniq.get(*idx).unwrap_or(&def);
+        let base = if js_falsy(Some(&Value::from(line.quantity))) { 1.0 } else { line.quantity };
+        let quantity = (base * mult).round().max(1.0);
+        let printing = match mode {
+            "foil" => "Holofoil",
+            "nonfoil" => "Normal",
+            _ => {
+                if line.is_foil {
+                    "Holofoil"
+                } else {
+                    "Normal"
+                }
+            }
+        }
+        .to_string();
+        let purchase_price = if line.price_cents.is_null() {
+            None
+        } else {
+            Some(js_tofixed2_number(js_number(Some(&line.price_cents)) / 100.0))
+        };
+        let condition = if !line.condition.is_empty()
+            && MP_VALID_CONDITIONS.contains(&line.condition.as_str())
+        {
+            line.condition.clone()
+        } else {
+            cond.clone()
+        };
+        plan.push(AddPlanEntry {
+            card_id: idv.cloned().unwrap_or(Value::Null),
+            quantity,
+            printing,
+            purchase_price,
+            condition,
+        });
+    }
+    // qtyById: Map keyed by card_id, quantity || 1 — `added` counts COPIES.
+    let qty_by_id: Vec<(String, f64)> = plan
+        .iter()
+        .map(|p| {
+            (
+                js_to_string(Some(&p.card_id)),
+                if js_falsy(Some(&Value::from(p.quantity))) { 1.0 } else { p.quantity },
+            )
+        })
+        .collect();
+
+    let mut added: f64 = 0.0;
+    let mut failed: Vec<Value> = Vec::new();
+    // Two bulkAddToCollection calls, Normal group first, index restarting per
+    // call — exactly the Secret Lair two-pass shape (all reads before any
+    // write so a mid-add Forward can replay clean).
+    for group in ["Normal", "Holofoil"] {
+        let members: Vec<(usize, &AddPlanEntry)> =
+            plan.iter().enumerate().filter(|(_, p)| p.printing == group).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let mut shared = Map::new();
+        shared.insert("condition".into(), Value::String(cond.clone()));
+        shared.insert("printing".into(), Value::String(group.to_string()));
+        shared.insert("language".into(), language.clone());
+        shared.insert("stackable".into(), json!(true));
+        enum Planned {
+            Ready(AddPlan),
+            Reject(String),
+        }
+        let mut planned: Vec<(usize, AddPlanEntry, Planned)> = Vec::new();
+        for (index, p) in members {
+            let mut merged = shared.clone();
+            // bulkAddToCollection perCard overrides: ride only when neither
+            // null nor '' (js_to_string rule, same convention as secret_lair).
+            let overrides: [(&str, Option<Value>); 4] = [
+                ("quantity", Some(js_num_json(p.quantity))),
+                ("purchase_price", p.purchase_price.map(js_num_json)),
+                ("condition", Some(Value::String(p.condition.clone()))),
+                ("printing", Some(Value::String(p.printing.clone()))),
+            ];
+            for (k, v) in overrides {
+                if let Some(v) = v {
+                    if !v.is_null() && js_to_string(Some(&v)) != "" {
+                        merged.insert(k.into(), v);
+                    }
+                }
+            }
+            merged.insert("card_id".into(), p.card_id.clone());
+            match plan_add(&conn, &merged) {
+                Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
+                Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
+                Ok(AddPlan::Forward) => {
+                    tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
+                    return Err(AddErr::Replay);
+                }
+                // Non-AddCardError: Node console.errors and reports the
+                // generic per-card message.
+                Err(e) => {
+                    tracing::error!(error = ?e, "marketplace add: plan failed");
+                    planned.push((index, (*p).clone(), Planned::Reject("Failed to add card".into())));
+                }
+            }
+        }
+        for (index, p, pl) in planned {
+            let mut fail = |error: String, failed: &mut Vec<Value>| {
+                let mut fm = Map::new();
+                fm.insert("card_id".into(), p.card_id.clone());
+                fm.insert("error".into(), Value::String(error));
+                fm.insert("index".into(), json!(index as i64));
+                failed.push(Value::Object(fm));
+            };
+            match pl {
+                Planned::Ready(pp) => match execute_add(&conn, user_id, &pp) {
+                    Ok(_) => {
+                        // Node's copy-count: qtyById is keyed by the ENTRY
+                        // card_id, but bulkAdd reports the INSERTED card_id —
+                        // which addCardToCollection may have swapped to the
+                        // localized printing. Map miss => || 1, so a
+                        // localized filing counts 1 copy per row, not qty.
+                        let AddPlan::Ready { card_id, .. } = &pp else { unreachable!() };
+                        // A non-TEXT bind could only be a JS number/null —
+                        // never === any string entry key (JS Map strictness),
+                        // so any sentinel that cannot collide is faithful.
+                        let key = match card_id {
+                            SqlValue::Text(s) => s.clone(),
+                            _ => "\u{0}non-string-card-id".to_string(),
+                        };
+                        added += qty_by_id
+                            .iter()
+                            .find(|(k, _)| *k == key)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(1.0);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "marketplace add: card failed");
+                        fail("Failed to add card".to_string(), &mut failed);
+                    }
+                },
+                Planned::Reject(msg) => fail(msg, &mut failed),
+            }
+        }
+    }
+    let extras_held = lines.extras as f64;
+    Ok(AddResult {
+        added,
+        failed,
+        resolved: plan.len(),
+        total_listed: uniq.len() as f64 + extras_held,
+        unresolved: bulk.not_found,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Slice-2 handlers
+// ---------------------------------------------------------------------------
+
+/// orderFromRequest twin: gates run in Node's exact order (source → shape →
+/// row → creds/enabled → provider fetch → parse). `Err(Response)` means the
+/// helper already answered (the `fail()` contract that keeps the caller from
+/// sending a second response).
+async fn order_from_request(
+    st: &AppState,
+    pool: &DbPool,
+    body: &Value,
+    user_id: i64,
+) -> Result<(ParsedOrder, bool), Response> {
+    let source = to_str_or_empty(body.get("source")).to_lowercase();
+    if !MP_SOURCES.contains(&source.as_str()) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("source must be one of: {}", MP_SOURCES.join(", ")),
+        ));
+    }
+    let number = js_trim(&to_str_or_empty(body.get("order_number"))).to_string();
+    if !order_number_shape_ok(&number) {
+        return Err(json_error(StatusCode::BAD_REQUEST, "order_number is required"));
+    }
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "marketplace: cannot open read connection");
+            return Err(internal_error());
+        }
+    };
+    let row = match load_row(&conn, user_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "marketplace: credential lookup failed");
+            return Err(internal_error());
+        }
+    };
+    drop(conn);
+    let Some(row) = row else {
+        return Err(json_error(StatusCode::NOT_FOUND, "User not found"));
+    };
+    // The fetchManapoolOrder enabled-gate has to live here too (route
+    // comment): this lookup happens first, so a Settings switch-off would be
+    // cosmetic for preview/add without it.
+    if js_falsy(row.get("manapool_email"))
+        || js_falsy(row.get("manapool_token"))
+        || js_falsy(row.get("manapool_enabled"))
+    {
+        return Err(json_error(StatusCode::BAD_REQUEST, MP_NOT_CONNECTED_MSG));
+    }
+    let creds = Creds {
+        email: js_to_string(row.get("manapool_email")),
+        token: js_to_string(row.get("manapool_token")),
+    };
+    let fetched = match fetch_manapool_order(st.mp_http.as_ref(), &creds, &number).await {
+        Ok(f) => f,
+        Err(e) => {
+            let status = match e.status {
+                Some(s) if s != 0 => s,
+                _ => 502,
+            };
+            let mut out = Map::new();
+            out.insert(
+                "error".into(),
+                Value::String(if e.message.is_empty() {
+                    "Order fetch failed".to_string()
+                } else {
+                    e.message
+                }),
+            );
+            return Err(json_response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                &Value::Object(out),
+            ));
+        }
+    };
+    let include_extras = matches!(body.get("include_extras"), Some(Value::Bool(true)));
+    parse_order_payload(&fetched.body, &number, include_extras).map(|p| (p, include_extras)).map_err(|e| {
+        let status = match e.status {
+            Some(s) if s != 0 => s,
+            _ => 502,
+        };
+        let mut out = Map::new();
+        out.insert(
+            "error".into(),
+            Value::String(if e.message.is_empty() {
+                "Order could not be read".to_string()
+            } else {
+                e.message
+            }),
+        );
+        if let Some(keys) = e.observed_keys {
+            out.insert("observedKeys".into(), Value::Array(keys));
+        }
+        json_response(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            &Value::Object(out),
+        )
+    })
+}
+
+fn mp_error_json(message: String) -> Response {
+    let mut out = Map::new();
+    out.insert("error".into(), Value::String(message));
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &Value::Object(out))
+}
+
+pub async fn route_preview(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        return crate::proxy(State(st), req).await;
+    }
+    handle_preview(st, req).await
+}
+
+pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        return crate::proxy(State(st), req).await;
+    }
+    handle_add(st, req).await
+}
+
+async fn handle_preview(st: AppState, req: Request) -> Response {
+    let headers: HeaderMap = req.headers().clone();
+    let (parts, bytes) = read_parts(req).await;
+    let _ = parts;
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let Some(pool) = st.db.clone() else { return internal_error() };
+    let user = match authenticate(&pool, &headers, false) {
+        Ok(u) => u,
+        Err(res) => return res,
+    };
+    // Node's invalidateOnWrite ran right after the global auth gate, for
+    // every authenticated non-GET, whatever the handler then answered.
+    stats::on_proxied_write(&st, &Method::POST, "/api/marketplace/preview", &headers);
+    let (parsed, include_extras) = match order_from_request(&st, &pool, &body, user.id).await {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    let mut out = parsed.to_json();
+    let preview = match preview_fold(&st, &pool, user.id, &parsed.lines, include_extras).await {
+        Ok(m) => m,
+        Err(()) => {
+            return replay_post(st, &headers, "/api/marketplace/preview", &body).await;
+        }
+    };
+    for (k, v) in preview {
+        out.insert(k, v);
+    }
+    json_response(StatusCode::OK, &Value::Object(out))
+}
+
+async fn handle_add(st: AppState, req: Request) -> Response {
+    let headers: HeaderMap = req.headers().clone();
+    let (parts, bytes) = read_parts(req).await;
+    let _ = parts;
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let Some(pool) = st.db.clone() else { return internal_error() };
+    let user = match authenticate(&pool, &headers, false) {
+        Ok(u) => u,
+        Err(res) => return res,
+    };
+    stats::on_proxied_write(&st, &Method::POST, "/api/marketplace/add", &headers);
+    let (parsed, _include_extras) = match order_from_request(&st, &pool, &body, user.id).await {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    let body_obj = body.as_object().cloned().unwrap_or_default();
+    let result = match add_fold(&st, &pool, user.id, &parsed.lines, &body_obj).await {
+        Ok(r) => r,
+        Err(AddErr::Replay) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
+        Err(AddErr::Boom(msg)) => return mp_error_json(msg),
+    };
+    let mut out = Map::new();
+    let mut order = Map::new();
+    order.insert("number".into(), parsed.number.clone());
+    order.insert("lineCount".into(), json!(parsed.lines.lines.len() as i64));
+    out.insert("order".into(), Value::Object(order));
+    out.insert("added".into(), js_num_json(result.added));
+    out.insert("resolved".into(), json!(result.resolved as i64));
+    out.insert("totalListed".into(), js_num_json(result.total_listed));
+    out.insert("unresolved".into(), json!(result.unresolved));
+    out.insert("failed".into(), Value::Array(result.failed));
+    let message = if js_falsy(Some(&Value::from(result.added))) {
+        "Nothing to add — no cards in the order resolved to catalogue cards.".to_string()
+    } else {
+        format!(
+            "Added {} card{} from order {}.",
+            js_to_string(Some(&js_num_json(result.added))),
+            if result.added == 1.0 { "" } else { "s" },
+            if js_falsy(Some(&parsed.number)) {
+                "?".to_string()
+            } else {
+                js_to_string(Some(&parsed.number))
+            }
+        )
+    };
+    out.insert("message".into(), Value::String(message));
+    json_response(StatusCode::OK, &Value::Object(out))
+}
+
+/// Whole untouched POST → Node (nothing local was written when the fold
+/// decides to forward; same helper shape as the Secret Lair twins).
+async fn replay_post(st: AppState, headers: &HeaderMap, path: &str, body: &Value) -> Response {
+    let mut rb = Request::builder().method(Method::POST).uri(path);
+    for (k, v) in headers.iter() {
+        if k != axum::http::header::CONTENT_LENGTH {
+            rb = rb.header(k, v);
+        }
+    }
+    let req = rb.body(Body::from(body.to_string())).unwrap_or_else(|_| Request::new(Body::empty()));
+    crate::proxy(State(st), req).await
 }
