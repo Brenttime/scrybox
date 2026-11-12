@@ -189,14 +189,21 @@ async function runTests() {
       await refreshSession();
 
       let rateLimited = false;
+      const histogram = new Map();
+      let lastStatus = null;
       for (let i = 0; i < 350; i++) {
         const res = await fetch(`http://localhost:${port}/api/search?game=mtg&name=Spam`, { headers: authHeaders });
         const status = res.status;
+        lastStatus = status;
         await res.text();
+        histogram.set(status, (histogram.get(status) || 0) + 1);
         if (status === 429) {
           rateLimited = true;
           break;
         }
+      }
+      if (!rateLimited) {
+        console.error('F3-TC4 status histogram (no 429 seen):', JSON.stringify([...histogram]), 'last:', lastStatus);
       }
       assert.ok(rateLimited, 'Rapid search requests must be rate limited with 429 status code');
       console.log('PASS: F3-TC4');

@@ -37,6 +37,16 @@ if (!BIN) {
   process.exit(2);
 }
 const MOCK = path.join(__dirname, 'rust-e2e-mock-server.js');
+// Orphan guard: a suite that throws leaves its spawned server holding its
+// port; the NEXT run's spawn then fails to bind while waitForServer happily
+// answers from the stale process (an old binary without the routes under
+// test — the F3-TC4 false negative). Track every BIN child and SIGKILL any
+// still alive when the suite process exits. Only OUR children; the :3320
+// lane service is never in this list.
+const rustChildren = [];
+process.on('exit', () => {
+  for (const c of rustChildren) { try { c.kill('SIGKILL'); } catch (e) { /* dead */ } }
+});
 // Base port for this suite's fixture servers, allocated (and released) by
 // run.js right before the suite spawns. +seq per server spawn (scryfall.test
 // boots up to 9). E2E_RUST_MOCK_BASE lets a single suite run standalone.
@@ -81,7 +91,16 @@ cp.spawn = function (cmd, args, opts) {
     delete env.SCRYBOX_STATIC_DIR;
     delete env.RUST_JOBS;
     delete env.RUST_MIGRATIONS_B;
-    return realSpawn(BIN, [], { ...(opts || {}), env });
+    const child = realSpawn(BIN, [], { ...(opts || {}), env });
+    rustChildren.push(child);
+    // Fail loudly (into the suite's stderr) if the port was already taken:
+    // without this the suite just sees the other process's answers.
+    child.once('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        console.error(`[rust-e2e] scrybox-server (port ${port}) exited with code ${code} — bind conflict or crash?`);
+      }
+    });
+    return child;
   }
   return realSpawn.apply(this, arguments);
 };

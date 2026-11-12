@@ -1650,4 +1650,80 @@ async fn collection_scope_prints_inert_and_image_proxies() {
     assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1", "image must hop to Node");
 }
 
+// --- searchLimiter twin (F3-TC4) -------------------------------------------
+
+/// Node mounts express-rate-limit's searchLimiter (300/15min per client IP,
+/// middleware/auth.js) ahead of searchCards, AFTER authenticateToken. The
+/// e2e F3-TC4 burst is the integration proof; this is the unit regression for
+/// the bucket advancing on EVERY authenticated request — including ones the
+/// native path serves from cache (the iter-7 bug: cache hits skipped the
+/// bucket, so 350-request bursts never saw a 429). Unique client IP so the
+/// process-global limiter cannot collide with the other tests' 127.0.0.1.
+#[tokio::test]
+async fn search_limiter_blocks_after_300_per_ip_in_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let r = router_for(seeded_db(dir.path()), &["search"], &format!("http://{upstream}"));
+
+    let hit = |i: u32| {
+        let r = r.clone();
+        async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/search?game=mtg&name=Sol%20Ring")
+                .extension(axum::extract::connect_info::ConnectInfo(
+                    format!("203.0.113.9:{}", 40000 + i).parse::<SocketAddr>().unwrap(),
+                ))
+                .header("authorization", "Bearer tok-session")
+                .body(Body::empty())
+                .unwrap();
+            let res = r.oneshot(req).await.unwrap();
+            let status = res.status();
+            let headers = res.headers().clone();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+            (status, headers, body)
+        }
+    };
+
+    for i in 1..=300 {
+        let (s, h, _) = hit(i).await;
+        assert_ne!(s, StatusCode::TOO_MANY_REQUESTS, "request {i} must not be limited yet");
+        assert_eq!(
+            h.get("ratelimit-limit").map(|v| v.to_str().unwrap()),
+            Some("300"),
+            "every authenticated search response carries the limiter headers (request {i})"
+        );
+        assert_eq!(
+            h.get("ratelimit-remaining").map(|v| v.to_str().unwrap()),
+            Some((300 - i).to_string().as_str()),
+            "bucket advances on every request, including cache hits (request {i})"
+        );
+        assert_eq!(h.get("ratelimit-policy").map(|v| v.to_str().unwrap()), Some("300;w=900"));
+    }
+
+    let (s, h, b) = hit(301).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap(),
+        json!({ "error": "Too many searches. Please slow down and try again shortly." })
+    );
+    assert_eq!(h.get("ratelimit-remaining").map(|v| v.to_str().unwrap()), Some("0"));
+    let retry_after: Option<String> = h.get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let ratelimit_reset: Option<String> = h.get("ratelimit-reset").and_then(|v| v.to_str().ok()).map(str::to_string);
+    assert_eq!(retry_after, ratelimit_reset, "retry-after mirrors ratelimit-reset");
+
+    // A different client IP has its own bucket (per-IP key, not global).
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/search?game=mtg&name=Sol%20Ring")
+        .extension(axum::extract::connect_info::ConnectInfo(
+            "203.0.113.10:40000".parse::<SocketAddr>().unwrap(),
+        ))
+        .header("authorization", "Bearer tok-session")
+        .body(Body::empty())
+        .unwrap();
+    let res = r.oneshot(req).await.unwrap();
+    assert_ne!(res.status(), StatusCode::TOO_MANY_REQUESTS, "bucket is per client IP");
+}
+
 
