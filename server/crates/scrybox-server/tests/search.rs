@@ -646,12 +646,29 @@ async fn post_number_and_falsy_coercions() {
     .await;
     assert_eq!(e, d);
 
-    // Truthy number on a LIKE key: name:5 → '%5%' — Node-gated identically
-    // (String(5) param). Assert the gate stays native, shape may be empty.
-    let (s, h, _) = post(&r, "/api/search", &json_ct(), r#"{"name":5,"number":true}"#).await;
-    assert_eq!(s, StatusCode::OK);
-    // Zero rows → build path proxies (walkable false for number shapes).
-    assert_eq!(h.get("x-node").unwrap().to_str().unwrap(), "1");
+    // Truthy non-strings on the LIKE keys are Node-crash shapes: runSearch's
+    // `(x || '').trim()` throws `.trim is not a function` and the route's
+    // catch answers 500 {"error":"Search failed"} (probed live:
+    // {"name":160}/{"number":160}/{"set":160}/{"name":true} all 500 on :3312).
+    // Rust never answers those natively — the whole request forwards so
+    // Node's own 500 rides verbatim. parity ps_post_number_numeric compares
+    // both sides live. Falsy non-strings (0/-0/false/null) stay native.
+    for body in [
+        r#"{"name":5,"number":true}"#,
+        r#"{"name":"Sol Ring","number":160}"#,
+        r#"{"name":"Sol Ring","set":160}"#,
+        r#"{"name":true}"#,
+        r#"{"name":"Sol Ring","set":{"a":1}}"#,
+    ] {
+        let (_, h, _) = post(&r, "/api/search", &json_ct(), body).await;
+        assert_eq!(
+            h.get("x-node").unwrap().to_str().unwrap(), "1",
+            "truthy non-string must forward whole-request: {body}"
+        );
+    }
+    // -0 stays falsy (JS `-0 || ''`), so it must NOT forward.
+    let (_, h, _) = post(&r, "/api/search", &json_ct(), r#"{"name":-0,"number":"160/b"}"#).await;
+    assert!(h.get("x-node").is_none(), "-0 name is falsy — native leg");
 }
 
 #[tokio::test]

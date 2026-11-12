@@ -571,9 +571,9 @@
     "tests": "cargo tests/scan_match_route.rs (10: 401/validation/503-notBuilt(+500 precedence)/500-set/429 limiter/forward arms) + lib cvscan::tests (11 incl. node_truth_parity_on_eval_corpus, subsample removed after vips-source audit) + npz::tests (3 vs frozen :3312 capture bench/scan-eval/node-truth.json); live A/B :3312-vs-:3320 scan-match-ab.mjs (detected/gate flags equal, top-8 cardIds equal, sims/sharpness/gap <=5e-4)"
   },
   "POST /api/search": {
-    "module": "scrybox-server::search (lib.rs any(/api/search) under the search group; bigJson 15mb twin + { ...query, ...body } merge gate, shares the GET native cache/ETag legs; rate-limit after auth+parse, no 304 replay on POST)",
-    "status": "staged",
-    "tests": "tests/search.rs post_* x8 (native body serve byte-identical to GET twin, body-overrides-query, falsy/number coercions, content-type ladder, 413, 500-before-limiter, no-304-replay, auth-before-parse); parity cases PENDING"
+    "module": "scrybox-server::search (lib.rs any(/api/search) under the search group; bigJson 15mb twin + { ...query, ...body } merge gate, shares the GET native cache/ETag legs; rate-limit after auth+parse, no 304 replay on POST; truthy non-string name/number/set forward whole-request — Node's runSearch `(x||'').trim()` TypeError answers its own 500; falsy 0/-0 gate to '' and never stringify into a LIKE param)",
+    "status": "verified",
+    "tests": "tests/search.rs post_* x11 (native body serve byte-identical to GET twin, body-overrides-query, gated-bodies forward with body preserved, falsy/number coercions incl. truthy-non-string forward ladder + -0 falsy, content-type ladder, 413, 500-before-limiter, no-304-replay, auth-before-parse, kill-switch, other-methods); parity.mjs ps_post_name, ps_post_merge_body_wins, ps_post_merge_body_limit, ps_post_number_numeric, ps_post_number_hash_str, ps_post_set_upper, ps_post_falsy_gates, ps_post_falsy_zero_names, ps_post_page_numeric, ps_post_plain_empty, ps_post_text_ct_skipped, ps_post_malformed_json, ps_post_exotic_page, ps_post_array_name, ps_post_dup_qs_name, ps_post_no_token, ps_post_apikey_403, ps_post_no304"
   },
   "POST /api/search-history": {
     "module": "scrybox-server::search_history (lib.rs /api/search-history under RUST_ROUTES=search_history; deflate-raw codec twin of zlib inflate/deflateRawSync)",

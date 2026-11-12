@@ -360,11 +360,18 @@ fn parse_big_json(headers: &HeaderMap, bytes: &[u8]) -> BigBody {
 /// (0/NaN-as-falsy callers check truthiness first; |n| >= 1e21 switches to
 /// JS exponential notation we do not model).
 fn js_number_to_string(n: &serde_json::Number) -> Option<Option<String>> {
+    // JS truthiness first: +0 and -0 are falsy, so the `if (x)` / `|| ''`
+    // gates never let String() see them (checked BEFORE as_i64, which would
+    // otherwise hand "0" to the LIKE param and answer a `%0%` search Node
+    // runs as no-name-at-all — live probe {"name":0} vs :3312).
+    if n.as_f64() == Some(0.0) {
+        return Some(None); // falsy → String() never gates a clause
+    }
     if let Some(i) = n.as_i64() {
         return Some(Some(i.to_string()));
     }
     let f = n.as_f64()?;
-    if f.is_nan() || f == 0.0 {
+    if f.is_nan() {
         return Some(None); // falsy → String() never gates a clause
     }
     if !f.is_finite() {
@@ -484,8 +491,23 @@ pub fn plan_post(
         return Plan::Proxy;
     }
 
-    // Stringified-with-truthiness-gate keys: name/number/set go through the
-    // `if (x)` gate then the String() SQL parameter; exotic shapes proxy.
+    // Stringified-with-truthiness-gate keys: name/number/set are consumed by
+    // runSearch as `(x || '').trim()` — any TRUTHY non-string (number, true,
+    // array, object) throws `.trim is not a function` inside the route's try
+    // and the catch answers the generic 500 {"error":"Search failed"}. Rust
+    // must not answer those natively: whole-request forward lets Node's own
+    // 500 ride verbatim. Falsy non-strings (0/-0/false/null) still take the
+    // `|| ''` leg; page/limit parseInt ToString's numbers without crashing;
+    // languages.resolve String()'s lang (utils/languages.js:28).
+    let node_crashes = |k: &str| match bq(k) {
+        Some(Value::String(_)) | Some(Value::Null) | None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().map_or(true, |f| f != 0.0),
+        Some(_) => true, // array / object
+    };
+    if ["name", "number", "set"].iter().any(|k| node_crashes(k)) {
+        return Plan::Proxy;
+    }
 
     // page = Math.max(1, parseInt(page, 10) || 1); limit = min(250, max(1,
     // parseInt(limit, 10) || 60)) — parseInt is ToString-first, so numbers

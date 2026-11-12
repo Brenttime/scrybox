@@ -112,6 +112,57 @@ for (const [i, p] of EXTRA_COLLECTION.entries()) {
 for (const [i, p] of EXTRA_SEARCH.entries()) {
   cases.push({ name: `search${i + 1}_${p.slice('/api/search'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
+// --- POST /api/search (iter-47 slice) -----------------------------------------
+// Node mounts the GET/POST pair (collection.js:233-234) and POST carries the
+// query through { ...req.query, ...req.body } (collection.js:81) after
+// authenticateToken and the app-level bigJson parse, searchLimiter in
+// between. Native arms are name/number/set/page/limit (JS-truthy gates +
+// String() coercion); q/image/exotic shapes ride a whole-request forward.
+// deepDiff compares bodies incl. key order, so the merge order and the
+// res.json ETag both assert against Node, not eyeballed. POST must NEVER
+// replay 304 (conditional revalidation is GET/HEAD) even on an ETag hit.
+const PS_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const psPost = (name, path, body, headers = PS_JSON, extra = {}) =>
+  cases.push({ name, path: path ?? '/api/search', headers, method: 'POST', body, ...extra });
+psPost('ps_post_name', undefined, JSON.stringify({ name: 'Sol Ring' }));
+psPost('ps_post_merge_body_wins', '/api/search?name=Black%20Lotus&limit=5', JSON.stringify({ name: 'Sol Ring' }));
+psPost('ps_post_merge_body_limit', '/api/search?limit=5', JSON.stringify({ name: 'Sol Ring', limit: '10' }));
+psPost('ps_post_number_numeric', undefined, JSON.stringify({ name: 'Sol Ring', number: 160 }));
+psPost('ps_post_number_hash_str', undefined, JSON.stringify({ name: 'Sol Ring', number: '#160/brc' }));
+psPost('ps_post_set_upper', undefined, JSON.stringify({ name: 'Sol Ring', set: 'BRC' }));
+psPost('ps_post_falsy_gates', undefined, JSON.stringify({ name: 'Sol Ring', number: '', set: '', page: 0, limit: 0 }));
+// 0/-0/false/null are JS-FALSY: runSearch's `(x || '')` gates them to ''
+// (probed: {"name":0} answers the no-name browse). Rust must not stringify
+// them into LIKE params.
+psPost('ps_post_falsy_zero_names', undefined, JSON.stringify({ name: 0, number: -0, set: false, lang: 0 }));
+psPost('ps_post_page_numeric', undefined, JSON.stringify({ name: 'Lightning', page: 2, limit: 10 }));
+psPost('ps_post_plain_empty', undefined, undefined);
+psPost('ps_post_text_ct_skipped', undefined, 'name=Sol Ring', { ...authHeaders, 'content-type': 'text/plain' });
+psPost('ps_post_malformed_json', undefined, '{"name":');
+psPost('ps_post_exotic_page', undefined, JSON.stringify({ name: 'Sol Ring', page: { x: 1 } }));
+psPost('ps_post_array_name', undefined, JSON.stringify({ name: ['Sol Ring'] }));
+psPost('ps_post_dup_qs_name', '/api/search?name=aa&name=Sol%20Ring', undefined);
+psPost('ps_post_no_token', undefined, JSON.stringify({ name: 'Sol Ring' }), { 'content-type': 'application/json' });
+// API key on POST: keys are GET-only, the gate answers 403 (is_get=false)
+// BEFORE the limiter consumes a bucket. shx_post_apikey_403 precedent.
+cases.push({
+  name: 'ps_post_apikey_403', path: '/api/search',
+  headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+  method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
+  setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
+  teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
+});
+// ETag hit on POST: the GET twin's ETag must NOT replay as 304 — both sides
+// answer the full 200 body (Express conditional revalidation is GET/HEAD).
+cases.push({
+  name: 'ps_post_no304', path: '/api/search',
+  headers: PS_JSON, method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
+  setup: async (base) => {
+    const r = await fetch(base + '/api/search?name=Sol%20Ring', { headers: { ...authHeaders, 'cache-control': 'no-cache' } });
+    const etag = r.headers.get('etag');
+    return { headers: { ...PS_JSON, ...(etag ? { 'if-none-match': etag } : {}) } };
+  },
+});
 for (const [i, p] of EXTRA_STATS.entries()) {
   cases.push({ name: `stats${i + 1}_${p.slice('/api/stats'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }
