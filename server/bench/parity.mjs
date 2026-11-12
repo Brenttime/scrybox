@@ -1114,6 +1114,7 @@ async function fetchSide(base, c, opts = {}) {
     source: res.headers.get('x-source'),
     etag: res.headers.get('etag'),
     ctype: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
+    disposition: res.headers.get('content-disposition'),
     readback,
     ms: Date.now() - t0,
   };
@@ -1184,6 +1185,7 @@ function compareCase(c, r, n) {
   const diffs = [];
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
   if (r.ctype !== n.ctype) diffs.push(`content-type ${r.ctype} vs ${n.ctype}`);
+  if (c.cmpDisposition && r.disposition !== n.disposition) diffs.push(`content-disposition ${r.disposition} vs ${n.disposition}`);
   if ((r.total ?? undefined) !== (n.total ?? undefined)) diffs.push(`x-total-count ${r.total} vs ${n.total}`);
   if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
@@ -2724,6 +2726,136 @@ cases.push({ name: 'pt_bare_301', path: '/scryfall-portal', headers: {}, method:
 cases.push({ name: 'pt_index', path: '/scryfall-portal/', headers: {}, method: 'GET' });
 cases.push({ name: 'pt_head_405', path: '/scryfall-portal/', headers: {}, method: 'HEAD' });
 cases.push({ name: 'pt_post_404', path: '/scryfall-portal/', headers: {}, method: 'POST' });
+
+
+// --- Lane A iter-38: export group (routes/importExport.js) -----------------
+// Byte contract: CSV/JSON attachment bytes, Content-Type (+charset),
+// Content-Disposition (cmpDisposition), Express body ETag + 304 replay
+// (etagReplay default for GETs), /import JSON key ORDER (deepDiff asserts
+// key order), and every rejection list verbatim. Import writes go against
+// the shared DB copy with a purchase_price marker and are deleted in
+// teardown; the read-back reads the shared table, so a Rust write is
+// verified through Node's read path and vice versa.
+{
+  const EX_H = { ...authHeaders, 'content-type': 'application/json' };
+  const exUserId = () => dbWrite((d) => d
+    .prepare('SELECT user_id FROM sessions WHERE token = ?')
+    .get(USER1_TOKEN)?.user_id);
+  const EX_MARKER = 0.71237;
+
+  cases.push({ name: 'ex_get_csv', path: '/api/export', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_json', path: '/api/export?format=json', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_manabox', path: '/api/export?ecosystem=MANABOX', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_tcg', path: '/api/export?format=csv&ecosystem=tcgplayer', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_empty_eco', path: '/api/export?ecosystem=&format=', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_noauth', path: '/api/export', headers: {}, method: 'GET', etagReplay: false });
+
+  cases.push({
+    name: 'ex_post_view', path: '/api/export', headers: EX_H, method: 'POST', cmpDisposition: true,
+    etagReplay: false,
+    setup: async () => {
+      const uid = exUserId();
+      const rows = dbWrite((d) => d
+        .prepare('SELECT id FROM collection WHERE user_id = ? ORDER BY id DESC LIMIT 3')
+        .all(uid));
+      const ids = rows.map((r) => r.id);
+      const body = JSON.stringify({ entry_ids: [...ids].reverse().concat(ids[0] ?? 1) });
+      return { body };
+    },
+  });
+  cases.push({
+    name: 'ex_post_view_json_eco', path: '/api/export', headers: EX_H, method: 'POST', cmpDisposition: true,
+    etagReplay: false,
+    setup: async () => {
+      const uid = exUserId();
+      const rows = dbWrite((d) => d
+        .prepare('SELECT id FROM collection WHERE user_id = ? ORDER BY id LIMIT 2')
+        .all(uid));
+      return { body: JSON.stringify({ entry_ids: rows.map((r) => r.id), format: 'json', ecosystem: 'DragonShield' }) };
+    },
+  });
+  cases.push({ name: 'ex_post_view_nonarray', path: '/api/export', headers: EX_H, method: 'POST', body: '{}', etagReplay: false });
+  cases.push({ name: 'ex_post_view_nonints', path: '/api/export', headers: EX_H, method: 'POST', body: '{"entry_ids":["a",{}]}', etagReplay: false });
+  cases.push({ name: 'ex_post_view_filter', path: '/api/export', headers: EX_H, method: 'POST', body: '{"entry_ids":["1",true,null,"zz"]}', etagReplay: false });
+
+  // Import — success writes, so every case runs serially with cleanup.
+  cases.push({
+    name: 'ex_import_json_ok', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    setup: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+      const card = dbWrite((d) => d
+        .prepare("SELECT id FROM card_cache WHERE id LIKE 'mtg-%' ORDER BY rowid LIMIT 1")
+        .get());
+      return {
+        body: JSON.stringify({
+          format: 'json',
+          data: [{
+            game: 'mtg', name: 'Parity Import Card', card_id: card.id,
+            quantity: 2, condition: 'Lightly Played', printing: 'Normal',
+            language: 'English', purchase_price: EX_MARKER,
+          }],
+        }),
+      };
+    },
+    readBack: async () => {
+      // marker-only predicate: the case's token is the bench user, not the
+      // sessions row behind USER1_TOKEN; 0.71237 is unique enough.
+      const rows = dbWrite((d) => d.prepare(
+        'SELECT quantity, condition, printing, language, purchase_price, is_proxy, card_id FROM collection WHERE purchase_price = ?',
+      ).all(EX_MARKER));
+      const ok = rows.length === 1;
+      return { ok, why: `imported rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+    teardown: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+    },
+  });
+  cases.push({
+    // all-or-nothing: the two bad rows reject the whole import (incl. the
+    // two good ones) — no partial writes, rejected list byte-equal.
+    name: 'ex_import_json_all_or_nothing', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    setup: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+      const card = dbWrite((d) => d
+        .prepare("SELECT id FROM card_cache WHERE id LIKE 'mtg-%' ORDER BY rowid LIMIT 1")
+        .get());
+      return {
+        body: JSON.stringify({
+          format: 'json',
+          data: [
+            { game: 'mtg', name: 'Parity Import Card', card_id: card.id, quantity: 1, purchase_price: EX_MARKER },
+            { game: 'pokemon', name: 'Not MTG', purchase_price: EX_MARKER },
+            { game: 'mtg', name: '', purchase_price: EX_MARKER },
+            { name: 'No Game Field', card_id: card.id, quantity: 3, purchase_price: EX_MARKER },
+          ],
+        }),
+      };
+    },
+    readBack: async () => {
+      const rows = dbWrite((d) => d.prepare(
+        'SELECT quantity, card_id FROM collection WHERE purchase_price = ?',
+      ).all(EX_MARKER));
+      const ok = rows.length === 0;
+      return { ok, why: `all-or-nothing wrote rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+    teardown: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+    },
+  });
+  cases.push({
+    name: 'ex_import_csv_rejected', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ format: 'tcgplayer', data: 'Card Name,Quantity\nNotARealCard Parity XYZ,2\nAlsoNotReal Parity QRS,1' }),
+  });
+  cases.push({ name: 'ex_import_csv_empty', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"manabox","data":"Card Name\\n"}' });
+  cases.push({ name: 'ex_import_nodata', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{}' });
+  cases.push({ name: 'ex_import_baddata', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":{}}' });
+  cases.push({ name: 'ex_import_null_item', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":[null]}' });
+  cases.push({ name: 'ex_import_fmt_num', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":5,"data":"a,b\\nc,d"}' });
+  cases.push({ name: 'ex_import_fmt_null', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":null,"data":"a,b\\nc,d"}' });
+  cases.push({ name: 'ex_import_badjson_str', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":"zzz"}' });
+  cases.push({ name: 'ex_import_printing_str_null', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":[{"game":"mtg","name":"X","printing":"null"}]}' });
+  cases.push({ name: 'ex_import_noauth', path: '/api/import', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}', etagReplay: false });
+}
 
 
 // --- run ---------------------------------------------------------------------

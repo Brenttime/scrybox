@@ -41,6 +41,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod export;
 pub mod settings;
 pub mod lists_body_writes;
 pub mod lists_reads;
@@ -540,6 +541,16 @@ pub fn app(state: AppState) -> Router {
             .route("/api/secret-lair", any(secret_lair::route_search))
             .route("/api/secret-lair/preview", any(secret_lair::route_preview))
             .route("/api/secret-lair/add", any(secret_lair::route_add))
+    } else {
+        router
+    };
+    // Lane A iter-38: export group (routes/importExport.js) under `export`:
+    // GET /api/export, POST /api/export (view subset), POST /api/import.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("export") {
+        router
+            .route("/api/export", any(export::route_export).post(export::route_export_post))
+            .route("/api/import", any(export::route_import))
     } else {
         router
     };
