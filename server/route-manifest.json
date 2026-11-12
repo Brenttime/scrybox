@@ -170,7 +170,9 @@
     "tests": "tests/decks_reads.rs::detail_shape_prices_and_printing_swap (display-printing current_printing_value, dlc<cur<cheap key order), detail_404_foreign_and_422_unresolved; parity.mjs dr_detail_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/combos": {
-    "status": "node"
+    "module": "scrybox-server::decks_combos (lib.rs /api/decks/{id}/combos GET under RUST_ROUTES=decks_combos; Spellbook find-my-combos proxy, route-catch 502 arms, trimCombo key-order/||/?? twins, front-face inDeck fallback)",
+    "status": "verified",
+    "tests": "crates/scrybox-server/src/decks_combos.rs unit tests (parseFloat/round/trim/sort/slug/mem-cap) + tests/decks_combos.rs::combos_ok_byte_exact_body_request_and_trim,combos_502_arms,combos_empty_rows_short_circuits_without_provider,combos_non_object_results_fold_to_empty; parity.mjs dc_combos_noauth_401/foreign_404/missing_404/empty_rows_200. Provider leg excluded per the provider-leg ruling (SPELLBOOK_URL is a Node module constant, no env override; real-leg arms stub-proven via AppState.deck_http)"
   },
   "GET /api/decks/:id/locations": {
     "module": "scrybox-server::decks_reads (lib.rs /api/decks/{id}/locations GET under RUST_ROUTES=decks_reads; coverage CTE: available=owned-locked, missing=required-available, own-deck-locked exclusion, missing-DESC sort)",
@@ -178,7 +180,9 @@
     "tests": "tests/decks_reads.rs::locations_coverage_math_and_sort (negative-available math pinned live: owned2-locked3 -> missing 4), locations_ignores_other_users_locked_decks, locations_404_and_422; parity.mjs dr_locations_200/locked_200/foreign_404/broken_422/noauth_401"
   },
   "GET /api/decks/:id/synergy": {
-    "status": "node"
+    "module": "scrybox-server::decks_combos (lib.rs /api/decks/{id}/synergy GET under RUST_ROUTES=decks_combos; EDHREC commander-page map, threshold-0.35 trim, partner-pair slug ladder, 24h mem+built-in-cap + disk cache with stale fallback and 404/403 negative memo)",
+    "status": "verified",
+    "tests": "crates/scrybox-server/src/decks_combos.rs unit tests (synergy_cards filter/round/sort, query_commander qs/slice rules) + tests/decks_combos.rs::synergy_no_commander_no_hint_early_return,synergy_hint_ok_slug_encoding_and_cards,synergy_404_memo_and_fallthrough,synergy_partner_pair_slug_ladder,synergy_disk_fresh_short_circuits_and_stale_falls_back,synergy_net_fail_without_disk_is_502,synergy_write_through_on_success; parity.mjs dc_synergy_noauth_401/foreign_404/no_commander_200/empty_deck_200. Provider leg excluded per the provider-leg ruling (EDHREC_URL is a Node module constant; real-leg arms stub-proven via AppState.deck_http)"
   },
   "GET /api/export": {
     "module": "scrybox-server::export (lib.rs /api/export + /api/import under RUST_ROUTES=export; byte-attachment CSV/JSON twin incl. Content-Disposition + Express body ETag/304, resolveCardPrice proxy-first twin, csvMappers once-mapped strategies, all-or-nothing validation loop, shared bulk_fetch_by_identifier + cache_normalized_cards legs, whole-request forwards)",

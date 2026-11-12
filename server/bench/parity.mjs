@@ -2165,9 +2165,28 @@ async function etagParity(c) {
   drCase('dr_locations_foreign_404', '/api/decks/931105/locations');
   drCase('dr_locations_broken_422', '/api/decks/931104/locations');
   drCase('dr_locations_noauth_401', '/api/decks/931102/locations', {});
-  // (No /combos parity case: it fetches the public Spellbook API — body is
-  // upstream-flaky. The never-swallow guard is pinned by the path test
-  // decks_reads.rs::detail_never_405s_shared_shape_to_writes instead.)
+  // Lane-A iter-5 decks_combos (Spellbook combos + EDHREC synergy). The
+  // provider legs are EXCLUDED per the provider-leg ruling (Spellbook and
+  // EDHREC URLs are Node module constants, no env override; the harness
+  // never recreates the Node container, so a stub-aim of both servers is
+  // impossible). Every arm that answers BEFORE a provider fetch is pinned
+  // here: auth, parse-before-auth, 404s, the empty-rows and no-commander
+  // 200 shapes (931104's card id misses the card_cache JOIN -> the combos
+  // early return; 931102 has no is_commander rows -> the synergy null).
+  // The provider arms themselves are stub-proven in
+  // crates/scrybox-server/tests/decks_combos.rs via AppState.deck_http.
+  cases.push({ name: 'dc_combos_noauth_401', path: '/api/decks/931101/combos', headers: {}, method: 'GET', setup: drPrep, teardown: drTeardown });
+  // (No badjson-preauth case here: undici forbids GET bodies — the
+  // express.json-before-auth 500 arm is pinned by tests/decks_combos.rs::
+  // auth_gate_and_parse_before_auth on the Rust side and the identical
+  // Node source order was live-pinned in iter-28.)
+  cases.push({ name: 'dc_combos_foreign_404', path: '/api/decks/931105/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_combos_missing_404', path: '/api/decks/999999/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_combos_empty_rows_200', path: '/api/decks/931104/combos', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_noauth_401', path: '/api/decks/931101/synergy', headers: {}, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_foreign_404', path: '/api/decks/931105/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_no_commander_200', path: '/api/decks/931102/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
+  cases.push({ name: 'dc_synergy_empty_deck_200', path: '/api/decks/931104/synergy', headers: authHeaders, method: 'GET', setup: drPrep, teardown: drTeardown });
 }
 
 // --- iter 31: card-list READS (Lane A port: GET /api/lists,
