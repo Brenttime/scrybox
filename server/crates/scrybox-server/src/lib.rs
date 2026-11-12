@@ -35,6 +35,7 @@ pub mod card_art;
 pub mod cards_tags;
 pub mod catalog_read;
 pub mod collq;
+pub mod cvscan;
 pub mod ip_limit;
 pub mod oidc;
 pub mod collection;
@@ -42,6 +43,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod npz;
 pub mod settings;
 pub mod lists_body_writes;
 pub mod lists_reads;
@@ -690,6 +692,17 @@ pub fn app(state: AppState) -> Router {
             .route("/api/cardscan/scan", any(cardscan::handle_scan))
             .layer(axum::middleware::from_fn(cardscan::compress));
         router.merge(cs)
+    } else {
+        router
+    };
+    // Lane B unit 6b: cvScan.js twin + POST /api/scan-match, behind
+    // RUST_ROUTES=scan_match. Same compression() twin treatment as the
+    // cardscan group (Node's global compression() gzips this JSON too).
+    let router = if state.owns("scan_match") {
+        let sm = axum::Router::new()
+            .route("/api/scan-match", any(cvscan::handle_scan_match))
+            .layer(axum::middleware::from_fn(cardscan::compress));
+        router.merge(sm)
     } else {
         router
     };

@@ -81,6 +81,12 @@ async fn main() {
     }
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");
     let state = scrybox_server::AppState::new(cfg.clone());
+    // Lane B unit 6b: server.js cvScan.warm twin — preload models + English
+    // catalog when the lane owns scan-match (no-op without ORT_DYLIB_PATH or
+    // built catalogs, so it never pays costs the lane won't use).
+    if state.owns("scan_match") {
+        scrybox_server::cvscan::spawn_warm();
+    }
     let router = scrybox_server::app(state);
     // Lane B unit 5c: optional HTTPS listener (utils/tls.js twin). A failure
     // — unreadable operator pair, no DB path, bind error — logs Node's line
