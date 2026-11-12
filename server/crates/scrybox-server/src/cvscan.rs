@@ -1217,12 +1217,12 @@ use crate::ip_limit::{self, FixedWindowLimiter};
 use crate::AppState;
 
 /// express-rate-limit v8 searchLimiter twin: 300 / 15 min per client IP.
-fn search_limiter() -> &'static FixedWindowLimiter {
+pub(crate) fn search_limiter() -> &'static FixedWindowLimiter {
     static L: OnceLock<FixedWindowLimiter> = OnceLock::new();
     L.get_or_init(|| FixedWindowLimiter::new(300, 15 * 60 * 1000))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

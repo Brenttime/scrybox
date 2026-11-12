@@ -32,7 +32,7 @@ use tokio::sync::OnceCell;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -44,6 +44,7 @@ use crate::{
     auth, collq,
     collection::{body_etag, etag_matches, gzip_bytes, parse_array_col, sqlite_value, truthy, wants_encoding},
     db::DbPool,
+    ip_limit,
     name_index::{self, NameIndex, OwnedCache, Txn},
     sidecar, AppState,
 };
@@ -613,7 +614,12 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 // Handler
 // ---------------------------------------------------------------------------
 
-pub async fn handle(method: Method, State(st): State<AppState>, req: Request) -> Response {
+pub async fn handle(
+    method: Method,
+    State(st): State<AppState>,
+    cc: ConnectInfo<std::net::SocketAddr>,
+    req: Request,
+) -> Response {
     // Only GET has a native path; POST /api/search reads a scan image body.
     if method != Method::GET {
         return crate::proxy(State(st.clone()), req).await;
@@ -632,11 +638,46 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         Err(res) => return res,
     };
 
+    // searchLimiter (middleware/auth.js:86, mounted ahead of searchCards on
+    // both GET and POST): 300 / 15 min / client IP, AFTER auth. The bucket is
+    // hit exactly once per authenticated request so it advances in lockstep
+    // with the Node limiter's bucket (which counts every request, including
+    // the ones Rust re-serves through the proxy).
+    let rl_key = ip_limit::client_ip_key(Some(cc.0.ip()), headers, &st.trust_proxy);
+    let rl = crate::cvscan::search_limiter().hit(&rl_key, crate::cvscan::now_ms());
+    let with_rl = |res: Response| -> Response {
+        let mut res = res;
+        let h = res.headers_mut();
+        let _ = h.try_insert("ratelimit-policy", HeaderValue::from_static("300;w=900"));
+        let _ = h.try_insert("ratelimit-limit", HeaderValue::from_static("300"));
+        let _ = h.try_insert(
+            "ratelimit-remaining",
+            HeaderValue::from_str(&rl.remaining.to_string()).unwrap(),
+        );
+        let _ = h.try_insert(
+            "ratelimit-reset",
+            HeaderValue::from_str(&rl.reset_secs.to_string()).unwrap(),
+        );
+        if rl.blocked {
+            let _ = h.try_insert(
+                "retry-after",
+                HeaderValue::from_str(&rl.reset_secs.to_string()).unwrap(),
+            );
+        }
+        res
+    };
+    if rl.blocked {
+        return with_rl(json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many searches. Please slow down and try again shortly.",
+        ));
+    }
+
     let raw_query = uri.query().map(|s| s.to_string());
     let p = match plan(user.id, raw_query.as_deref()) {
         Plan::Native(p) => p,
         Plan::CollectionQ(cq) => {
-            return serve_collq(st, req, pool, cq).await;
+            return with_rl(serve_collq(st, req, pool, cq).await);
         }
         Plan::Proxy => return crate::proxy(State(st.clone()), req).await,
     };
@@ -792,7 +833,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                 Ok(Ok(None)) => return crate::proxy(State(st.clone()), req).await,
                 Ok(Err(ref e)) | Err(ref e) => {
                     tracing::error!(error = %e, "search build failed");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+                    return with_rl(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"));
                 }
             }
         }
@@ -800,7 +841,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
 
     // Express's default body ETag on res.json(cards): a matching conditional
     // GET replays as an empty 304, with the headers set before send().
-    respond_entry(&entry, inm.as_deref(), ae.as_deref(), None)
+    with_rl(respond_entry(&entry, inm.as_deref(), ae.as_deref(), None))
 }
 
 /// Emit a cached native search response, honoring the entry's header
