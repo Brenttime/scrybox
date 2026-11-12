@@ -53,6 +53,7 @@ pub mod moxfield;
 pub mod moxfield_api;
 pub mod name_index;
 pub mod precons;
+pub mod rules;
 pub mod scryfall;
 pub mod secheaders;
 pub mod scry_jobs;
@@ -183,6 +184,20 @@ pub struct AppState {
     /// only (snapshot at boot, like SettingsEnv — an env read per request
     /// would race across parallel integration tests).
     pub mtgjson_base: String,
+    /// rules.js CACHE — the shared rules doc (dirname(DB)/mtg-rules.json,
+    /// same bind-mounted file the Node container reads). RULES_CACHE env
+    /// override like the Node twin.
+    pub rules_cache_path: std::path::PathBuf,
+    /// rules.js hard-coded upstream URLs (test hooks; production keeps the
+    /// JS constants — same snapshot pattern as `mtgjson_base`).
+    pub rules_index_url: String,
+    pub rules_commander_url: String,
+    pub rules_cr_base: String,
+    /// rules.js module-level `mem` + `kwMem` (per-process), + the `inflight`
+    /// build-dedup twin. Per AppState so fixtures stay isolated.
+    pub rules_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    pub kw_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    pub rules_build: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -211,7 +226,12 @@ impl AppState {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::precons::MTGJSON.to_string());
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base }
+        let rules_cache_path = std::env::var("RULES_CACHE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::rules::default_cache_path(cfg.db_path.as_ref()));
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -497,6 +517,16 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/precons", any(precons::route_precons))
             .route("/api/precons/import", any(precons::route_import))
+    } else {
+        router
+    };
+    // Lane A iter-36: rules group (GET /api/rules, GET /api/rules/keywords)
+    // under `rules`. Handlers self-check group+method and forward anything
+    // else — never 405/404 locally.
+    let router = if state.owns("rules") {
+        router
+            .route("/api/rules", any(rules::route_rules))
+            .route("/api/rules/keywords", any(rules::route_keywords))
     } else {
         router
     };

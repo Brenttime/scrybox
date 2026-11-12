@@ -811,6 +811,31 @@ cases.push({ name: 'pc_import_overrides', path: '/api/precons/import', headers: 
   },
   teardown: async () => { pcClean(PC_NAME_B); } });
 
+// --- rules group (iter-36: GET /api/rules, /api/rules/keywords; RUST_ROUTES=rules)
+// `mem` is PER PROCESS in the Node twin: once each server has built, its
+// fetched stamp is its own (like two Node processes would). '$.fetched' is
+// therefore stripped on every case (same class as networth's '$.asOf'), and
+// '$.stale' for live-upstream hiccup resilience; everything else — the full
+// rules/keywords payloads, key ORDER, crUrl/crVersion/commanderUrl — is
+// compared byte-for-byte.
+cases.push({ name: 'rl_rules_ok', path: '/api/rules', headers: authHeaders, method: 'GET',
+  strip: ['$.fetched', '$.stale'], etagReplay: false });
+cases.push({ name: 'rl_rules_no_token', path: '/api/rules', headers: {}, method: 'GET', etagReplay: false });
+cases.push({ name: 'rl_rules_bad_token', path: '/api/rules', headers: { Authorization: `Bearer ${'Bad' + 'Token999'}` }, method: 'GET', etagReplay: false });
+cases.push({ name: 'rl_keywords_ok', path: '/api/rules/keywords', headers: authHeaders, method: 'GET',
+  strip: ['$.fetched'], etagReplay: false });
+cases.push({ name: 'rl_keywords_no_token', path: '/api/rules/keywords', headers: {}, method: 'GET', etagReplay: false });
+// 'refresh' presence (any value, incl. bare ?refresh) forces the rebuild —
+// both sides must answer 200 with the same payload minus build stamps.
+cases.push({ name: 'rl_rules_refresh', path: '/api/rules?refresh=1', headers: authHeaders, method: 'GET',
+  strip: ['$.fetched', '$.crUrl', '$.crVersion', '$.commanderUrl', '$.stale'], etagReplay: false });
+cases.push({ name: 'rl_keywords_refresh', path: '/api/rules/keywords?refresh', headers: authHeaders, method: 'GET',
+  strip: ['$.fetched'], etagReplay: false });
+// fall-throughs: unknown subpath under the mount + non-GET never 405 locally
+// (handlers self-check and forward; Node's router answers).
+cases.push({ name: 'rl_unknown_subpath', path: '/api/rules/nope', headers: authHeaders, method: 'GET', etagReplay: false });
+cases.push({ name: 'rl_post_method', path: '/api/rules', headers: { ...authHeaders, 'content-type': 'application/json' }, method: 'POST', body: '{}', etagReplay: false });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each
