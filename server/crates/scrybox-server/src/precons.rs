@@ -69,7 +69,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 /// preconData.INDEX_MAX_AGE_MS — re-download once Date.now()-fetchedAt >= it.
 const INDEX_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 /// express.json default limit (normalJson), the POST import body cap.
-const BODY_LIMIT: usize = 1024 * 1024;
+pub(crate) const BODY_LIMIT: usize = 1024 * 1024;
 
 /// `String.prototype.trim` twin (WhiteSpace + LineTerminator set) — same
 /// helper the settings port pinned.
@@ -78,7 +78,7 @@ pub(crate) fn js_trim(s: &str) -> &str {
 }
 
 /// JS `String(v)` over JSON values.
-fn js_string(v: &Value) -> String {
+pub(crate) fn js_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => "null".into(),
@@ -90,7 +90,7 @@ fn js_string(v: &Value) -> String {
 }
 
 /// `String(v || '')` — falsy (undefined/null/''/0/false) collapses to ''.
-fn js_str_or_empty(v: Option<&Value>) -> String {
+pub(crate) fn js_str_or_empty(v: Option<&Value>) -> String {
     match v {
         Some(v) if truthy(v) => js_string(v),
         _ => String::new(),
@@ -551,17 +551,17 @@ fn scryfall_uuid(v: Option<&Value>) -> Option<String> {
     Some(raw)
 }
 
-struct BulkOut {
-    cards: Vec<Value>,
+pub(crate) struct BulkOut {
+    pub(crate) cards: Vec<Value>,
     /// (uniq-row index, normalized card) in RESPONSE order, Node's pairs.
-    pairs: Vec<(usize, Map<String, Value>)>,
-    not_found: i64,
+    pub(crate) pairs: Vec<(usize, Map<String, Value>)>,
+    pub(crate) not_found: i64,
 }
 
 /// scryfallApi.bulkFetchByIdentifier twin, DEFAULT config (sidecar-eligible
 /// via the shared Scry client — NOT the upstream-pinned sweep job): 75-row
 /// batches, byKey Map (last set wins), scryPostRetried's 4 attempts.
-async fn bulk_fetch_by_identifier(st: &AppState, rows: &[Map<String, Value>]) -> Result<BulkOut, String> {
+pub(crate) async fn bulk_fetch_by_identifier(st: &AppState, rows: &[Map<String, Value>]) -> Result<BulkOut, String> {
     let mut out = BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 };
     for (ci, chunk) in rows.chunks(75).enumerate() {
         let chunk_start = ci * 75;
@@ -664,7 +664,7 @@ fn by_key_push(map: &mut Vec<(String, usize)>, key: String, i: usize) {
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn json_response(status: StatusCode, map: &Map<String, Value>) -> Response {
+pub(crate) fn json_response(status: StatusCode, map: &Map<String, Value>) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -673,7 +673,7 @@ fn json_response(status: StatusCode, map: &Map<String, Value>) -> Response {
         .into_response()
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn json_error(status: StatusCode, msg: &str) -> Response {
     let mut m = Map::new();
     m.insert("error".into(), Value::String(msg.to_string()));
     json_response(status, &m)
@@ -705,7 +705,7 @@ async fn read_capped(mut body: Body, limit: usize) -> (Vec<u8>, bool) {
 /// non-JSON content-types leave req.body === {} (body-parser skips, the
 /// route's `req.body || {}` keeps {}), malformed JSON answers the generic
 /// 500 (global errorHandler), >1 MiB the 413 shape.
-async fn read_json_body(req: Request, limit: usize) -> (Value, Option<Response>) {
+pub(crate) async fn read_json_body(req: Request, limit: usize) -> (Value, Option<Response>) {
     let is_json = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1039,7 +1039,7 @@ fn import_failed(status: StatusCode, message: &str, not_found: Value) -> Respons
 
 /// `Number(v)` for JSON values (deck `count`/`number` arrive as JSON
 /// scalars; strings use JS String→Number semantics).
-fn js_number(v: &Value) -> Option<f64> {
+pub(crate) fn js_number(v: &Value) -> Option<f64> {
     match v {
         Value::Null => Some(0.0), // Number(null) === 0
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
@@ -1067,7 +1067,7 @@ fn js_num(v: Option<&Value>) -> f64 {
     }
 }
 
-fn num_out(v: f64) -> Value {
+pub(crate) fn num_out(v: f64) -> Value {
     if v.is_finite() && v == v.trunc() && v.abs() < 9.007199254740992e15 {
         Value::from(v as i64)
     } else if v.is_finite() {

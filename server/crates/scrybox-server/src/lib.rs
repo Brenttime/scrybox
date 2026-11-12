@@ -27,7 +27,9 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
+pub mod admin_users;
 pub mod backup;
+pub mod cards_meta;
 pub mod card_cache;
 pub mod card_sets;
 pub mod catalog_build;
@@ -45,6 +47,7 @@ pub mod collection_writes;
 pub mod db;
 pub mod decks_writes;
 pub mod decks_reads;
+pub mod export;
 pub mod npz;
 pub mod settings;
 pub mod lists_body_writes;
@@ -64,6 +67,7 @@ pub mod scryfall;
 pub mod secheaders;
 pub mod scry_jobs;
 pub mod search;
+pub mod secret_lair;
 pub mod sets;
 pub mod sidecar;
 pub mod stats;
@@ -549,6 +553,55 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/rules", any(rules::route_rules))
             .route("/api/rules/keywords", any(rules::route_keywords))
+    } else {
+        router
+    };
+    // Lane A iter-37: secret_lair group (GET /api/secret-lair,
+    // GET /api/secret-lair/preview, POST /api/secret-lair/add) under
+    // `secret_lair`. Handlers self-check group+method and forward anything
+    // else — never 405/404 locally.
+    let router = if state.owns("secret_lair") {
+        router
+            .route("/api/secret-lair", any(secret_lair::route_search))
+            .route("/api/secret-lair/preview", any(secret_lair::route_preview))
+            .route("/api/secret-lair/add", any(secret_lair::route_add))
+    } else {
+        router
+    };
+    // Lane A iter-38: export group (routes/importExport.js) under `export`:
+    // GET /api/export, POST /api/export (view subset), POST /api/import.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("export") {
+        router
+            .route("/api/export", any(export::route_export).post(export::route_export_post))
+            .route("/api/import", any(export::route_import))
+    } else {
+        router
+    };
+    // Lane A iter-39: cards-meta group (stats.js card routes + the
+    // collection.js suggest) under `cards_meta`: POST /api/cards/highlight,
+    // GET /api/cards/{id}/decks, GET /api/cards/{id}/price-history,
+    // GET /api/stats/commander-of-the-day, GET /api/suggest.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("cards_meta") {
+        router
+            .route("/api/cards/highlight", any(cards_meta::handle_highlight))
+            .route("/api/cards/{id}/decks", any(cards_meta::handle_card_decks))
+            .route("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
+            .route("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
+            .route("/api/suggest", any(cards_meta::handle_suggest))
+    } else {
+        router
+    };
+    // Lane A iter-40: admin USERS group (GET/POST /api/admin/users,
+    // PUT/DELETE /api/admin/users/:id) under `admin_users`. The rest of
+    // admin.js (seed-cards, catalogs, models, backups) is Lane B's unit-4
+    // surface; everything unmatched here rides the catch-all proxy —
+    // never a local 404/405.
+    let router = if state.owns("admin_users") {
+        router
+            .route("/api/admin/users", any(admin_users::route_users))
+            .route("/api/admin/users/{id}", any(admin_users::route_user))
     } else {
         router
     };

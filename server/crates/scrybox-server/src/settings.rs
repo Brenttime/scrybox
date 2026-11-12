@@ -474,13 +474,14 @@ pub async fn route_version(State(st): State<AppState>, req: Request) -> Response
     }
 }
 
-fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> Result<auth::AuthUser, Response> {
+pub(crate) fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> Result<auth::AuthUser, Response> {
     let token = auth::bearer_token(headers).map(str::to_string);
     auth::authenticate(pool, token.as_deref(), is_get)
 }
 
 /// middleware/auth.js requireAdmin (API keys are never admin credentials).
-fn admin_gate(user: &auth::AuthUser) -> Option<Response> {
+/// Shared with admin_users (iter-40).
+pub(crate) fn admin_gate(user: &auth::AuthUser) -> Option<Response> {
     if user.via_api_key {
         return Some(json_error(
             StatusCode::FORBIDDEN,

@@ -811,6 +811,155 @@ cases.push({ name: 'pc_import_overrides', path: '/api/precons/import', headers: 
   },
   teardown: async () => { pcClean(PC_NAME_B); } });
 
+// --- iter 37: secret_lair group (Lane A port: GET /api/secret-lair,
+// GET /api/secret-lair/preview, POST /api/secret-lair/add; RUST_ROUTES=secret_lair)
+// Search reads ride the SAME shared mirror data/precons.json the precons
+// group pinned (<24 h → zero upstream hits, identical DeckList on both
+// sides). Needle 'box of rocks' scores exactly the A Box of Rocks base + its
+// FoilEdition twin (slot fold by trimmed-lowercased NAME, /foiledition/i on
+// the NAME — distinct from the fileName test in resolveFoilFileName); q=the
+// exercises the rank ladder + localeCompare ties over a large match set.
+// preview/add fetch the MTGJSON deck file through the SHARED data/precons/
+// cache; Scryfall bulk is live (same lane as pc_import). The collection
+// writes land in the shared DB and are deleted by card id in teardown;
+// owned counts compare server-vs-server over the same table, so ordering is
+// not a divergence source.
+const SL_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const SL_BASE = 'ABoxOfRocks_SLD';
+const SL_FOIL = 'ABoxOfRocksFoilEdition_SLD';
+const SL_NOTWIN = 'AlienAuroras_SLD';
+async function slDeckIds(fileName) {
+  const r = await fetch(`https://mtgjson.com/api/v5/decks/${encodeURIComponent(fileName)}.json`);
+  const j = await r.json();
+  const rows = [...(j?.data?.mainBoard || []), ...(j?.data?.commander || [])];
+  return rows
+    .map((c) => c?.identifiers?.scryfallId)
+    .filter(Boolean)
+    .map((id) => `mtg-${id}`);
+}
+function slClean(_base, ids) {
+  dbWrite((d) => {
+    const del = d.prepare('DELETE FROM collection WHERE card_id = ?');
+    for (const id of (ids || [])) del.run(id);
+    return (ids || []).length;
+  });
+}
+cases.push({ name: 'sl_search_no_token', path: '/api/secret-lair?q=rocks', headers: {}, method: 'GET' });
+cases.push({ name: 'sl_search_empty_q', path: '/api/secret-lair?q=', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_rocks', path: '/api/secret-lair?q=box%20of%20rocks', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_the_rank', path: '/api/secret-lair?q=the', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_limit3', path: '/api/secret-lair?q=the&limit=3', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_limit_bad', path: '/api/secret-lair?q=the&limit=abc', headers: authHeaders, method: 'GET' });
+// qs twin on the new keys: repeated q joins; q[0] is an array slot;
+// foil arriving as an ARRAY never === '1' (false), fileName array → String().
+cases.push({ name: 'sl_search_join_q', path: '/api/secret-lair?q=rocks&q=box', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_search_arr0_q', path: '/api/secret-lair?q%5B0%5D=rocks', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_no_token', path: `/api/secret-lair/preview?fileName=${SL_BASE}`, headers: {}, method: 'GET' });
+cases.push({ name: 'sl_preview_missing_file', path: '/api/secret-lair/preview', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_blank_file', path: '/api/secret-lair/preview?fileName=%20', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_ok', path: `/api/secret-lair/preview?fileName=${SL_BASE}`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_twin', path: `/api/secret-lair/preview?fileName=${SL_BASE}&foil=1`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_passthrough', path: `/api/secret-lair/preview?fileName=${SL_FOIL}&foil=true`, headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_preview_foil_missing_422', path: `/api/secret-lair/preview?fileName=${SL_NOTWIN}&foil=1`, headers: authHeaders, method: 'GET' });
+// unknown fileName passes the twin lookup untouched; the deck fetch answers
+// honestly with the axios-status-carrying message.
+cases.push({ name: 'sl_preview_missing_deck', path: '/api/secret-lair/preview?fileName=NoSuchDeckXYZ', headers: authHeaders, method: 'GET' });
+// fileName arriving as an array → String(['A','B']) === 'A,B' → cleaned to
+// 'AB' → deck 404 (pins the String() coercion, not a 400).
+cases.push({ name: 'sl_preview_arr_file', path: '/api/secret-lair/preview?fileName%5B0%5D=A&fileName%5B1%5D=B', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_add_no_token', path: '/api/secret-lair/add', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+cases.push({ name: 'sl_add_missing_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'sl_add_blank_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":"   "}' });
+cases.push({ name: 'sl_add_bad_json', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":' });
+cases.push({ name: 'sl_add_nonstring_file', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":42}' });
+// add guard ORDER: fileName required answers BEFORE the foil twin lookup
+// (blank fileName + foil:true still the plain 400).
+cases.push({ name: 'sl_add_blank_file_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST', body: '{"fileName":"","foil":true}' });
+// happy add: 5 SLD card types through the live Scryfall bulk, collection
+// rows verified in the shared DB (same rows read by BOTH sides — the
+// response itself carries the counts).
+cases.push({ name: 'sl_add_ok', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, condition: 'Near Mint' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing, language, condition FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal'
+        && r.condition === 'Near Mint' && r.quantity >= 1),
+      why: `collection rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// foil=true strict form swaps the twin; copies '2x' is the Number()-vs-
+// parseInt trap: Number('2x') is NaN → || 1 → mult 1, so every quantity
+// stays at the product's own count (1). The response fileName is the twin,
+// resolvedFoil true.
+cases.push({ name: 'sl_add_copies_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_FOIL) } }),
+  body: JSON.stringify({ fileName: SL_BASE, foil: true, copies: '2x' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal' && r.quantity === 1),
+      why: `foil/copy rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// copies '2' IS a clean Number → mult 2 → every quantity doubles (2x1).
+cases.push({ name: 'sl_add_copies_numeric', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, copies: '2' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Normal' && r.quantity === 2),
+      why: `numeric-copy rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// printingMode 'Foil' hits the whitelist after toLowerCase → EVERY row is
+// forced Holofoil even though the deck rows are isFoil-blind.
+cases.push({ name: 'sl_add_printing_mode_foil', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, printingMode: 'Foil' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, quantity, printing FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.printing === 'Holofoil'),
+      why: `mode-forced rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// Off-list condition is rewritten to 'Near Mint' by the util's own whitelist.
+cases.push({ name: 'sl_add_condition_whitelist', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, condition: 'Like New' }),
+  readBack: async (other, ctx) => {
+    const got = dbWrite((d) => d.prepare(
+      `SELECT card_id, condition FROM collection
+        WHERE card_id IN (${ctx.ids.map(() => '?').join(',')}) ORDER BY card_id`,
+    ).all(...ctx.ids));
+    return { ok: got.length === ctx.ids.length && got.every((r) => r.condition === 'Near Mint'),
+      why: `grade-rewritten rows: ${JSON.stringify(got)}`, seen: got };
+  },
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// body.foil === '1' (string) is NOT a strict-=== form → base product.
+cases.push({ name: 'sl_add_foil_strict_string', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  setup: async () => ({ ctx: { ids: await slDeckIds(SL_BASE) } }),
+  body: JSON.stringify({ fileName: SL_BASE, foil: '1' }),
+  teardown: async (_b, ctx) => slClean(_b, ctx?.ids || []) });
+// no FoilEdition twin → the route-level 422 {error} before any deck fetch.
+cases.push({ name: 'sl_add_foil_missing_422', path: '/api/secret-lair/add', headers: SL_JSON, method: 'POST',
+  body: JSON.stringify({ fileName: SL_NOTWIN, foil: true }) });
+// unknown subpath + other method never 405 from Rust: handlers self-check
+// and forward; Node's router answers either way.
+cases.push({ name: 'sl_unknown_subpath', path: '/api/secret-lair/nope', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'sl_put_method', path: '/api/secret-lair', headers: SL_JSON, method: 'PUT', body: '{}' });
+
 // --- rules group (iter-36: GET /api/rules, /api/rules/keywords; RUST_ROUTES=rules)
 // `mem` is PER PROCESS in the Node twin: once each server has built, its
 // fetched stamp is its own (like two Node processes would). '$.fetched' is
@@ -965,6 +1114,7 @@ async function fetchSide(base, c, opts = {}) {
     source: res.headers.get('x-source'),
     etag: res.headers.get('etag'),
     ctype: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
+    disposition: res.headers.get('content-disposition'),
     readback,
     ms: Date.now() - t0,
   };
@@ -1035,6 +1185,7 @@ function compareCase(c, r, n) {
   const diffs = [];
   if (r.status !== n.status) diffs.push(`status ${r.status} vs ${n.status}`);
   if (r.ctype !== n.ctype) diffs.push(`content-type ${r.ctype} vs ${n.ctype}`);
+  if (c.cmpDisposition && r.disposition !== n.disposition) diffs.push(`content-disposition ${r.disposition} vs ${n.disposition}`);
   if ((r.total ?? undefined) !== (n.total ?? undefined)) diffs.push(`x-total-count ${r.total} vs ${n.total}`);
   if ((r.source ?? undefined) !== (n.source ?? undefined)) diffs.push(`x-source ${r.source} vs ${n.source}`);
   if (r.json !== undefined || n.json !== undefined) {
@@ -2600,6 +2751,378 @@ cases.push({ name: 'spa_head_index', path: '/', headers: {}, method: 'HEAD' });
 cases.push({ name: 'spa_post_404_finalhandler', path: '/collection', headers: {}, method: 'POST', body: '{}' });
 cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, method: 'GET' });
 
+
+
+// --- Lane A iter-38: export group (routes/importExport.js) -----------------
+// Byte contract: CSV/JSON attachment bytes, Content-Type (+charset),
+// Content-Disposition (cmpDisposition), Express body ETag + 304 replay
+// (etagReplay default for GETs), /import JSON key ORDER (deepDiff asserts
+// key order), and every rejection list verbatim. Import writes go against
+// the shared DB copy with a purchase_price marker and are deleted in
+// teardown; the read-back reads the shared table, so a Rust write is
+// verified through Node's read path and vice versa.
+{
+  const EX_H = { ...authHeaders, 'content-type': 'application/json' };
+  const exUserId = () => dbWrite((d) => d
+    .prepare('SELECT user_id FROM sessions WHERE token = ?')
+    .get(USER1_TOKEN)?.user_id);
+  const EX_MARKER = 0.71237;
+
+  cases.push({ name: 'ex_get_csv', path: '/api/export', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_json', path: '/api/export?format=json', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_manabox', path: '/api/export?ecosystem=MANABOX', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_tcg', path: '/api/export?format=csv&ecosystem=tcgplayer', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_empty_eco', path: '/api/export?ecosystem=&format=', headers: authHeaders, method: 'GET', cmpDisposition: true });
+  cases.push({ name: 'ex_get_noauth', path: '/api/export', headers: {}, method: 'GET', etagReplay: false });
+
+  cases.push({
+    name: 'ex_post_view', path: '/api/export', headers: EX_H, method: 'POST', cmpDisposition: true,
+    etagReplay: false,
+    setup: async () => {
+      const uid = exUserId();
+      const rows = dbWrite((d) => d
+        .prepare('SELECT id FROM collection WHERE user_id = ? ORDER BY id DESC LIMIT 3')
+        .all(uid));
+      const ids = rows.map((r) => r.id);
+      const body = JSON.stringify({ entry_ids: [...ids].reverse().concat(ids[0] ?? 1) });
+      return { body };
+    },
+  });
+  cases.push({
+    name: 'ex_post_view_json_eco', path: '/api/export', headers: EX_H, method: 'POST', cmpDisposition: true,
+    etagReplay: false,
+    setup: async () => {
+      const uid = exUserId();
+      const rows = dbWrite((d) => d
+        .prepare('SELECT id FROM collection WHERE user_id = ? ORDER BY id LIMIT 2')
+        .all(uid));
+      return { body: JSON.stringify({ entry_ids: rows.map((r) => r.id), format: 'json', ecosystem: 'DragonShield' }) };
+    },
+  });
+  cases.push({ name: 'ex_post_view_nonarray', path: '/api/export', headers: EX_H, method: 'POST', body: '{}', etagReplay: false });
+  cases.push({ name: 'ex_post_view_nonints', path: '/api/export', headers: EX_H, method: 'POST', body: '{"entry_ids":["a",{}]}', etagReplay: false });
+  cases.push({ name: 'ex_post_view_filter', path: '/api/export', headers: EX_H, method: 'POST', body: '{"entry_ids":["1",true,null,"zz"]}', etagReplay: false });
+
+  // Import — success writes, so every case runs serially with cleanup.
+  cases.push({
+    name: 'ex_import_json_ok', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    setup: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+      const card = dbWrite((d) => d
+        .prepare("SELECT id FROM card_cache WHERE id LIKE 'mtg-%' ORDER BY rowid LIMIT 1")
+        .get());
+      return {
+        body: JSON.stringify({
+          format: 'json',
+          data: [{
+            game: 'mtg', name: 'Parity Import Card', card_id: card.id,
+            quantity: 2, condition: 'Lightly Played', printing: 'Normal',
+            language: 'English', purchase_price: EX_MARKER,
+          }],
+        }),
+      };
+    },
+    readBack: async () => {
+      // marker-only predicate: the case's token is the bench user, not the
+      // sessions row behind USER1_TOKEN; 0.71237 is unique enough.
+      const rows = dbWrite((d) => d.prepare(
+        'SELECT quantity, condition, printing, language, purchase_price, is_proxy, card_id FROM collection WHERE purchase_price = ?',
+      ).all(EX_MARKER));
+      const ok = rows.length === 1;
+      return { ok, why: `imported rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+    teardown: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+    },
+  });
+  cases.push({
+    // all-or-nothing: the two bad rows reject the whole import (incl. the
+    // two good ones) — no partial writes, rejected list byte-equal.
+    name: 'ex_import_json_all_or_nothing', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    setup: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+      const card = dbWrite((d) => d
+        .prepare("SELECT id FROM card_cache WHERE id LIKE 'mtg-%' ORDER BY rowid LIMIT 1")
+        .get());
+      return {
+        body: JSON.stringify({
+          format: 'json',
+          data: [
+            { game: 'mtg', name: 'Parity Import Card', card_id: card.id, quantity: 1, purchase_price: EX_MARKER },
+            { game: 'pokemon', name: 'Not MTG', purchase_price: EX_MARKER },
+            { game: 'mtg', name: '', purchase_price: EX_MARKER },
+            { name: 'No Game Field', card_id: card.id, quantity: 3, purchase_price: EX_MARKER },
+          ],
+        }),
+      };
+    },
+    readBack: async () => {
+      const rows = dbWrite((d) => d.prepare(
+        'SELECT quantity, card_id FROM collection WHERE purchase_price = ?',
+      ).all(EX_MARKER));
+      const ok = rows.length === 0;
+      return { ok, why: `all-or-nothing wrote rows -> ${JSON.stringify(rows)}`, seen: rows };
+    },
+    teardown: async () => {
+      dbWrite((d) => d.prepare('DELETE FROM collection WHERE purchase_price = ?').run(EX_MARKER));
+    },
+  });
+  cases.push({
+    name: 'ex_import_csv_rejected', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ format: 'tcgplayer', data: 'Card Name,Quantity\nNotARealCard Parity XYZ,2\nAlsoNotReal Parity QRS,1' }),
+  });
+  cases.push({ name: 'ex_import_csv_empty', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"manabox","data":"Card Name\\n"}' });
+  cases.push({ name: 'ex_import_nodata', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{}' });
+  cases.push({ name: 'ex_import_baddata', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":{}}' });
+  cases.push({ name: 'ex_import_null_item', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":[null]}' });
+  cases.push({ name: 'ex_import_fmt_num', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":5,"data":"a,b\\nc,d"}' });
+  cases.push({ name: 'ex_import_fmt_null', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":null,"data":"a,b\\nc,d"}' });
+  cases.push({ name: 'ex_import_badjson_str', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":"zzz"}' });
+  cases.push({ name: 'ex_import_printing_str_null', path: '/api/import', headers: EX_H, method: 'POST', etagReplay: false, body: '{"format":"json","data":[{"game":"mtg","name":"X","printing":"null"}]}' });
+  cases.push({ name: 'ex_import_noauth', path: '/api/import', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}', etagReplay: false });
+  // ===== cards_meta (iter 39): POST /api/cards/highlight,
+  // GET /api/cards/:id/decks, GET /api/cards/:id/price-history,
+  // GET /api/stats/commander-of-the-day, GET /api/suggest under
+  // RUST_ROUTES=cards_meta. Fixed ids; setup reseeds per side-run. =====
+  const CM_PH = 'rusttest-cm-ph';
+  const CM_PH_BAD = 'rusttest-cm-ph-bad';
+  const CM_DUP = 'rusttest-cm-dup-emh';
+  const CM_PLAIN = 'rusttest-cm-plain';
+  function cmUid(d) {
+    const t = String(authHeaders.Authorization || '').replace(/^Bearer\s+/i, '');
+    const s = d.prepare('SELECT user_id FROM sessions WHERE token = ?').get(t);
+    if (!s) throw new Error('parity: bench session not found for cards_meta cases');
+    return Number(s.user_id);
+  }
+  function cmClear(d) {
+    d.prepare('DELETE FROM price_history WHERE card_id IN (?,?)').run(CM_PH, CM_PH_BAD);
+    d.prepare('DELETE FROM deck_cards WHERE deck_id BETWEEN 931101 AND 931103').run();
+    d.prepare('DELETE FROM decks WHERE id BETWEEN 931101 AND 931103').run();
+    d.prepare('DELETE FROM card_cache WHERE id IN (?,?)').run(CM_DUP, CM_PLAIN);
+  }
+  function cmPrep() {
+    dbWrite((d) => {
+      cmClear(d);
+      const uid = cmUid(d);
+      const ins = d.prepare('INSERT INTO decks (id,user_id,name,description,checked_out,created_at) VALUES (?,?,?,?,?,?)');
+      ins.run(931101, uid, 'CM Checked One', '', 1, '2026-01-01 00:00:00');
+      ins.run(931102, uid, 'CM Not Checked', '', 0, '2026-01-01 00:00:00');
+      d.prepare("INSERT INTO card_cache (id,name,types,subtypes,rarity,price_trend) VALUES (?,?,?,?,'Rare',0.2)")
+        .run(CM_DUP, 'Emergency Medical Hologram', '["Artifact"]', '[]');
+      d.prepare("INSERT INTO card_cache (id,supertype,name,types,subtypes,rarity,price_trend) VALUES (?,?,?,?,?, 'Common',0.1)")
+        .run(CM_PLAIN, 'Land', 'Plains', '["Land"]', '["Basic","Plains"]');
+      const dc = d.prepare('INSERT INTO deck_cards (deck_id,card_id,quantity) VALUES (?,?,?)');
+      dc.run(931101, CW_CARD, 2);
+      dc.run(931101, CM_DUP, 1);
+      dc.run(931101, CM_PLAIN, 4);
+      dc.run(931102, CW_CARD, 7);
+      const ph = d.prepare('INSERT INTO price_history (card_id,price,recorded_at) VALUES (?,?,?)');
+      ph.run(CM_PH, 1.0, '2020-01-01 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-01 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-02 00:00:00');
+      ph.run(CM_PH, 2.5, '2026-01-03 00:00:00');
+      ph.run(CM_PH, 3.0, '2026-01-04 00:00:00');
+      ph.run(CM_PH_BAD, 2.5, 'bad-date');
+    });
+  }
+  function cmTeardown() { dbWrite((d) => cmClear(d)); }
+  cases.push({ name: 'cm_decks_hit', path: `/api/cards/${CW_CARD}/decks`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_decks_basic', path: `/api/cards/${CM_PLAIN}/decks`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_all', path: `/api/cards/${CM_PH}/price-history?range=x`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_default', path: `/api/cards/${CM_PH}/price-history`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_bad500', path: `/api/cards/${CM_PH_BAD}/price-history?range=x`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_ctor', path: `/api/cards/${CM_PH}/price-history?range=constructor`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_proto', path: `/api/cards/${CM_PH}/price-history?range=__proto__`, headers: authHeaders, setup: cmPrep, teardown: cmTeardown });
+  cases.push({ name: 'cm_ph_noauth', path: `/api/cards/${CM_PH}/price-history`, headers: {} });
+  cases.push({ name: 'cm_hl_ok', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'goblin', names: ['Goblin Racketeer', 'Island', 'goblin racketeer', ''] }) });
+  cases.push({ name: 'cm_hl_val', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'goblin' }) });
+  cases.push({ name: 'cm_hl_grammar', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: JSON.stringify({ q: 'is:land', names: ['Island'] }) });
+  cases.push({ name: 'cm_hl_badjson', path: '/api/cards/highlight', headers: EX_H, method: 'POST', etagReplay: false,
+    body: '{oops' });
+  cases.push({ name: 'cm_hl_text', path: '/api/cards/highlight', headers: { ...authHeaders, 'content-type': 'text/plain' }, method: 'POST', etagReplay: false,
+    body: 'q=goblin' });
+  cases.push({ name: 'cm_hl_noauth', path: '/api/cards/highlight', headers: { 'content-type': 'application/json' }, method: 'POST', etagReplay: false,
+    body: '{}' });
+  cases.push({ name: 'cm_sug', path: '/api/suggest?q=lig', headers: authHeaders });
+  cases.push({ name: 'cm_sug_upper', path: '/api/suggest?q=Goblin', headers: authHeaders });
+  cases.push({ name: 'cm_sug_short', path: '/api/suggest?q=a', headers: authHeaders });
+  cases.push({ name: 'cm_sug_noauth', path: '/api/suggest?q=lig', headers: {} });
+  cases.push({ name: 'cm_cotd', path: '/api/stats/commander-of-the-day?day=2026-11-12', headers: authHeaders });
+  cases.push({ name: 'cm_cotd_arr', path: '/api/stats/commander-of-the-day?day[]=x', headers: authHeaders });
+
+  // --- iter-40: admin users group (RUST_ROUTES=admin_users;
+  // GET/POST /api/admin/users, PUT/DELETE /api/admin/users/:id;
+  // backend/src/routes/admin.js:122-272). Every probe row (users, sessions,
+  // decks) is dbWrite-owned with a fixed created_at, so both sides see an
+  // identical users table at request time (setup runs per side right before
+  // the request; cases run serially). The bench session (authHeaders) is
+  // 'brenttime' — role admin — so the admin arms ride it. Write arms carry
+  // write->read verification on the OPPOSITE server (rule 2); cleanup
+  // deletes exactly the probe rows (rule 4). Gate arms: no-token/bad-token
+  // 401, member 403, api-key-on-admin-GET 403, api-key write 403 read-only.
+  const AU_PW = 'paritypass123';
+  const AU_KEY = 'bnd'.concat('_', 'a'.repeat(48)); // bnd_ + 48 hex-ish; distinct from FIXED_KEY
+  const AU_T0 = '2024-01-01 00:00:00';   // fixed created_at (cross-side determinism)
+  const AU_RO_TOK = 'rusttest-au-ro'.concat('-tok');
+  const AU_RO_HDR = 'Bearer '.concat(AU_RO_TOK);
+  const AU_BADTOK = 'Bearer '.concat('dead'.repeat(4));
+  function auPurge(...names) {
+    dbWrite((d) => {
+      for (const name of names) {
+        const row = d.prepare('SELECT id FROM users WHERE username = ?').get(name);
+        if (!row) continue;
+        d.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM decks WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM collection WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM users WHERE id = ?').run(row.id);
+      }
+    });
+  }
+  function auSeed(name, role, { apiKey = null, id = null } = {}) {
+    auPurge(name);
+    dbWrite((d) => {
+      if (id !== null) {
+        // Explicit id (own 9313xx block): both sides must see the SAME id in
+        // the GET list body and in readBack `seen`, so probes cannot ride
+        // AUTOINCREMENT (it differs per side by construction).
+        d.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM decks WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM collection WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM users WHERE id = ?').run(id);
+        d.prepare('INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, created_at, api_key) VALUES (?, ?, ?, ?, ?, 0, ?, ?)')
+          .run(id, name, '210000:00000000000000000000000000000000:00', role, `rusttest-${name}-shr`, AU_T0, apiKey);
+        return;
+      }
+      d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, created_at, api_key) VALUES (?, ?, ?, ?, 0, ?, ?)')
+        .run(name, '210000:00000000000000000000000000000000:00', role, `rusttest-${name}-shr`, AU_T0, apiKey);
+    });
+  }
+  function auSession(name, tok) {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE token = ?').run(tok);
+      const row = d.prepare('SELECT id FROM users WHERE username = ?').get(name);
+      if (!row) throw new Error(`auSession: no user ${name}`);
+      d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(tok, row.id, SESSION_EXP);
+    });
+  }
+  const auId = (name) => dbWrite((d) => d.prepare('SELECT id FROM users WHERE username = ?').get(name)?.id);
+  const auList = (base, username) => apiReq(base, 'GET', '/api/admin/users', authHeaders)
+    .then((r) => ({ ...r, user: Array.isArray(r.json) ? r.json.find((u) => u.username === username) : undefined }));
+  const AU_JSONH = { ...authHeaders, 'content-type': 'application/json' };
+
+  cases.push({ name: 'au_list', path: '/api/admin/users', headers: authHeaders, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_member', 'member', { id: 931301 }); },
+    teardown: async () => { auPurge('rusttest_au_member'); } });
+  cases.push({ name: 'au_list_noauth', path: '/api/admin/users', headers: {}, method: 'GET' });
+  cases.push({ name: 'au_list_badtoken', path: '/api/admin/users', headers: { Authorization: AU_BADTOK }, method: 'GET' });
+  cases.push({ name: 'au_list_member', path: '/api/admin/users', headers: {}, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_ro', 'member'); auSession('rusttest_au_ro', AU_RO_TOK); return { headers: { Authorization: AU_RO_HDR } }; },
+    teardown: async () => { auPurge('rusttest_au_ro'); } });
+  cases.push({ name: 'au_list_apikey', path: '/api/admin/users', headers: {}, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_key', 'member', { apiKey: AU_KEY }); return { headers: { Authorization: `Bearer ${AU_KEY}` } }; },
+    teardown: async () => { auPurge('rusttest_au_key'); } });
+
+  cases.push({ name: 'au_post_ok', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: ' RustTest_Au_Guy ', password: AU_PW }),
+    setup: async () => { auPurge('rusttest_au_guy'); },
+    readBack: async (other) => {
+      const r = await auList(other, 'rusttest_au_guy');
+      const u = r.user;
+      const view = u ? { username: u.username, role: u.role, share_enabled: u.share_enabled, total_cards: u.total_cards, total_value: u.total_value } : null;
+      return view && view.role === 'member' && view.share_enabled === 0 && view.total_cards === 0 && view.total_value === 0
+        ? { ok: true, why: 'created user visible on the other server with destructure-default shape', seen: view }
+        : { ok: false, why: `created user missing/wrong on other server: ${r.status} ${fmt(u)}`, seen: view };
+    },
+    teardown: async () => { auPurge('rusttest_au_guy'); } });
+  cases.push({ name: 'au_post_required', path: '/api/admin/users', headers: AU_JSONH, method: 'POST', body: '{}' });
+  cases.push({ name: 'au_post_shortpw', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: 'short' }) });
+  cases.push({ name: 'au_post_badrole', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW, role: 'owner' }) });
+  cases.push({ name: 'au_post_dup', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: ' RustTest_Au_Dup ', password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_dup', 'member'); },
+    teardown: async () => { auPurge('rusttest_au_dup'); } });
+  cases.push({ name: 'au_post_apikey', path: '/api/admin/users', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_key2', 'member', { apiKey: AU_KEY }); return { headers: { Authorization: `Bearer ${AU_KEY}`, 'content-type': 'application/json' } }; },
+    teardown: async () => { auPurge('rusttest_au_key2'); } });
+  cases.push({ name: 'au_post_noauth', path: '/api/admin/users', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW }) });
+
+  cases.push({ name: 'au_put_role_ok', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'admin' }),
+    setup: async () => { auSeed('rusttest_au_edit', 'member', { id: 931302 }); const id = auId('rusttest_au_edit'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other) => {
+      const r = await auList(other, 'rusttest_au_edit');
+      return r.user?.role === 'admin'
+        ? { ok: true, why: 'role=admin visible on the other server', seen: r.user }
+        : { ok: false, why: `role not persisted on other server: ${r.status} ${fmt(r.user)}`, seen: r.user ?? null };
+    },
+    teardown: async () => { auPurge('rusttest_au_edit'); } });
+  cases.push({ name: 'au_put_pw_ok', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_pw', 'member'); const id = auId('rusttest_au_pw'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other) => {
+      // Cross-side password verification: the seeded hash is garbage, so a
+      // successful login on the OTHER server proves the write landed and the
+      // hash written by one server verifies on the other (Rust hash ->
+      // Node-side check via Node's login path and vice versa).
+      const login = await apiReq(other, 'POST', '/api/auth/login', { 'content-type': 'application/json' },
+        JSON.stringify({ username: 'rusttest_au_pw', password: AU_PW }));
+      return login.status === 200 && typeof login.json?.token === 'string'
+        ? { ok: true, why: 'new password logs in on the other server', seen: { role: login.json?.user?.role } }
+        : { ok: false, why: `login with new password failed on other server: ${login.status} ${fmt(login.text)}`, seen: null };
+    },
+    teardown: async () => { auPurge('rusttest_au_pw'); } });
+  cases.push({ name: 'au_put_404', path: '/api/admin/users/931399', headers: AU_JSONH, method: 'PUT', body: '{}' });
+  cases.push({ name: 'au_put_badrole', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'owner' }),
+    setup: async () => { auSeed('rusttest_au_brole', 'member'); const id = auId('rusttest_au_brole'); return { path: `/api/admin/users/${id}` }; },
+    teardown: async () => { auPurge('rusttest_au_brole'); } });
+  cases.push({ name: 'au_put_shortpw', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ password: 'short' }),
+    setup: async () => { auSeed('rusttest_au_spw', 'member'); const id = auId('rusttest_au_spw'); return { path: `/api/admin/users/${id}` }; },
+    teardown: async () => { auPurge('rusttest_au_spw'); } });
+  cases.push({ name: 'au_put_selfdemote', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'member' }),
+    setup: async () => {
+      // The self-demotion gate answers 400 BEFORE any write on both sides.
+      const id = dbWrite((d) => d.prepare("SELECT id FROM users WHERE username = 'brenttime'").get()?.id);
+      if (!id) throw new Error('au_put_selfdemote: bench user missing');
+      return { path: `/api/admin/users/${id}` };
+    } });
+
+  cases.push({ name: 'au_delete_ok', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => { auSeed('rusttest_au_del', 'member'); const id = auId('rusttest_au_del'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other, ctx) => {
+      const gone = dbWrite((d) => !d.prepare('SELECT id FROM users WHERE id = ?').get(ctx.id));
+      const r = await auList(other, 'rusttest_au_del');
+      return gone && !r.user
+        ? { ok: true, why: 'user absent from DB and from the other server list', seen: { deleted: true } }
+        : { ok: false, why: `user still present after delete: db=${!gone} other=${fmt(r.user)}`, seen: r.user ?? null };
+    },
+    teardown: async () => { auPurge('rusttest_au_del'); } });
+  cases.push({ name: 'au_delete_409', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => {
+      auSeed('rusttest_au_co', 'member');
+      const id = auId('rusttest_au_co');
+      dbWrite((d) => d.prepare('INSERT INTO decks (user_id, name, checked_out) VALUES (?, ?, 1)').run(id, 'rusttest au loan deck'));
+      return { path: `/api/admin/users/${id}` };
+    },
+    teardown: async () => { auPurge('rusttest_au_co'); } });
+  cases.push({ name: 'au_delete_404', path: '/api/admin/users/931398', headers: authHeaders, method: 'DELETE' });
+  cases.push({ name: 'au_delete_self', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => {
+      const id = dbWrite((d) => d.prepare("SELECT id FROM users WHERE username = 'brenttime'").get()?.id);
+      if (!id) throw new Error('au_delete_self: bench user missing');
+      return { path: `/api/admin/users/${id}` };
+    } });
+  cases.push({ name: 'au_delete_noauth', path: '/api/admin/users/1', headers: {}, method: 'DELETE' });
+}
 
 
 // --- run ---------------------------------------------------------------------

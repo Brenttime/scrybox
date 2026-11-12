@@ -28,6 +28,8 @@ pub struct MockState {
     pub collection_batches: Mutex<Vec<Value>>,
     /// GET /cards/search response body.
     pub search: Mutex<Value>,
+    /// GET /api/suggest response body (cards_meta port).
+    pub suggest: Mutex<Value>,
     /// Per-key status scripts: "GET /sets" -> [429, 200] (last entry
     /// repeats once the script is exhausted).
     pub statuses: Mutex<HashMap<String, Vec<u16>>>,
@@ -73,6 +75,7 @@ pub async fn spawn_mock() -> (SocketAddr, Arc<MockState>) {
     let state = Arc::new(MockState::default());
     *state.sets.lock().unwrap() = serde_json::json!({"data": []});
     *state.search.lock().unwrap() = serde_json::json!({"data": [], "has_more": false});
+    *state.suggest.lock().unwrap() = serde_json::json!({"suggestions": []});
 
     let app_state = state.clone();
     let router = Router::new().fallback(move |req: Request| {
@@ -138,6 +141,10 @@ pub async fn spawn_mock() -> (SocketAddr, Arc<MockState>) {
                 }
                 ("GET", "/cards/search") => {
                     let body = state.search.lock().unwrap().clone();
+                    json_resp(StatusCode::OK, &body, None)
+                }
+                ("GET", "/api/suggest") => {
+                    let body = state.suggest.lock().unwrap().clone();
                     json_resp(StatusCode::OK, &body, None)
                 }
                 (m, p) => json_resp(

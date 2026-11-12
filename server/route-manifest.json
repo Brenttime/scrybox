@@ -1,6 +1,7 @@
 {
   "DELETE /api/admin/users/:id": {
-    "status": "node"
+    "module": "scrybox-server::admin_users (lib.rs DELETE /api/admin/users/{id} under RUST_ROUTES=admin_users; admin.js:238 twin: parseInt self-delete 400 before auth-write, withAllocationLock + dedicated-tx FK-ON cascade, 400/404/409 arms, sessions+collection+users deletes, changes!==1 vanish guard)",
+    "status": "verified"
   },
   "DELETE /api/auth/api-key": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
@@ -88,7 +89,8 @@
     "tests": "tests/catalog_build_route.rs (models_status_shape_and_download_409, kill_switch_off_proxies_everything, catalogs_auth_ladder_and_list_shape)"
   },
   "GET /api/admin/users": {
-    "status": "node"
+    "module": "scrybox-server::admin_users (lib.rs GET /api/admin/users under RUST_ROUTES=admin_users; admin.js:122 twin: SELECT..ORDER BY username ASC + per-user stats SELECT, ||0 folds, toFixed(2) via js_fixed_parsed, insertion key order id..total_value, 500 'Failed to retrieve users list')",
+    "status": "verified"
   },
   "GET /api/auth/config": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
@@ -121,7 +123,9 @@
     "tests": "tests/catalog_art_route.rs (index_folds_layers_sorted_deduped, index_absent_dirs_answer_empty); parity.mjs card_art_index"
   },
   "GET /api/cards/:id/decks": {
-    "status": "node"
+    "module": "scrybox-server::cards_meta (lib.rs /api/cards/{id}/decks under RUST_ROUTES=cards_meta; Node CROSS-JOIN verbatim incl. checked_out=1, quantity>0, NOT sqlIsBasicLand(target), shared sql_card_key twin, GROUP BY + NOCASE order, Number()||0)",
+    "status": "verified",
+    "tests": "tests/cards_meta_route.rs decks_logical_match_all_printings_and_gates (multi-printing SUM, basic target exclusion, checked_out gate, unknown id), decks_requires_auth_and_off_switch; parity.mjs cm_decks_*"
   },
   "GET /api/cards/:id/oracle": {
     "module": "scrybox-server::cards_tags (lib.rs GET /api/cards/{id}/oracle)",
@@ -134,7 +138,9 @@
     "tests": "tests/cards_tags_route.rs (oracle_tags_direct_inherited_and_via, oracle_tags_no_gen_no_oracle_and_fallback, oracle_tags_auth_gate_and_proxy); parity.mjs cards_oracle_tags_ok/cards_oracle_tags_fallback/cards_oracle_tags_404_shape/cards_oracle_tags_no_token"
   },
   "GET /api/cards/:id/price-history": {
-    "status": "node"
+    "module": "scrybox-server::cards_meta (lib.rs /api/cards/{id}/price-history under RUST_ROUTES=cards_meta; collapse-flat-runs keeps both ends, sort-by-time NaN-stable, surviving Invalid-Date -> 500 twin, collapsed-away NaN poisons spanDays only, prototype-key windowDays quirks (constructor dropped/__proto__ {}), shared parse_sqlite_utc + iso_utc_ms)",
+    "status": "verified",
+    "tests": "tests/cards_meta_route.rs price_history_all_collapses_flat_runs, default_window_is_30d, nan_time_paths, window_days_prototype_curiosities; parity.mjs cm_ph_*"
   },
   "GET /api/cardscan/status": {
     "module": "scrybox-server::cardscan (lib.rs sub-router /api/cardscan* under RUST_ROUTES=cardscan; cardscan.js twin: sidecar proxy legs, card_cache hydration, res.json/body_etag/compression twins; unparsed-body arms forward to Node)",
@@ -173,7 +179,9 @@
     "status": "node"
   },
   "GET /api/export": {
-    "status": "node"
+    "module": "scrybox-server::export (lib.rs /api/export + /api/import under RUST_ROUTES=export; byte-attachment CSV/JSON twin incl. Content-Disposition + Express body ETag/304, resolveCardPrice proxy-first twin, csvMappers once-mapped strategies, all-or-nothing validation loop, shared bulk_fetch_by_identifier + cache_normalized_cards legs, whole-request forwards)",
+    "status": "verified",
+    "tests": "tests/export_route.rs (+ src unit tests) get_export_csv/json/ecosystem, etag 304 replay, post view order+dedup+validation, import validation rejections, game/printing gates, cache-hit write, uncached bulk, unrecognized/non-mtg, bulk-error forward, off-switch; parity.mjs ex_get_*, ex_post_*, ex_import_*"
   },
   "GET /api/health": {
     "module": "scrybox-server::health (lib.rs GET /api/health)",
@@ -255,10 +263,14 @@
     "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "GET /api/secret-lair": {
-    "status": "node"
+    "module": "scrybox-server::secret_lair (lib.rs /api/secret-lair under RUST_ROUTES=secret_lair; shared precons getPreconIndex mirror + rankPrecons ladder, SL_TYPE gate, byKey slot fold w/ nameKey non-word-RUN collapse (JS /[^\\w]+/g), limit clamp 1..100 default 25)",
+    "status": "verified",
+    "tests": "tests/secret_lair.rs::kill_switch_off_proxies, auth_gate_401_on_every_shape, search_filter_fold_and_shape, search_ranking_strip_and_limit_clamp, search_limit_clamps, search_name_key_run_collapse, search_stale_fallback_and_502; parity.mjs sl_search_*, sl_unknown_subpath, sl_put_method"
   },
   "GET /api/secret-lair/preview": {
-    "status": "node"
+    "module": "scrybox-server::secret_lair (lib.rs /api/secret-lair/preview under RUST_ROUTES=secret_lair; resolveFoilFileName twin swap, previewSecretLairDrop fold on shared getPreconCardList + bulkFetchByIdentifier, getPreconCardList name/isFoil-blindness, ownedCountForCards, whole-request forwards on Scryfall client errors)",
+    "status": "verified",
+    "tests": "tests/secret_lair.rs::kill_switch_off_proxies, auth_gate_401_on_every_shape, preview_requires_file_name, preview_shape_records_and_owned, preview_dedupe_unresolved_and_count_floors, preview_foil_twin_resolution_and_passthrough, preview_foil_twin_missing_422, preview_upstream_failures, preview_scryfall_client_error_forwards; parity.mjs sl_preview_*"
   },
   "GET /api/sets": {
     "module": "scrybox-server::sets (lib.rs GET /api/sets)",
@@ -286,7 +298,9 @@
     "tests": "tests/stats.rs (15); parity.mjs stats + stats_post_write (5 s SWR per owner ruling)"
   },
   "GET /api/stats/commander-of-the-day": {
-    "status": "node"
+    "module": "scrybox-server::cards_meta (lib.rs /api/stats/commander-of-the-day under RUST_ROUTES=cards_meta; dayHash FNV-1a/UTF-16 twin, manual US-Eastern DST easternDay, edhrecSlug NFD+combining-strip twin, deterministic idx pick, per-day cache cap 7, total/empty 503s, every-throw 502)",
+    "status": "verified",
+    "tests": "tests/cards_meta_route.rs (+ src unit tests) cotd_day_param_payload_and_cache (payload/key order, show flag, cache hit), cotd_error_shapes, day_hash/slug/eastern_day node-generated vectors; parity.mjs cm_cotd_*"
   },
   "GET /api/stats/history": {
     "module": "scrybox-server::stats_subs (lib.rs exact-path mounts /api/stats/history, /api/stats/networth, /api/stats/top-mover under RUST_ROUTES=stats_subs; HEAD/POST/trailing-slash/unknown methods proxy untouched; named entries share the /stats StatsCache store via stats::StatsCache::{key_named,get_entry,set_named,slot_for,finish_key} \u2014 same user gen + trigger-maintained dataRevision + 5 min TTL + 500 LRU as statsCache.js; historyCards cached per user on dataRevision, STATS_CACHE=0 bypass matches Node); SQL verbatim-verified vs backend/src/routes/stats.js (WHITESPACE-NORMALIZED full-text check); sweep/qs/label semantics are node-generated unit vectors (unit tests in stats_subs.rs; qs expectations captured from qs.parse in scrybox-rusttest-node)",
@@ -304,7 +318,9 @@
     "tests": "tests/stats_subs.rs::top_mover_user1_matches_node_oracle_bytes (full static body incl card key order + Math.round price/pct vectors) + top_mover_user2_no_owned_moves ({card:null}), miss_hit_304_replay_and_byte_stability, price_history_write_bumps_aux_trigger_and_freshens_named_entries (winner flips Sol Ring->Zephyr Falcon, pct=172.7 vs node-computed vector), proxied-write gen test, auth + kill-switch + path tests; parity.mjs ss_topmover(+_user1) byte-diffed incl key order; ss_topmover_noauth + ss_topmover_badtoken (401 error-path byte parity incl error body, etagReplay:false \u2014 closes orchestrator audit 2026-11-10 20:20 ruling 1)"
   },
   "GET /api/suggest": {
-    "status": "node"
+    "module": "scrybox-server::cards_meta (lib.rs /api/suggest under RUST_ROUTES=cards_meta; sidecar /api/suggest 2500ms twin, UTF-16 slice(0,80) incl. lone-surrogate -> empty, lowercase dedup filter, slice 8, ||'' field defaults, all-failure empty)",
+    "status": "verified",
+    "tests": "tests/cards_meta_route.rs suggest_dedup_cap_and_defaults, suggest_empty_paths; parity.mjs cm_sug_*"
   },
   "GET /models/cornelius.onnx": {
     "module": "scrybox-server::static_assets (lib.rs GET/HEAD /models/cornelius.onnx under RUST_ROUTES=static_assets; static_assets.rs = sendFile twin with 30-day immutable CC; non-GET => finalhandler default 404, missing file => 404 empty)",
@@ -340,7 +356,8 @@
     "status": "node"
   },
   "POST /api/admin/users": {
-    "status": "node"
+    "module": "scrybox-server::admin_users (lib.rs POST /api/admin/users under RUST_ROUTES=admin_users; admin.js:162 twin: validation order required/3/8/role, destructure default role='member' (null !== undefined), UTF-16 length gate, cleaned-username dup, scrypt hash, randomBytes(16)-hex share token, 201 message)",
+    "status": "verified"
   },
   "POST /api/auth/api-key": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
@@ -371,7 +388,9 @@
     "status": "node"
   },
   "POST /api/cards/highlight": {
-    "status": "node"
+    "module": "scrybox-server::cards_meta (lib.rs /api/cards/highlight under RUST_ROUTES=cards_meta; free-text analyze-gate twin with whole-POST replay for grammar/validation, fetchWindow scryPage twin incl 4x429 retry, chunked !\"exact\" queries, DFC front-face matching, engine error ladder 404/400-422/else)",
+    "status": "verified",
+    "tests": "tests/cards_meta_route.rs (+ src unit tests) highlight_native (query encoding, order=name), engine 404/400/503/429 ladder, validation 400s, analyze-gate + badjson replays; parity.mjs cm_hl_*"
   },
   "POST /api/cards/role-tags": {
     "module": "scrybox-server::cards_tags (lib.rs POST /api/cards/role-tags)",
@@ -444,10 +463,14 @@
     "tests": "tests/decks_writes.rs::register_collection_contract (400 no-cards / 422 unresolved / 404 foreign / 409 checked-out, 201 body + stacked rows (no dedup, register twice -> 6 rows), language COALESCE 'English', price sweep one row per distinct card); parity.mjs dk2_register_201 (opposite-server collection rows incl. condition/language/is_trade), dk2_register_empty_400, dk2_register_unresolved_422, dk2_register_checkedout_409, dk2_register_badjson_500 (parse-before-auth on body-ignoring route), dk2_register_noauth_401"
   },
   "POST /api/export": {
-    "status": "node"
+    "module": "scrybox-server::export (lib.rs /api/export + /api/import under RUST_ROUTES=export; byte-attachment CSV/JSON twin incl. Content-Disposition + Express body ETag/304, resolveCardPrice proxy-first twin, csvMappers once-mapped strategies, all-or-nothing validation loop, shared bulk_fetch_by_identifier + cache_normalized_cards legs, whole-request forwards)",
+    "status": "verified",
+    "tests": "tests/export_route.rs (+ src unit tests) get_export_csv/json/ecosystem, etag 304 replay, post view order+dedup+validation, import validation rejections, game/printing gates, cache-hit write, uncached bulk, unrecognized/non-mtg, bulk-error forward, off-switch; parity.mjs ex_get_*, ex_post_*, ex_import_*"
   },
   "POST /api/import": {
-    "status": "node"
+    "module": "scrybox-server::export (lib.rs /api/export + /api/import under RUST_ROUTES=export; byte-attachment CSV/JSON twin incl. Content-Disposition + Express body ETag/304, resolveCardPrice proxy-first twin, csvMappers once-mapped strategies, all-or-nothing validation loop, shared bulk_fetch_by_identifier + cache_normalized_cards legs, whole-request forwards)",
+    "status": "verified",
+    "tests": "tests/export_route.rs (+ src unit tests) get_export_csv/json/ecosystem, etag 304 replay, post view order+dedup+validation, import validation rejections, game/printing gates, cache-hit write, uncached bulk, unrecognized/non-mtg, bulk-error forward, off-switch; parity.mjs ex_get_*, ex_post_*, ex_import_*"
   },
   "POST /api/limited/analyze": {
     "status": "node"
@@ -538,10 +561,13 @@
     "tests": "tests/search_history_shared.rs::auth_gate_and_parse_order, post_merge_persists_and_replays_via_get, oversized_body_answers_the_413_shape, kill_switch_proxies_everything_untouched; parity.mjs shx_get_noauth/shx_get_badtoken/shx_post_noauth/shx_post_badjson_noauth/shx_post_too_large_noauth/shx_get_empty(+304)/shx_post_items_ok/shx_post_q_ok/shx_post_empty/shx_post_items_all_blank/shx_post_array_body/shx_post_apikey_403/shx_delete_one/shx_delete_clear/shx_delete_nobody"
   },
   "POST /api/secret-lair/add": {
-    "status": "node"
+    "module": "scrybox-server::secret_lair (lib.rs /api/secret-lair/add under RUST_ROUTES=secret_lair; addSecretLairToCollection twin on the preview fold \u2014 Number(copies)||1 mult clamped 1..500 (NOT parseInt), quantity max(1, round(count*mult)), printingMode whitelist w/ foil/nonfoil force, util-level VALID_CONDITIONS rewrite to 'Near Mint', language param-default (explicit null rides) \u2014 Normal/Holofoil group order, collection_writes plan_add+execute_add re-use, early 'No cards to add' 422 key order, pre-write whole-request forwards)",
+    "status": "verified",
+    "tests": "tests/secret_lair.rs::kill_switch_off_proxies, auth_gate_401_on_every_shape, add_requires_file_name_and_bad_body, add_early_422_nothing_resolved, add_happy_db_writes_and_shape, add_copies_mult_number_fold_round_and_clamp, add_printing_mode_and_condition_whitelists, add_foil_flag_is_strict_and_twin_422, add_scard_client_error_forwards, add_per_card_failure_shape_from_db; parity.mjs sl_add_* (incl. sl_add_copies_foil parseInt-trap, sl_add_copies_numeric, sl_add_printing_mode_foil, sl_add_condition_whitelist)"
   },
   "PUT /api/admin/users/:id": {
-    "status": "node"
+    "module": "scrybox-server::admin_users (lib.rs PUT /api/admin/users/{id} under RUST_ROUTES=admin_users; admin.js:201 twin: 404 first, !==undefined null-gates (null -> route-catch 500), password arm commits BEFORE bad-role 400, parseInt self-demotion gate, 500 'Failed to update user')",
+    "status": "verified"
   },
   "PUT /api/auth/settings": {
     "module": "scrybox-server::auth_routes (+auth_support, ip_limit, oidc; lib.rs /api/auth + /api/auth/{*rest} under RUST_ROUTES=auth)",
