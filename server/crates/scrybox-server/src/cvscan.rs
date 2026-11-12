@@ -582,8 +582,8 @@ pub fn resize_lanczos3(src: &RawRgb, ow: usize, oh: usize) -> RawRgb {
     let scale_x = ow as f64 / src.w as f64;
     let scale_y = oh as f64 / src.h as f64;
     let mut cur = src.clone();
-    let mut hs = scale_x;
-    let mut vs = scale_y;
+    let hs = scale_x;
+    let vs = scale_y;
     // 1. NO integer pre-shrink for lanczos3. vips_resize's shrink/subsample
     // fast paths are NEAREST-kernel only (resize.c lines 166-203); sharp
     // 0.33.5 calls vips_resize without @gap (default 0.0), so lanczos3 is a
