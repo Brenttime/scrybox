@@ -14,16 +14,16 @@
 //! assignment (only the broad query may set it, and only if the call returns
 //! normally — a 404/422 discards the whole window, partial pages included).
 //!
-//! Deliberate divergence (design note, iter-7): Node's leg `cacheCards`-
-//! upserts the walked rows into `card_cache` as a side effect. Rust does
-//! not. Parity is unaffected — both servers consult the *shared* card_cache
-//! first and fall back to the same deterministic sidecar, so skipping the
-//! write cannot make the two disagree (Rust would only have to reproduce
-//! Node's cache state; it never has to). It also keeps Rust's own rev-keyed
-//! caches from invalidating on every walk and keeps card_cache warming
-//! exactly as Node's own walks produced it. If a request ever errors on the
-//! sidecar leg, Rust proxies instead — Node then answers verbatim, including
-//! its own upserts, retries and 503 semantics.
+//! Cache side effect (unit 7c): like Node's leg, a non-empty field-filter
+//! walk upserts the walked rows into `card_cache` — the caller (search.rs)
+//! runs them through the shared `card_cache::cache_normalized_cards` twin
+//! before answering, exactly like Node's `await cacheCards(cards)` in
+//! runSearch. That write is observable (suites read card_cache right after
+//! the response) and it is what keeps walked cards answerable from the cache
+//! leg when the sidecar/upstream later goes dark. Both servers share the one
+//! card_cache, so both must write it or the two disagree by construction. If
+//! a request errors on the sidecar leg, Rust proxies instead — Node then
+//! answers verbatim, including its own upserts, retries and 503 semantics.
 
 use serde_json::{Map, Value};
 
@@ -561,6 +561,10 @@ pub struct NamesWalk {
     /// round-trip through the durable table byte-exactly).
     pub total: Option<Value>,
     pub fetched_count: u64,
+    /// The first `min(500, walk_limit)` RAW cards of the window — the input
+    /// to resolveCollectionQuery's bounded card_cache backfill (unit 7c),
+    /// which mirrors Node's `fetched.slice(0, 500)` pre-normalize slice.
+    pub fetched: Vec<Value>,
 }
 
 pub enum NamesWalkErr {
@@ -638,10 +642,19 @@ pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &st
     let mut total: Option<Value> = None;
     let mut names: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // resolveCollectionQuery's backfill slice is over the WINDOW (fetched,
+    // capped at the walk limit), first 500 — keep exactly that raw prefix
+    // without buffering the whole 20k walk.
+    let fetch_cap = walk_limit.min(500).max(0) as usize;
+    let mut fetched: Vec<Value> = Vec::new();
     while out_len < walk_limit {
         let p = names_page(st, base, &scoped, page, non_en).await?;
         if p.total.is_some() {
             total = p.total;
+        }
+        if fetched.len() < fetch_cap {
+            let take = (fetch_cap - fetched.len()).min(p.data.len());
+            fetched.extend(p.data[..take].iter().cloned());
         }
         out_len += p.data.len() as i64;
         for raw in &p.data {
@@ -679,7 +692,7 @@ pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &st
     // hasMore = hasMore || out.length > limit — a walk that stopped because
     // the window filled is a REAL but INCOMPLETE prefix (runWalk's comment).
     let truncated = out_len > walk_limit;
-    Ok(NamesWalk { names, complete: !has_more && !truncated, total, fetched_count: out_len.min(walk_limit).max(0) as u64 })
+    Ok(NamesWalk { names, complete: !has_more && !truncated, total, fetched_count: out_len.min(walk_limit).max(0) as u64, fetched })
 }
 
 /// The field-filter walk for the name-only branch:

@@ -179,10 +179,14 @@ fn color_value_ok(value: &str) -> bool {
 
 /// The accepted operator keywords, by lowercased spelling. `is:` is excluded
 /// (makeLeaf rewrites it to `t:` with hyphen→space quoting), `oracle:`/
-/// `name:`/… stay proxied — only the two data operators the bench and UI
-/// conjunctions need are proven here.
+/// `name:`/… stay proxied — the two data operators the bench and UI
+/// conjunctions need, plus the Scrybox `otag:` catalog leaf (unit 7c: the
+/// tokenizer lowercases the typed operator into `raw` and leafToScryfall
+/// re-emits it VERBATIM, so `otag:`/`oracletag:`/`function:` echo exactly
+/// what Node walks; the engine — and the durable cache key — see the same
+/// string either way).
 fn allowed_operator_kw(kw_lower: &str) -> bool {
-    matches!(kw_lower, "t" | "type" | "c" | "color" | "colour")
+    matches!(kw_lower, "t" | "type" | "c" | "color" | "colour" | "otag" | "oracletag" | "function")
 }
 
 /// The free-text + operator-conjunction gate + `toScryfall` normalization.
@@ -473,10 +477,38 @@ pub async fn get_names(st: AppState, cq: &Arc<CollectionQ>) -> NamesOutcome {
                 return Ok(Ok((e, false)));
             }
             init_st.collq_cache.walks.fetch_add(1, Ordering::Relaxed);
-            let walk = match sidecar::walk_collection_names(&init_st, &init_base, &init_cq.walk_q(), &init_cq.lang_code, WALK_LIMIT).await {
+            let mut walk = match sidecar::walk_collection_names(&init_st, &init_base, &init_cq.walk_q(), &init_cq.lang_code, WALK_LIMIT).await {
                 Ok(w) => w,
                 Err(e) => return Ok(Err(e)),
             };
+            // resolveCollectionQuery's bounded backfill (unit 7c): the first
+            // 500 RAW cards of the window, normalized and upserted through
+            // the shared card_cache writer WITHOUT blocking the answer —
+            // Node runs it on a floating promise for exactly this reason.
+            // `fetched` is only non-empty on a real walk (never on an
+            // entry reuse), matching Node's `{ entry, fetched }` contract.
+            if !walk.fetched.is_empty() {
+                let backfill_raw = std::mem::take(&mut walk.fetched);
+                let lang_name = crate::search::to_name(Some(init_cq.scry_code.as_str()));
+                let backfill_pool = Arc::clone(init_st.db.as_ref().expect("db present above"));
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(move || {
+                        let maps: Vec<serde_json::Map<String, Value>> = backfill_raw
+                            .iter()
+                            .map(|raw| sidecar::normalize_card(raw, &lang_name))
+                            .collect();
+                        let conn = backfill_pool.get().map_err(|e| e.to_string())?;
+                        crate::card_cache::cache_normalized_cards(&conn, &maps)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                    match res {
+                        Err(j) => tracing::error!("Scryfall collection query caching failed: {j}"),
+                        Ok(Err(s)) => tracing::error!("Scryfall collection query caching failed: {s}"),
+                        Ok(Ok(())) => {}
+                    }
+                });
+            }
             let entry = Arc::new(QEntry {
                 names: walk.names,
                 complete: walk.complete,

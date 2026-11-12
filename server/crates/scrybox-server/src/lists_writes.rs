@@ -103,6 +103,31 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // Unit 7c: Node's batched hydration of names this install has never
+    // seen (routes/lists.js:118) — probe the cache, resolve the misses
+    // through /cards/collection (sidecar-swapped, cached), and let
+    // create_list match natively; anything still unresolved reports as
+    // `unmatched` exactly like Node's post-fetch loop.
+    if let Some(Value::String(t)) = body.get("list_text") {
+        let lines = parse_list_text(t);
+        if !lines.is_empty() {
+            if let Ok(conn) = pool.get() {
+                let mut missing: Vec<String> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for l in &lines {
+                    if find_cached_card(&conn, &l.name).ok().flatten().is_none()
+                        && seen.insert(l.name.to_lowercase())
+                    {
+                        missing.push(l.name.clone());
+                    }
+                }
+                drop(conn);
+                if !missing.is_empty() {
+                    bulk_resolve_names(&st, &missing).await;
+                }
+            }
+        }
+    }
     match create_list(&pool, user.id, &body) {
         CreateOutcome::Response(res) => res,
         CreateOutcome::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
@@ -602,9 +627,69 @@ pub(crate) fn js_bind(v: &Value) -> SqlValue {
 
 enum CreateOutcome {
     Response(Response),
-    /// At least one parsed name misses the cache: the whole request goes to
-    /// Node untouched (Scryfall hydration + lastID + unmatched all Node-side).
+    /// (unit 7c: the uncached-name hydration gate is gone — the batched
+    /// `/cards/collection` resolve now runs natively in handle_create, so
+    /// uncached lines report unmatched exactly like Node. Variant kept for
+    /// genuinely Node-owned futures.)
     Forward,
+}
+
+/// `bulkFetchByIdentifier([{name}…])` (no `upstream` pin — so the shared
+/// Scry client swaps to the sidecar when LOCAL_SCRYFALL is on, exactly like
+/// Node's default `scryRequest`) + `cacheCards`, for the list-create import
+/// leg (routes/lists.js:120, unit 7c). Batches of 75; `scryPostRetried`
+/// semantics (4 attempts). Any failure logs and returns: Node's route
+/// catches it (`List import: Scryfall lookup failed:`) and every
+/// unresolved line simply lands in `unmatched`.
+async fn bulk_resolve_names(st: &AppState, names: &[String]) {
+    const COLLECTION_BATCH: usize = 75;
+    let Some(pool) = st.db.as_ref().map(|p| std::sync::Arc::clone(p)) else { return };
+    let lang_name = crate::search::to_name(None);
+    for chunk in names.chunks(COLLECTION_BATCH) {
+        let identifiers: Vec<Value> = chunk
+            .iter()
+            .map(|n| json!({ "name": n }))
+            .collect();
+        let mut body = serde_json::Map::new();
+        body.insert("identifiers".into(), Value::Array(identifiers));
+        let resp = st
+            .scry
+            .post_retried(
+                "/cards/collection",
+                Value::Object(body),
+                &crate::scryfall::ScryOpts::default(),
+                4,
+            )
+            .await;
+        let data = match resp {
+            Ok(Some(v)) => v
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            // Node guards `resp.data` (non-JSON answers carry no cards);
+            // a transport/retry exhaustion is the caught-error path.
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::error!("List import: Scryfall lookup failed: {e}");
+                return;
+            }
+        };
+        if data.is_empty() {
+            continue;
+        }
+        let maps: Vec<serde_json::Map<String, Value>> =
+            data.iter().map(|raw| crate::sidecar::normalize_card(raw, &lang_name)).collect();
+        let pool_w = std::sync::Arc::clone(&pool);
+        let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = pool_w.get().map_err(|e| e.to_string())?;
+            crate::card_cache::cache_normalized_cards(&conn, &maps).map_err(|e| e.to_string())
+        })
+        .await;
+        if let Err(e) = wrote {
+            tracing::error!("List import: Scryfall lookup failed: {e:?}");
+        }
+    }
 }
 
 fn create_list(pool: &DbPool, user_id: i64, body: &Value) -> CreateOutcome {
@@ -638,18 +723,10 @@ fn create_list(pool: &DbPool, user_id: i64, body: &Value) -> CreateOutcome {
         Err(e) => return CreateOutcome::Response(fail(&e)),
     };
 
-    // Hydration gate BEFORE the INSERT: any uncached name forwards the whole
-    // request, so Node performs the single authoritative INSERT.
-    if !lines.is_empty() {
-        for l in &lines {
-            match find_cached_card(&conn, &l.name) {
-                Ok(Some(_)) => {}
-                Ok(None) => return CreateOutcome::Forward,
-                Err(e) => return CreateOutcome::Response(fail(&e)),
-            }
-        }
-    }
-
+    // Unit 7c: the pre-INSERT hydration gate is gone. handle_create has
+    // already run Node's batched `/cards/collection` hydration, so any name
+    // still missing here is genuinely unresolved and reports as `unmatched`
+    // through the post-INSERT loop — Node's exact outcome shape.
     if let Err(e) = conn.execute(
         "INSERT INTO card_lists (name, description, accent_color, icon, user_id) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![

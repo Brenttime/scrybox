@@ -13,7 +13,7 @@
 //! brief's prose is secondary to that source wherever they disagree (see the
 //! module tests; deliberate deviations are documented on the functions).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -1687,6 +1687,14 @@ pub(crate) enum AddPlan {
         price: Value,
     },
     Reject(String),
+    /// card_cache miss on a STRING id (unit 7c): Node runs
+    /// `cardApi.getCardById` — a Scryfall GET `/cards/{rawId}` +
+    /// `cacheCards([norm])` — and only then continues (or 404s
+    /// `Card ID {id} not found.`). getCardById is lane B's scryfallApi
+    /// territory: the handler attempts that leg natively via the shared
+    /// Scry client and re-plans; any outcome the native leg cannot own
+    /// (transport, non-200, Node deployed) falls back to Forward.
+    FetchCard(String),
     Forward,
 }
 
@@ -1714,8 +1722,13 @@ pub(crate) fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result
         &[json_to_sql(card_id_v)?],
     )? {
         Some(r) => r,
-        // Node would cardApi.getCardById() → Scryfall. Not Rust's to do.
-        None => return Ok(AddPlan::Forward),
+        // Node would cardApi.getCardById() → Scryfall. A string id names
+        // that leg exactly (FetchCard); anything else (number, object)
+        // Node answers through its own coercion ladder — not Rust's to do.
+        None => match card_id_v {
+            Some(Value::String(s)) => return Ok(AddPlan::FetchCard(s.clone())),
+            _ => return Ok(AddPlan::Forward),
+        },
     };
 
     let language_default = Value::String("English".into());
@@ -1897,6 +1910,69 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     };
     let plan = match plan_add(&conn, m) {
         Ok(AddPlan::Reject(msg)) => return json_error(StatusCode::BAD_REQUEST, &msg),
+        Ok(AddPlan::FetchCard(card_id)) => {
+            // Node's cache-miss leg is cardApi.getCardById → scryGet
+            // `/cards/{rawId}` → cacheCards([normalizeCard(data)]), then the
+            // row is re-read (unit 7c). Any answer that leg cannot own —
+            // non-200/404/transport (Node's catch turns them all into a
+            // null → 404), or a deployed Node that should author its own
+            // fetch (hybrid mode keeps byte-parity by proxying) — falls
+            // back to the pre-7c Forward behavior.
+            let raw_id = card_id.strip_prefix("mtg-").unwrap_or(&card_id).to_string();
+            let path = format!("/cards/{}", crate::sidecar::encode_uri_component(&raw_id));
+            // Relative URL = Node's `scryGet('/cards/…')`: resolve() swaps
+            // to the sidecar base when LOCAL_SCRYFALL is on (and skips
+            // pacing there), else the upstream base with full pacing.
+            let got = st
+                .scry
+                .get_opt(&path, &crate::scryfall::ScryOpts::default())
+                .await;
+            let v = match got {
+                Ok(Some(v)) if v.is_object() => v,
+                _ => {
+                    if !st.cfg.node_upstream.is_empty() {
+                        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+                    }
+                    // Standalone: Node's getCardById catch → null →
+                    // AddCardError(404, `Card ID ${card_id} not found.`).
+                    return json_error(
+                        StatusCode::NOT_FOUND,
+                        &format!("Card ID {card_id} not found."),
+                    );
+                }
+            };
+            let norm = crate::sidecar::normalize_card(&v, &crate::search::to_name(None));
+            let pool_w = Arc::clone(&pool);
+            let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let conn = pool_w.get().map_err(|e| e.to_string())?;
+                crate::card_cache::cache_normalized_cards(
+                    &conn,
+                    std::slice::from_ref(&norm),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+            if let Err(e) = wrote {
+                // Node: cacheCards throwing lands in the route catch → 500.
+                tracing::error!(error=%e, "add card: getCardById cache write failed");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+            }
+            let conn = match pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error=?e, "add card pool failure");
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+                }
+            };
+            match plan_add(&conn, m) {
+                Ok(p @ AddPlan::Ready { .. }) => p,
+                // Still not ownable (localized printing, defensive): the
+                // pre-7c contract — Node authors the rest.
+                _ => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
+            }
+        }
         Ok(AddPlan::Forward) => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
         Ok(p @ AddPlan::Ready { .. }) => p,
         Err(e) => {
@@ -2008,7 +2084,10 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         outcomes.push(match plan_add(&conn, &merged) {
             Ok(p @ AddPlan::Ready { .. }) => BulkEntry::Ready { plan: p, card_id, index },
             Ok(AddPlan::Reject(msg)) => BulkEntry::Failed { error: msg, card_id, index },
-            Ok(AddPlan::Forward) => BulkEntry::Forward,
+            Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => BulkEntry::Forward,
+            // A FetchCard entry in a bulk add forwards the WHOLE request
+            // (unit 7c keeps the single-add fetch leg native only; Node
+            // still authors multi-entry Scryfall fetches itself).
             // Non-AddCardError: Node console.errors and reports the generic
             // per-card message.
             Err(e) => {
