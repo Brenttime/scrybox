@@ -57,18 +57,22 @@ pub struct ProxiedContent;
 // ---------------------------------------------------------------------------
 
 /// etag package statValues form: W/"{size:x}-{mtimeMs:x}".
-fn file_etag(size: u64, mtime_ms: u128) -> String {
+pub(crate) fn file_etag(size: u64, mtime_ms: u128) -> String {
     format!("W/\"{size:x}-{mtime_ms:x}\"")
 }
 
 /// mime package lookup for the file types the two trees actually hold,
 /// pre-joined with the '; charset=UTF-8' send appends for text types.
-fn mime_of(name: &str) -> &'static str {
+/// Verified against send's mime@1.6.0 in the container (`lookup` +
+/// `charsets.lookup` per extension): .js/.mjs are application/javascript
+/// there (NOT text/javascript), .webmanifest carries no charset, and
+/// woff2/jpeg joined the table with the SPA tree (unit 5c).
+pub(crate) fn mime_of(name: &str) -> &'static str {
     let lc = name.to_ascii_lowercase();
     let ext = lc.rsplit('.').next().unwrap_or("");
     match ext {
         "json" | "map" => "application/json; charset=UTF-8",
-        "js" | "mjs" => "text/javascript; charset=UTF-8",
+        "js" | "mjs" | "cjs" => "application/javascript; charset=UTF-8",
         "css" => "text/css; charset=UTF-8",
         "html" | "htm" => "text/html; charset=UTF-8",
         "txt" | "text" => "text/plain; charset=UTF-8",
@@ -104,7 +108,7 @@ pub(crate) fn compressible_ct(ct: Option<&str>) -> bool {
 
 /// RFC1123 HTTP-date -> epoch seconds (If-Modified-Since). Strict; any parse
 /// failure means "ignore the header", exactly like send's Date.parse NaN.
-fn parse_http_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_http_date(s: &str) -> Option<i64> {
     let mut it = s.split_whitespace();
     let (_dow, dom, mon, year, time, tz) = (
         it.next()?,
@@ -252,13 +256,17 @@ pub(crate) fn serve_reply(
 /// express `res.json(value)` twin for the fixed bodies this module emits:
 /// CT charset=utf-8 + the package's weak ETag (Content-Length is set by
 /// hyper on the buffered body).
-fn express_json(status: StatusCode, body: &'static str) -> Response<Body> {
+pub(crate) fn express_json(status: StatusCode, body: &'static str) -> Response<Body> {
     let mut h = HeaderMap::new();
+    // Node's res.send stamp order, live-pinned :3312 (500 generic-error and
+    // any res.json arm): Content-Type, Content-Length, ETag — the CL is set
+    // BEFORE the tag, so it must be inserted before it here too (hyper
+    // appends its own CL last, which put the tag ahead of it).
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
     if let Ok(v) = HeaderValue::from_str(&body_etag(body.as_bytes())) {
         h.insert(header::ETAG, v);
     }
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
     let mut parts = Response::new(Body::from(body)).into_parts().0;
     parts.status = status;
     parts.headers = h;
@@ -266,7 +274,7 @@ fn express_json(status: StatusCode, body: &'static str) -> Response<Body> {
 }
 
 /// escape-html (finalhandler's) set: & < > " '.
-fn escape_html(s: &str) -> String {
+pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -287,17 +295,19 @@ fn escape_html(s: &str) -> String {
 /// text/html; charset=utf-8, NO ETag. This is what a non-GET on an
 /// app.get-only route reaches on Node (the route never matches, the request
 /// falls through every mount to finalhandler).
-fn express_default_404(method: &Method, path: &str) -> Response<Body> {
+pub(crate) fn express_default_404(method: &Method, path: &str) -> Response<Body> {
     let body = format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot {method} {path}</pre>\n</body>\n</html>\n",
         path = escape_html(path),
     );
     let mut h = HeaderMap::new();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    // finalhandler's stamp order, live-pinned :3312 (POST /collection):
+    // Content-Security-Policy, Content-Type, Content-Length.
     h.insert(
         axum::http::HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static("default-src 'none'"),
     );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
     let mut parts = Response::new(Body::from(body.clone())).into_parts().0;
     parts.status = StatusCode::NOT_FOUND;
@@ -315,9 +325,54 @@ fn default_model_dir() -> PathBuf {
 
 pub async fn handle_scan_assets(State(st): State<AppState>, req: Request) -> Response<Body> {
     let root = scan_dir(&st);
-    let below = req.uri().path().strip_prefix("/scan-assets").unwrap_or("/").to_string();
+    let full = req.uri().path().to_string();
+    let below = full.strip_prefix("/scan-assets").unwrap_or("/").to_string();
     let cc = if below.ends_with("manifest.json") { "no-cache" } else { "public, max-age=31536000, immutable" };
+    // serve-static redirect:true directory arm (live :3312 pin, GET
+    // /scan-assets => 301): an EXISTING directory requested without the
+    // trailing slash 301s to path + '/', same 156-B send document as the
+    // SPA mount's /assets arm. A directory WITH the slash is ENOENT under
+    // index:false => the 500 miss arm (live :3312 pin, GET /scan-assets/
+    // => 500) — which is what serve_reply's miss branch answers once the
+    // 301 below declines it. Method gate: only GET/HEAD reach send's
+    // directory handling (non-GET is the 405 methodError in serve_reply).
+    if matches!(*req.method(), Method::GET | Method::HEAD) {
+        if let Some(decoded) = crate::shared::percent_decode(below.as_bytes()) {
+            let segs: Vec<&str> = decoded
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+                .collect();
+            let dot = segs.iter().any(|p| p.len() > 1 && p.starts_with('.'));
+            if !dot {
+                let mut dir = root.clone();
+                for p in &segs {
+                    dir.push(p);
+                }
+                if !decoded.ends_with('/') && std::fs::metadata(&dir).map(|m| m.is_dir()).unwrap_or(false) {
+                    // send: Location = encodeURI(pathname + '/'), pathname
+                    // being send's DECODED path (mount prefix + decoded
+                    // below); dir_redirect appends the trailing slash.
+                    return crate::spa::dir_redirect(&encode_uri(&format!("/scan-assets{decoded}")));
+                }
+            }
+        }
+    }
     serve_reply(&root, &below, cc, req.method(), req.headers(), MissMode::ServerError)
+}
+
+/// encodeURI (send's redirect Location): percent-encode everything outside
+/// RFC-3986 unreserved + the URI reserved/safe set (spaces, quotes, CJK...).
+fn encode_uri(s: &str) -> String {
+    const SAFE: &[u8] = b";/?:@&=+$,#-_.!~*'()";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || SAFE.contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub async fn handle_model(State(st): State<AppState>, req: Request) -> Response<Body> {

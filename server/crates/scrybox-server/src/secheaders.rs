@@ -42,6 +42,15 @@ pub const CSP_REPORT_ONLY: &str = "default-src 'self';script-src 'self' 'wasm-un
 #[derive(Clone, Copy)]
 pub struct NoCompressionVary;
 
+/// Marker for the SPA catch-all's INTERNAL /api proxy leg (unit 5c): the
+/// response is Node's own output from :3312 — Node already ran the identical
+/// COEP/helmet/cors stack for it — so the guard passes it through COMPLETELY
+/// untouched, exactly like the router-level fallback (which sits below the
+/// guard layer). Without the marker the wildcard route would re-stamp the
+/// twin headers onto Node's already-stamped response.
+#[derive(Clone, Copy)]
+pub struct NodeProxied;
+
 /// The twin of `selfSignedTls()` in backend/src/utils/tls.js:103-105.
 /// With the self-signed HTTPS listener active (and no operator-provided
 /// cert / trusted proxy), Node turns HSTS off because a self-signed warning
@@ -415,6 +424,13 @@ pub async fn guard(req: Request, next: Next) -> Response<Body> {
     // identical twin headers are dropped and re-emitted in Node's order.
     let path = req.uri().path().to_string();
     let resp = next.run(req).await;
+    // Internal /api proxy leg of the SPA catch-all (unit 5c): Node already
+    // ran the identical COEP/helmet/cors stack for this body — the
+    // router-level fallback passes such replies through untouched, so this
+    // leg must too, even though the wildcard route sits under the layer.
+    if resp.extensions().get::<NodeProxied>().is_some() {
+        return resp;
+    }
     // server.js portal handler strips CSP + CSP-RO + COEP for proxied
     // content only (its 301/405/502 arms return before the removes). The
     // portal handler marks the content replies; honour that here.

@@ -2434,12 +2434,37 @@ cases.push({ name: 'sa_gz_head', path: '/scan-assets/scan-index.3c89ac0fafc6.jso
 cases.push({ name: 'sa_missing_500', path: '/scan-assets/no-such-file.json', headers: {}, method: 'GET' });
 cases.push({ name: 'sa_dotfile_500', path: '/scan-assets/.hidden', headers: {}, method: 'GET' });
 cases.push({ name: 'sa_post_405', path: '/scan-assets/manifest.json', headers: {}, method: 'POST', body: '{}' });
+cases.push({ name: 'sa_dir_301', path: '/scan-assets', headers: {}, method: 'GET' });
+cases.push({ name: 'sa_dir_slash_500', path: '/scan-assets/', headers: {}, method: 'GET' });
 cases.push({ name: 'md_model_head', path: '/models/cornelius.onnx', headers: {}, method: 'HEAD' });
 cases.push({ name: 'md_model_post_404', path: '/models/cornelius.onnx', headers: {}, method: 'POST' });
 cases.push({ name: 'pt_bare_301', path: '/scryfall-portal', headers: {}, method: 'GET' });
 cases.push({ name: 'pt_index', path: '/scryfall-portal/', headers: {}, method: 'GET' });
 cases.push({ name: 'pt_head_405', path: '/scryfall-portal/', headers: {}, method: 'HEAD' });
 cases.push({ name: 'pt_post_404', path: '/scryfall-portal/', headers: {}, method: 'POST' });
+// --- Lane B unit 5c: the SPA mount ------------------------------------------
+// Byte parity of the vite tree itself is GUARANTEED by construction: the Rust
+// instance serves a docker-cp copy of the container's /app/frontend/dist
+// (data/frontend-dist-5c; mtime + md5 verified equal file-by-file, so send's
+// W/"{size:x}-{mtimeMs:x}" ETags and Last-Modified agree by construction).
+// These cases pin the RESPONSE twins: catch-all sendFile (public, max-age=0),
+// setHeaders classes (hashed /assets/ immutable vs public/ no-cache), the
+// serve-static directory 301 document, finalhandler non-GET 404, and Node's
+// catch-all startsWith('/api') gate (/apifoo is NOT SPA land). The gzip index
+// leg rides implicitly: undici always sends accept-encoding and both bodies
+// are compared decoded. 304 pairs, dotfile arms and the %zz 500 are pinned by
+// cargo (spa.rs lib tests + tests/spa_route.rs).
+cases.push({ name: 'spa_index', path: '/', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_deep_link', path: '/collection', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_deep_link_dots', path: '/deckbuilder/12/xyz', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_assets_301', path: '/assets', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_logo_nocache_class', path: '/logo.svg', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_hashed_js_immutable', path: '/assets/AddCards-BImmNJm_.js', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_webmanifest', path: '/manifest.webmanifest', headers: {}, method: 'GET' });
+cases.push({ name: 'spa_head_index', path: '/', headers: {}, method: 'HEAD' });
+cases.push({ name: 'spa_post_404_finalhandler', path: '/collection', headers: {}, method: 'POST', body: '{}' });
+cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, method: 'GET' });
+
 
 
 // --- run ---------------------------------------------------------------------

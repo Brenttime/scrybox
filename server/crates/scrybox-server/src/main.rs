@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use scrybox_server::{app, AppState, Config};
+use scrybox_server::Config;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -80,7 +80,32 @@ async fn main() {
         }
     }
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");
-    let router = app(AppState::new(cfg));
+    let state = scrybox_server::AppState::new(cfg.clone());
+    let router = scrybox_server::app(state);
+    // Lane B unit 5c: optional HTTPS listener (utils/tls.js twin). A failure
+    // — unreadable operator pair, no DB path, bind error — logs Node's line
+    // and the plain-HTTP front keeps serving; a TLS crash can never take it
+    // down. HTTPS_PORT unset (test harness default) = no listener, matching
+    // Node startHttps's early return.
+    if !std::env::var("HTTPS_PORT").unwrap_or_default().is_empty() {
+        let port: u16 = match std::env::var("HTTPS_PORT").unwrap().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::error!("HTTPS listener failed to start: HTTPS_PORT is not a number");
+                0
+            }
+        };
+        if port != 0 {
+            let addr = std::net::SocketAddr::new(cfg.bind.ip(), port);
+            let db = cfg.db_path.clone();
+            let rt = router.clone();
+            tokio::spawn(async move {
+                if let Err(e) = scrybox_server::tls::serve(addr, db, rt).await {
+                    tracing::error!("HTTPS listener failed to start: {e}");
+                }
+            });
+        }
+    }
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
