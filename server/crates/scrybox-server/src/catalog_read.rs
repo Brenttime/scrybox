@@ -28,14 +28,18 @@ use crate::AppState;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct LangEntry {
-    code: String,
-    name: String,
-    scryfall: Option<String>,
+pub struct LangEntry {
+    pub(crate) code: String,
+    pub(crate) name: String,
+    pub(crate) scryfall: Option<String>,
 }
 
-fn load_languages(st: &AppState) -> Option<Vec<LangEntry>> {
-    let file = st.shared_dir.as_ref()?.join("languages.json");
+pub(crate) fn load_languages(st: &AppState) -> Option<Vec<LangEntry>> {
+    load_languages_dir(st.shared_dir.as_deref())
+}
+
+pub(crate) fn load_languages_dir(dir: Option<&std::path::Path>) -> Option<Vec<LangEntry>> {
+    let file = dir?.join("languages.json");
     let text = std::fs::read_to_string(file).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let arr = v.as_array()?;
@@ -57,7 +61,7 @@ fn load_languages(st: &AppState) -> Option<Vec<LangEntry>> {
     Some(out)
 }
 
-fn resolve_lang<'a>(langs: &'a [LangEntry], input: &str) -> &'a LangEntry {
+pub(crate) fn resolve_lang<'a>(langs: &'a [LangEntry], input: &str) -> &'a LangEntry {
     // resolve(): trim + lowercase, then byCode, byName (name lowercased),
     // byProvider (Scryfall's own spelling); unknown falls back to the first
     // entry (English) rather than throwing.
@@ -75,8 +79,13 @@ fn resolve_lang<'a>(langs: &'a [LangEntry], input: &str) -> &'a LangEntry {
 }
 
 /// `languages.toName(input)` — display name; anything unknown is English.
-fn to_name(langs: &[LangEntry], input: Option<&str>) -> String {
+pub(crate) fn to_name(langs: &[LangEntry], input: Option<&str>) -> String {
     resolve_lang(langs, input.unwrap_or("")).name.clone()
+}
+
+/// `languages.toCode(input)` — `resolve(input).code`.
+pub(crate) fn to_code(langs: &[LangEntry], input: &str) -> String {
+    resolve_lang(langs, input).code.clone()
 }
 
 // ---------------------------------------------------------------------------
