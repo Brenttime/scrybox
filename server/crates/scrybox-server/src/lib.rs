@@ -298,8 +298,72 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
+/// Node-http twin: express answers an early response (e.g. the auth gate's
+/// 401) without consuming the request body, and Node's http server then reads
+/// the remainder to /dev/null so the client finishes its upload and receives
+/// the response. hyper instead drops the unread body and RSTs — a client
+/// still mid-upload sees EPIPE instead of the 401. Drain (never parse) with
+/// Node-comparable bounds before answering early.
+async fn drain_request_body(body: &mut Body) {
+    // Node has no request cap at the http layer; the bigJson route parsers
+    // top out at 15–40 MB. 100 MB read-and-discard bounds hostile input.
+    const CAP: u64 = 100 * 1024 * 1024;
+    const WINDOW: Duration = Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let mut read: u64 = 0;
+    loop {
+        if read >= CAP || started.elapsed() > WINDOW {
+            return;
+        }
+        let frame = match tokio::time::timeout(WINDOW, http_body_util::BodyExt::frame(body)).await {
+            Ok(Some(Ok(f))) => f,
+            _ => return,
+        };
+        match frame.into_data() {
+            Ok(d) => read += d.len() as u64,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Paths Node mounts ABOVE its single `app.use('/api', authenticateToken)`
+/// gate (server.js): their routers authenticate themselves or are deliberately
+/// public (login, shared collection, card art, health). Everything else under
+/// /api passes through the gate before its route runs.
+fn pre_gate_api_path(p: &str) -> bool {
+    p.starts_with("/api/health")
+        || p.starts_with("/api/auth")
+        || p.starts_with("/api/shared")
+        || p.starts_with("/api/admin")
+        || p.starts_with("/api/card-art")
+}
+
 /// Reverse-proxy one request to Node, streaming both bodies.
 pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
+    // Lane B unit 7b (e2e-on-Rust): in standalone (Node-free) mode this is
+    // ALSO where Node's one authentication gate lives. A request reaching a
+    // proxy leg — router fallback, or a native dispatcher handing back a
+    // method/plan it does not serve — is, in Node, a request that would have
+    // passed `authenticateToken` before its route ran. Unauthenticated
+    // traffic must therefore see the gate's 401/403/500 arms, not the
+    // dead-upstream 502 (POST /api/search with no token: Node says 401 before
+    // any body parsing, and this must not answer 502). Authenticated traffic
+    // to an unported path keeps the 502 — the route is simply not ported
+    // (readiness manifest). Internal proxy legs from handlers that already
+    // authenticated just pay one more µs-cached SELECT.
+    if st.cfg.node_upstream.is_empty() {
+        let p = req.uri().path();
+        if p.starts_with("/api/") && !pre_gate_api_path(p) {
+            if let Some(pool) = st.db.as_ref() {
+                let token = auth::bearer_token(req.headers()).map(|s| s.to_string());
+                let is_get = req.method() == axum::http::Method::GET;
+                if let Err(res) = auth::authenticate(pool, token.as_deref(), is_get) {
+                    drain_request_body(req.body_mut()).await;
+                    return res;
+                }
+            }
+        }
+    }
     // statsCache.invalidateOnWrite twin: an authenticated non-GET /api write
     // bumps that user's stats generation so their cached /stats body is
     // dropped (best-effort; never delays or fails the proxied request).
