@@ -840,7 +840,7 @@ const PRINTING_FIELDS: [&str; 13] = [
     "price_trend", "price_normal", "price_holofoil", "price_etched", "price_currency", "price_estimated",
 ];
 
-fn root_collator() -> icu_collator::CollatorBorrowed<'static> {
+pub(crate) fn root_collator() -> icu_collator::CollatorBorrowed<'static> {
     Collator::try_new(
         CollatorPreferences::from_locale_strict(&icu_locale::Locale::try_from_str("und").unwrap()).unwrap(),
         CollatorOptions::default(),

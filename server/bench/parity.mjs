@@ -701,6 +701,116 @@ cases.push({
   teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
 });
 
+// --- iter 35: precons group (Lane A port: GET /api/precons,
+// POST /api/precons/import, RUST_ROUTES=precons) ------------------------------
+// The search reads ride the SHARED mirror data/precons.json (bind-mounted
+// into both containers), so with the mirror < 24 h old both sides answer from
+// the same deck list with ZERO upstream hits — the ?nocache= refresh leg is
+// cargo-fixture-only (parallel sides would race the mirror write). The rank
+// ladder, PRECON_TYPES filter, 50-cap and localeCompare tie-break are
+// compared byte-for-byte incl. key order. The q fold exercises the shared
+// live-pinned qs twin (repeated-key join, q[]/q[0] array slots, q[k] object,
+// raw-% escape kept literal — container qs probes). Import: guards answer
+// before any upstream; deck-file fetch failures forward the WHOLE request so
+// Node authors both sides' bytes; the happy paths run the real Scryfall bulk
+// (deck BRC Urza's Iron Alliance, 100 cards, clean resolutions) and the
+// created deck is verified through the OPPOSITE server's GET /api/decks/:id
+// (deck id is random by design → stripped; message/cards/notFound must agree,
+// persisted shape cross-checked, probes deleted by name in teardown).
+const PC_JSON = { ...authHeaders, 'content-type': 'application/json' };
+const PC_DECK = 'UrzaSIronAlliance_BRC'; // Commander Deck, 2022 BRC — stable, fully resolvable
+const PC_NAME_A = 'PCParity Commander';
+const PC_NAME_B = 'PCParity Override';
+function pcClean(name) {
+  dbWrite((d) => {
+    const ids = d.prepare('SELECT id FROM decks WHERE name = ?').all(name).map((r) => r.id);
+    const delc = d.prepare('DELETE FROM deck_cards WHERE deck_id = ?');
+    for (const id of ids) delc.run(id);
+    return d.prepare('DELETE FROM decks WHERE name = ?').run(name).changes;
+  });
+}
+function pcReadDeck(other, id) {
+  return fetch(other + `/api/decks/${id}`, {
+    headers: { ...authHeaders, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' },
+    redirect: 'manual',
+  }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+}
+function pcDeckView(j) {
+  if (!j) return null;
+  const cards = Array.isArray(j.cards) ? j.cards : [];
+  return {
+    name: j.name, format: j.format, category: j.category,
+    accent: j.accent_color, size: j.target_size, src: j.source,
+    n: cards.length, ncmd: cards.filter((c) => c.is_commander).length,
+  };
+}
+cases.push({ name: 'pc_search_no_token', path: '/api/precons?q=urza', headers: {}, method: 'GET' });
+cases.push({ name: 'pc_search_missing_q', path: '/api/precons', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_blank_q', path: '/api/precons?q=%20%20', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_ok_urza', path: '/api/precons?q=urza', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_caps_the', path: '/api/precons?q=the', headers: authHeaders, method: 'GET' });
+// qs fold: repeated keys join with ',' (matches nothing); q[0] builds an
+// array slot (needle 'urza'); q[k] stringifies to '[object Object]'.
+cases.push({ name: 'pc_search_join_q', path: '/api/precons?q=zzz&q=alpha', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_arr0_q', path: '/api/precons?q%5B0%5D=urza', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_obj_q', path: '/api/precons?q%5Bk%5D=urza', headers: authHeaders, method: 'GET' });
+// raw malformed escape: qs keeps '%zz' literal — 200 empty, NOT 400.
+cases.push({ name: 'pc_search_rawpct_q', path: '/api/precons?q=%zz', headers: authHeaders, method: 'GET' });
+// Node applies no charset gate to q: odd needles simply search empty.
+cases.push({ name: 'pc_search_underscore_q', path: '/api/precons?q=Sol_Ring', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_search_bang_q', path: '/api/precons?q=my_deck%21', headers: authHeaders, method: 'GET' });
+// unknown subpath / other methods never 405 from Rust: the handlers
+// self-check and forward; Node's router 404s either way.
+cases.push({ name: 'pc_unknown_subpath', path: '/api/precons/nope', headers: authHeaders, method: 'GET' });
+cases.push({ name: 'pc_put_method', path: '/api/precons', headers: PC_JSON, method: 'PUT', body: '{}' });
+// import guards (answer before any upstream touch)
+cases.push({ name: 'pc_import_no_token', path: '/api/precons/import', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+cases.push({ name: 'pc_import_missing_file', path: '/api/precons/import', headers: PC_JSON, method: 'POST', body: '{}' });
+cases.push({ name: 'pc_import_nonstring_file', path: '/api/precons/import', headers: PC_JSON, method: 'POST', body: '{"fileName":42}' });
+cases.push({ name: 'pc_import_sanitized_empty', path: '/api/precons/import', headers: PC_JSON, method: 'POST', body: '{"fileName":"../../"}' });
+cases.push({ name: 'pc_import_bad_json', path: '/api/precons/import', headers: PC_JSON, method: 'POST', body: '{"fileName":' });
+// deck-file fetch errors answer LOCALLY with the byte-faithful axios-shape
+// message ('Request failed with status code 404'); only Scryfall-side states
+// forward the whole request (see cargo pins import_deck_fetch_errors /
+// import_partial_miss_forwards_whole_request).
+cases.push({ name: 'pc_import_missing_deck', path: '/api/precons/import', headers: PC_JSON, method: 'POST',
+  body: JSON.stringify({ fileName: 'NoSuchDeckXYZ' }) });
+// happy path 1: commander deck, default shape (Commander/EDH, #8b5cf6, 100,
+// category null), includeCommander default-true keeps the commander section.
+cases.push({ name: 'pc_import_ok', path: '/api/precons/import', headers: PC_JSON, method: 'POST',
+  strip: ['$.id'],
+  setup: async () => { pcClean(PC_NAME_A); pcClean(PC_NAME_B); return { ctx: {} }; },
+  body: JSON.stringify({ fileName: PC_DECK, name: PC_NAME_A }),
+  readBack: async (other, ctx, res) => {
+    const id = res?.json?.id;
+    if (typeof id !== 'number') return { ok: false, why: `no deck id in ${JSON.stringify(res?.json)}`, seen: null };
+    const { status, json } = await pcReadDeck(other, id);
+    const view = pcDeckView(json);
+    return { ok: status === 200 && view && view.src === 'precon' && view.format === 'Commander / EDH'
+        && view.category === null && view.accent === '#8b5cf6' && view.size === 100 && view.ncmd >= 1,
+      why: `deck read-back: ${status} ${JSON.stringify(view)}`, seen: view };
+  },
+  teardown: async () => { pcClean(PC_NAME_A); } });
+// happy path 2: every body override honoured + includeCommander=false drops
+// the commander section; targetSize arrives as a STRING ('81' → Number 81,
+// stored INTEGER — REAL would diverge through the opposite server's read).
+cases.push({ name: 'pc_import_overrides', path: '/api/precons/import', headers: PC_JSON, method: 'POST',
+  strip: ['$.id'],
+  setup: async () => { pcClean(PC_NAME_A); pcClean(PC_NAME_B); return { ctx: {} }; },
+  body: JSON.stringify({ fileName: PC_DECK, name: PC_NAME_B, format: 'Legacy', category: 'Casual',
+    accentColor: '#123456', targetSize: '81', includeCommander: false }),
+  readBack: async (other, ctx, res) => {
+    const id = res?.json?.id;
+    if (typeof id !== 'number') return { ok: false, why: `no deck id in ${JSON.stringify(res?.json)}`, seen: null };
+    const { status, json } = await pcReadDeck(other, id);
+    const view = pcDeckView(json);
+    return { ok: status === 200 && view && view.name === PC_NAME_B && view.format === 'Legacy'
+        && view.category === 'Casual' && view.accent === '#123456' && view.size === 81
+        && view.src === 'precon' && view.ncmd === 0,
+      why: `deck read-back: ${status} ${JSON.stringify(view)}`, seen: view };
+  },
+  teardown: async () => { pcClean(PC_NAME_B); } });
+
 // --- write-parity helpers (iter 22: collection_writes group) -----------------
 // A write case is only honest if BOTH sides answer the identical request from
 // the identical starting state. `setup(base)` runs immediately before each

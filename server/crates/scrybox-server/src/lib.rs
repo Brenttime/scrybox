@@ -52,6 +52,7 @@ pub mod mfx_payload;
 pub mod moxfield;
 pub mod moxfield_api;
 pub mod name_index;
+pub mod precons;
 pub mod scryfall;
 pub mod scry_jobs;
 pub mod search;
@@ -172,6 +173,14 @@ pub struct AppState {
     /// (deck_list_revision, built body bytes). Per process like Node's
     /// module-level Map; per AppState in tests keeps fixtures isolated.
     pub deck_list_cache: Arc<std::sync::Mutex<std::collections::HashMap<i64, (i64, Vec<u8>)>>>,
+    /// preconData.js `indexFile` — the shared MTGJSON mirror
+    /// (dirname(DB)/precons.json), the SAME file the Node container reads
+    /// through its /app/database bind mount. Tests point it at a temp dir.
+    pub precons_index_path: std::path::PathBuf,
+    /// preconData.MTGJSON_BASE; SCRYBOX_MTGJSON_BASE overrides for tests
+    /// only (snapshot at boot, like SettingsEnv — an env read per request
+    /// would race across parallel integration tests).
+    pub mtgjson_base: String,
 }
 
 impl AppState {
@@ -195,7 +204,12 @@ impl AppState {
                 }
             }
         });
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())) }
+        let precons_index_path = crate::precons::default_index_path(cfg.db_path.as_ref());
+        let mtgjson_base = std::env::var("SCRYBOX_MTGJSON_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::precons::MTGJSON.to_string());
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), precons_index_path, mtgjson_base }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
@@ -471,6 +485,16 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/settings", any(settings::route_settings))
             .route("/api/settings/version", any(settings::route_version))
+    } else {
+        router
+    };
+    // Lane A iter-35: precons group (GET /api/precons, POST
+    // /api/precons/import) under `precons`. Handlers self-check
+    // group+method and forward anything else — never 405/404 locally.
+    let router = if state.owns("precons") {
+        router
+            .route("/api/precons", any(precons::route_precons))
+            .route("/api/precons/import", any(precons::route_import))
     } else {
         router
     };

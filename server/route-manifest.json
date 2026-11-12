@@ -211,7 +211,9 @@
     "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
   },
   "GET /api/precons": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::precons (lib.rs /api/precons + /api/precons/import under RUST_ROUTES=precons; mirror-backed DeckList fold, rankPrecons ladder, PRECON_TYPES gate, importPreconCardsIntoDeck twin with whole-request forwards, shared live-pinned qs twin)",
+    "tests": "tests/precons.rs::is_precon_whitelist, clean_file_name_strips_foreign_runs, rank_score_ladder_and_sort, kill_switch_off_proxies, auth_gate_401_and_member_ok, q_required_fold, fresh_download_mirror_filter_rank_cap, setlist_failure_is_best_effort, stale_fallback_and_502, import_happy_shape_and_db, import_reprint_fold_by_card_name, import_shape_fallbacks_and_overrides, import_include_commander_gates, import_guard_order_and_guards, import_deck_fetch_errors, import_all_unresolvable_422, import_partial_miss_forwards_whole_request, import_scryfall_client_error_forwards, import_batching_over_75; parity.mjs pc_search_*, pc_import_*, pc_unknown_subpath, pc_put_method"
   },
   "GET /api/rules": {
     "status": "node"
@@ -476,7 +478,9 @@
     "notes": "Scheduler twin gated by the same gate: boot catch-up + 20s tick + in-flight dedup native; test harness quiesces both ticks (Rust SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1, Node container /app/moxfield-scheduler.disabled flag file + repo env switch). Node copy stays full."
   },
   "POST /api/precons/import": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::precons (lib.rs /api/precons + /api/precons/import under RUST_ROUTES=precons; mirror-backed DeckList fold, rankPrecons ladder, PRECON_TYPES gate, importPreconCardsIntoDeck twin with whole-request forwards, shared live-pinned qs twin)",
+    "tests": "tests/precons.rs::is_precon_whitelist, clean_file_name_strips_foreign_runs, rank_score_ladder_and_sort, kill_switch_off_proxies, auth_gate_401_and_member_ok, q_required_fold, fresh_download_mirror_filter_rank_cap, setlist_failure_is_best_effort, stale_fallback_and_502, import_happy_shape_and_db, import_reprint_fold_by_card_name, import_shape_fallbacks_and_overrides, import_include_commander_gates, import_guard_order_and_guards, import_deck_fetch_errors, import_all_unresolvable_422, import_partial_miss_forwards_whole_request, import_scryfall_client_error_forwards, import_batching_over_75; parity.mjs pc_search_*, pc_import_*, pc_unknown_subpath, pc_put_method"
   },
   "POST /api/scan-match": {
     "status": "node"

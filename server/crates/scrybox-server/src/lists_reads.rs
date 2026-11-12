@@ -200,26 +200,36 @@ pub async fn handle_cardlist(Path(id): Path<String>, State(st): State<AppState>,
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq)]
-enum QsVal {
+pub(crate) enum QsVal {
     Missing,
     Scalar(String),
     Array(Vec<String>),
     Obj,
 }
 
-fn qs_get(query: Option<&str>, key: &str) -> QsVal {
+pub(crate) fn qs_get(query: Option<&str>, key: &str) -> QsVal {
     let q = match query {
         Some(q) => q,
         None => return QsVal::Missing,
     };
     let mut result: Option<QsVal> = None;
     for (k, v) in form_urlencoded::parse(q.as_bytes()) {
-        // Bracket forms: `key[]` pushes onto the array, any other
-        // `key[...]` makes the value an object.
+        // Bracket forms: `key[]` pushes onto the array; a numeric index
+        // within qs's arrayLimit (`key[0]`..`key[20]`) pushes too (container
+        // qs probe: q[0]=urza -> {q:['urza']} -> String() 'urza'); any other
+        // `key[...]` makes the value an object. Sparse index holes
+        // (q[5]=x -> ',,,,x' through Array.join on a holey array) are NOT
+        // modelled — no route here distinguishes them and no parity case
+        // uses them; pushing keeps the value a plain scalar/array slot.
         let (base, push) = match k.split_once('[') {
             None => (k.as_ref(), None),
             Some((base, rest)) => {
-                if rest != "]" {
+                let idx = rest.strip_suffix(']').unwrap_or("");
+                let numeric = !idx.is_empty()
+                    && idx.len() <= 2
+                    && idx.chars().all(|c| c.is_ascii_digit())
+                    && idx.parse::<u32>().map(|n| n <= 20).unwrap_or(false);
+                if rest != "]" && !numeric {
                     if base == key {
                         result = Some(QsVal::Obj);
                     }
@@ -249,7 +259,7 @@ fn qs_get(query: Option<&str>, key: &str) -> QsVal {
 
 /// `String(req.query[key] || '')` — arrays join with commas, objects stringify
 /// to '[object Object]', absent/'' are empty.
-fn qs_string(query: Option<&str>, key: &str) -> String {
+pub(crate) fn qs_string(query: Option<&str>, key: &str) -> String {
     match qs_get(query, key) {
         QsVal::Scalar(s) => s,
         QsVal::Array(v) => v.join(","),
@@ -768,6 +778,10 @@ mod tests {
         assert_eq!(qs_string(Some("q[]=Sol%20Ring"), "q"), "Sol Ring");
         assert_eq!(qs_string(Some("q=a&q[]=b"), "q"), "a,b");
         assert_eq!(qs_string(Some("q[a]=b"), "q"), "[object Object]");
+        // Numeric index within qs arrayLimit -> ARRAY slot (live qs probe:
+        // qs.parse('q[0]=urza') -> {q:['urza']}); beyond it -> object.
+        assert_eq!(qs_string(Some("q%5B0%5D=urza"), "q"), "urza");
+        assert_eq!(qs_string(Some("q[21]=urza"), "q"), "[object Object]");
         // ';' is NOT a delimiter (whole remainder is the value).
         assert_eq!(qs_string(Some("q=a;b=c"), "q"), "a;b=c");
     }
