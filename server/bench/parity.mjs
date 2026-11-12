@@ -2953,6 +2953,175 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
   cases.push({ name: 'cm_cotd', path: '/api/stats/commander-of-the-day?day=2026-11-12', headers: authHeaders });
   cases.push({ name: 'cm_cotd_arr', path: '/api/stats/commander-of-the-day?day[]=x', headers: authHeaders });
 
+  // --- iter-40: admin users group (RUST_ROUTES=admin_users;
+  // GET/POST /api/admin/users, PUT/DELETE /api/admin/users/:id;
+  // backend/src/routes/admin.js:122-272). Every probe row (users, sessions,
+  // decks) is dbWrite-owned with a fixed created_at, so both sides see an
+  // identical users table at request time (setup runs per side right before
+  // the request; cases run serially). The bench session (authHeaders) is
+  // 'brenttime' — role admin — so the admin arms ride it. Write arms carry
+  // write->read verification on the OPPOSITE server (rule 2); cleanup
+  // deletes exactly the probe rows (rule 4). Gate arms: no-token/bad-token
+  // 401, member 403, api-key-on-admin-GET 403, api-key write 403 read-only.
+  const AU_PW = 'paritypass123';
+  const AU_KEY = 'bnd'.concat('_', 'a'.repeat(48)); // bnd_ + 48 hex-ish; distinct from FIXED_KEY
+  const AU_T0 = '2024-01-01 00:00:00';   // fixed created_at (cross-side determinism)
+  const AU_RO_TOK = 'rusttest-au-ro'.concat('-tok');
+  const AU_RO_HDR = 'Bearer '.concat(AU_RO_TOK);
+  const AU_BADTOK = 'Bearer '.concat('dead'.repeat(4));
+  function auPurge(...names) {
+    dbWrite((d) => {
+      for (const name of names) {
+        const row = d.prepare('SELECT id FROM users WHERE username = ?').get(name);
+        if (!row) continue;
+        d.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM decks WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM collection WHERE user_id = ?').run(row.id);
+        d.prepare('DELETE FROM users WHERE id = ?').run(row.id);
+      }
+    });
+  }
+  function auSeed(name, role, { apiKey = null, id = null } = {}) {
+    auPurge(name);
+    dbWrite((d) => {
+      if (id !== null) {
+        // Explicit id (own 9313xx block): both sides must see the SAME id in
+        // the GET list body and in readBack `seen`, so probes cannot ride
+        // AUTOINCREMENT (it differs per side by construction).
+        d.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM decks WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM collection WHERE user_id = ?').run(id);
+        d.prepare('DELETE FROM users WHERE id = ?').run(id);
+        d.prepare('INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, created_at, api_key) VALUES (?, ?, ?, ?, ?, 0, ?, ?)')
+          .run(id, name, '210000:00000000000000000000000000000000:00', role, `rusttest-${name}-shr`, AU_T0, apiKey);
+        return;
+      }
+      d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, created_at, api_key) VALUES (?, ?, ?, ?, 0, ?, ?)')
+        .run(name, '210000:00000000000000000000000000000000:00', role, `rusttest-${name}-shr`, AU_T0, apiKey);
+    });
+  }
+  function auSession(name, tok) {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE token = ?').run(tok);
+      const row = d.prepare('SELECT id FROM users WHERE username = ?').get(name);
+      if (!row) throw new Error(`auSession: no user ${name}`);
+      d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(tok, row.id, SESSION_EXP);
+    });
+  }
+  const auId = (name) => dbWrite((d) => d.prepare('SELECT id FROM users WHERE username = ?').get(name)?.id);
+  const auList = (base, username) => apiReq(base, 'GET', '/api/admin/users', authHeaders)
+    .then((r) => ({ ...r, user: Array.isArray(r.json) ? r.json.find((u) => u.username === username) : undefined }));
+  const AU_JSONH = { ...authHeaders, 'content-type': 'application/json' };
+
+  cases.push({ name: 'au_list', path: '/api/admin/users', headers: authHeaders, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_member', 'member', { id: 931301 }); },
+    teardown: async () => { auPurge('rusttest_au_member'); } });
+  cases.push({ name: 'au_list_noauth', path: '/api/admin/users', headers: {}, method: 'GET' });
+  cases.push({ name: 'au_list_badtoken', path: '/api/admin/users', headers: { Authorization: AU_BADTOK }, method: 'GET' });
+  cases.push({ name: 'au_list_member', path: '/api/admin/users', headers: {}, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_ro', 'member'); auSession('rusttest_au_ro', AU_RO_TOK); return { headers: { Authorization: AU_RO_HDR } }; },
+    teardown: async () => { auPurge('rusttest_au_ro'); } });
+  cases.push({ name: 'au_list_apikey', path: '/api/admin/users', headers: {}, method: 'GET',
+    setup: async () => { auSeed('rusttest_au_key', 'member', { apiKey: AU_KEY }); return { headers: { Authorization: `Bearer ${AU_KEY}` } }; },
+    teardown: async () => { auPurge('rusttest_au_key'); } });
+
+  cases.push({ name: 'au_post_ok', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: ' RustTest_Au_Guy ', password: AU_PW }),
+    setup: async () => { auPurge('rusttest_au_guy'); },
+    readBack: async (other) => {
+      const r = await auList(other, 'rusttest_au_guy');
+      const u = r.user;
+      const view = u ? { username: u.username, role: u.role, share_enabled: u.share_enabled, total_cards: u.total_cards, total_value: u.total_value } : null;
+      return view && view.role === 'member' && view.share_enabled === 0 && view.total_cards === 0 && view.total_value === 0
+        ? { ok: true, why: 'created user visible on the other server with destructure-default shape', seen: view }
+        : { ok: false, why: `created user missing/wrong on other server: ${r.status} ${fmt(u)}`, seen: view };
+    },
+    teardown: async () => { auPurge('rusttest_au_guy'); } });
+  cases.push({ name: 'au_post_required', path: '/api/admin/users', headers: AU_JSONH, method: 'POST', body: '{}' });
+  cases.push({ name: 'au_post_shortpw', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: 'short' }) });
+  cases.push({ name: 'au_post_badrole', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW, role: 'owner' }) });
+  cases.push({ name: 'au_post_dup', path: '/api/admin/users', headers: AU_JSONH, method: 'POST',
+    body: JSON.stringify({ username: ' RustTest_Au_Dup ', password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_dup', 'member'); },
+    teardown: async () => { auPurge('rusttest_au_dup'); } });
+  cases.push({ name: 'au_post_apikey', path: '/api/admin/users', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_key2', 'member', { apiKey: AU_KEY }); return { headers: { Authorization: `Bearer ${AU_KEY}`, 'content-type': 'application/json' } }; },
+    teardown: async () => { auPurge('rusttest_au_key2'); } });
+  cases.push({ name: 'au_post_noauth', path: '/api/admin/users', headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: JSON.stringify({ username: 'rusttest_au_x', password: AU_PW }) });
+
+  cases.push({ name: 'au_put_role_ok', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'admin' }),
+    setup: async () => { auSeed('rusttest_au_edit', 'member', { id: 931302 }); const id = auId('rusttest_au_edit'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other) => {
+      const r = await auList(other, 'rusttest_au_edit');
+      return r.user?.role === 'admin'
+        ? { ok: true, why: 'role=admin visible on the other server', seen: r.user }
+        : { ok: false, why: `role not persisted on other server: ${r.status} ${fmt(r.user)}`, seen: r.user ?? null };
+    },
+    teardown: async () => { auPurge('rusttest_au_edit'); } });
+  cases.push({ name: 'au_put_pw_ok', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ password: AU_PW }),
+    setup: async () => { auSeed('rusttest_au_pw', 'member'); const id = auId('rusttest_au_pw'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other) => {
+      // Cross-side password verification: the seeded hash is garbage, so a
+      // successful login on the OTHER server proves the write landed and the
+      // hash written by one server verifies on the other (Rust hash ->
+      // Node-side check via Node's login path and vice versa).
+      const login = await apiReq(other, 'POST', '/api/auth/login', { 'content-type': 'application/json' },
+        JSON.stringify({ username: 'rusttest_au_pw', password: AU_PW }));
+      return login.status === 200 && typeof login.json?.token === 'string'
+        ? { ok: true, why: 'new password logs in on the other server', seen: { role: login.json?.user?.role } }
+        : { ok: false, why: `login with new password failed on other server: ${login.status} ${fmt(login.text)}`, seen: null };
+    },
+    teardown: async () => { auPurge('rusttest_au_pw'); } });
+  cases.push({ name: 'au_put_404', path: '/api/admin/users/931399', headers: AU_JSONH, method: 'PUT', body: '{}' });
+  cases.push({ name: 'au_put_badrole', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'owner' }),
+    setup: async () => { auSeed('rusttest_au_brole', 'member'); const id = auId('rusttest_au_brole'); return { path: `/api/admin/users/${id}` }; },
+    teardown: async () => { auPurge('rusttest_au_brole'); } });
+  cases.push({ name: 'au_put_shortpw', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ password: 'short' }),
+    setup: async () => { auSeed('rusttest_au_spw', 'member'); const id = auId('rusttest_au_spw'); return { path: `/api/admin/users/${id}` }; },
+    teardown: async () => { auPurge('rusttest_au_spw'); } });
+  cases.push({ name: 'au_put_selfdemote', path: '/api/admin/users/0', headers: AU_JSONH, method: 'PUT',
+    body: JSON.stringify({ role: 'member' }),
+    setup: async () => {
+      // The self-demotion gate answers 400 BEFORE any write on both sides.
+      const id = dbWrite((d) => d.prepare("SELECT id FROM users WHERE username = 'brenttime'").get()?.id);
+      if (!id) throw new Error('au_put_selfdemote: bench user missing');
+      return { path: `/api/admin/users/${id}` };
+    } });
+
+  cases.push({ name: 'au_delete_ok', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => { auSeed('rusttest_au_del', 'member'); const id = auId('rusttest_au_del'); return { path: `/api/admin/users/${id}`, ctx: { id } }; },
+    readBack: async (other, ctx) => {
+      const gone = dbWrite((d) => !d.prepare('SELECT id FROM users WHERE id = ?').get(ctx.id));
+      const r = await auList(other, 'rusttest_au_del');
+      return gone && !r.user
+        ? { ok: true, why: 'user absent from DB and from the other server list', seen: { deleted: true } }
+        : { ok: false, why: `user still present after delete: db=${!gone} other=${fmt(r.user)}`, seen: r.user ?? null };
+    },
+    teardown: async () => { auPurge('rusttest_au_del'); } });
+  cases.push({ name: 'au_delete_409', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => {
+      auSeed('rusttest_au_co', 'member');
+      const id = auId('rusttest_au_co');
+      dbWrite((d) => d.prepare('INSERT INTO decks (user_id, name, checked_out) VALUES (?, ?, 1)').run(id, 'rusttest au loan deck'));
+      return { path: `/api/admin/users/${id}` };
+    },
+    teardown: async () => { auPurge('rusttest_au_co'); } });
+  cases.push({ name: 'au_delete_404', path: '/api/admin/users/931398', headers: authHeaders, method: 'DELETE' });
+  cases.push({ name: 'au_delete_self', path: '/api/admin/users/0', headers: authHeaders, method: 'DELETE',
+    setup: async () => {
+      const id = dbWrite((d) => d.prepare("SELECT id FROM users WHERE username = 'brenttime'").get()?.id);
+      if (!id) throw new Error('au_delete_self: bench user missing');
+      return { path: `/api/admin/users/${id}` };
+    } });
+  cases.push({ name: 'au_delete_noauth', path: '/api/admin/users/1', headers: {}, method: 'DELETE' });
 }
 
 

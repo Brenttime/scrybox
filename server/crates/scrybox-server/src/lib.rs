@@ -27,6 +27,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod auth_routes;
 pub mod auth_support;
+pub mod admin_users;
 pub mod backup;
 pub mod cards_meta;
 pub mod card_cache;
@@ -570,6 +571,18 @@ pub fn app(state: AppState) -> Router {
             .route("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
             .route("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
             .route("/api/suggest", any(cards_meta::handle_suggest))
+    } else {
+        router
+    };
+    // Lane A iter-40: admin USERS group (GET/POST /api/admin/users,
+    // PUT/DELETE /api/admin/users/:id) under `admin_users`. The rest of
+    // admin.js (seed-cards, catalogs, models, backups) is Lane B's unit-4
+    // surface; everything unmatched here rides the catch-all proxy —
+    // never a local 404/405.
+    let router = if state.owns("admin_users") {
+        router
+            .route("/api/admin/users", any(admin_users::route_users))
+            .route("/api/admin/users/{id}", any(admin_users::route_user))
     } else {
         router
     };
