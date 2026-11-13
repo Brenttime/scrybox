@@ -525,6 +525,56 @@ async fn background_refresher_prebuilds_post_bump_body() {
     assert_eq!(fresh["summary"]["change7d"]["abs"], json!(4.5), "9.0→12.0 on qty 3");
 }
 
+/// Gate D iter-25: the /stats cold compute queues on the shared build
+/// budget (same shape as the collection cache's builds). Saturate the
+/// budget, start one cold /stats request, and it must sit queued until a
+/// permit is released. Guards the gate itself: the pre-iter-25 unbounded
+/// code answers during the sleep and fails this assertion.
+#[tokio::test]
+async fn cold_build_waits_for_the_build_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded_stats_db(dir.path(), "budget.db");
+    let upstream = spawn_fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: format!("http://{upstream}"),
+        static_dir: None,
+        rust_routes: ["stats".to_string()].into_iter().collect(),
+        db_path: Some(db_path),
+        sidecar_url: None,
+    };
+    let state = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&state.stats_cache);
+    let r = app(state);
+    assert_eq!(cache.build_permits_available(), 2, "stats build budget is 2 (collection parity)");
+
+    let p1 = cache.build_permit().await;
+    let p2 = cache.build_permit().await;
+    assert_eq!(cache.build_permits_available(), 0);
+
+    let h = {
+        let r = r.clone();
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/stats")
+                .header("authorization", "Bearer tok-stats-rich")
+                .body(Body::empty())
+                .unwrap();
+            r.oneshot(req).await.unwrap().status()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!h.is_finished(), "cold /stats build must queue while the budget is saturated");
+    drop((p1, p2));
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), h)
+        .await
+        .expect("request must complete once the budget frees")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache.computes(), 1);
+}
+
 #[tokio::test]
 async fn proxied_write_bumps_user_generation() {
     let dir = tempfile::tempdir().unwrap();

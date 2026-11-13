@@ -28,7 +28,7 @@ use std::{
         Arc, Mutex, OnceLock,
     },
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use axum::{
     body::Body,
@@ -1289,7 +1289,20 @@ pub struct SearchCache {
     /// the retained store after the search_db leg).
     trim_dirty_bytes: AtomicU64,
     trim_dirty: AtomicBool,
+    /// Gate D iter-25: cold-recompute budget, twin of the collection
+    /// cache's `builds` (iter 15). Single-flight coalesces ONE compute per
+    /// key, but N distinct cold keys (boot warm, rev-bump fan-out, varied
+    /// realistic mix) each spawned an unbounded blocking build. The permit
+    /// is acquired INSIDE the OnceCell init, around the heavy leg only —
+    /// same-key waiters never consume one, and the sidecar-walk leg
+    /// (network-bound) stays ungated so walks never queue behind CPU.
+    builds: Arc<Semaphore>,
 }
+
+/// Concurrent cold search computes allowed across all search legs
+/// (database build, collection-owned, collq). Matches the collection
+/// cache's build budget.
+const BUILD_BUDGET: usize = 2;
 
 impl Default for SearchCache {
     fn default() -> Self {
@@ -1306,6 +1319,7 @@ impl SearchCache {
             max_bytes: AtomicU64::new(search_store_max_bytes()),
             trim_dirty_bytes: AtomicU64::new(crate::collection::TRIM_DIRTY_BYTES),
             trim_dirty: AtomicBool::new(false),
+            builds: Arc::new(Semaphore::new(BUILD_BUDGET)),
         }
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<SearchEntry>> {
@@ -1405,6 +1419,16 @@ impl SearchCache {
     /// Swap off the "big heap drop happened" flag (trim timer → malloc_trim).
     fn take_trim(&self) -> bool {
         self.trim_dirty.swap(false, Ordering::Relaxed)
+    }
+    /// One compute slot (Gate D iter-25). Held INSIDE the OnceCell init,
+    /// around the heavy leg — waiters on the same key never take one.
+    pub async fn build_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        // acquire() only fails on close(), which never happens here.
+        Arc::clone(&self.builds).acquire_owned().await.expect("build semaphore")
+    }
+    /// Observability + budget guard tests.
+    pub fn build_permits_available(&self) -> usize {
+        self.builds.available_permits()
     }
 }
 
@@ -2213,6 +2237,10 @@ pub async fn handle(
                     let built = if init_p.internet {
                         None
                     } else {
+                        // Budget-gated CPU leg (iter 25): held across the
+                        // blocking build+gzip, dropped before the walk leg
+                        // so sidecar walks never queue behind builds.
+                        let _permit = init_cache.build_permit().await;
                         let built = tokio::task::spawn_blocking(move || {
                         let Some((body, _total, stale)) =
                             build_body(&build_pool, &build_idx, &build_owned, &p2)?
@@ -2642,6 +2670,8 @@ async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, i
     let build_o = (*o).clone();
     let res: Result<&Result<Option<Arc<SearchEntry>>, String>, String> = slot
         .get_or_try_init(move || async move {
+            // Budget-gated compute (iter 25), twin of the collection cache.
+            let _permit = init_cache.build_permit().await;
             let built = tokio::task::spawn_blocking(move || build_owned_body(&build_pool, &build_o))
                 .await
                 .unwrap_or_else(|e| Err(format!("collection-owned build task panicked: {e}")))?;
@@ -2733,6 +2763,8 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
     let build_cq = (*cq).clone();
     let res: Result<&Result<Option<Arc<SearchEntry>>, String>, String> = slot
         .get_or_try_init(move || async move {
+            // Budget-gated compute (iter 25), twin of the collection cache.
+            let _permit = init_cache.build_permit().await;
             let built = tokio::task::spawn_blocking(move || collq::build(&build_pool, &build_cq, &entry))
                 .await
                 .unwrap_or_else(|e| collq::BuildOutcome::Failed(format!("collq build task panicked: {e}")));

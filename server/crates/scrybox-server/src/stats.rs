@@ -36,7 +36,7 @@ use axum::{
 use bytes::Bytes;
 use rusqlite::{types::Value as SqlValue, Connection, Row};
 use serde_json::{Map, Value};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::collection::{
     body_etag, etag_matches, gzip_bytes, json_num, resolve_card_price, sqlite_value, truthy,
@@ -151,11 +151,28 @@ pub struct StatsCache {
     inner: Mutex<Inner>,
     /// Number of full bodies actually computed (test + observability).
     computes: AtomicU64,
+    /// Gate D iter-25: cold-recompute budget. Single-flight already caps
+    /// ONE compute per key, but N distinct cold keys (rev-bump fan-out,
+    /// fresh boot, refresher sweep) each spawned their own blocking build
+    /// with no bound — the realistic peak-write-mix suspect. Same shape as
+    /// the collection cache's `builds` (iter 15): the permit is held for
+    /// the duration of ONE compute, acquired INSIDE the OnceCell init so
+    /// same-key waiters never consume a permit.
+    builds: Arc<Semaphore>,
 }
+
+/// Concurrent cold computes allowed across every stats key (request path,
+/// SWR background rebuild, refresher, and the stats_subs legs share the
+/// store AND this budget). Matches the collection cache's build budget.
+const BUILD_BUDGET: usize = 2;
 
 impl Default for StatsCache {
     fn default() -> Self {
-        Self { inner: Mutex::new(Inner::default()), computes: AtomicU64::new(0) }
+        Self {
+            inner: Mutex::new(Inner::default()),
+            computes: AtomicU64::new(0),
+            builds: Arc::new(Semaphore::new(BUILD_BUDGET)),
+        }
     }
 }
 
@@ -178,6 +195,18 @@ impl StatsCache {
     /// Observability for the single-flight test and ops dashboards.
     pub fn computes(&self) -> u64 {
         self.computes.load(Ordering::Relaxed)
+    }
+
+    /// One compute slot (Gate D iter-25). Held INSIDE the OnceCell init,
+    /// around the blocking build — waiters on the same key never take one.
+    pub async fn build_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        // acquire() only fails on close(), which never happens here.
+        Arc::clone(&self.builds).acquire_owned().await.expect("build semaphore")
+    }
+
+    /// Observability + budget guard tests.
+    pub fn build_permits_available(&self) -> usize {
+        self.builds.available_permits()
     }
 
     /// statsCache.bump(userId) — invalidate everything computed for a user.
@@ -906,6 +935,9 @@ pub fn spawn_refresher(state: &AppState) {
                         let c = Arc::clone(&init_cache);
                         let p = Arc::clone(&init_pool);
                         let k = init_key.clone();
+                        // Budget-gated compute (iter 25): the refresher
+                        // sweep shares the request path's build budget.
+                        let _permit = c.build_permit().await;
                         // get_or_try_init nests: the stored value is the
                         // compute Result; the outer Err carries a JoinError
                         // (same shape as the request-path init below).
@@ -1297,6 +1329,10 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             let c = Arc::clone(&init_cache);
             let p = Arc::clone(&init_pool);
             let k = init_key.clone();
+            // Budget-gated compute (iter 25): covers BOTH users of this
+            // init — the SWR background rebuild and the blocking cold
+            // path. Waiters on the same slot never reach here.
+            let _permit = c.build_permit().await;
             let r = tokio::task::spawn_blocking(move || compute_and_store(&c, &p, user_id, k))
                 .await
                 .map_err(|e| format!("stats task panicked: {e}"))?;

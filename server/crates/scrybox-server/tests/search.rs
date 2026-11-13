@@ -1527,6 +1527,60 @@ async fn concurrent_misses_coalesce_into_one_build() {
     assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
 }
 
+/// Gate D iter-25: distinct cold keys no longer spawn unbounded parallel
+/// builds — every CPU leg queues on the shared build budget (twin of the
+/// collection cache's `builds`, iter 15). Saturate the budget by hand,
+/// start one cold request, and it must sit queued until a permit frees.
+/// The unbounded (pre-iter-25) code completes this request during the
+/// sleep, so the assertion below fails without the gate — it guards the
+/// gate itself, not the fixture.
+#[tokio::test]
+async fn cold_build_waits_for_the_build_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let upstream = format!("http://{}", spawn_fake_node().await);
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream,
+        static_dir: None,
+        rust_routes: ["search".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(path),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    let cache = Arc::clone(&st.search_cache);
+    let r = app(st);
+    assert_eq!(cache.build_permits_available(), 2, "search build budget is 2 (collection parity)");
+
+    let p1 = cache.build_permit().await;
+    let p2 = cache.build_permit().await;
+    assert_eq!(cache.build_permits_available(), 0);
+
+    let h = {
+        let r = r.clone();
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/search?scope=database&name=Sol%20Ring")
+                .header("authorization", "Bearer tok-session")
+                .extension(ConnectInfo(next_peer()))
+                .body(Body::empty())
+                .unwrap();
+            r.oneshot(req).await.unwrap().status()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!h.is_finished(), "cold build must queue while the build budget is saturated");
+    drop((p1, p2));
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), h)
+        .await
+        .expect("request must complete once the budget frees")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache.computes(), 1, "the queued request computed exactly one body");
+}
+
 // --- collection-scope q leg (iter 9) ---------------------------------------
 //
 // Node answers `scope=collection&q=…` via resolveCollectionQuery: a match

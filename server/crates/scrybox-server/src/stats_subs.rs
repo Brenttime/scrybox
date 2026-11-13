@@ -672,6 +672,9 @@ async fn route(
                 let c = Arc::clone(&init_cache);
                 let p = Arc::clone(&init_pool);
                 let k = init_key.clone();
+                // Budget-gated compute (iter 25): shares the /stats build
+                // budget — same store, same working-set shape.
+                let _permit = c.build_permit().await;
                 let r = tokio::task::spawn_blocking(move || -> Result<Arc<StatsEntry>, String> {
                     let raw = init_kind.build(&p, user_id, hist_cache)?;
                     let entry = Arc::new(StatsEntry::new(Bytes::from(raw)));
@@ -693,6 +696,10 @@ async fn route(
     } else {
         let build_pool = Arc::clone(&pool);
         let build_kind = kind.clone();
+        // Cache off (NODE_ENV=test / STATS_CACHE=0): Node calls the handler
+        // directly per request. Still budget-gated (iter 25) — same
+        // compute, same working set.
+        let _permit = cache.build_permit().await;
         match tokio::task::spawn_blocking(move || -> Result<(bool, Arc<StatsEntry>), String> {
             let raw = build_kind.build(&build_pool, user_id, hist_cache)?;
             Ok((false, Arc::new(StatsEntry::new(Bytes::from(raw)))))
