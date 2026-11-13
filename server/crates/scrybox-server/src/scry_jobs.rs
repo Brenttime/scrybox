@@ -9,8 +9,8 @@ use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 
 use crate::card_cache::{
-    cache_normalized_cards, mark_prices_swept, record_price, refresh_all_estimates,
-    should_sweep_prices, UNPRICED_SQL,
+    cache_normalized_cards, cache_prepared_cards, mark_prices_swept, prepare_card, record_price,
+    refresh_all_estimates, should_sweep_prices, PreparedCard, UNPRICED_SQL,
 };
 use crate::card_norm::{normalize_card, scryfall_uuid};
 use crate::scryfall::{Scry, ScryEnv, ScryOpts};
@@ -120,9 +120,14 @@ pub struct SweepOutcome {
 async fn bulk_fetch_by_identifier(
     scry: &Scry,
     rows: &[SweepRow],
-) -> Result<(Vec<Map<String, Value>>, Vec<(SweepRow, Map<String, Value>)>, usize), String> {
-    let mut cards: Vec<Map<String, Value>> = Vec::new();
-    let mut pairs: Vec<(SweepRow, Map<String, Value>)> = Vec::new();
+) -> Result<(Vec<PreparedCard>, Vec<(SweepRow, f64)>, usize), String> {
+    // Gate D (iter-20): the Node twin accumulates every card's object for the
+    // whole collection before writing. Rust pre-binds each chunk's rows into
+    // their SQLite params (PreparedCard) and keeps only (row, price) per
+    // pair, so the JSON trees die with their chunk instead of piling up to
+    // ~259 MB peak at 20k cards (measured; tests/sweep_memory.rs).
+    let mut cards: Vec<PreparedCard> = Vec::new();
+    let mut pairs: Vec<(SweepRow, f64)> = Vec::new();
     let mut not_found = 0usize;
     for chunk in rows.chunks(COLLECTION_BATCH) {
         // Node's exact contract: identifiers are OBJECTS — {id} | {set,
@@ -155,15 +160,23 @@ async fn bulk_fetch_by_identifier(
             )
             .await
             .map_err(|e| e.to_string())?;
-        let data = resp
+        let data: &[Value] = resp
             .as_ref()
             .and_then(|v| v.get("data"))
             .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
         let fresh: Vec<Map<String, Value>> =
             data.iter().map(|raw| normalize_card(raw, None)).filter_map(|v| v.as_object().cloned()).collect();
-        cards.extend(fresh.iter().cloned());
+        // Pre-bind the cacheable cards NOW (Node filters price_source before
+        // cacheNormalizedCards; the id filter lives in prepare_card) so this
+        // chunk's trees are droppable once the pairing below has run.
+        cards.extend(
+            fresh
+                .iter()
+                .filter(|c| matches!(c.get("price_source"), Some(Value::String(_))))
+                .filter_map(prepare_card),
+        );
 
         // Node's pairing: byKey is keyed from the REQUEST rows (id:/sn:/n:),
         // and each response card resolves its row through the same fallback
@@ -193,7 +206,9 @@ async fn bulk_fetch_by_identifier(
                 .or_else(|| by_key.iter().find(|(bk, _)| bk == &key_n))
                 .map(|(_, row)| (*row).clone());
             if let Some(row) = row {
-                pairs.push((row, norm.clone()));
+                // The recordPrice argument, extracted while the tree is
+                // still alive (recordPrice itself rejects 0/NaN/non-finite).
+                pairs.push((row, norm.get("price_trend").and_then(|v| v.as_f64()).unwrap_or(0.0)));
             }
         }
         not_found += resp
@@ -233,11 +248,10 @@ pub async fn update_collection_prices(
         }
     };
     if !fresh.is_empty() {
-        cache_normalized_cards(conn, &fresh).map_err(|e| e.to_string())?;
+        cache_prepared_cards(conn, &fresh).map_err(|e| e.to_string())?;
     }
-    for (row, card) in &pairs {
-        let price = card.get("price_trend").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        record_price(conn, &row.card_id, price).map_err(|e| e.to_string())?;
+    for (row, price) in &pairs {
+        record_price(conn, &row.card_id, *price).map_err(|e| e.to_string())?;
     }
     mark_prices_swept(conn, "mtg").map_err(|e| e.to_string())?;
     tracing::info!("MTG price update complete: {} priced, {not_found} not found on Scryfall.", pairs.len());

@@ -33,6 +33,13 @@ pub struct MockState {
     /// Per-key status scripts: "GET /sets" -> [429, 200] (last entry
     /// repeats once the script is exhausted).
     pub statuses: Mutex<HashMap<String, Vec<u16>>>,
+    /// Identifier-driven /cards/collection responder: when set (and
+    /// collection_batches is empty), each POST answers from the REQUEST's
+    /// identifiers — gen(identifier) per entry — so a sweep test never has
+    /// to pre-script chunks whose order it cannot know (sweep_rows follows
+    /// SQL order, not insertion order).
+    pub collection_generator:
+        Mutex<Option<Arc<dyn Fn(&Value) -> Value + Send + Sync>>>,
     /// Retry-After value for scripted 429s.
     pub retry_after: Mutex<Option<String>>,
     /// Every request: (METHOD path?query, raw body).
@@ -124,6 +131,20 @@ pub async fn spawn_mock() -> (SocketAddr, Arc<MockState>) {
                         return json_resp(
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({ "status_code": 400, "details": "identifier must be an object" }),
+                            None,
+                        );
+                    }
+                    let gen = state.collection_generator.lock().unwrap().clone();
+                    if let Some(gen) = gen.filter(|_| {
+                        state.collection_batches.lock().unwrap().is_empty()
+                    }) {
+                        let data = req["identifiers"]
+                            .as_array()
+                            .map(|a| a.iter().map(|id| gen(id)).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        return json_resp(
+                            StatusCode::OK,
+                            &serde_json::json!({ "data": data, "not_found": [] }),
                             None,
                         );
                     }

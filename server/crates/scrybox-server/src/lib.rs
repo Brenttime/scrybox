@@ -261,11 +261,15 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(30))
             .build(conn);
         let db = cfg.db_path.as_ref().and_then(|path| {
-            match db::DbPool::open(path, 16) {
+            // Gate D DB tuning: pool sized to cores, one GLOBAL page-cache
+            // budget split across connections, right-sized mmap window.
+            let default_max = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
+            let pcfg = db::PoolConfig::from_env(default_max);
+            match db::DbPool::open_with(path, pcfg) {
                 Ok(pool) => {
                     // Hit-path checkouts (auth + revision) run inline on
                     // runtime workers; pre-fill so they never pay connect().
-                    pool.warm(16);
+                    pool.warm(pcfg.max);
                     Some(Arc::new(pool))
                 }
                 Err(e) => {
