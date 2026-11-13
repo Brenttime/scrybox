@@ -375,6 +375,68 @@ async fn card_cache_price_update_invalidates_full_cache() {
     assert_eq!(rows[0]["price_trend"], json!(10));
 }
 
+// --- review 2026-11-13 C1: allocation shapes keyed on deck_list_revision ------
+
+/// The full and include_allocation=1 shapes embed checked_out_qty, which is
+/// computed from decks/deck_cards — tables whose triggers bump
+/// deck_list_revision, NOT collection_read_revision. The cache must key
+/// those shapes on BOTH counters or a deck edit serves stale allocations
+/// forever (Node computes them fresh every request).
+#[tokio::test]
+async fn deck_edit_invalidates_checked_out_qty_in_alloc_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let r = router_for(path.clone(), &["collection"], "http://127.0.0.1:1");
+
+    let alloc_paths = ["/api/collection", "/api/collection?include_allocation=1&limit=10"];
+
+    // Prime both allocation caches: deck d1 (user 1) is checked out with
+    // 2x cc1, so entry_id 1 carries checked_out_qty = 2.
+    for path in alloc_paths {
+        let (s, _, v) = get_json(&r, path).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        let rows = v.as_array().cloned().unwrap_or_else(|| v["data"].as_array().unwrap().clone());
+        let e1 = rows.iter().find(|e| e["entry_id"] == json!(1)).unwrap();
+        assert_eq!(e1["checked_out_qty"], json!(2), "seed state: {path}");
+    }
+
+    // Deck-side edit: check the deck back in. The decks UPDATE trigger bumps
+    // deck_list_revision ONLY — collection_read_revision must not move, or
+    // this test would not isolate the C1 failure mode. (Counters are read
+    // relative: the seed's own INSERTs already fired the triggers.)
+    let (dl_before, cr_before) = {
+        let conn = Connection::open(&path).unwrap();
+        (
+            conn.query_row("SELECT revision FROM deck_list_revision WHERE id = 1", [], |r| r.get::<_, i64>(0)).unwrap(),
+            conn.query_row("SELECT revision FROM collection_read_revision WHERE id = 1", [], |r| r.get::<_, i64>(0)).unwrap(),
+        )
+    };
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE decks SET checked_out = 0 WHERE id = 1", []).unwrap();
+        let dl: i64 = conn
+            .query_row("SELECT revision FROM deck_list_revision WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        let cr: i64 = conn
+            .query_row("SELECT revision FROM collection_read_revision WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dl, dl_before + 1, "deck trigger bumped deck_list_revision");
+        assert_eq!(cr, cr_before, "collection counter must be untouched for this test");
+    }
+
+    for path in alloc_paths {
+        let (s, _, v) = get_json(&r, path).await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        let rows = v.as_array().cloned().unwrap_or_else(|| v["data"].as_array().unwrap().clone());
+        let e1 = rows.iter().find(|e| e["entry_id"] == json!(1)).unwrap();
+        assert_eq!(
+            e1["checked_out_qty"],
+            json!(0),
+            "C1: cached allocation body survived a deck edit on {path}"
+        );
+    }
+}
+
 // --- compression ---------------------------------------------------------------
 
 #[tokio::test]

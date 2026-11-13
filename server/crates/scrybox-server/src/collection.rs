@@ -162,6 +162,14 @@ pub fn parse_params(user_id: i64, raw_query: Option<&str>) -> CollectionParams {
 }
 
 impl CollectionParams {
+    /// Shapes whose body embeds `checked_out_qty`: the full/unpaginated
+    /// shape always, the paginated shape only with include_allocation=1.
+    /// These cache entries carry a second validity key
+    /// (`deck_list_revision`) — review 2026-11-13 C1.
+    fn needs_alloc(&self) -> bool {
+        !self.paginated || self.alloc
+    }
+
     fn cache_key(&self) -> String {
         format!(
             "{}|{}|{}|{}|{}|{}|{}|{}",
@@ -853,8 +861,45 @@ const PREWARM_GEN_BUDGET_MS: u64 = 2_000;
 /// Recent entries older than this are dropped when the reaper runs.
 const RECENT_WINDOW: Duration = Duration::from_secs(120);
 
+/// Cache validity key. `coll` is `collection_read_revision` (bumped by
+/// collection/card_cache triggers); `deck` is `deck_list_revision` (bumped
+/// by decks/deck_cards triggers) and is only meaningful for shapes with
+/// `needs_alloc()` — every other shape stores and compares `NO_DECK` so a
+/// deck edit never invalidates plain pages (review 2026-11-13 C1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RevPair {
+    coll: i64,
+    deck: i64,
+}
+
+/// Deck-revision value for shapes that do not embed checked_out_qty.
+pub const NO_DECK: i64 = 0;
+/// Deck-revision value when the counter row is missing on an alloc shape —
+/// distinct from every real revision so the entry self-heals once the
+/// counter exists (mirrors rev_i = -1 for a missing collection counter).
+pub const DECK_MISSING: i64 = i64::MIN;
+
+impl RevPair {
+    /// Validity key for one shape. Non-alloc shapes ignore the deck
+    /// counter entirely; alloc shapes must rebuild when EITHER counter moves.
+    pub fn for_shape(p: &CollectionParams, coll: Option<i64>, deck: Option<i64>) -> RevPair {
+        RevPair {
+            coll: coll.unwrap_or(-1),
+            deck: if p.needs_alloc() { deck.unwrap_or(DECK_MISSING) } else { NO_DECK },
+        }
+    }
+}
+
+impl From<i64> for RevPair {
+    /// Plain-collection-revision construction (non-alloc shapes, tests).
+    fn from(coll: i64) -> Self {
+        RevPair { coll, deck: NO_DECK }
+    }
+}
+
 pub struct CacheEntry {
     rev: i64,
+    deck_rev: i64,
     raw: Bytes,
     total: Option<u64>,
     /// Express-default body ETag, computed once with the body.
@@ -940,9 +985,14 @@ impl CollectionCache {
     pub fn new() -> Self {
         Self::default()
     }
-    fn get(&self, key: &str, rev: i64) -> Option<Arc<CacheEntry>> {
+    fn get(&self, key: &str, rev: impl Into<RevPair>) -> Option<Arc<CacheEntry>> {
+        let rp = rev.into();
         let e = self.inner.lock().unwrap();
-        let hit = e.entries.get(key).filter(|e| e.rev == rev).cloned();
+        let hit = e
+            .entries
+            .get(key)
+            .filter(|e| e.rev == rp.coll && e.deck_rev == rp.deck)
+            .cloned();
         if let Some(entry) = &hit {
             // Serve = most-recently-used; the byte-budget eviction reads
             // this clock to pick its victim.
@@ -962,18 +1012,20 @@ impl CollectionCache {
     /// - a big enough drop arms `trim_dirty` so the refresher tick returns
     ///   the freed heap to the OS off the request path (glibc keeps large
     ///   freed blocks in its arenas otherwise).
-    fn put(&self, key: String, rev: i64, raw: Vec<u8>, total: Option<u64>, cost: Duration) -> Arc<CacheEntry> {
+    fn put(&self, key: String, rev: impl Into<RevPair>, raw: Vec<u8>, total: Option<u64>, cost: Duration) -> Arc<CacheEntry> {
+        let rp = rev.into();
         let etag = body_etag(&raw);
         let seen = self.clock.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(CacheEntry {
-            rev,
+            rev: rp.coll,
+            deck_rev: rp.deck,
             raw: Bytes::from(raw),
             total,
             etag,
             gz: OnceCell::new(),
             seen: AtomicU64::new(seen),
         });
-        self.max_rev.fetch_max(rev, Ordering::Relaxed);
+        self.max_rev.fetch_max(rp.coll, Ordering::Relaxed);
         let live_rev = self.max_rev.load(Ordering::Relaxed);
         let mut freed: u64 = 0;
         {
@@ -1072,9 +1124,12 @@ impl CollectionCache {
         out
     }
     /// True when the stored entry for `key` already carries the current rev.
-    fn is_current(&self, key: &str, rev: i64) -> bool {
+    fn is_current(&self, key: &str, rev: impl Into<RevPair>) -> bool {
+        let rp = rev.into();
         let e = self.inner.lock().unwrap();
-        e.entries.get(key).map_or(false, |e| e.rev == rev)
+        e.entries
+            .get(key)
+            .map_or(false, |e| e.rev == rp.coll && e.deck_rev == rp.deck)
     }
     /// A build already in flight for this key (request-path or refresher) —
     /// the poller skips it this tick; the slot's owner will land the body.
@@ -1153,9 +1208,9 @@ pub fn spawn_refresher(state: &AppState) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_observed: Option<i64> = None;
+        let mut last_observed: Option<(i64, i64)> = None;
         let mut stable_ticks: u8 = 0;
-        let mut built_rev: Option<i64> = None;
+        let mut built_rev: Option<(i64, i64)> = None;
         loop {
             tick.tick().await;
             // Heap hygiene: a big prune/eviction above arms the flag; the
@@ -1167,14 +1222,21 @@ pub fn spawn_refresher(state: &AppState) {
             if active.is_empty() {
                 continue;
             }
-            // One revision read per tick, kept off the runtime workers.
+            // One revision read per tick (both counters on one connection),
+            // kept off the runtime workers.
             let pool2 = Arc::clone(&pool);
-            let rev = match tokio::task::spawn_blocking(move || {
-                pool2.get().ok().and_then(|c| crate::db::current_revision(&c).ok().flatten())
+            let (rev, deck_rev) = match tokio::task::spawn_blocking(move || {
+                pool2.get().ok().map(|c| {
+                    (
+                        crate::db::current_revision(&c).ok().flatten(),
+                        crate::db::current_deck_revision(&c).ok().flatten(),
+                    )
+                })
             })
             .await
             {
-                Ok(r) => r,
+                Ok(Some(pair)) => pair,
+                Ok(None) => (None, None),
                 Err(_) => return, // runtime shutting down
             };
             let Some(rev) = rev else {
@@ -1182,13 +1244,14 @@ pub fn spawn_refresher(state: &AppState) {
                 stable_ticks = 0;
                 continue;
             };
-            if built_rev == Some(rev) {
+            let observed = (rev, deck_rev.unwrap_or(DECK_MISSING));
+            if built_rev == Some(observed) {
                 continue;
             }
-            if last_observed == Some(rev) {
+            if last_observed == Some(observed) {
                 stable_ticks = stable_ticks.saturating_add(1);
             } else {
-                last_observed = Some(rev);
+                last_observed = Some(observed);
                 stable_ticks = 1;
             }
             if stable_ticks < REFRESH_DEBOUNCE_TICKS {
@@ -1196,7 +1259,8 @@ pub fn spawn_refresher(state: &AppState) {
             }
             let mut retry_next_tick = false;
             for (key, p) in active {
-                if cache.is_current(&key, rev) || cache.on_cooldown(&key) {
+                let rp = RevPair::for_shape(&p, Some(rev), deck_rev);
+                if cache.is_current(&key, rp) || cache.on_cooldown(&key) {
                     continue;
                 }
                 if cache.inflight_contains(&key) {
@@ -1218,7 +1282,7 @@ pub fn spawn_refresher(state: &AppState) {
                         let t0 = Instant::now();
                         let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
                             let (body, total) = build_body_parallel(&init_pool, &p)?;
-                            Ok(init_cache.put(init_key, rev, body, total, t0.elapsed()))
+                            Ok(init_cache.put(init_key, rp, body, total, t0.elapsed()))
                         })
                         .await
                         .map_err(|e| format!("collection refresh join: {e}"))?;
@@ -1245,7 +1309,7 @@ pub fn spawn_refresher(state: &AppState) {
                 });
             }
             if !retry_next_tick {
-                built_rev = Some(rev);
+                built_rev = Some(observed);
             }
         }
     });
@@ -1336,10 +1400,18 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
     // Revision probe: single indexed read; also the cache invalidator.
-    let rev = pool
-        .get()
-        .ok()
-        .and_then(|c| crate::db::current_revision(&c).ok().flatten());
+    // Alloc shapes (full, include_allocation=1) additionally probe the deck
+    // counter on the SAME connection — their checked_out_qty comes from
+    // decks/deck_cards, which bump deck_list_revision only (C1).
+    let (rev, deck_rev) = match pool.get() {
+        Ok(c) => (
+            crate::db::current_revision(&c).ok().flatten(),
+            p.needs_alloc()
+                .then(|| crate::db::current_deck_revision(&c).ok().flatten())
+                .flatten(),
+        ),
+        Err(_) => (None, None),
+    };
 
     let mut extra_headers: Vec<(header::HeaderName, HeaderValue)> = Vec::new();
     // True when the route's own revision tag was emitted; Express's default
@@ -1371,8 +1443,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let key = p.cache_key();
     // Refresher candidate bookkeeping (see `spawn_refresher`).
     st.collection_cache.touch(&p);
-    let rev_i = rev.unwrap_or(-1);
-    let entry: Arc<CacheEntry> = match st.collection_cache.get(&key, rev_i) {
+    let rp = RevPair::for_shape(&p, rev, deck_rev);
+    let entry: Arc<CacheEntry> = match st.collection_cache.get(&key, rp) {
         Some(e) => e,
         None => {
             // Coalesced regeneration (stats.rs pattern): every concurrent
@@ -1390,7 +1462,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     let t0 = Instant::now();
                     let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
                         let (body, total) = build_body_parallel(&init_pool, &init_p)?;
-                        Ok(init_cache.put(init_key, rev_i, body, total, t0.elapsed()))
+                        Ok(init_cache.put(init_key, rp, body, total, t0.elapsed()))
                     })
                     .await
                     .map_err(|e| format!("collection build task panicked: {e}"))?;
@@ -1837,5 +1909,62 @@ mod store_budget {
             inner.entries.contains_key(&params(0).cache_key()),
             "the only entry survives even over budget (hot full shape)"
         );
+    }
+
+    // --- review 2026-11-13 C1: deck counter keys allocation shapes only -----
+
+    #[test]
+    fn rev_pair_keys_deck_counter_only_for_alloc_shapes() {
+        // Alloc shape: EITHER counter moving changes the validity key.
+        let a = CollectionParams { alloc: true, ..params(0) };
+        assert_ne!(
+            RevPair::for_shape(&a, Some(1), Some(1)),
+            RevPair::for_shape(&a, Some(1), Some(2)),
+            "deck edit must invalidate allocation shapes (C1)"
+        );
+        assert_ne!(
+            RevPair::for_shape(&a, Some(1), Some(1)),
+            RevPair::for_shape(&a, Some(2), Some(1)),
+        );
+        // Missing deck counter is distinct from every real revision.
+        assert_ne!(
+            RevPair::for_shape(&a, Some(1), None),
+            RevPair::for_shape(&a, Some(1), Some(0)),
+        );
+        // Plain paginated shape: deck counter ignored entirely.
+        let page = params(0); // paginated=true, alloc=false
+        assert_eq!(
+            RevPair::for_shape(&page, Some(1), Some(1)),
+            RevPair::for_shape(&page, Some(1), Some(999)),
+            "deck edits must not invalidate plain pages"
+        );
+        // Full (unpaginated) shape needs alloc keying even without the flag.
+        let full = CollectionParams { paginated: false, ..params(0) };
+        assert_ne!(
+            RevPair::for_shape(&full, Some(1), Some(1)),
+            RevPair::for_shape(&full, Some(1), Some(2)),
+        );
+    }
+
+    #[test]
+    fn deck_revision_bump_misses_alloc_entries_only() {
+        let cache = CollectionCache::new();
+        let ka = CollectionParams { alloc: true, ..params(0) }.cache_key();
+        let page = params(0);
+        let kp = page.cache_key();
+        cache.put(ka.clone(), RevPair { coll: 1, deck: 1 }, b"a".to_vec(), None, Duration::from_millis(50));
+        // Stored exactly the way the handler stores a plain page: NO_DECK.
+        cache.put(kp.clone(), RevPair::for_shape(&page, Some(1), Some(1)), b"p".to_vec(), None, Duration::from_millis(50));
+        let a = CollectionParams { alloc: true, ..params(0) };
+        assert!(
+            cache.get(&ka, RevPair::for_shape(&a, Some(1), Some(2))).is_none(),
+            "stale allocation body must not survive a deck edit"
+        );
+        assert!(
+            cache.get(&kp, RevPair::for_shape(&page, Some(1), Some(2))).is_some(),
+            "plain page survives deck traffic"
+        );
+        // Unmoved counter still hits.
+        assert!(cache.get(&ka, RevPair::for_shape(&a, Some(1), Some(1))).is_some());
     }
 }

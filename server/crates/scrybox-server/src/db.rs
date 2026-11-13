@@ -171,6 +171,21 @@ pub fn current_revision(conn: &Connection) -> rusqlite::Result<Option<i64>> {
     Ok(rows.next()?.map(|r| r.get::<_, i64>(0)).transpose()?)
 }
 
+/// The `deck_list_revision` counter, bumped by DB triggers on every
+/// decks/deck_cards write. Not used by Node's collection ETag (Node
+/// recomputes the allocation views fresh per request) — the Rust
+/// collection cache uses it as a SECOND validity key for the shapes that
+/// embed `checked_out_qty` (review 2026-11-13 C1). `None` when the row
+/// does not exist.
+pub fn current_deck_revision(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = match conn.prepare_cached("SELECT revision FROM deck_list_revision WHERE id = 1") {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let mut rows = stmt.query([])?;
+    Ok(rows.next()?.map(|r| r.get::<_, i64>(0)).transpose()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
