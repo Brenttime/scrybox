@@ -84,7 +84,15 @@ async fn main() {
     // Lane B unit 6b: server.js cvScan.warm twin — preload models + English
     // catalog when the lane owns scan-match (no-op without ORT_DYLIB_PATH or
     // built catalogs, so it never pays costs the lane won't use).
-    if state.owns("scan_match") {
+    // Gate D iter-23: boot warm is OPT-IN (SCRYBOX_CVSCAN_WARM=1 restores
+    // Node's eager shape). Attribution: the warm alone accounts for ~168 MB
+    // of the 229 MB boot VmHWM floor (ort dylib + 2 ONNX sessions + the
+    // 56 MB English npz catalog + rowSets); everything else boots at 62 MB,
+    // under Gate D's <66 MB idle target. Owner ruling 2026-11-11: heavy
+    // assets load lazily on first use — match_scan() already lazy-loads and
+    // static-caches models + catalogs, so the only cost of lazy is the first
+    // scan-match request paying the load once.
+    if state.owns("scan_match") && scrybox_server::cvscan::warm_requested() {
         scrybox_server::cvscan::spawn_warm();
     }
     let router = scrybox_server::app(state);

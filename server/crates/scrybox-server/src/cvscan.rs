@@ -1523,8 +1523,22 @@ fn replay(parts: axum::http::request::Parts, bytes: Vec<u8>, headers: HeaderMap)
     req
 }
 
+/// Boot-warm opt-in (Gate D iter-23; owner ruling 2026-11-11 — heavy assets
+/// load lazily on first use). Node's server.js warms cvScan at boot; Rust
+/// does NOT unless SCRYBOX_CVSCAN_WARM is 1/true: the eager warm pins ~168
+/// MB of VmHWM (ort dylib + ONNX sessions + English catalog npz + rowSets)
+/// from t=0 with zero request demand. match_scan() lazy-loads and caches on
+/// first use either way, so opt-out only shifts the cost to the first
+/// scan-match request.
+pub fn warm_requested() -> bool {
+    std::env::var("SCRYBOX_CVSCAN_WARM")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
 /// server.js startup warm twin: preload models + the English catalog so the
 /// first scan pays npz/ORT init costs once, at boot, not in a request.
+/// Gated by warm_requested() — opt-in since Gate D iter-23.
 pub fn spawn_warm() {
     tokio::spawn(async move {
         let _ = tokio::task::spawn_blocking(|| {
@@ -1542,6 +1556,24 @@ mod tests {
 
     fn pt(x: f64, y: f64) -> Pt {
         Pt { x, y }
+    }
+
+    #[test]
+    fn boot_warm_is_opt_in() {
+        // Gate D iter-23 (owner ruling: heavy assets lazy-load on first use).
+        // The eager boot warm pinned ~168 MB of the 229 MB boot VmHWM floor;
+        // default must be OFF, and 1/true must opt back into Node's shape.
+        std::env::remove_var("SCRYBOX_CVSCAN_WARM");
+        assert!(!warm_requested(), "default must be lazy");
+        std::env::set_var("SCRYBOX_CVSCAN_WARM", "1");
+        assert!(warm_requested());
+        std::env::set_var("SCRYBOX_CVSCAN_WARM", "true");
+        assert!(warm_requested());
+        std::env::set_var("SCRYBOX_CVSCAN_WARM", "0");
+        assert!(!warm_requested());
+        std::env::set_var("SCRYBOX_CVSCAN_WARM", "yes");
+        assert!(!warm_requested(), "only 1/true opt in");
+        std::env::remove_var("SCRYBOX_CVSCAN_WARM");
     }
 
     #[test]
