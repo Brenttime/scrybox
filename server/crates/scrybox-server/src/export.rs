@@ -1337,27 +1337,7 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
             ]
         })
         .collect();
-    let tx_ok = tokio::task::spawn_blocking(move || -> Result<(), ()> {
-        let conn = db.get().map_err(|_| ())?;
-        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION").map_err(|_| ())?;
-        let result = (|| -> rusqlite::Result<()> {
-            cache_normalized_cards(&conn, &cards)?;
-            let mut stmt = conn.prepare_cached(
-                "INSERT INTO collection (card_id, quantity, condition, printing, language, purchase_price, user_id, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            )?;
-            for r in &rows {
-                stmt.execute(rusqlite::params_from_iter(r.iter()))?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT").map_err(|_| ()),
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(())
-            }
-        }
-    })
+    let tx_ok = tokio::task::spawn_blocking(move || import_transaction(&db, &cards, &rows, None))
     .await;
     if !matches!(tx_ok, Ok(Ok(()))) {
         // Node's withTransaction rolls back and the catch 500s with the
@@ -1377,6 +1357,53 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     // (same established pattern as the other write groups).
     stats::on_proxied_write(&st, &Method::POST, "/api/import", &headers);
     crate::decks_reads::json_read_response(&headers, bytes, Vec::<(String, String)>::new())
+}
+
+/// The /import write transaction, extracted from the spawn_blocking leg so
+/// the COMMIT-failure rollback is unit-testable. Node's withTransaction
+/// rolls back on a failing statement AND on a failing COMMIT; a pooled
+/// connection returned to the pool inside an open transaction holds the WAL
+/// write lock against every later writer (same class as the admin_users
+/// DELETE pool-leak note).
+///
+/// `after_begin` exists only for the unit tests: it runs inside the opened
+/// transaction (PRAGMA defer_foreign_keys is transaction-scoped, so a
+/// COMMIT-time failure injection has to land after the BEGIN). Production
+/// passes `None`.
+fn import_transaction(
+    db: &crate::db::DbPool,
+    cards: &[Map<String, Value>],
+    rows: &[Vec<SqlValue>],
+    after_begin: Option<&dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>>,
+) -> Result<(), ()> {
+    let conn = db.get().map_err(|_| ())?;
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION").map_err(|_| ())?;
+    let result = (|| -> rusqlite::Result<()> {
+        if let Some(f) = after_begin {
+            f(&conn)?;
+        }
+        cache_normalized_cards(&conn, cards)?;
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO collection (card_id, quantity, condition, printing, language, purchase_price, user_id, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )?;
+        for r in rows {
+            stmt.execute(rusqlite::params_from_iter(r.iter()))?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(())
+            }
+        },
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(())
+        }
+    }
 }
 
 /// `String(item.game ?? '')` — ?? folds null AND undefined to ''.
@@ -1600,5 +1627,130 @@ mod tests {
         assert_eq!(js_parse_float("2.5abc"), Some(2.5));
         assert_eq!(js_parse_float(""), None);
         assert_eq!(js_parse_float(".5"), Some(0.5));
+    }
+}
+
+#[cfg(test)]
+mod import_tx_tests {
+    //! LANE-B review H1/H2-writes (export.rs leg): the /import transaction
+    //! must ROLLBACK when the COMMIT statement itself fails. Red before the
+    //! fix: `Ok(()) => conn.execute_batch("COMMIT").map_err(|_| ())` left
+    //! the pooled connection inside an open transaction, holding the WAL
+    //! write lock against every later writer.
+
+    use super::*;
+    use crate::db::DbPool;
+
+    fn pool_with_schema(tag: &str) -> (tempfile::TempDir, DbPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.db"));
+        // DbPool opens READ_WRITE without CREATE — the file must exist
+        // (same convention as db.rs temp_db).
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = DbPool::open(path, 1).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL);
+                 CREATE TABLE card_cache (
+                   id TEXT PRIMARY KEY, oracle_id TEXT, scryfall_search_eligible INTEGER,
+                   name TEXT, supertype TEXT, subtypes TEXT, types TEXT, rarity TEXT,
+                   set_id TEXT, set_name TEXT, number TEXT, image_url TEXT,
+                   price_trend REAL, price_normal REAL, price_holofoil REAL, price_etched REAL,
+                   cmc REAL, color_identity TEXT, language TEXT, printed_name TEXT,
+                   tcgplayer_url TEXT, cardmarket_url TEXT, tcgplayer_product_id INTEGER,
+                   price_currency TEXT, price_source TEXT, oracle_text TEXT, oracle_faces TEXT,
+                   price_estimated INTEGER NOT NULL DEFAULT 0,
+                   last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+                 );
+                 CREATE TABLE collection (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   card_id TEXT NOT NULL,
+                   quantity INTEGER DEFAULT 1,
+                   condition TEXT, printing TEXT, language TEXT,
+                   purchase_price REAL,
+                   user_id INTEGER REFERENCES users(id),
+                   added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                   FOREIGN KEY(card_id) REFERENCES card_cache(id)
+                 );
+                 INSERT INTO users (id, username, password_hash) VALUES (1, 'u', 'x');",
+            )
+            .unwrap();
+        }
+        (dir, pool)
+    }
+
+    fn import_row(card_id: &str) -> Vec<SqlValue> {
+        vec![
+            SqlValue::Text(card_id.into()),
+            SqlValue::Integer(1),
+            SqlValue::Text("Near Mint".into()),
+            SqlValue::Text("Normal".into()),
+            SqlValue::Text("English".into()),
+            SqlValue::Real(0.0),
+            SqlValue::Integer(1),
+        ]
+    }
+
+    /// Failure injection (not a parity surface): PRAGMA foreign_keys is a
+    /// no-op inside a transaction, and PRAGMA defer_foreign_keys is
+    /// transaction-scoped (read at COMMIT time) — so BOTH are set on the
+    /// pooled connection while it is idle, BEFORE import_transaction opens
+    /// its BEGIN. With FK checks deferred, the dangling card_id insert
+    /// succeeds and the violation surfaces from the COMMIT statement
+    /// itself, leaving the transaction open — exactly like a BUSY/IO
+    /// commit failure. (Verified against the same rusqlite 0.37/bundled
+    /// build: COMMIT → SQLITE_CONSTRAINT(787), is_autocommit stays false.)
+    fn fail_the_commit(pool: &DbPool) {
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        }
+        // cards EMPTY on purpose: cache_normalized_cards would otherwise
+        // insert 'dangling' into card_cache and the FK would be satisfied.
+        let cards: Vec<Map<String, Value>> = Vec::new();
+        let defer = |c: &rusqlite::Connection| c.execute_batch("PRAGMA defer_foreign_keys = ON;");
+        assert!(
+            import_transaction(pool, &cards, &[import_row("dangling")], Some(&defer)).is_err(),
+            "deferred FK must fail the COMMIT"
+        );
+    }
+
+    #[test]
+    fn commit_failure_rolls_the_pooled_connection_back() {
+        let (_d, pool) = pool_with_schema("commitfail");
+        fail_the_commit(&pool);
+        let conn = pool.get().unwrap();
+        assert!(conn.is_autocommit(), "pooled conn still inside a transaction after failed COMMIT");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collection", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "failed import must persist nothing");
+        // Connection must be immediately usable for the next writer.
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO users (username, password_hash) VALUES ('v','x'); COMMIT;")
+            .unwrap();
+    }
+
+    #[test]
+    fn positive_control_successful_import_commits_and_stays_clean() {
+        // Guards the failure test above from passing vacuously: same rig,
+        // FK satisfied → Ok, row persisted, card cached, autocommit ON.
+        let (_d, pool) = pool_with_schema("importok");
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON; INSERT INTO card_cache (id, name) VALUES ('ok-1','Card');")
+                .unwrap();
+        }
+        let cards: Vec<Map<String, Value>> = vec![Map::from_iter([(
+            "id".to_string(),
+            Value::String("ok-1".into()),
+        )])];
+        import_transaction(&pool, &cards, &[import_row("ok-1")], None).unwrap();
+        let conn = pool.get().unwrap();
+        assert!(conn.is_autocommit());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collection WHERE card_id = 'ok-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "successful import must persist the row");
     }
 }

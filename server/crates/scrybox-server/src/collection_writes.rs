@@ -384,8 +384,13 @@ impl<'a> Tx<'a> {
         Ok(Self { conn, done: false })
     }
     pub(crate) fn commit(&mut self) -> Result<(), WriteError> {
-        self.done = true;
+        // done flips ONLY after COMMIT succeeds (name_index::Txn shape).
+        // Setting it first turned a failed COMMIT (BUSY, I/O, deferred-FK)
+        // into a swallowed rollback: Drop saw done==true, the pooled
+        // connection went back to the pool still holding the WAL write
+        // lock, and every later writer hit it.
         self.conn.execute_batch("COMMIT")?;
+        self.done = true;
         Ok(())
     }
     pub(crate) fn rollback(&mut self) {
@@ -2250,4 +2255,77 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         stats::on_proxied_write(&st, &Method::POST, "/api/collection/bulk-add", &headers);
     }
     resp
+}
+
+#[cfg(test)]
+mod tx_tests {
+    //! LANE-B review H1/H2-writes: `Tx` must leave the connection in a
+    //! clean autocommit state when COMMIT itself fails — Node's
+    //! withTransaction rolls back on the COMMIT failure too. Red before the
+    //! fix: commit() set `done` before executing COMMIT, so the guard's
+    //! rollback/Drop skipped it and the connection stayed inside an open
+    //! transaction (pool lock-leak class, cf. the admin_users DELETE note).
+
+    use super::*;
+
+    fn fk_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child  (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Begin a guard and park a deferred FK violation inside it, then fail
+    /// the COMMIT (defer_foreign_keys defers the check to COMMIT time —
+    /// SQLITE_CONSTRAINT surfaces from the COMMIT statement itself, leaving
+    /// the transaction OPEN exactly like a BUSY/IO commit failure).
+    fn begin_failing_commit(conn: &Connection) -> Tx<'_> {
+        let mut tx = Tx::begin(conn).unwrap();
+        conn.execute_batch("PRAGMA defer_foreign_keys = ON;").unwrap();
+        conn.execute("INSERT INTO child (parent_id) VALUES (42)", []).unwrap();
+        assert!(tx.commit().is_err(), "deferred FK must fail the COMMIT");
+        tx
+    }
+
+    #[test]
+    fn commit_failure_then_explicit_rollback_returns_conn_to_autocommit() {
+        let conn = fk_conn();
+        let mut tx = begin_failing_commit(&conn);
+        // The failed COMMIT must NOT have disarmed the guard: rollback()
+        // now has to actually issue the ROLLBACK.
+        tx.rollback();
+        assert!(conn.is_autocommit(), "conn still inside a transaction after rollback()");
+    }
+
+    #[test]
+    fn commit_failure_then_drop_rolls_back() {
+        let conn = fk_conn();
+        {
+            let _tx = begin_failing_commit(&conn);
+        } // Drop must roll the failed commit back.
+        assert!(conn.is_autocommit(), "conn still inside a transaction after Drop");
+        // And the connection is usable for the next BEGIN IMMEDIATE — the
+        // pool-leak signature was every later writer hitting it.
+        let mut tx2 = Tx::begin(&conn).unwrap();
+        tx2.rollback();
+    }
+
+    #[test]
+    fn positive_control_successful_commit_is_clean_and_permanent() {
+        // Guards against the two failure tests above passing vacuously:
+        // the happy path must COMMIT (row visible) AND leave autocommit ON.
+        let conn = fk_conn();
+        let mut tx = Tx::begin(&conn).unwrap();
+        conn.execute("INSERT INTO parent (id) VALUES (7)", []).unwrap();
+        tx.commit().unwrap();
+        assert!(conn.is_autocommit());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parent WHERE id = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "successful commit must persist");
+    }
 }
