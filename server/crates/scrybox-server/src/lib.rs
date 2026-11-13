@@ -439,6 +439,31 @@ pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
     }
 }
 
+/// REVIEW-errors H2: twin of Node's generic error handler
+/// (`server.js:642` — `console.error(err)` then
+/// `res.status(500).json({error:'Internal server error'})`), used as the
+/// custom response of the CatchPanicLayer in `app()`. The body and its
+/// Content-Type/Content-Length/ETag stamp order come from the same
+/// `express_json` twin the static-asset miss path already live-pins; the
+/// COEP/helmet/cors headers arrive on the way back out through the
+/// secheaders guard (the catcher sits INNER of that layer). Node's
+/// `console.error(err)` twin is the tracing::error below — the panic text
+/// goes to the log, never to the client.
+pub fn node_panic_500(err: Box<dyn std::any::Any + Send>) -> Response {
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic (non-string payload)".to_string()
+    };
+    tracing::error!(panic = %msg, "handler panicked — answering Node's 500");
+    crate::static_assets::express_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{\"error\":\"Internal server error\"}",
+    )
+}
+
 /// Build the router. Ported routes are mounted explicitly; everything else
 /// falls back to Node (optionally after a static-file lookup).
 pub fn app(state: AppState) -> Router {
@@ -941,6 +966,39 @@ pub fn app(state: AppState) -> Router {
     // the NATIVE routes only. Attached before the fallback is registered so
     // proxied traffic keeps Node's own header output untouched — axum
     // applies .layer() only to the routes added above it.
+    //
+    // REVIEW-errors H2 red-before-fix hook (tests/panic_500.rs): a route
+    // that ALWAYS panics, registered only under the same full production
+    // layer stack (CatchPanic inside secheaders::guard). Gated on an env
+    // var nothing in production sets; when unset the route does not exist,
+    // not even as a 404 (falls through to proxy like every unowned path).
+    let router = if std::env::var("SCRYBOX_TEST_PANIC_ROUTE").is_ok() {
+        // Diverging handler as a named async fn with an explicit return
+        // type: an inline `|| async { panic!(..) }` closure leaves the
+        // future's Output = ! and trips the (deny-by-default)
+        // never-type-fallback rust_2024_compat lint.
+        async fn boom() -> StatusCode {
+            panic!("SCRYBOX_TEST_PANIC_ROUTE: intentional handler panic (REVIEW-errors H2 test)")
+        }
+        router.route("/api/__test_panic", any(boom))
+    } else {
+        router
+    };
+    // REVIEW-errors H2 (fix queue): tower-http CatchPanicLayer answering
+    // Node's generic error handler (server.js:642 `res.status(500).json(
+    // {error:'Internal server error'})`) byte-for-byte on a handler panic
+    // instead of hyper resetting the connection. Placed INNER of the
+    // secheaders guard (layers added later are outer in axum): the panic
+    // unwinds out of the handler into the catcher, the resulting 500 then
+    // travels back OUT through the guard, which stamps the same COEP/
+    // helmet/cors twin headers Node's stack had already set before the
+    // route threw. Only covers routes registered above (the native ones);
+    // the Node-proxy fallback carries Node's own error output by design.
+    // Requires panic = "unwind" (workspace Cargo.toml profile — do not set
+    // panic = "abort").
+    let router = router.layer(tower_http::catch_panic::CatchPanicLayer::custom(
+        node_panic_500,
+    ));
     let router = router.layer(axum::middleware::from_fn(crate::secheaders::guard));
     let router = match state.cfg.static_dir.clone() {
         Some(dir) => {
