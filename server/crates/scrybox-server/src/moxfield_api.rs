@@ -58,6 +58,8 @@ const NOT_FOUND_404: &str = "Moxfield returned 404 (deck or user not found)";
 
 /// execFile({ maxBuffer }) — stdout beyond 10MB is an execFile error.
 const MAX_STDOUT_BYTES: usize = 10 * 1024 * 1024;
+/// Only the first 200 chars of stderr are ever used.
+const MAX_STDERR_BYTES: usize = 4096;
 
 /// A failed Moxfield call, with the HTTP status the sync maps to a route
 /// response (0 for transport/parse failures with no status, like Node's
@@ -155,37 +157,78 @@ impl MfxApi {
             .kill_on_drop(true)
             .spawn();
         let (stdout, stderr, exec_err) = match spawned {
-            Ok(child) => {
-                let waited = tokio::time::timeout(
-                    Duration::from_secs(TIMEOUT_S + 5),
-                    child.wait_with_output(),
-                )
+            Ok(mut child) => {
+                // Stream both pipes with caps: stdout over maxBuffer kills the
+                // child right away (Node's execFile), stderr keeps 4 KB.
+                use tokio::io::AsyncReadExt;
+                let mut out_pipe = child.stdout.take();
+                let mut err_pipe = child.stderr.take();
+                let read_out = async {
+                    let mut buf = Vec::new();
+                    if let Some(p) = out_pipe.as_mut() {
+                        let _ = p.take(MAX_STDOUT_BYTES as u64 + 1).read_to_end(&mut buf).await;
+                    }
+                    buf
+                };
+                let read_err = async {
+                    let mut buf = Vec::new();
+                    if let Some(p) = err_pipe.as_mut() {
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match p.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let room = MAX_STDERR_BYTES.saturating_sub(buf.len());
+                                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                                }
+                            }
+                        }
+                    }
+                    buf
+                };
+                let waited = tokio::time::timeout(Duration::from_secs(TIMEOUT_S + 5), async {
+                    let out_fut = read_out;
+                    tokio::pin!(out_fut);
+                    let err_fut = read_err;
+                    tokio::pin!(err_fut);
+                    let mut err_buf: Option<Vec<u8>> = None;
+                    let out = loop {
+                        tokio::select! {
+                            o = &mut out_fut => break o,
+                            e = &mut err_fut, if err_buf.is_none() => err_buf = Some(e),
+                        }
+                    };
+                    if out.len() > MAX_STDOUT_BYTES {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Ok((out, Vec::new(), None));
+                    }
+                    let err = match err_buf {
+                        Some(e) => e,
+                        None => err_fut.await,
+                    };
+                    child.wait().await.map(|st| (out, err, Some(st)))
+                })
                 .await;
                 match waited {
-                    Ok(Ok(o)) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                        if o.stdout.len() > MAX_STDOUT_BYTES {
+                    Ok(Ok((out, err, status))) => {
+                        let stderr = String::from_utf8_lossy(&err).to_string();
+                        match status {
                             // maxBuffer exceeded → err, stderr empty in Node.
-                            (String::new(), String::new(), Some("maxBuffer exceeded".to_string()))
-                        } else if !o.status.success() {
-                            // execFile errors on non-zero exit codes.
-                            (
+                            None => (String::new(), String::new(), Some("maxBuffer exceeded".to_string())),
+                            Some(st) if !st.success() => (
+                                // execFile errors on non-zero exit codes.
                                 String::new(),
                                 stderr,
-                                Some(format!(
-                                    "Command failed: {} {}",
-                                    self.curl_bin,
-                                    args.join(" ")
-                                )),
-                            )
-                        } else {
-                            (stdout, stderr, None)
+                                Some(format!("Command failed: {} {}", self.curl_bin, args.join(" "))),
+                            ),
+                            Some(_) => (String::from_utf8_lossy(&out).to_string(), stderr, None),
                         }
                     }
                     Ok(Err(e)) => (String::new(), String::new(), Some(e.to_string())),
                     Err(_) => {
                         // timeout: execFile kills the child; err message form
+                        let _ = child.start_kill();
                         (String::new(), String::new(), Some("spawnSync /bin/sh ETIMEDOUT".to_string()))
                     }
                 }
