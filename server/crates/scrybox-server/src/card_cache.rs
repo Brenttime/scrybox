@@ -193,15 +193,33 @@ const CHUNK: usize = 50;
 /// ON CONFLICT clause, and a price-less source cannot stamp $0 over a real
 /// quote.
 pub fn cache_normalized_cards(conn: &Connection, cards: &[Map<String, Value>]) -> rusqlite::Result<()> {
-    let rows: Vec<&Map<String, Value>> = cards
-        .iter()
-        .filter(|c| {
-            c.get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
-        })
-        .collect();
+    let rows: Vec<PreparedCard> = cards.iter().filter_map(prepare_card).collect();
+    cache_prepared_cards(conn, &rows)
+}
+
+/// A normalized card pre-bound for the UPSERT: the exact `bind_row` output
+/// plus the row id (the estimate-refresh key). The price sweep pre-binds
+/// every card as its chunk arrives and drops the JSON tree immediately —
+/// holding `Value` trees for the whole collection was the boot-sweep RSS
+/// spike (Gate D; see tests/sweep_memory.rs).
+pub struct PreparedCard {
+    pub id: String,
+    pub params: Vec<rusqlite::types::Value>,
+}
+
+/// `bind_row` at pre-bound shape; `None` for the rows cacheNormalizedCards
+/// would filter out anyway (missing/empty id).
+pub fn prepare_card(c: &Map<String, Value>) -> Option<PreparedCard> {
+    let id = c.get("id").and_then(|v| v.as_str())?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(PreparedCard { id: id.to_string(), params: bind_row(c) })
+}
+
+/// `cacheNormalizedCards` on already-bound rows — the shared writer behind
+/// both entry points.
+pub fn cache_prepared_cards(conn: &Connection, rows: &[PreparedCard]) -> rusqlite::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -215,7 +233,7 @@ pub fn cache_normalized_cards(conn: &Connection, cards: &[Map<String, Value>]) -
         let mut params: Vec<rusqlite::types::Value> =
             Vec::with_capacity(chunk.len() * COLUMNS.len());
         for c in chunk {
-            params.extend(bind_row(c));
+            params.extend(c.params.iter().cloned());
         }
         let values = vec![row_sql.as_str(); chunk.len()].join(", ");
         let ps: Vec<&dyn rusqlite::types::ToSql> =
@@ -230,10 +248,7 @@ pub fn cache_normalized_cards(conn: &Connection, cards: &[Map<String, Value>]) -
         )?;
     }
     // Re-estimate the touched logical cards (Node logs and continues).
-    let ids: Vec<String> = rows
-        .iter()
-        .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
-        .collect();
+    let ids: Vec<String> = rows.iter().map(|c| c.id.clone()).collect();
     if let Err(e) = refresh_estimates_for_ids(conn, &ids) {
         tracing::error!("price estimate refresh failed: {e}");
     }
