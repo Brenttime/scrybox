@@ -76,12 +76,46 @@ async fn post(r: &Router, path: &str, ct: &str, body: String) -> (StatusCode, Va
     (st, serde_json::from_slice(&b).unwrap_or(Value::Null))
 }
 
+/// Raw AF_INET socket, bound to an ephemeral 127.0.0.1 port, NEVER listen()ed:
+/// connects get kernel RST (ECONNREFUSED) while the returned fd keeps the
+/// port off-limits to bind(0) elsewhere. Caller must hold the fd for the
+/// duration of the test.
+fn bound_unlistening_port() -> (i32, u16) {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket() failed");
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_be(0x7f00_0001) },
+            sin_zero: [0; 8],
+        };
+        let rc = libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        );
+        assert_eq!(rc, 0, "bind() failed");
+        let mut name: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let rc = libc::getsockname(
+            fd,
+            &mut name as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        );
+        assert_eq!(rc, 0, "getsockname() failed");
+        (fd, u16::from_be(name.sin_port))
+    }
+}
+
 #[tokio::test]
 async fn refused_sidecar_is_503_unavailable() {
-    // Bind then drop a listener: a port with nothing behind it → ECONNREFUSED.
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
+    // A bound-but-NOT-listening socket: the kernel RSTs every SYN to it
+    // (→ the route's ECONNREFUSED arm) and the port stays claimed for the
+    // test's lifetime. The old bind-then-drop freed the port, and a bind(0)
+    // mock in a sibling test binary used to steal it and answer 200 — the
+    // workspace-run flake (std::net::TcpSocket is unstable, hence libc).
+    let (_fd, port) = bound_unlistening_port();
     let r = harness(&format!("http://127.0.0.1:{port}")).await;
     let (st, v) = post(&r, "/api/cardscan", "application/json", r#"{"cards":[{"a":1}]}"#.to_string()).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
