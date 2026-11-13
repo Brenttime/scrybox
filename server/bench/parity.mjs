@@ -11,6 +11,8 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 // 'Bearer ' built at runtime: earlier sessions' toolchain redacted
 // `Bearer <token>` literals to '***' at write time (see PROGRESS iter-49 note).
@@ -18,6 +20,59 @@ const BP = ['Be','ar','er '].join('');
 
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- cross-lane parity lock (iter-52 orchestrator action item) ---------------
+// Both lanes run this script against the SHARED Node oracle (:3312): a search
+// request hitting Node's 300/15m searchLimiter bucket mid-window cliffs every
+// remaining search case into one-sided 429s (iter-49/52 run-invalidations).
+// Unique-XFF rotation makes each harness request its own bucket (probe:
+// 320/320 200s iter-53), but two co-resident lanes still drain Node's shared
+// loopback bucket via no-XFF proxy legs and the bench. So a parity run takes
+// an exclusive flock for its whole duration; a second parity run queues.
+// Default: <repo-parent>/.parity.lock — identical file for wt and wt-b.
+// Override with --parity-lock <path> or PARITY_LOCK (empty string disables).
+async function acquireParityLock() {
+  const lockPath = opt('--parity-lock', process.env.PARITY_LOCK === '' ? null
+    : (process.env.PARITY_LOCK || new URL('../../../.parity.lock', import.meta.url).pathname));
+  if (!lockPath) { console.log('# parity lock DISABLED'); return; }
+  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* exists */ }
+  // flock -x holds until `read` EOFs; closing our stdin ends the child and
+  // releases the lock. SIGKILL of this process closes the pipe too — no
+  // stale locks. If flock(1) is unavailable, fall back to a mkdir lock with
+  // a 30-minute staleness takeover.
+  const child = spawn('flock', ['-x', lockPath, '-c', 'echo .parity.lock held; read _ || true'],
+    { stdio: ['pipe', 'pipe', 'inherit'] });
+  let gotLock = false, enoent = false;
+  child.stdout.on('data', (b) => { if (b.toString().includes('held')) gotLock = true; });
+  child.on('error', (e) => { if (e.code === 'ENOENT') enoent = true; });
+  const deadline = Date.now() + 45 * 60 * 1000;
+  let waited = false;
+  while (!gotLock && !enoent && Date.now() < deadline) {
+    await sleep(2000);
+    if (!waited) { waited = true; console.log(`# waiting for ${lockPath} (another parity run in flight)...`); }
+  }
+  if (gotLock) {
+    process.on('exit', () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } });
+    return;
+  }
+  if (!enoent) { console.error(`parity lock: timed out after 45 min waiting for ${lockPath}`); process.exit(3); }
+  // mkdir fallback
+  const dir = lockPath + '.d';
+  for (;;) {
+    try { fs.mkdirSync(dir); fs.writeFileSync(dir + '/pid', String(process.pid)); break; }
+    catch {
+      let age = 0;
+      try { age = Date.now() - fs.statSync(dir).mtimeMs; } catch { continue; } // lost race, retry
+      if (age > 30 * 60 * 1000) { console.log(`# parity lock stale (${Math.round(age / 60000)} min), taking over`); fs.rmSync(dir, { recursive: true, force: true }); continue; }
+      if (!waited) { waited = true; console.log(`# waiting for ${dir} (another parity run in flight)...`); }
+    }
+    await sleep(2000);
+  }
+  process.on('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } });
+}
+await acquireParityLock();
+
 const scenPath = args.find(a => a.endsWith('.json')) ||
   new URL('.', import.meta.url).pathname + '../../../scen-rust.json';
 const scen = JSON.parse(fs.readFileSync(scenPath, 'utf8'));
@@ -3721,11 +3776,51 @@ for (const c of cases) {
     // probe could be trimmed out from under its own flow. Sequential keeps
     // the "identical request from identical fresh state" property and makes
     // the trim deterministic. Pure reads stay parallel.
-    const [r, n] = c.setup
-      ? [await fetchSide(RUST, c), await fetchSide(NODE, c)]
-      : await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
+    // Connection-level throws (fetchSide's 3-strike ECONNRESET/EPIPE, or
+    // etagParity's refetch dying — iter-53 collection_full_varied#5 crash:
+    // the fetchSide throw escaped the MAX_TRIES loop entirely and killed the
+    // suite mid-run with RC=1). Treat them as diffs so the case retries
+    // instead of crashing; a persistent error still FAILs after MAX_TRIES.
+    let r, n;
+    try {
+      [r, n] = c.setup
+        ? [await fetchSide(RUST, c), await fetchSide(NODE, c)]
+        : await Promise.all([fetchSide(RUST, c), fetchSide(NODE, c)]);
+    } catch (e) {
+      lastDiffs = [`fetch threw after inner retries: ${e && e.cause ? (e.cause.code || e.cause.message) : e}`];
+      etagDiffs = [];
+      if (tries < MAX_TRIES - 1) { await sleep(2000); continue; }
+      break;
+    }
     lastDiffs = compareCase(c, r, n);
-    if (lastDiffs.length === 0) { etagDiffs = await etagParity(c); if (etagDiffs.length === 0) break; }
+    if (lastDiffs.length === 0) {
+      try { etagDiffs = await etagParity(c); } catch (e) {
+        etagDiffs = [`etagParity threw: ${e && e.cause ? (e.cause.code || e.cause.message) : e}`];
+      }
+      if (etagDiffs.length === 0) break;
+    }
+    // One-sided 429 = shared limiter-window artifact (iter-49/52 class: a
+    // co-resident load drained one front's fixed 15-min bucket), never a
+    // content mismatch — an immediate retry hits the same drained window,
+    // so pace the retry instead of burning all MAX_TRIES. A case where BOTH
+    // sides answer 429 compares equal and never reaches here. Also covers
+    // the etagParity-refetch flavour ("replay of own ETag answered 429",
+    // iter-53 run3: main fetches answered 200, the refetch hit the drained
+    // Node bucket — Node buckets ALL harness traffic under one loopback key
+    // since it only trusts loopback, so back-to-back full runs cliff).
+    if (lastDiffs.length && tries < MAX_TRIES - 1 && (r.status === 429) !== (n.status === 429)) {
+      console.log(`  .. ${c.name}: one-sided 429 (limiter-window artifact), pacing 20 s before retry ${tries + 2}/${MAX_TRIES}`);
+      await sleep(20000);
+    }
+    if (!lastDiffs.length && etagDiffs.length && tries < MAX_TRIES - 1
+        && etagDiffs.some((d) => d.includes('429'))) {
+      // Node's searchLimiter twin is fed by scryfallApi's live-call gate: a
+      // real Scryfall 429 arms a ~60 s global cooldown (scryfallApi.js:91
+      // default), so pacing shorter than that burns all MAX_TRIES inside the
+      // cooldown. 70 s clears it with margin.
+      console.log(`  .. ${c.name}: etagParity 429 (upstream cooldown artifact), pacing 70 s before retry ${tries + 2}/${MAX_TRIES}`);
+      await sleep(70000);
+    }
   }
   const ok = lastDiffs.length === 0 && etagDiffs.length === 0;
   if (ok && tries > 0) { flaky++; console.log(`PASS(flaky x${tries + 1}) ${c.name}`); continue; }
@@ -3747,7 +3842,6 @@ for (const c of cases) {
 // wait > 5 s, require an exact rust==node match, then revert the edit so the
 // DB copy is left as found.
 const pw = { name: 'stats_post_write', path: '/api/stats', headers: authHeaders, method: 'GET' };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function putTrade(v) {
   return new Promise((resolve) => {
     const body = JSON.stringify({ is_trade: v });
