@@ -52,7 +52,18 @@ impl MockState {
     fn next_status(&self, key: &str) -> u16 {
         // The current hit is already recorded when this runs: index with
         // count-1 so a script [429, 200] serves 429 first, 200 after.
-        let hits = self.hits.lock().unwrap().iter().filter(|(k, _)| k == key).count().saturating_sub(1);
+        // Hit keys carry the query string ("GET /cards/search?q=…") while
+        // script keys do not — count both forms or a query-carrying endpoint
+        // would serve script[0] forever.
+        let prefix = format!("{key}?");
+        let hits = self
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == key || k.starts_with(&prefix))
+            .count()
+            .saturating_sub(1);
         let script = self.statuses.lock().unwrap();
         match script.get(key) {
             Some(v) if !v.is_empty() => *v.get(hits).or_else(|| v.last()).unwrap(),

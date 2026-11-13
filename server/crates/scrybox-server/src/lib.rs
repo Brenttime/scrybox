@@ -76,6 +76,7 @@ pub mod stats;
 mod stats_sql;
 pub mod stats_subs;
 pub mod search_history;
+pub mod seed_cards;
 pub mod shared;
 pub mod spa;
 pub mod static_assets;
@@ -589,6 +590,14 @@ pub fn app(state: AppState) -> Router {
             .route("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
             .route("/api/admin/models", any(model_assets::handle_models))
             .route("/api/admin/models/download", any(model_assets::handle_models))
+    } else {
+        router
+    };
+    // Lane B unit 4 (iter-12): admin.js POST /seed-cards under its own gate
+    // (RUST_ROUTES=seed_cards). The catch-all proxies the path while off;
+    // non-POST methods forward to Node even when on (router.post twin).
+    let router = if state.owns("seed_cards") {
+        router.route("/api/admin/seed-cards", any(seed_cards::handle))
     } else {
         router
     };

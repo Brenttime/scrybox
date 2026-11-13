@@ -363,7 +363,10 @@
     "tests": "tests/catalog_build_route.rs (models_status_shape_and_download_409, kill_switch_off_proxies_everything, catalogs_auth_ladder_and_list_shape)"
   },
   "POST /api/admin/seed-cards": {
-    "status": "node"
+    "module": "scrybox-server::seed_cards (lib.rs POST /api/admin/seed-cards under RUST_ROUTES=seed_cards; admin.js:19 twin: getCardsBySet lea+mh3 via scryGet /cards/search with 3-try 429 loop + cacheCards, 500ms inter-set pause, LIMIT 500 parseCardRow cache fallback + 502, alloc-lock + BEGIN IMMEDIATE purge with logicalInventoryStatus 409, 168+40 randomEntry inserts, message-count == Σqty)",
+    "status": "verified",
+    "notes": "Random by design (Math.random twin: splitmix64): addedCount ∈ [208,416], price = parseFloat((rand*max).toFixed(2)) with ECMAScript tie-to-larger, qty ∈ {1,2}, 4-condition/3-English-1-Japanese slots, printsForCard [Normal?,Holofoil?] fallback ['Normal']. Parity pins message SHAPE + row count + domains + purge/survival via dedicated-user readBack (never the bench admin). API-key POST answers authenticateToken's read-only 403, NOT requireAdmin's admin-key message (middleware/auth.js:30-33). Non-POST + strict-parse failures Forward; kill switch off proxies.",
+    "tests": "tests/seed_cards_route.rs (11: kill-switch/method/badbody forwards, POST auth ladder incl. api-key-read-only-before-admin, happy path 208 rows + Σqty + cacheCards + 2 legs, cache fallback, 502, 409 rollback, checked-in deck passes, 429 retry, all-429); src/seed_cards.rs toFixed(2) node-pinned vectors; bench/parity.mjs seed_* (7 cases)"
   },
   "POST /api/admin/users": {
     "module": "scrybox-server::admin_users (lib.rs POST /api/admin/users under RUST_ROUTES=admin_users; admin.js:162 twin: validation order required/3/8/role, destructure default role='member' (null !== undefined), UTF-16 length gate, cleaned-username dup, scrypt hash, randomBytes(16)-hex share token, 201 message)",
