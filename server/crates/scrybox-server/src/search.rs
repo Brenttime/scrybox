@@ -583,17 +583,6 @@ pub fn plan_post(
         && set.is_empty()
         && lang_name == "English";
 
-    // Raw merged `lang` for the sidecar-walk legs lane-B's iter-10 merge
-    // added (lang_codes resolve input + rawPageCache key element, Node's
-    // `lang || ''`): falsy/absent fold to None (Node's null/'' share the
-    // ''-keyed entry); exotic forms already proxied via lang_name above.
-    let lang_raw = match mv("lang") {
-        None | Some(Merged::Falsy) => None,
-        Some(Merged::Query(s)) => Some(s.to_string()),
-        Some(Merged::Str(s)) => Some(s),
-        Some(Merged::Exotic) => return Plan::Proxy,
-    };
-
     Plan::Native(SearchQuery {
         user_id,
         name: name.trim().to_string(),
@@ -603,10 +592,16 @@ pub fn plan_post(
         page,
         limit,
         walkable,
-        lang: lang_raw,
-        // POST's internet/q/scope-collection arms proxy verbatim (iter-46),
-        // so a natively-served POST is always the collection scope.
+        // plan_post proxies scope=collection/internet wholesale, so the
+        // merge leg here is always the database scope. Raw lang for the
+        // langSearch resolve + rawPageCache key (`lang || ''`): Falsy shapes
+        // key as '' (== absent), Exotic already returned Plan::Proxy above.
         internet: false,
+        lang: match mv("lang") {
+            Some(Merged::Query(s)) => Some(s.to_string()),
+            Some(Merged::Str(s)) => Some(s),
+            _ => None,
+        },
     })
 }
 
