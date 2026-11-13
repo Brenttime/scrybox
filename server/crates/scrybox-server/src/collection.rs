@@ -815,7 +815,21 @@ const RECENT_MAX: usize = 256;
 /// retained freed blocks ratcheted RSS to ~3 GB over a realistic run
 /// (iter-15). Above this budget `put` LRU-evicts (least-recently-served
 /// first) until the stored bytes fit.
-const STORE_MAX_BYTES: u64 = 1 << 30; // 1 GiB
+///
+/// Gate D iter-22: the 1 GiB default was chosen to stop the 3 GB runaway,
+/// not as a target — per-leg bench attribution showed this budget alone
+/// (+379 MB VmHWM on collection_full_varied) overshoots the idle-66/
+/// peak-110 Gate D envelope. Default now 256 MiB, env-tunable
+/// (SCRYBOX_COLLECTION_CACHE_MAX_MB) for hosts that want the old headroom.
+const STORE_MAX_BYTES_DEFAULT: u64 = 256 << 20; // 256 MiB
+
+fn store_max_bytes() -> u64 {
+    std::env::var("SCRYBOX_COLLECTION_CACHE_MAX_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb << 20)
+        .unwrap_or(STORE_MAX_BYTES_DEFAULT)
+}
 
 /// Freed bytes (pruned/evicted) in one `put` before the refresher tick is
 /// asked to return heap to the OS (`malloc_trim`). Small churn is left for
@@ -914,7 +928,7 @@ impl Default for CollectionCache {
             computes: AtomicU64::new(0),
             builds: Arc::new(Semaphore::new(2)),
             clock: AtomicU64::new(0),
-            max_bytes: AtomicU64::new(STORE_MAX_BYTES),
+            max_bytes: AtomicU64::new(store_max_bytes()),
             trim_dirty_bytes: AtomicU64::new(TRIM_DIRTY_BYTES),
             trim_dirty: AtomicBool::new(false),
             max_rev: AtomicI64::new(i64::MIN),

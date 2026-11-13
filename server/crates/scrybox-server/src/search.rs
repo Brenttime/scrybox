@@ -1244,33 +1244,128 @@ type ComputeSlot = OnceCell<Result<Option<Arc<SearchEntry>>, String>>;
 struct Inner {
     entries: HashMap<String, Arc<SearchEntry>>,
     inflight: HashMap<String, Arc<ComputeSlot>>,
+    /// LRU clock per key + the per-key stored-bytes estimate; eviction
+    /// (byte budget, Gate D iter-22) picks victims from these.
+    seen: HashMap<String, u64>,
+    bytes: HashMap<String, u64>,
+    total_bytes: u64,
+    /// Highest revision any entry was stored at — entries from older
+    /// generations are dead weight (`get` filters by exact rev) and get
+    /// pruned on the next insert, mirroring the collection cache.
+    max_rev: i64,
+}
+
+/// Default byte budget for the serialized search bodies. The count cap
+/// alone (>64 → clear) never bounded BYTES: an entry is raw+gz body plus
+/// stale identifier rows, and the realistic bench (64 varied queries)
+/// ratcheted the process VmHWM +694 MB through this one cache
+/// (lane-B iter-22 per-leg attribution). Env-tunable like the DB pools.
+const SEARCH_STORE_MAX_BYTES_DEFAULT: u64 = 128 << 20; // 128 MiB
+/// Heap estimate per stale identifier row (small objects; errs generous).
+const STALE_ROW_BYTES: u64 = 1024;
+
+fn search_store_max_bytes() -> u64 {
+    std::env::var("SCRYBOX_SEARCH_CACHE_MAX_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(|mb| mb << 20)
+        .unwrap_or(SEARCH_STORE_MAX_BYTES_DEFAULT)
 }
 
 /// Serialized native search responses keyed by (params, revision). Bounded
-/// the same way the collection cache is.
-#[derive(Default)]
+/// by BOTH the 64-entry count cap and a global byte budget (LRU eviction,
+/// same shape as the collection cache — the old "bounded the same way"
+/// comment promised more than the code delivered).
 pub struct SearchCache {
     inner: Mutex<Inner>,
     /// Number of full bodies actually computed (single-flight test + ops).
     computes: AtomicU64,
+    clock: AtomicU64,
+    max_bytes: AtomicU64,
+}
+
+impl Default for SearchCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SearchCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(Inner::default()),
+            computes: AtomicU64::new(0),
+            clock: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(search_store_max_bytes()),
+        }
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<SearchEntry>> {
-        let e = self.inner.lock().unwrap();
-        e.entries.get(key).filter(|e| e.rev == rev).cloned()
+        let mut e = self.inner.lock().unwrap();
+        let hit = e.entries.get(key).filter(|x| x.rev == rev).cloned();
+        if hit.is_some() {
+            // Serve = most-recently-used; byte-budget eviction picks its
+            // victim from this clock.
+            let seen = self.clock.fetch_add(1, Ordering::Relaxed);
+            e.seen.insert(key.to_string(), seen);
+        }
+        hit
     }
     fn insert(&self, key: String, entry: SearchEntry) -> Arc<SearchEntry> {
         let entry = Arc::new(entry);
+        let bytes = entry.raw.len() as u64
+            + entry.gz.len() as u64
+            + entry.stale.len() as u64 * STALE_ROW_BYTES;
+        let seen = self.clock.fetch_add(1, Ordering::Relaxed);
         {
             let mut e = self.inner.lock().unwrap();
             if e.entries.len() > 64 {
                 e.entries.clear();
+                e.seen.clear();
+                e.bytes.clear();
+                e.total_bytes = 0;
             }
-            e.entries.insert(key, entry.clone());
+            // Superseded-generation entries are never served (get filters by
+            // exact rev) — drop their bodies instead of counting them.
+            if entry.rev > e.max_rev {
+                e.max_rev = entry.rev;
+            }
+            e.total_bytes += bytes;
+            e.bytes.insert(key.clone(), bytes);
+            e.seen.insert(key.clone(), seen);
+            e.entries.insert(key.clone(), entry.clone());
+            if e.entries.len() > 1 {
+                let live = e.max_rev;
+                let dead: Vec<String> = e.entries.iter()
+                    .filter(|(_, v)| v.rev != live)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in dead {
+                    e.entries.remove(&k);
+                    if let Some(b) = e.bytes.remove(&k) {
+                        e.total_bytes = e.total_bytes.saturating_sub(b);
+                    }
+                    e.seen.remove(&k);
+                }
+            }
+            // Byte budget: evict least-recently-served until under budget,
+            // always keeping the entry just inserted.
+            let max = self.max_bytes.load(Ordering::Relaxed);
+            while e.total_bytes > max && e.entries.len() > 1 {
+                let victim = e.seen.iter()
+                    .filter(|(k, _)| e.entries.contains_key(*k) && **k != key)
+                    .min_by_key(|(_, s)| **s)
+                    .map(|(k, _)| k.clone());
+                match victim {
+                    Some(k) => {
+                        e.entries.remove(&k);
+                        if let Some(b) = e.bytes.remove(&k) {
+                            e.total_bytes = e.total_bytes.saturating_sub(b);
+                        }
+                        e.seen.remove(&k);
+                    }
+                    None => break,
+                }
+            }
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
         entry
@@ -2717,4 +2812,81 @@ async fn serve_local(
         stale: Arc::new(Vec::new()),
     });
     respond_entry(&entry, inm.as_deref(), ae.as_deref(), Some(("local", "local")))
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+
+    fn entry(rev: i64, body: &str) -> SearchEntry {
+        let raw = Bytes::from(body.as_bytes().to_vec());
+        SearchEntry {
+            rev,
+            raw,
+            gz: Bytes::from(Vec::new()),
+            etag: String::new(),
+            total: None,
+            source: "cache",
+            x_source: true,
+            catalog: None,
+            stale: Arc::new(Vec::new()),
+        }
+    }
+
+    fn budget_cache(max_bytes: u64) -> SearchCache {
+        let c = SearchCache::new();
+        c.max_bytes.store(max_bytes, Ordering::Relaxed);
+        c
+    }
+
+    #[test]
+    fn byte_budget_evicts_least_recently_served() {
+        // Three ~1 KiB entries under a 2.5 KiB budget: the two oldest are
+        // gone unless a serve refreshed them.
+        let c = budget_cache(2560);
+        let body = "x".repeat(1024);
+        c.insert("a".into(), entry(1, &body));
+        c.insert("b".into(), entry(1, &body));
+        assert!(c.get("a", 1).is_some()); // refresh a -> b is now the LRU
+        c.insert("c".into(), entry(1, &body));
+        assert!(c.get("a", 1).is_some(), "recently-served entry must survive");
+        assert!(c.get("b", 1).is_none(), "LRU victim must be evicted");
+        assert!(c.get("c", 1).is_some());
+        let e = c.inner.lock().unwrap();
+        assert!(e.total_bytes <= 2560, "stored bytes must fit the budget");
+        assert!(e.bytes.values().sum::<u64>() == e.total_bytes);
+    }
+
+    #[test]
+    fn superseded_generation_entries_are_pruned() {
+        let c = budget_cache(u64::MAX);
+        c.insert("a".into(), entry(1, "old generation"));
+        c.insert("b".into(), entry(2, "new generation"));
+        // get filters by exact rev even pre-pruning; post-pruning the dead
+        // body must not count against the store at all.
+        assert!(c.get("a", 1).is_none());
+        let e = c.inner.lock().unwrap();
+        assert!(!e.entries.contains_key("a"), "dead-rev entry must be dropped");
+        assert!(!e.bytes.contains_key("a"), "dead-rev bytes must be uncounted");
+    }
+
+    #[test]
+    fn count_cap_still_clears_and_resets_counters() {
+        let c = budget_cache(u64::MAX);
+        for i in 0..66 {
+            c.insert(format!("k{i}"), entry(1, "x"));
+        }
+        let e = c.inner.lock().unwrap();
+        assert_eq!(e.entries.len(), 1);
+        assert_eq!(e.total_bytes, 1); // the single "x" body, counters reset on clear
+    }
+
+    #[test]
+    fn env_overrides_default_budget() {
+        std::env::set_var("SCRYBOX_SEARCH_CACHE_MAX_MB", "7");
+        assert_eq!(search_store_max_bytes(), 7 << 20);
+        std::env::set_var("SCRYBOX_SEARCH_CACHE_MAX_MB", "garbage");
+        assert_eq!(search_store_max_bytes(), SEARCH_STORE_MAX_BYTES_DEFAULT);
+        std::env::remove_var("SCRYBOX_SEARCH_CACHE_MAX_MB");
+    }
 }
