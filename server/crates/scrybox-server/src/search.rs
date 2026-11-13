@@ -271,7 +271,14 @@ pub fn plan(user_id: i64, raw_query: Option<&str>, local_scrayfall: bool) -> Pla
                 let has_window =
                     pairs.iter().any(|(kk, _)| kk == "page" || kk == "limit");
                 let include_total = first("count").as_deref() != Some("0");
-                let expected_snapshot = first("snapshot");
+                // Route line 140: `typeof query.snapshot === 'string' ?
+                // query.snapshot : null` — a duplicated key parses as an
+                // array in qs, so Node performs NO snapshot check anywhere
+                // (and does not proxy on it).
+                let dup_snapshot =
+                    pairs.iter().filter(|(kk, _)| kk == "snapshot").count() > 1;
+                let expected_snapshot =
+                    if dup_snapshot { None } else { first("snapshot") };
                 if !local_scrayfall {
                     if let Some(lq) = collq::local_plan(
                         user_id, &qraw, has_window, page, limit, include_total,
@@ -280,10 +287,12 @@ pub fn plan(user_id: i64, raw_query: Option<&str>, local_scrayfall: bool) -> Pla
                         return Plan::CollectionLocalRows(Arc::new(lq));
                     }
                 }
-                if let Some(walk) = plan_collection_q(user_id, &pairs, &qraw, first) {
+                if let Some(walk) =
+                    plan_collection_q(user_id, &pairs, &qraw, first, expected_snapshot.clone())
+                {
                     if let Some(tags) = collq::local_plan(
                         user_id, &qraw, has_window, page, limit, include_total,
-                        expected_snapshot.clone(), true,
+                        expected_snapshot, true,
                     ) {
                         return Plan::CollectionLocalTags {
                             tags: Arc::new(tags),
@@ -291,29 +300,6 @@ pub fn plan(user_id: i64, raw_query: Option<&str>, local_scrayfall: bool) -> Pla
                         };
                     }
                     return Plan::CollectionQ(Arc::new(walk));
-                }
-                // snapshot-only walk rejection: the tag leg verifies the
-                // snapshot itself (per-request read txn, no durable cache —
-                // Node's readCatalogSnapshot), so retry the walk fallback
-                // with the param stripped. A NotReady tag leg with a snapshot
-                // in hand proxies instead (the walk leg's own snapshot check
-                // stays Node's).
-                let npairs: Vec<(String, String)> =
-                    pairs.iter().filter(|(k, _)| k != "snapshot").cloned().collect();
-                if npairs.len() != pairs.len() {
-                    if let Some(tags) = collq::local_plan(
-                        user_id, &qraw, has_window, page, limit, include_total,
-                        expected_snapshot, true,
-                    ) {
-                        let nfirst =
-                            |k: &str| npairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
-                        if let Some(walk) = plan_collection_q(user_id, &npairs, &qraw, nfirst) {
-                            return Plan::CollectionLocalTags {
-                                tags: Arc::new(tags),
-                                walk: Arc::new(walk),
-                            };
-                        }
-                    }
                 }
             }
         }
@@ -677,18 +663,17 @@ pub fn plan_post(
 /// Gate + normalization for the collection-scope q leg
 /// (`searchCards`' `scope === 'collection' && q.trim()` branch). Returns
 /// None (→ proxy) whenever anything outside the ported name + operator-
-/// conjunction subset is involved, including the `snapshot` parameter
-/// (expectedSnapshot mismatch is Node's 409 contract) and duplicate `count`
-/// keys (qs array semantics).
+/// conjunction subset is involved (duplicate `count` keys carry qs array
+/// semantics). The `snapshot` parameter is carried natively since iter-16:
+/// the string lands in `expected_snapshot` (a duplicated key is a qs array,
+/// which Node reads as `null` → no check).
 fn plan_collection_q(
     user_id: i64,
     pairs: &[(String, String)],
     qraw: &str,
     first: impl Fn(&str) -> Option<String>,
+    expected_snapshot: Option<String>,
 ) -> Option<collq::CollectionQ> {
-    if pairs.iter().any(|(k, _)| k == "snapshot") {
-        return None;
-    }
     if pairs.iter().filter(|(k, _)| k == "count").count() > 1 {
         return None;
     }
@@ -701,7 +686,7 @@ fn plan_collection_q(
     let limit = if limit == 0 { 60 } else { limit }.clamp(1, 2000);
     let has_window = pairs.iter().any(|(k, _)| k == "page" || k == "limit");
     let include_total = first("count").as_deref() != Some("0");
-    Some(collq::CollectionQ { user_id, walk_base, lang_code, scry_code, has_window, page, limit, include_total })
+    Some(collq::CollectionQ { user_id, walk_base, lang_code, scry_code, has_window, page, limit, include_total, expected_snapshot })
 }
 
 // ---------------------------------------------------------------------------
@@ -2581,6 +2566,18 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
     // X-Catalog-Cache, never X-Source. 'local-fallback' belongs to Node.
     let source: &'static str = "sidecar";
 
+    // readCatalogSnapshot's remote-mode check (iter-16): Node verifies the
+    // caller-supplied snapshot AFTER the match list resolves (an engine 400
+    // outranks the 409) and BEFORE answering, on a per-request pinned read
+    // txn. The response cache never keys on the snapshot — every replay,
+    // fresh or cached, passes this check against the current revision.
+    if let Some(exp) = cq.expected_snapshot.as_deref() {
+        if let Err(actual) = collq::check_remote_snapshot(&pool, &entry.names, exp) {
+            tracing::debug!(expected = %exp, actual = %actual, "catalog snapshot mismatch");
+            return json_error(StatusCode::CONFLICT, "CATALOG_SNAPSHOT_CHANGED");
+        }
+    }
+
     if let Some(e) = st.search_cache.get(&key, rev_i) {
         return respond_entry(&e, inm.as_deref(), ae.as_deref(), Some((status, source)));
     }
@@ -2667,11 +2664,10 @@ async fn serve_local(
             // branch and pays for the engine.
             match fallback {
                 Some((req, cq)) => {
-                    // A snapshot-carrying request must not ride the walk leg
-                    // (its own snapshot check is not ported): Node answers.
-                    if lq.expected_snapshot.is_some() {
-                        return crate::proxy(axum::extract::State(st), req).await;
-                    }
+                    // The walk leg carries its own snapshot check
+                    // (serve_collq → collq::check_remote_snapshot, iter-16):
+                    // a snapshot-carrying request is answered natively —
+                    // rows or 409 — instead of proxying.
                     return serve_collq(st, req, pool, cq).await;
                 }
                 None => {

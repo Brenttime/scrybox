@@ -83,6 +83,12 @@ pub struct CollectionQ {
     pub limit: i64,
     /// `query.count !== '0'`.
     pub include_total: bool,
+    /// Route line 140: `typeof query.snapshot === 'string' ? query.snapshot
+    /// : null` — a duplicated key is an array, so no check happens anywhere
+    /// in Node (plan_collection_q passes None). The walk leg verifies it
+    /// against the fresh `remote:{membershipVersion}:{revision}` token per
+    /// request (`check_remote_snapshot`).
+    pub expected_snapshot: Option<String>,
 }
 
 impl CollectionQ {
@@ -704,6 +710,35 @@ fn catalog_snapshot(conn: &Connection) -> Result<i64, String> {
         None => 0,
     };
     Ok(rev)
+}
+
+/// `readCatalogSnapshot(readDb, 'remote', membershipVersion, expected)` —
+/// the walk leg's per-request snapshot check (iter-16). Node computes
+/// `remote:{mv}:{revision}` inside the same dedicated read transaction that
+/// reads the owned rows and throws CATALOG_SNAPSHOT_CHANGED on mismatch
+/// (route → 409 `{error}`). Here the response cache is rev-gated and the
+/// header token build() minted came from a pinned txn of the same revision,
+/// so the check re-reads the revision itself on its own pinned txn per
+/// request — a cached replay never skips it. Falsy `expected` (empty string,
+/// absent, duplicated key → array → None) skips the check exactly like
+/// Node's `if (expectedSnapshot && expectedSnapshot !== token)`.
+/// Ok(()) = serve; Err(actual token) = 409 CATALOG_SNAPSHOT_CHANGED.
+pub fn check_remote_snapshot(
+    pool: &DbPool,
+    names: &[String],
+    expected: &str,
+) -> Result<(), String> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let _txn = Txn::begin(&conn).map_err(|e| e.to_string())?;
+    let rev = catalog_snapshot(&conn)?;
+    let token = format!("remote:{}:{rev}", membership_version(names));
+    if token != expected {
+        return Err(token);
+    }
+    Ok(())
 }
 
 fn owned_rows(conn: &Connection, cq: &CollectionQ, membership: &str) -> Result<Vec<Value>, String> {
