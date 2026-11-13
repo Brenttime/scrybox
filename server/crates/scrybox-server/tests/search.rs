@@ -146,6 +146,26 @@ fn router_for(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
     app(st)
 }
 
+/// router_for pinned to sidecar mode (LOCAL_SCRYFALL parity): the collq
+/// walk/durable legs answer, and the iter-14 upstream-mode SQLite answer legs
+/// (answerLocally / Oracle-Tag-local) stand down — they are Node-parity arms
+/// for the mode WITHOUT a sidecar. Collq tests that pin walk behaviour
+/// (durable headers, out-of-subset proxy) use this.
+fn router_for_sidecar_mode(db_path: PathBuf, routes: &[&str], upstream: &str) -> Router {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: upstream.to_string(),
+        static_dir: None,
+        rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+        db_path: Some(db_path),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.stale_refresh = false;
+    st.local_scrayfall = true;
+    app(st)
+}
+
 /// Like router_for, but pins Scry to a mock — the iter-10 live merge leg
 /// talks to st.scry and must never touch api.scryfall.com from the suite.
 fn router_for_live(db_path: PathBuf, routes: &[&str], upstream: &str, scry: scrybox_server::scryfall::Scry) -> Router {
@@ -1419,6 +1439,9 @@ fn sidecar_state(path: PathBuf, upstream: &str, sidecar: &str) -> AppState {
     };
     let mut st = AppState::new(cfg);
     st.stale_refresh = false;
+    // A wired sidecar IS sidecar mode (LOCAL_SCRYFALL parity): the walk legs
+    // answer; the iter-14 upstream-mode SQLite answer legs must stand down.
+    st.local_scrayfall = true;
     st
 }
 
@@ -1584,7 +1607,9 @@ async fn collq_durable_hit_serves_native_shape_and_headers() {
     // sidecar is wired at all — a walk attempt would show as an x-node hop.
     seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
     let upstream = spawn_fake_node().await;
-    let r = router_for(path.clone(), &["search"], &format!("http://{upstream}"));
+    // Sidecar mode: the durable/walk contract is the LOCAL_SCRYFALL parity
+    // arm — upstream mode answers this query via the iter-14 SQLite legs.
+    let r = router_for_sidecar_mode(path.clone(), &["search"], &format!("http://{upstream}"));
     // Whitespace/case normalization must land on the durable key 'sol ring'.
     let (s, h, b) = get_json(&r, "/api/search?scope=collection&q=%20SOL%20%20Ring%20&limit=60&page=1").await;
     assert_eq!(s, StatusCode::OK);
@@ -1628,7 +1653,10 @@ async fn collq_structured_queries_and_params_proxy() {
     let path = seeded_db(dir.path());
     seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
     let upstream = spawn_fake_node().await;
-    let r = router_for(path.clone(), &["search", "search_sidecar"], &format!("http://{upstream}"));
+    // Sidecar mode (LOCAL_SCRYFALL parity): anything outside the proven walk
+    // subset proxies. In upstream mode several of these are answered by the
+    // iter-14 SQLite legs instead (pinned in gated_queries / collq_local).
+    let r = router_for_sidecar_mode(path.clone(), &["search", "search_sidecar"], &format!("http://{upstream}"));
     for url in [
         "/api/search?scope=collection&q=t%3Acreature%20and%20and%20c%3Ag&limit=60", // doubled 'and' → Node throws → raw-passthrough key
         "/api/search?scope=collection&q=colorless",                                  // Node rewrites bare colorless to c:c
@@ -1732,6 +1760,16 @@ fn collq_walk_base_operator_battery() {
         ("t:creature naïve", "t:creature naïve"),
         // Plain name-only queries keep the exact iter-9 output.
         ("Sol Ring", "sol ring"),
+        // `is:` Scrybox extension: a TYPE_WORDS value is rewritten to the
+        // canonical t: leaf by Node's own leafToScryfall (verified against
+        // shared/scryfallQuery.js); hyphenated words gain a space and are
+        // QUOTED; anything else is the isflag leaf, echoed verbatim.
+        ("is:land", "t:land"),
+        ("is:Land", "t:land"),
+        ("is:world", "t:world"),
+        ("is:basic-land", "t:\"basic land\""),
+        ("is:Foo", "is:Foo"),
+        ("is:land t:creature", "t:land t:creature"),
     ];
     const REJECT: &[&str] = &[
         // Node's parser THROWS on these → sidecar mode walks the raw string
@@ -1747,7 +1785,6 @@ fn collq_walk_base_operator_battery() {
         "or",
         "sol ring or plains",
         "sol ring not",
-        "is:land",
         "unique:cards",
         "oracle:fire",
         "t=creature",
@@ -1897,8 +1934,16 @@ async fn collq_transport_failure_and_missing_sidecar_proxy() {
     assert_eq!(h["x-source"], "live");
 
     // Kill switch off (no search_sidecar): a cold key with no durable row
-    // proxies instead of walking.
-    let r2 = router_for(path.clone(), &["search"], &format!("http://{upstream}"));
+    // proxies instead of walking. Sidecar mode — upstream mode would answer
+    // this name query natively via the iter-14 SQLite leg.
+    let r2 = router_for_idx_owned_sidecar(
+        path.clone(),
+        &["search"],
+        &format!("http://{upstream}"),
+        NameIndex::new(),
+        OwnedCache::new(),
+        Some(sidecar.clone()),
+    );
     let (_s, h2, _) = get_json(&r2, "/api/search?scope=collection&q=some%20cold%20name").await;
     assert_eq!(h2["x-node"], "1");
 }
