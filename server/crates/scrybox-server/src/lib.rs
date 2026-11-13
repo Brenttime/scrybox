@@ -464,6 +464,10 @@ pub fn app(state: AppState) -> Router {
         router
     };
     let router = if state.owns("search") {
+        // Gate D iter-24: deferred malloc_trim for the search cache's
+        // churned bodies (rev-prune/eviction arm the flag; this timer pays
+        // it back, never a serving thread).
+        search::spawn_trim_timer(&state);
         router.route("/api/search", any(search::handle))
     } else {
         router

@@ -24,7 +24,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
@@ -1282,6 +1282,13 @@ pub struct SearchCache {
     computes: AtomicU64,
     clock: AtomicU64,
     max_bytes: AtomicU64,
+    /// Freed bytes (pruned/evicted) in one `insert` before the trim timer is
+    /// asked to return heap to the OS — same shape as the collection cache's
+    /// `trim_dirty` (Gate D iter-24: the search legs were the only big
+    /// churning caches without a trim path; iter-22 held RSS ~312 MB above
+    /// the retained store after the search_db leg).
+    trim_dirty_bytes: AtomicU64,
+    trim_dirty: AtomicBool,
 }
 
 impl Default for SearchCache {
@@ -1297,6 +1304,8 @@ impl SearchCache {
             computes: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             max_bytes: AtomicU64::new(search_store_max_bytes()),
+            trim_dirty_bytes: AtomicU64::new(crate::collection::TRIM_DIRTY_BYTES),
+            trim_dirty: AtomicBool::new(false),
         }
     }
     fn get(&self, key: &str, rev: i64) -> Option<Arc<SearchEntry>> {
@@ -1316,9 +1325,11 @@ impl SearchCache {
             + entry.gz.len() as u64
             + entry.stale.len() as u64 * STALE_ROW_BYTES;
         let seen = self.clock.fetch_add(1, Ordering::Relaxed);
+        let mut freed: u64 = 0;
         {
             let mut e = self.inner.lock().unwrap();
             if e.entries.len() > 64 {
+                freed += e.total_bytes;
                 e.entries.clear();
                 e.seen.clear();
                 e.bytes.clear();
@@ -1342,6 +1353,7 @@ impl SearchCache {
                 for k in dead {
                     e.entries.remove(&k);
                     if let Some(b) = e.bytes.remove(&k) {
+                        freed += b;
                         e.total_bytes = e.total_bytes.saturating_sub(b);
                     }
                     e.seen.remove(&k);
@@ -1359,6 +1371,7 @@ impl SearchCache {
                     Some(k) => {
                         e.entries.remove(&k);
                         if let Some(b) = e.bytes.remove(&k) {
+                            freed += b;
                             e.total_bytes = e.total_bytes.saturating_sub(b);
                         }
                         e.seen.remove(&k);
@@ -1366,6 +1379,13 @@ impl SearchCache {
                     None => break,
                 }
             }
+        }
+        // Big drops (generation prune, budget eviction, count-cap clear)
+        // leave multi-MB blocks free in glibc's arenas; arm the deferred
+        // malloc_trim so the timer — never a serving thread — hands them
+        // back. Small churn is left for the allocator to reuse.
+        if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) {
+            self.trim_dirty.store(true, Ordering::Relaxed);
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
         entry
@@ -1382,6 +1402,33 @@ impl SearchCache {
     pub fn computes(&self) -> u64 {
         self.computes.load(Ordering::Relaxed)
     }
+    /// Swap off the "big heap drop happened" flag (trim timer → malloc_trim).
+    fn take_trim(&self) -> bool {
+        self.trim_dirty.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Heap hygiene for the search legs (Gate D iter-24): the collection cache
+/// got its deferred `malloc_trim` on the refresher tick in iter 15; the
+/// search caches (iter-22 byte budget + rev pruning) churn the same
+/// multi-MB bodies with no trim path, and iter-22 measured ~180 MB of freed
+/// heap retained above the live store after the search_db leg. This timer
+/// consumes the same arm-flag shape: `insert` arms it on a big drop, the
+/// tick (never a serving thread) trims. 2 s cadence — a full trim costs
+/// well under a ms at these heap sizes, and the flag gates it when idle.
+pub fn spawn_trim_timer(state: &AppState) {
+    let cache = Arc::clone(&state.search_cache);
+    crate::collection::tune_allocator(); // idempotent; owns("collection") may not run
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if cache.take_trim() {
+                crate::collection::trim_heap();
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2888,5 +2935,58 @@ mod cache_budget_tests {
         std::env::set_var("SCRYBOX_SEARCH_CACHE_MAX_MB", "garbage");
         assert_eq!(search_store_max_bytes(), SEARCH_STORE_MAX_BYTES_DEFAULT);
         std::env::remove_var("SCRYBOX_SEARCH_CACHE_MAX_MB");
+    }
+
+    fn trim_cache(threshold: u64) -> SearchCache {
+        let c = SearchCache::new();
+        c.trim_dirty_bytes.store(threshold, Ordering::Relaxed);
+        c
+    }
+
+    #[test]
+    fn big_eviction_arms_trim_small_ones_do_not() {
+        // Budget eviction freeing >= the threshold arms the deferred trim;
+        // eviction below it stays silent (allocator reuse is enough).
+        let c = trim_cache(2000);
+        let body = "x".repeat(1024);
+        c.insert("a".into(), entry(1, &body));
+        assert!(!c.take_trim(), "first insert frees nothing");
+        c.insert("b".into(), entry(1, &body)); // fits the default budget, frees 0
+        assert!(!c.take_trim(), "plain inserts free nothing");
+        let c2 = trim_cache(2000);
+        c2.max_bytes.store(1500, Ordering::Relaxed);
+        c2.insert("a".into(), entry(1, &body));
+        c2.insert("b".into(), entry(1, &body)); // evicts a (1024 freed < 2000)
+        assert!(!c2.take_trim(), "small eviction must not arm trim");
+        // Now cross the threshold: two 2 KiB entries, budget 3 KiB, and one
+        // 4 KiB insert evicting both.
+        let big = "y".repeat(2048);
+        let c3 = trim_cache(2000);
+        c3.max_bytes.store(3072, Ordering::Relaxed);
+        c3.insert("a".into(), entry(1, &big));
+        c3.insert("b".into(), entry(1, &big));
+        assert!(c3.take_trim(), "two 2 KiB frees (4096) cross the threshold");
+        assert!(!c3.take_trim(), "take_trim swaps the flag off");
+    }
+
+    #[test]
+    fn generation_prune_arms_trim() {
+        let c = trim_cache(2000);
+        c.insert("a".into(), entry(1, &"x".repeat(4096)));
+        assert!(!c.take_trim());
+        c.insert("b".into(), entry(2, "new generation")); // prunes 4096 bytes
+        assert!(c.take_trim(), "dead-generation prune >= threshold must arm");
+    }
+
+    #[test]
+    fn count_cap_clear_arms_trim() {
+        let c = trim_cache(2000);
+        let body = "x".repeat(1024);
+        for i in 0..65 {
+            c.insert(format!("k{i}"), entry(1, &body));
+        }
+        assert!(!c.take_trim(), "no big drop while under the count cap");
+        c.insert("cap".into(), entry(1, &body)); // 66th sees len>64 -> clears the store
+        assert!(c.take_trim(), "count-cap clear frees the store -> arms trim");
     }
 }
