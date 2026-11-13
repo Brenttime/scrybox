@@ -509,6 +509,18 @@ async fn handle_delete(State(st): State<AppState>, id: String, req: Request) -> 
         conn.execute_batch("COMMIT")?;
         Ok(username)
     })();
+    // The three DELETE executes above propagate with `?` and cannot call
+    // rollback() at the site. A RAISE(ABORT) trigger (or any statement
+    // error) aborts just THAT statement — the BEGIN IMMEDIATE transaction
+    // stays open — and returning that pooled connection to the r2d2 pool
+    // while it still holds the WAL write lock deadlocks every later writer
+    // (the printing-identity e2e "SQLITE_BUSY flake" was this, not a race).
+    // Node's withDedicatedSqliteTransaction always ROLLBACKs in its catch;
+    // mirror that here. An extra ROLLBACK when a path already rolled back
+    // is a harmless no-op error, swallowed like the others.
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
     restore();
     match result {
         Ok(username) => json_response(

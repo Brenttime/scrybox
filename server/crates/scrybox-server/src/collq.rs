@@ -265,6 +265,27 @@ pub fn walk_base(raw: &str) -> Option<String> {
         if value.is_empty() || value.starts_with('"') || value.starts_with('/') {
             return None; // Node throws (needs a value) or enters quoted/regex mode
         }
+        // `is:` rides the walk too (sidecar parity): a TYPE_WORDS value
+        // becomes the canonical `t:` leaf — leafToScryfall's is branch:
+        // v.replace(/-/g,' ') then fmtValue(v, /\s/.test(v)) — a hyphenated
+        // word gains a space and is QUOTED. Anything else is the isflag
+        // catalog leaf, emitted `${raw}${cmp}${fmtValue(value,false)}` =
+        // verbatim (raw is the lowercased keyword; the token excludes every
+        // character fmtValue would quote).
+        if kw_lower == "is" {
+            let v = value.to_lowercase();
+            if TYPE_WORDS.contains(&v.as_str()) {
+                let r = v.replace('-', " ");
+                if r.contains(is_js_ws) {
+                    out.push(format!("t:\"{r}\""));
+                } else {
+                    out.push(format!("t:{r}"));
+                }
+            } else {
+                out.push(format!("is:{value}"));
+            }
+            continue;
+        }
         if !allowed_operator_kw(&kw_lower) {
             return None;
         }
@@ -687,44 +708,7 @@ fn catalog_snapshot(conn: &Connection) -> Result<i64, String> {
 
 fn owned_rows(conn: &Connection, cq: &CollectionQ, membership: &str) -> Result<Vec<Value>, String> {
     let window = cq.row_window();
-    let mut sql = String::from(
-        "SELECT
-      c.id AS entry_id,
-      c.card_id,
-      c.quantity,
-      c.condition,
-      c.printing,
-      c.language,
-      c.purchase_price,
-      c.added_at,
-      c.is_trade,
-      c.notes,
-      c.is_proxy,
-      cc.oracle_id,
-      cc.name,
-      cc.printed_name,
-      cc.supertype,
-      cc.subtypes,
-      cc.types,
-      cc.cmc,
-      cc.color_identity,
-      cc.rarity,
-      cc.set_id,
-      cc.set_name,
-      cc.number,
-      cc.image_url,
-      cc.price_trend,
-      cc.price_normal,
-      cc.price_holofoil,
-      cc.price_etched,
-      cc.price_currency,
-      cc.price_source,
-      cc.price_estimated,
-      cc.tcgplayer_url,
-      cc.cardmarket_url,
-      cc.tcgplayer_product_id
-    ",
-    );
+    let mut sql = format!("SELECT {PROJECTION}");
     sql.push_str(OWNED_BASE);
     let mut params: Vec<Sql> = vec![Sql::Integer(cq.user_id), Sql::Text(membership.to_string())];
     if let Some((limit, offset)) = window {
@@ -798,4 +782,532 @@ fn shape_q_row(raw: Vec<Value>) -> Result<Map<String, Value>, String> {
     // applyProxyRarity appends base_rarity after the row keys.
     obj.insert("base_rarity".to_string(), rarity_raw.clone());
     Ok(obj)
+}
+
+// ---------------------------------------------------------------------------
+// Node's two LOCAL answer legs (resolveCollectionQuery, scryfallApi.js
+// 1371-1440). The walk path above mirrors sidecar mode; these mirror the
+// SQLite answers Node runs WITHOUT the engine:
+//   * answerLocally — `parsed.mode === 'local' && !LOCAL_SCRYFALL`: every
+//     term is data-backed, the owned rows ARE the answer (no API, no tag
+//     index, no eligibility gate; eligibleOnly:false).
+//   * the local Oracle Tags path — supportsLocalCollectionQuery: operators
+//     include `otag:` and every operator is LOCAL_COLLECTION_OPERATORS
+//     (color/identity/rarity/lang/mv/otag + directives); fires in BOTH modes
+//     once a generation is active and the user's owned rows are backfilled,
+//     with eligibleOnly:true (compileCollectionQuery's default).
+// Both share rawQuerySql.compileCollectionQuery; only the accepted-subset
+// gate differs. Anything outside the subset (or/not/or grouping, rarity,
+// mv, set, number, lang, quoted terms, …) stays on the walk/proxy contract.
+// ---------------------------------------------------------------------------
+
+/// shared/scryfallQuery.js TYPE_WORDS — the values `is:` answers locally.
+const TYPE_WORDS: &[&str] = &[
+    "land", "creature", "artifact", "enchantment", "instant", "sorcery", "planeswalker", "battle",
+    "legendary", "basic", "snow", "tribal", "kindred", "world", "ongoing", "basic-land",
+    "conspiracy", "plane", "phenomenon", "scheme", "vanguard", "dungeon",
+];
+
+/// DIRECTIVES — display/result-shape terms that never filter a row.
+const DIRECTIVE_KWS: &[&str] =
+    &["include", "unique", "order", "sort", "direction", "prefer", "display"];
+
+/// shared/scryfallQuery.js COLOR_WORDS (parseColorValue's word table).
+const COLOR_WORDS: &[(&str, &str)] = &[
+    ("white", "w"), ("blue", "u"), ("black", "b"), ("red", "r"), ("green", "g"),
+    ("azorius", "wu"), ("dimir", "ub"), ("rakdos", "br"), ("gruul", "rg"), ("selesnya", "gw"),
+    ("orzhov", "wb"), ("izzet", "ur"), ("golgari", "bg"), ("boros", "rw"), ("simic", "gu"),
+    ("bant", "gwu"), ("esper", "wub"), ("grixis", "ubr"), ("jund", "brg"), ("naya", "rgw"),
+    ("abzan", "wbg"), ("jeskai", "urw"), ("sultai", "bgu"), ("mardu", "rwb"), ("temur", "gur"),
+    ("quandrix", "gu"), ("silverquill", "wb"), ("witherbloom", "bg"), ("loreheld", "rw"),
+    ("prismari", "ur"), ("chaos", "ubrg"), ("aggression", "wbrg"), ("altruism", "wurg"),
+    ("growth", "wubg"), ("artifice", "wubr"),
+];
+
+/// parseColorValue's accept-verdict + mask build; None when Node THROWS
+/// (an unparseable color makes `parsed` null upstream → no local answer).
+fn parse_color_spec(value: &str) -> Option<ColorSpec> {
+    let v = value.trim_matches(is_js_ws).to_lowercase();
+    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(ColorSpec::Count(v.parse::<i64>().ok()?));
+    }
+    match v.as_str() {
+        "m" | "multicolor" | "multicolored" => return Some(ColorSpec::Multi),
+        "c" | "colorless" => return Some(ColorSpec::Mask(0)),
+        _ => {}
+    }
+    let letters_owned;
+    let letters = match COLOR_WORDS.iter().find(|(w, _)| *w == v) {
+        Some((_, l)) => *l,
+        None => {
+            letters_owned = v.clone();
+            &letters_owned
+        }
+    };
+    if letters.is_empty() || !letters.chars().all(|c| matches!(c, 'w' | 'u' | 'b' | 'r' | 'g')) {
+        return None;
+    }
+    let mut mask: i64 = 0;
+    for ch in letters.chars() {
+        mask |= match ch {
+            'w' => 1,
+            'u' => 2,
+            'b' => 4,
+            'r' => 8,
+            _ => 16,
+        };
+    }
+    Some(ColorSpec::Mask(mask))
+}
+
+#[derive(Clone, Debug)]
+pub enum ColorSpec {
+    Count(i64),
+    Multi,
+    Mask(i64),
+}
+
+/// The accepted leaf set (see the module block above). `cmp` is always the
+/// `:` comparator — the only one the gate admits (walk_base's rule, reused).
+#[derive(Clone, Debug)]
+pub enum Leaf {
+    /// bare word / name leaf — lowercased value (makeLeaf).
+    Name(String),
+    /// is:<TYPE_WORD> (makeLeaf keeps the lowercased word; SQL dashes→spaces).
+    Is(String),
+    /// t:/type: — subtypesLine LIKE %v%.
+    Type(String),
+    /// c:/color:/colour: (and the bare `colorless` rewrite → Mask(0)).
+    Color(ColorSpec),
+    /// id:/ci:/commander:/cmd: — color_identity, defaultCmp '<='.
+    Identity(ColorSpec),
+    /// otag:/oracletag:/function: — local Oracle Tags EXISTS.
+    Otag(String),
+    /// display directive — compiles to 1 (no filter).
+    Directive,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalQ {
+    pub user_id: i64,
+    pub leaves: Vec<Leaf>,
+    /// true = the Oracle Tags leg (eligibleOnly:true, isReady gate,
+    /// snapshot mode 'local':{genId}); false = answerLocally ('rows':0).
+    pub tag_leg: bool,
+    pub has_window: bool,
+    pub page: i64,
+    pub limit: i64,
+    pub include_total: bool,
+    pub expected_snapshot: Option<String>,
+}
+
+/// One token → accepted leaf, None (whole query leaves the leg) on anything
+/// outside the subset. Token-level structural refusals mirror walk_base.
+fn local_leaf(tok: &str) -> Option<Leaf> {
+    let first = tok.chars().next()?;
+    if matches!(first, '"' | '!' | '-' | '/' | '(' | ')') {
+        return None;
+    }
+    if tok.contains(['"', '(', ')', '|']) {
+        return None;
+    }
+    let lower = tok.to_lowercase();
+    if lower == "or" || lower == "not" {
+        return None;
+    }
+    let (kw_len, cmp_len) = op_shape(tok);
+    if cmp_len == 0 {
+        // makeLeaf's bare-word colorless rewrite ({op:'color',raw:'c',cmp:':'
+        // ,value:'c'} → popcount mask 0).
+        if lower == "colorless" {
+            return Some(Leaf::Color(ColorSpec::Mask(0)));
+        }
+        return Some(Leaf::Name(lower));
+    }
+    if cmp_len != 1 || tok.as_bytes()[kw_len] != b':' {
+        return None;
+    }
+    let kw = tok[..kw_len].to_ascii_lowercase();
+    let value = &tok[kw_len + 1..];
+    if value.is_empty() || value.starts_with('"') || value.starts_with('/') {
+        return None;
+    }
+    match kw.as_str() {
+        "is" => {
+            let v = value.to_lowercase();
+            TYPE_WORDS.iter().any(|w| *w == v).then(|| Leaf::Is(v))
+        }
+        "t" | "type" => Some(Leaf::Type(value.to_lowercase())),
+        "c" | "color" | "colour" => parse_color_spec(value).map(Leaf::Color),
+        "id" | "ci" | "commander" | "cmd" => parse_color_spec(value).map(Leaf::Identity),
+        "otag" | "oracletag" | "function" => Some(Leaf::Otag(value.to_lowercase())),
+        k if DIRECTIVE_KWS.contains(&k) => Some(Leaf::Directive),
+        _ => None,
+    }
+}
+
+/// Gate + normalization for both local legs. The caller (search::plan) owns
+/// the mode gate: rows leg only when `!LOCAL_SCRYFALL`; tag leg in both
+/// modes. `tag_leg` mode restricts leaves to LOCAL_COLLECTION_OPERATORS
+/// (otag + color family + directives) with at least one otag leaf.
+pub fn local_plan(
+    user_id: i64,
+    qraw: &str,
+    has_window: bool,
+    page: i64,
+    limit: i64,
+    include_total: bool,
+    expected_snapshot: Option<String>,
+    tag_leg: bool,
+) -> Option<LocalQ> {
+    let toks: Vec<&str> = qraw.split(is_js_ws).filter(|t| !t.is_empty()).collect();
+    let mut leaves: Vec<Leaf> = Vec::new();
+    for (idx, tok) in toks.iter().enumerate() {
+        let lower = tok.to_lowercase();
+        if lower == "and" {
+            // parseAnd consumes the keyword only between two terms.
+            let term_ok = |t: &str| {
+                let l = t.to_lowercase();
+                l != "and" && l != "or" && l != "not"
+            };
+            let prev_ok = idx > 0 && term_ok(toks[idx - 1]);
+            let next_ok = toks.get(idx + 1).is_some_and(|n| term_ok(n));
+            if !prev_ok || !next_ok {
+                return None;
+            }
+            continue;
+        }
+        let leaf = local_leaf(tok)?;
+        if tag_leg
+            && !matches!(
+                leaf,
+                Leaf::Otag(_) | Leaf::Color(_) | Leaf::Identity(_) | Leaf::Directive
+            )
+        {
+            // 'name'/'is'/'type' operators are NOT in LOCAL_COLLECTION_OPERATORS.
+            return None;
+        }
+        leaves.push(leaf);
+    }
+    if leaves.is_empty() {
+        return None;
+    }
+    let has_otag = leaves.iter().any(|l| matches!(l, Leaf::Otag(_)));
+    if tag_leg != has_otag {
+        // tag leg REQUIRES otag (supportsLocalCollectionQuery); the rows leg
+        // must stay mode-local — an otag leaf makes analyze() return
+        // 'catalog' and the local answer never fires.
+        return None;
+    }
+    Some(LocalQ {
+        user_id,
+        leaves,
+        tag_leg,
+        has_window,
+        page,
+        limit,
+        include_total,
+        expected_snapshot,
+    })
+}
+
+/// QuerySyntaxError verdicts PROVABLE at tokenizer level, used for Node's
+/// upstream-mode pre-reject (`classifyQuery` throw → route 400
+/// INVALID_QUERY): unterminated quote, or unbalanced parens (stray ')' or
+/// unclosed '('). Deliberately narrow — anything subtler keeps the existing
+/// walk/proxy contract instead of guessing at the parser.
+pub fn definitely_invalid(q: &str) -> bool {
+    let chars: Vec<char> = q.chars().collect();
+    let mut i = 0usize;
+    let mut in_q = false;
+    let mut depth: i32 = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_q {
+            // readQuoted consumes \\x as the literal x — the escape eats the
+            // next character, never the quote state.
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_q = false;
+            }
+        } else if c == '"' {
+            in_q = true;
+        } else if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth < 0 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    in_q || depth != 0
+}
+
+// ---- rawQuerySql.compileCollectionQuery twin (accepted subset) -------------
+
+fn subtypes_line() -> &'static str {
+    "COALESCE((SELECT group_concat(LOWER(je.value), ' ') FROM json_each(cc.subtypes) je), '')"
+}
+
+fn mask_expr(column: &str) -> String {
+    format!(
+        "COALESCE((SELECT SUM(DISTINCT CASE LOWER(x.value) WHEN 'white' THEN 1 WHEN 'blue' THEN 2 WHEN 'black' THEN 4 WHEN 'red' THEN 8 WHEN 'green' THEN 16 ELSE 0 END) FROM json_each(CASE WHEN {column} IS NULL OR {column} = '' THEN '[]' ELSE {column} END) x), 0)"
+    )
+}
+
+fn popcount_expr(m: &str) -> String {
+    format!("(({m} & 1) + (({m} >> 1) & 1) + (({m} >> 2) & 1) + (({m} >> 3) & 1) + (({m} >> 4) & 1))")
+}
+
+fn leaf_sql(leaf: &Leaf, p: &mut Vec<Sql>) -> String {
+    match leaf {
+        Leaf::Name(v) => {
+            p.push(Sql::Text(format!("%{v}%")));
+            p.push(Sql::Text(format!("%{v}%")));
+            "(cc.name LIKE ? OR COALESCE(cc.printed_name, '') LIKE ?)".to_string()
+        }
+        Leaf::Is(v) => {
+            let val = v.replace('-', " ");
+            if val.contains(' ') {
+                p.push(Sql::Text(format!("% {val} %")));
+                format!("(' ' || {} || ' ') LIKE ?", subtypes_line())
+            } else {
+                p.push(Sql::Text(val));
+                format!("EXISTS (SELECT 1 FROM json_each(cc.subtypes) je WHERE LOWER(je.value) = ?)")
+            }
+        }
+        Leaf::Type(v) => {
+            p.push(Sql::Text(format!("%{v}%")));
+            format!("{} LIKE ?", subtypes_line())
+        }
+        Leaf::Color(spec) | Leaf::Identity(spec) => {
+            // colorMatch: cc.types with defaultCmp '>=' / cc.color_identity
+            // with '<='. cmp is always ':' (the gate's only comparator).
+            let column = match leaf {
+                Leaf::Identity(_) => "cc.color_identity",
+                _ => "cc.types",
+            };
+            let m = mask_expr(column);
+            match spec {
+                ColorSpec::Multi => format!("({} >= 2)", popcount_expr(&m)),
+                ColorSpec::Count(n) => {
+                    p.push(Sql::Integer(*n));
+                    format!("({} = ?)", popcount_expr(&m))
+                }
+                ColorSpec::Mask(q) => {
+                    if *q == 0 {
+                        format!("({m}) = 0")
+                    } else if matches!(leaf, Leaf::Identity(_)) {
+                        format!("(({m}) | {q}) = {q}")
+                    } else {
+                        format!("(({m}) & {q}) = {q}")
+                    }
+                }
+            }
+        }
+        Leaf::Otag(alias) => {
+            p.push(Sql::Text(alias.clone()));
+            "EXISTS (\n    SELECT 1\n    FROM oracle_tag_generations otg\n    CROSS JOIN oracle_tag_aliases ota\n    CROSS JOIN oracle_tag_closure otc\n    CROSS JOIN oracle_tag_assignments otm\n    WHERE otg.active = 1\n      AND ota.generation_id = otg.id AND ota.alias = ?\n      AND otc.generation_id = otg.id AND otc.ancestor_tag_id = ota.tag_id\n      AND otm.generation_id = otg.id\n      AND otm.tag_id = otc.descendant_tag_id\n      AND otm.oracle_id = cc.oracle_id\n  )".to_string()
+        }
+        Leaf::Directive => "1".to_string(),
+    }
+}
+
+/// compileWhere for the flat AND the subset can build: nodeToSql of an
+/// `and` node wraps multi-term joins in parens, a single term does not.
+fn compile_where(leaves: &[Leaf], p: &mut Vec<Sql>) -> String {
+    let parts: Vec<String> = leaves.iter().map(|l| leaf_sql(l, p)).collect();
+    if parts.len() == 1 {
+        format!("AND {}", parts[0])
+    } else {
+        format!("AND ({})", parts.join(" AND "))
+    }
+}
+
+/// compileCollectionQuery's projection == Q_COLS (the walk leg's row order).
+const LOCAL_BASE: &str = "
+    FROM collection c
+    JOIN card_cache cc ON cc.id = c.card_id
+    WHERE c.user_id = ? AND c.quantity > 0";
+
+/// ownedByNames projection (shared by the walk leg's owned_rows and the
+/// local legs — identical Q_COLS column order).
+const PROJECTION: &str = "
+      c.id AS entry_id,
+      c.card_id,
+      c.quantity,
+      c.condition,
+      c.printing,
+      c.language,
+      c.purchase_price,
+      c.added_at,
+      c.is_trade,
+      c.notes,
+      c.is_proxy,
+      cc.oracle_id,
+      cc.name,
+      cc.printed_name,
+      cc.supertype,
+      cc.subtypes,
+      cc.types,
+      cc.cmc,
+      cc.color_identity,
+      cc.rarity,
+      cc.set_id,
+      cc.set_name,
+      cc.number,
+      cc.image_url,
+      cc.price_trend,
+      cc.price_normal,
+      cc.price_holofoil,
+      cc.price_etched,
+      cc.price_currency,
+      cc.price_source,
+      cc.price_estimated,
+      cc.tcgplayer_url,
+      cc.cardmarket_url,
+      cc.tcgplayer_product_id
+    ";
+
+pub enum LocalOutcome {
+    Built { cards: Vec<Value>, total: Option<String>, snapshot: String },
+    /// expectedSnapshot mismatch — Node throws CATALOG_SNAPSHOT_CHANGED and
+    /// the route answers 409; carries the ACTUAL token for the log.
+    Mismatch { actual: String },
+    /// tag leg, isReady gate failed → Node continues to the walk.
+    NotReady,
+    Failed(String),
+}
+
+pub fn build_local(pool: &DbPool, lq: &LocalQ) -> LocalOutcome {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => return LocalOutcome::Failed(format!("pool: {e}")),
+    };
+    // withDedicatedReadTransaction twin: readiness, generation, snapshot and
+    // rows/count pin to ONE WAL view (the coverage-gate comment in
+    // scryfallApi.js — a collection mutation cannot slip between them).
+    let txn = match Txn::begin(&conn) {
+        Ok(t) => t,
+        Err(e) => return LocalOutcome::Failed(format!("BEGIN: {e:?}")),
+    };
+
+    let mut gen_id: i64 = 0;
+    if lq.tag_leg {
+        // oracleTags.supportsLocalCollectionQuery fired at plan time; here
+        // isReady(database, userId) decides, exactly like Node:
+        // active generation + no owned mtg-% row missing oracle_id /
+        // scryfall_search_eligible. Failure answers `null` → the walk runs.
+        let active: Option<i64> = match conn.query_row(
+            "SELECT id FROM oracle_tag_generations WHERE active = 1 LIMIT 1",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return LocalOutcome::Failed(format!("generation: {e}")),
+        };
+        let Some(id) = active else {
+            // Txn::Drop issues the ROLLBACK.
+            return LocalOutcome::NotReady;
+        };
+        gen_id = id;
+        let missing: Option<i64> = match conn.query_row(
+            "SELECT 1 AS missing FROM card_cache
+             WHERE id LIKE 'mtg-%'
+               AND (oracle_id IS NULL OR scryfall_search_eligible IS NULL)
+               AND EXISTS (
+                 SELECT 1 FROM collection c
+                 WHERE c.card_id = card_cache.id AND c.user_id = ? AND c.quantity > 0
+               ) LIMIT 1",
+            rusqlite::params![lq.user_id],
+            |r| r.get::<_, Option<i64>>(0),
+        ) {
+            Ok(v) => v,
+            // No row = nothing missing (Node's `get` returns undefined).
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return LocalOutcome::Failed(format!("readiness: {e}")),
+        };
+        if missing.is_some() {
+            return LocalOutcome::NotReady;
+        }
+    }
+
+    let rev = match catalog_snapshot(&conn) {
+        Ok(s) => s,
+        Err(e) => return LocalOutcome::Failed(e),
+    };
+    // readCatalogSnapshot(client, mode, sourceVersion, expected):
+    // `${mode}:${sourceVersion}:${Number(row?.revision) || 0}`.
+    let mode = if lq.tag_leg { "local" } else { "rows" };
+    let token = format!("{mode}:{}:{rev}", if lq.tag_leg { gen_id } else { 0 });
+    if let Some(exp) = &lq.expected_snapshot {
+        if !exp.is_empty() && exp != &token {
+            return LocalOutcome::Mismatch { actual: token };
+        }
+    }
+
+    let mut params: Vec<Sql> = vec![Sql::Integer(lq.user_id)];
+    let where_sql = compile_where(&lq.leaves, &mut params);
+    let eligible = if lq.tag_leg { "\n      AND cc.scryfall_search_eligible = 1" } else { "" };
+    let base = format!("{LOCAL_BASE}{eligible}");
+
+    let rows_sql = format!(
+        "SELECT {PROJECTION} {base} {where_sql}\n      ORDER BY c.added_at DESC, c.id DESC{}",
+        if lq.has_window { " LIMIT ? OFFSET ?" } else { "" }
+    );
+    let mut row_params = params.clone();
+    if let Some((limit, offset)) = lq.row_window() {
+        row_params.push(Sql::Integer(limit));
+        row_params.push(Sql::Integer(offset));
+    }
+    let cards = (|| -> Result<Vec<Value>, String> {
+        let mut stmt = conn.prepare_cached(&rows_sql).map_err(|e| format!("prepare rows: {e}"))?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(row_params.iter()))
+            .map_err(|e| format!("rows query: {e}"))?;
+        let mut out: Vec<Value> = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("row scan: {e}"))? {
+            let mut raw = Vec::with_capacity(Q_COLS.len());
+            for i in 0..Q_COLS.len() {
+                raw.push(sqlite_value(row, i).map_err(|e| e.to_string())?);
+            }
+            out.push(Value::Object(shape_q_row(raw)?));
+        }
+        Ok(out)
+    })();
+    let cards = match cards {
+        Ok(v) => v,
+        Err(e) => return LocalOutcome::Failed(e),
+    };
+    let total = if lq.include_total {
+        let count_sql = format!("SELECT COUNT(*) AS n {base} {where_sql}");
+        let n: i64 = match conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(params.iter()),
+            |r| r.get::<_, Option<i64>>(0),
+        ) {
+            Ok(v) => v.unwrap_or(0),
+            Err(e) => return LocalOutcome::Failed(format!("count: {e}")),
+        };
+        // `Number(count && count.n) || 0`
+        Some(n.to_string())
+    } else {
+        None
+    };
+    if txn.commit().is_err() {
+        return LocalOutcome::Failed("COMMIT".to_string());
+    }
+    LocalOutcome::Built { cards, total, snapshot: token }
+}
+
+impl LocalQ {
+    fn row_window(&self) -> Option<(i64, i64)> {
+        self.has_window.then(|| (self.limit, (self.page - 1).saturating_mul(self.limit)))
+    }
 }

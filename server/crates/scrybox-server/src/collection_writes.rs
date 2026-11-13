@@ -1876,6 +1876,71 @@ pub(crate) fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Re
     Ok((last, ids))
 }
 
+/// The getCardById cache-miss leg shared by POST /collection and the bulk
+/// bulk-add pass (`cardApi.getCardById` → `scryGet('/cards/{rawId}')` →
+/// `cacheCards([normalizeCard(data)])`, then the row is re-planned). Answers
+/// the leg cannot own (non-200/404/transport, or a throwing cacheCards) all
+/// become Node's `null` → `AddCardError(404, 'Card ID {card_id} not found.')`;
+/// `Unusable` additionally marks "hybrid may still proxy this request"
+/// (`NotFound` = getCardById saw the engine's own 404 — Node's null either
+/// way, kept to document the two transport shapes).
+enum FetchCardOutcome {
+    Ready(AddPlan),
+    NotFound,
+    Unusable,
+}
+
+async fn fetch_card_then_replan(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    card_id: &str,
+    merged: &Map<String, Value>,
+) -> FetchCardOutcome {
+    let raw_id = card_id.strip_prefix("mtg-").unwrap_or(card_id).to_string();
+    let path = format!("/cards/{}", crate::sidecar::encode_uri_component(&raw_id));
+    // Relative URL = Node's `scryGet('/cards/…')`: resolve() swaps
+    // to the sidecar base when LOCAL_SCRYFALL is on (and skips
+    // pacing there), else the upstream base with full pacing.
+    let got = st
+        .scry
+        .get_opt(&path, &crate::scryfall::ScryOpts::default())
+        .await;
+    let v = match got {
+        Ok(Some(v)) if v.is_object() => v,
+        // Ok(None) = the engine's 404 (Node: scryGet null → getCardById
+        // catch); Err/* = transport/shape — both are Node's null, and
+        // Unusable additionally flags "hybrid may still proxy".
+        Ok(None) => return FetchCardOutcome::NotFound,
+        _ => return FetchCardOutcome::Unusable,
+    };
+    let norm = crate::sidecar::normalize_card(&v, &crate::search::to_name(None));
+    let pool_w = Arc::clone(pool);
+    let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = pool_w.get().map_err(|e| e.to_string())?;
+        crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&norm))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if let Err(e) = wrote {
+        // Node: a throwing cacheCards lands inside getCardById's catch →
+        // null → AddCardError 404 (route catch only sees what escapes it).
+        tracing::error!(error=%e, "add card: getCardById cache write failed");
+        return FetchCardOutcome::Unusable;
+    }
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(_) => return FetchCardOutcome::Unusable,
+    };
+    match plan_add(&conn, merged) {
+        Ok(p @ AddPlan::Ready { .. }) => FetchCardOutcome::Ready(p),
+        // Still not ownable (localized printing, defensive): the
+        // pre-7c contract — Node authors the rest.
+        _ => FetchCardOutcome::Unusable,
+    }
+}
+
 /// `POST /collection` — routes/collection.js route 3.
 pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
@@ -1918,18 +1983,9 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
             // null → 404), or a deployed Node that should author its own
             // fetch (hybrid mode keeps byte-parity by proxying) — falls
             // back to the pre-7c Forward behavior.
-            let raw_id = card_id.strip_prefix("mtg-").unwrap_or(&card_id).to_string();
-            let path = format!("/cards/{}", crate::sidecar::encode_uri_component(&raw_id));
-            // Relative URL = Node's `scryGet('/cards/…')`: resolve() swaps
-            // to the sidecar base when LOCAL_SCRYFALL is on (and skips
-            // pacing there), else the upstream base with full pacing.
-            let got = st
-                .scry
-                .get_opt(&path, &crate::scryfall::ScryOpts::default())
-                .await;
-            let v = match got {
-                Ok(Some(v)) if v.is_object() => v,
-                _ => {
+            match fetch_card_then_replan(&st, &pool, &card_id, m).await {
+                FetchCardOutcome::Ready(p) => p,
+                FetchCardOutcome::NotFound | FetchCardOutcome::Unusable => {
                     if !st.cfg.node_upstream.is_empty() {
                         return crate::proxy(State(st), rebuild(parts, &bytes)).await;
                     }
@@ -1940,37 +1996,6 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
                         &format!("Card ID {card_id} not found."),
                     );
                 }
-            };
-            let norm = crate::sidecar::normalize_card(&v, &crate::search::to_name(None));
-            let pool_w = Arc::clone(&pool);
-            let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let conn = pool_w.get().map_err(|e| e.to_string())?;
-                crate::card_cache::cache_normalized_cards(
-                    &conn,
-                    std::slice::from_ref(&norm),
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
-            if let Err(e) = wrote {
-                // Node: cacheCards throwing lands in the route catch → 500.
-                tracing::error!(error=%e, "add card: getCardById cache write failed");
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
-            }
-            let conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error=?e, "add card pool failure");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
-                }
-            };
-            match plan_add(&conn, m) {
-                Ok(p @ AddPlan::Ready { .. }) => p,
-                // Still not ownable (localized printing, defensive): the
-                // pre-7c contract — Node authors the rest.
-                _ => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
             }
         }
         Ok(AddPlan::Forward) => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
@@ -2002,6 +2027,10 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
 enum BulkEntry {
     Ready { plan: AddPlan, card_id: Option<Value>, index: usize },
     Failed { error: String, card_id: Option<Value>, index: usize },
+    /// Cache-miss entry: Node's addCardToCollection authors the
+    /// getCardById fetch itself. Kept aside (pass 1 stays pure reads) so
+    /// the legs can run sequentially, in request order, before any write.
+    Fetch { merged: Map<String, Value>, card_id: Option<Value>, index: usize },
     Forward,
 }
 
@@ -2084,10 +2113,13 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         outcomes.push(match plan_add(&conn, &merged) {
             Ok(p @ AddPlan::Ready { .. }) => BulkEntry::Ready { plan: p, card_id, index },
             Ok(AddPlan::Reject(msg)) => BulkEntry::Failed { error: msg, card_id, index },
-            Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => BulkEntry::Forward,
-            // A FetchCard entry in a bulk add forwards the WHOLE request
-            // (unit 7c keeps the single-add fetch leg native only; Node
-            // still authors multi-entry Scryfall fetches itself).
+            Ok(AddPlan::Forward) => BulkEntry::Forward,
+            // A FetchCard entry with a deployed Node forwards the WHOLE
+            // request (hybrid keeps byte-parity by letting Node author the
+            // multi-entry fetches itself). Standalone rides the same
+            // getCardById leg the single route owns — resolved below,
+            // sequentially, before any write.
+            Ok(AddPlan::FetchCard(_)) => BulkEntry::Fetch { merged, card_id, index },
             // Non-AddCardError: Node console.errors and reports the generic
             // per-card message.
             Err(e) => {
@@ -2096,9 +2128,49 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
             }
         });
     }
+    drop(conn);
     if outcomes.iter().any(|o| matches!(o, BulkEntry::Forward)) {
         return crate::proxy(State(st), rebuild(parts, &bytes)).await;
     }
+
+    // Sequential getCardById legs, in request order — Node's
+    // bulkAddToCollection awaits addCardToCollection per entry, and the
+    // cache hydration of entry N is visible to entry N+1 (duplicate cache
+    // misses fetch upstream exactly once). Only standalone runs them:
+    // hybrid forwarded the whole request above.
+    if st.cfg.node_upstream.is_empty() {
+        for i in 0..outcomes.len() {
+            let (merged, card_id, index) = match &outcomes[i] {
+                BulkEntry::Fetch { merged, card_id, index } => {
+                    (merged.clone(), card_id.clone(), *index)
+                }
+                _ => continue,
+            };
+            // Node: getCardById catch → null → AddCardError(404) — the bulk
+            // core's catch reports the AddCardError message per entry.
+            let cid_str = card_id.as_ref().map(|v| js_to_string(Some(v))).unwrap_or_default();
+            outcomes[i] = match fetch_card_then_replan(&st, &pool, &cid_str, &merged).await {
+                FetchCardOutcome::Ready(plan) => {
+                    BulkEntry::Ready { plan, card_id, index }
+                }
+                FetchCardOutcome::NotFound | FetchCardOutcome::Unusable => BulkEntry::Failed {
+                    error: format!("Card ID {cid_str} not found."),
+                    card_id,
+                    index,
+                },
+            };
+        }
+    } else if outcomes.iter().any(|o| matches!(o, BulkEntry::Fetch { .. })) {
+        // Hybrid: Node authors the fetches itself (pre-7c Forward behavior).
+        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+    }
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "bulk add pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        }
+    };
 
     // Pass 2 — sequential writes in request order, per-entry transactions
     // (a throwing entry costs Node exactly that one entry: its INSERT
@@ -2134,6 +2206,11 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
             },
             BulkEntry::Failed { error, card_id, index } => {
                 failed.push(fail_obj(&card_id, &error, index));
+            }
+            // Resolved by the sequential fetch legs above (standalone) or
+            // short-circuited into a whole-request forward (hybrid).
+            BulkEntry::Fetch { .. } => {
+                unreachable!("fetch entries resolve before the write pass")
             }
             BulkEntry::Forward => unreachable!("handled by the pre-write forward"),
         }

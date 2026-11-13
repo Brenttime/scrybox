@@ -53,3 +53,13 @@ lto = "thin"
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+# Fast iteration build (parity/e2e loops and the lane's live instance —
+# restart-rust-b.sh builds --profile iter). Mirrors lane A's wt/server
+# profile; real `release` stays for final benches and the Docker image only.
+[profile.iter]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = 0

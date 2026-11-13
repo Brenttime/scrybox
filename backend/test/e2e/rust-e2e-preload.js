@@ -74,14 +74,17 @@ cp.spawn = function (cmd, args, opts) {
     env.HTTPS_PORT = '';
     env.SCRYFALL_GAP_SCALE = '0';
     env.SCRYFALL_BASE_URL = `http://127.0.0.1:${mp}/api.scryfall.com`;
-    // Cold-search legs (name walks, catalog/otag resolution, import
-    // resolution) answer through the scryfall-local sidecar protocol —
-    // scryfall-shaped pages with pacing off. The fixture server answers both
-    // shapes; pinning local here is exactly how the lane's parity harness
-    // runs BOTH sides (Node LOCAL_SCRYFALL_* + Rust SCRYBOX_SIDECAR_URL) on
-    // one frozen snapshot, minus the container.
-    env.LOCAL_SCRYFALL_ENABLED = 'true';
-    env.LOCAL_SCRYFALL_URL = `http://127.0.0.1:${mp}/api.scryfall.com`;
+    // Upstream mode — matching how the Node suites run (they never set
+    // LOCAL_SCRYFALL_ENABLED, so scryfallApi answers mode-local queries from
+    // SQLite and resolves catalog queries via the upstream base). Pinning
+    // LOCAL_SCRYFALL here would put the Rust side in sidecar mode, which the
+    // Node suites never exercise (and which made e.g. `is:land` unanswerable
+    // against the fixture: the sidecar walk leg proxies it in hybrid, and
+    // there is no hybrid here). The sidecar URL stays: it is the walk-leg
+    // transport (the fixture answers both shapes) and the kill-switch target
+    // for the iter-10 sidecar-off cases.
+    delete env.LOCAL_SCRYFALL_ENABLED;
+    delete env.LOCAL_SCRYFALL_URL;
     env.SCRYBOX_SIDECAR_URL = `http://127.0.0.1:${mp}/api.scryfall.com`;
     env.SCRYBOX_MTGJSON_BASE = `http://127.0.0.1:${mp}/mtgjson.com/api/v5`;
     env.MOXFIELD_API_BASE = `http://127.0.0.1:${mp}/api2.moxfield.com`;
@@ -91,7 +94,7 @@ cp.spawn = function (cmd, args, opts) {
     delete env.SCRYBOX_STATIC_DIR;
     delete env.RUST_JOBS;
     delete env.RUST_MIGRATIONS_B;
-    const child = realSpawn(BIN, [], { ...(opts || {}), env });
+    const child = realSpawn(BIN, [], { ...(opts || {}), env, stdio: process.env.RUST_E2E_VERBOSE === '1' ? 'inherit' : (opts && opts.stdio) });
     rustChildren.push(child);
     // Fail loudly (into the suite's stderr) if the port was already taken:
     // without this the suite just sees the other process's answers.
