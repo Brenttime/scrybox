@@ -92,7 +92,10 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let body = match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),
@@ -140,7 +143,10 @@ pub async fn handle_order(State(st): State<AppState>, req: Request) -> Response 
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let body = match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),
@@ -160,7 +166,10 @@ pub async fn handle_update(Path(id): Path<String>, State(st): State<AppState>, r
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let body = match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),
@@ -182,7 +191,10 @@ pub async fn handle_delete(Path(id): Path<String>, State(st): State<AppState>, r
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),

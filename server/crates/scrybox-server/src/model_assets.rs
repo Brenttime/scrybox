@@ -377,8 +377,36 @@ pub async fn handle_models(State(st): State<AppState>, mut req: Request) -> Resp
     // normalJson ran before the auth gate (server.js chain); parse, Forward
     // on strict-parse failures so Node renders its own page.
     let body_val: Value = if req.method() == axum::http::Method::POST {
-        let (parts, body) = req.into_parts();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        let (mut parts, body) = req.into_parts();
+        // Capped stream read at normalJson's 1mb ceiling (REVIEW-auth.md
+        // H1). A content-length above the cap (body-parser's immediate 413
+        // arm) answers here for JSON content-types — pre-auth, as Node's
+        // global normalJson runs before the auth gate. Non-JSON skips
+        // body-parser entirely: the abandoned (empty) body under a cleared
+        // content-length is the equivalent request. A chunked stream error
+        // past the cap forwards body-less, where Node renders its own
+        // verdict (its parser sees the real size and 413s JSON itself).
+        let cl_over_cap = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n > crate::collection_writes::BODY_NORMAL)
+            .unwrap_or(false);
+        let bytes = match axum::body::to_bytes(body, crate::collection_writes::BODY_NORMAL + 1).await {
+            Ok(b) => b,
+            Err(_) if cl_over_cap && crate::collection_writes::is_json_ct(&parts.headers) => {
+                return crate::collection_writes::too_large();
+            }
+            Err(_) if cl_over_cap => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                axum::body::Bytes::new()
+            }
+            Err(_) => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
+            }
+        };
         match crate::cardscan::parse_outer_json(&parts.headers, &bytes) {
             Ok(v) => {
                 req = Request::from_parts(parts, Body::from(bytes.to_vec()));

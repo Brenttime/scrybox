@@ -473,7 +473,10 @@ pub async fn handle(
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
     };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: HeaderMap = parts.headers;
 
     // (1) normalJson runs BEFORE the auth gate (server.js:207-211): probe-

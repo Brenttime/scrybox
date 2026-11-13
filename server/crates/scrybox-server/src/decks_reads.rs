@@ -61,7 +61,10 @@ pub async fn handle_list(State(st): State<AppState>, req: Request) -> Response {
         return crate::proxy(State(st), req).await;
     }
     let pool = st.db.clone().unwrap();
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     // express.json runs globally ahead of the auth gate (iter-28 live pin):
     // a GET carrying an unparseable JSON body answers 500 before auth.
     match parse_body(&parts.headers, &bytes) {
@@ -170,7 +173,10 @@ where
         return crate::proxy(State(st), req).await;
     }
     let pool = st.db.clone().unwrap();
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),

@@ -2070,8 +2070,8 @@ pub async fn handle(
     // limiter. POST bytes are buffered here (read_parts/rebuild precedent
     // from collection_writes) but only INTERPRETED after auth; every proxy
     // leg below re-attaches the original bytes untouched.
-    let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default().to_vec();
+    let (parts, bytes, oversize) =
+        crate::collection_writes::read_parts(req, crate::collection_writes::BODY_BIG).await;
     let headers = parts.headers.clone();
     let uri = parts.uri.clone();
     let to_node = |st: &AppState, parts: axum::http::request::Parts, bytes: Vec<u8>| {
@@ -2090,6 +2090,17 @@ pub async fn handle(
         Ok(u) => u,
         Err(res) => return res,
     };
+
+    // bigJson (15mb) mounts AFTER authenticateToken (server.js:462): an
+    // oversize JSON body answers the parser's 413 only once auth passed.
+    // Non-JSON content-types skip the parser — the empty (abandoned) body
+    // is the equivalent and the proxy legs forward it body-less.
+    if oversize && crate::collection_writes::is_json_ct(&headers) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Upload too large. Try exporting/importing in smaller batches.",
+        );
+    }
 
     // express.json({limit:'15mb'}) twin (bigJson, server.js:204/462). Parse
     // failures answer the GLOBAL handler's 500 (server.js:634-642: only

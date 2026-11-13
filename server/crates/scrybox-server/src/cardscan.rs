@@ -782,7 +782,14 @@ pub async fn handle_detect(State(st): State<AppState>, req: Request) -> Response
     if let Err(res) = authed(&st, req.headers(), false) {
         return node_exact(res).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let headers = parts.headers.clone();
     let raw = match parse_raw_image(&parts.headers, &bytes) {
         Ok(Some(b)) if b.len() >= 100 => b,
@@ -806,7 +813,14 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
         Err(res) => return node_exact(res).await,
     };
     let headers = req.headers().clone();
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let raw = match parse_raw_image(&parts.headers, &bytes) {
         Ok(Some(b)) if b.len() >= 100 => b,
         // req.body not a Buffer → Missing image — but only when the outer
@@ -930,7 +944,14 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
     if let Err(res) = authed(&st, req.headers(), false) {
         return node_exact(res).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
@@ -1003,7 +1024,14 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
     if let Err(res) = authed(&st, req.headers(), false) {
         return node_exact(res).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
@@ -1046,7 +1074,14 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
     if let Err(res) = authed(&st, req.headers(), false) {
         return node_exact(res).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
@@ -1130,7 +1165,14 @@ pub async fn handle_telemetry(State(st): State<AppState>, req: Request) -> Respo
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
-    let (parts, bytes) = read_body(req).await;
+    // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_TELEMETRY).await;
+    if oversize {
+        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if matches!(first.as_str(), "application/json" | "text/plain") {
+            return crate::collection_writes::too_large();
+        }
+    }
     let body = match parse_telemetry_body(&parts.headers, &bytes) {
         Ok(v) => v,
         Err(_) => {

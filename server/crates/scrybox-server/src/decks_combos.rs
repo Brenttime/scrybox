@@ -161,7 +161,10 @@ async fn guard(st: &AppState, req: Request, group: &str) -> Result<Ctx, Response
         return Err(crate::proxy(State(st.clone()), req).await);
     }
     let pool = st.db.clone().unwrap();
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return Err(crate::collection_writes::too_large());
+    }
     // express.json runs globally ahead of the /api auth gate: a GET carrying
     // an unparseable JSON body answers 500 before auth (iter-28 live pin).
     match parse_body(&parts.headers, &bytes) {

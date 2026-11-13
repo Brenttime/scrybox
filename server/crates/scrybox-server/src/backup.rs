@@ -285,7 +285,10 @@ pub async fn handle_backups_collection(State(st): State<AppState>, req: Request)
     if (!matches!(method, Method::GET | Method::POST)) || !owns_backup(&st) {
         return crate::proxy(State(st), req).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     if method == Method::POST {
         // normalJson runs BEFORE the admin router's auth in Node: parse

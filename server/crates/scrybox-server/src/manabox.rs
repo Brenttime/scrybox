@@ -1179,12 +1179,19 @@ pub async fn handle_preview(State(st): State<AppState>, req: Request) -> Respons
     if req.method() != Method::POST || !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
     let user = match authed(&st, &headers, false) {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // bigJson (40mb, server.js:464) mounts AFTER the auth gate: oversize
+    // JSON answers the parser's 413 only once authenticateToken passed.
+    // Non-JSON content-types skip the parser entirely — empty body is the
+    // equivalent (content-length was cleared with the abandoned stream).
+    if oversize && is_json_ct(&headers) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Upload too large. Try exporting/importing in smaller batches.");
+    }
     let body = match parse_body_40mb(&headers, &bytes) {
         BigOutcome::TooLarge => {
             return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Upload too large. Try exporting/importing in smaller batches.")
@@ -1225,12 +1232,19 @@ pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response 
     if req.method() != Method::POST || !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
     let user = match authed(&st, &headers, false) {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // bigJson (40mb, server.js:464) mounts AFTER the auth gate: oversize
+    // JSON answers the parser's 413 only once authenticateToken passed.
+    // Non-JSON content-types skip the parser entirely — empty body is the
+    // equivalent (content-length was cleared with the abandoned stream).
+    if oversize && is_json_ct(&headers) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Upload too large. Try exporting/importing in smaller batches.");
+    }
     let body = match parse_body_40mb(&headers, &bytes) {
         BigOutcome::TooLarge => {
             return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Upload too large. Try exporting/importing in smaller batches.")
