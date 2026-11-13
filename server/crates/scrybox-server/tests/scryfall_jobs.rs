@@ -575,6 +575,37 @@ async fn sweep_batches_at_75_boundary() {
 }
 
 #[tokio::test]
+async fn sweep_survives_transient_429_via_retry_ladder() {
+    // Live-cutover regression: the sweep must ride out a 429 the same way
+    // Node does — scryPostRetried (4 attempts, each queued behind the shared
+    // cooldown). A plain post would abort the whole sweep on the first 429.
+    let (addr, mock) = spawn_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded_db(dir.path(), "sweep429.db");
+    seed_sweep_db(&conn);
+    let rows = sweep_rows(&conn).unwrap();
+    let data: Vec<Value> = rows
+        .iter()
+        .filter(|r| r.card_id != "mtg-plain-5")
+        .map(|r| raw_card(&r.card_id[4..], &r.name, &r.set_id, &r.number, Some(0.5)))
+        .collect();
+    *mock.collection_batches.lock().unwrap() =
+        vec![json!({"data": data, "not_found": [json!("n:Plains")]})];
+    *mock.search.lock().unwrap() = json!({"data": [], "has_more": false});
+    mock.statuses.lock().unwrap().insert("POST /cards/collection".into(), vec![429, 200]);
+    *mock.retry_after.lock().unwrap() = Some("0".into());
+
+    let scry = scry_for(addr, 0.001);
+    let out = update_collection_prices(&conn, &scry, true).await.unwrap();
+    assert!(out.swept, "one transient 429 must not abort the sweep");
+    assert_eq!(mock.hits_for("POST /cards/collection").len(), 2, "429 then retry");
+    let swept: Option<String> = conn
+        .query_row("SELECT mtg_prices_swept_at FROM app_settings WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(swept.is_some(), "retry success still records the sweep timestamp");
+}
+
+#[tokio::test]
 async fn sweep_respects_unforced_gate() {
     let (addr, mock) = spawn_mock().await;
     let dir = tempfile::tempdir().unwrap();

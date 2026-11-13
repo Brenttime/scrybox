@@ -141,7 +141,7 @@ async fn bulk_fetch_by_identifier(
             })
             .collect();
         let resp = scry
-            .post(
+            .post_retried(
                 "/cards/collection",
                 Value::Object({
                     let mut m = Map::new();
@@ -149,6 +149,9 @@ async fn bulk_fetch_by_identifier(
                     m
                 }),
                 &ScryOpts { upstream: true, ..Default::default() },
+                // Node's scryPostRetried default retries = 4: re-queue on 429,
+                // each retry lining up behind the shared cooldown.
+                4,
             )
             .await
             .map_err(|e| e.to_string())?;

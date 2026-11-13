@@ -113,6 +113,35 @@ fn client_ip_key_trust_matrix() {
 }
 
 #[test]
+fn client_ip_key_rules_gate_xff_on_socket_trust() {
+    // proxy-addr forwarded(): the XFF chain is consulted only when the
+    // socket is trusted. This is the parity.mjs battery shape — unique
+    // 198.18.x.y XFFs from the docker/loopback socket, which Node resolves
+    // per-request (untrusted XFF value wins) while an untrusted socket must
+    // ignore the header outright.
+    let trust = Trust::from_env_value("loopback, uniquelocal");
+    let mut h = HeaderMap::new();
+    h.insert("x-forwarded-for", "198.18.0.7".parse().unwrap());
+    let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "198.18.0.7");
+    let docker: SocketAddr = "172.18.0.1:1".parse().unwrap(); // bridge = uniquelocal
+    assert_eq!(client_ip_key(Some(docker.ip()), &h, &trust), "198.18.0.7");
+    // Untrusted socket: spoofed XFF must NOT mint a fresh bucket.
+    let public: SocketAddr = "203.0.113.9:1".parse().unwrap();
+    assert_eq!(client_ip_key(Some(public.ip()), &h, &trust), "203.0.113.9");
+    // Trusted right-hand hop is walked; the untrusted client stays.
+    h.insert("x-forwarded-for", "198.18.0.7, 172.18.0.2".parse().unwrap());
+    assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "198.18.0.7");
+    // All hops trusted → proxy-addr's walk finds no untrusted hop and falls
+    // back to the socket (every actor in the chain is a proxy we trust).
+    h.insert("x-forwarded-for", "10.0.0.5, 127.0.0.1".parse().unwrap());
+    assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "127.0.0.1");
+    // No XFF at all → socket.
+    let h3 = HeaderMap::new();
+    assert_eq!(client_ip_key(Some(peer.ip()), &h3, &trust), "127.0.0.1");
+}
+
+#[test]
 fn fixed_window_limiter_matches_express_rate_limit() {
     let lim = FixedWindowLimiter::new(3, 60_000);
     let t0 = 1_000_000u64;
