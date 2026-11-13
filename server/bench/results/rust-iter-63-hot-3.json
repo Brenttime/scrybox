@@ -1,0 +1,113 @@
+{
+  "at": "2026-11-13T15:58:02.607Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": null,
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 228520,
+      "variants": 1,
+      "rps": 22852,
+      "p50_ms": 0.56,
+      "p99_ms": 1.93,
+      "p999_ms": 4.33,
+      "max_ms": 12.07,
+      "peak_rss_mb": 926.5,
+      "codes": {
+        "200": 228520
+      }
+    },
+    {
+      "name": "collection_page100",
+      "conc": 16,
+      "n": 68030,
+      "variants": 1,
+      "rps": 6799.6,
+      "p50_ms": 1.71,
+      "p99_ms": 7.56,
+      "p999_ms": 10.89,
+      "max_ms": 16.01,
+      "peak_rss_mb": 926.5,
+      "codes": {
+        "200": 68030
+      }
+    },
+    {
+      "name": "collection_full_27MB",
+      "conc": 2,
+      "n": 489,
+      "variants": 1,
+      "rps": 32.5,
+      "p50_ms": 58.68,
+      "p99_ms": 109.1,
+      "p999_ms": 121.87,
+      "max_ms": 121.87,
+      "peak_rss_mb": 926.5,
+      "codes": {
+        "200": 489
+      }
+    },
+    {
+      "name": "stats",
+      "conc": 16,
+      "n": 151175,
+      "variants": 1,
+      "rps": 15117.5,
+      "p50_ms": 0.84,
+      "p99_ms": 4.82,
+      "p999_ms": 8.38,
+      "max_ms": 19.17,
+      "peak_rss_mb": 926.5,
+      "codes": {
+        "200": 151175
+      }
+    },
+    {
+      "name": "search_coll_t_creature_c_g",
+      "conc": 16,
+      "n": 18542,
+      "variants": 1,
+      "rps": 1852.3,
+      "p50_ms": 8.41,
+      "p99_ms": 18.79,
+      "p999_ms": 26,
+      "max_ms": 32.04,
+      "peak_rss_mb": 862.7,
+      "codes": {
+        "200": 18542
+      }
+    },
+    {
+      "name": "search_coll_sol_ring",
+      "conc": 16,
+      "n": 18990,
+      "variants": 1,
+      "rps": 1897.7,
+      "p50_ms": 8.19,
+      "p99_ms": 17.81,
+      "p999_ms": 26.54,
+      "max_ms": 35,
+      "peak_rss_mb": 862.7,
+      "codes": {
+        "200": 18990
+      }
+    },
+    {
+      "name": "search_db_name_sol_ring",
+      "conc": 16,
+      "n": 19642,
+      "variants": 1,
+      "rps": 1962.8,
+      "p50_ms": 7.95,
+      "p99_ms": 17.13,
+      "p999_ms": 24.36,
+      "max_ms": 31.65,
+      "peak_rss_mb": 862.7,
+      "codes": {
+        "200": 19642
+      }
+    }
+  ]
+}

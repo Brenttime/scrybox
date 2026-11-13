@@ -1,0 +1,118 @@
+{
+  "at": "2026-11-13T16:07:13.767Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": {
+    "every_ms": 2000,
+    "ticks": 52,
+    "errors": 0,
+    "target": "http://127.0.0.1:3312/api/collection/4"
+  },
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 204324,
+      "variants": 1,
+      "rps": 20430.4,
+      "p50_ms": 0.67,
+      "p99_ms": 2.39,
+      "p999_ms": 5.44,
+      "max_ms": 17.53,
+      "peak_rss_mb": 532.8,
+      "codes": {
+        "200": 204324
+      }
+    },
+    {
+      "name": "collection_page_varied",
+      "conc": 16,
+      "n": 14755,
+      "variants": 52,
+      "rps": 1413.3,
+      "p50_ms": 2.11,
+      "p99_ms": 406.39,
+      "p999_ms": 888.74,
+      "max_ms": 1000.81,
+      "peak_rss_mb": 517.8,
+      "codes": {
+        "200": 14755
+      }
+    },
+    {
+      "name": "collection_full_varied",
+      "conc": 2,
+      "n": 96,
+      "variants": 6,
+      "rps": 6.4,
+      "p50_ms": 64.18,
+      "p99_ms": 1433.84,
+      "p999_ms": 1433.84,
+      "max_ms": 1433.84,
+      "peak_rss_mb": 811.6,
+      "codes": {
+        "200": 96
+      }
+    },
+    {
+      "name": "stats_varied",
+      "conc": 16,
+      "n": 77168,
+      "variants": 52,
+      "rps": 7714.5,
+      "p50_ms": 1.6,
+      "p99_ms": 9.36,
+      "p999_ms": 32.81,
+      "max_ms": 57.02,
+      "peak_rss_mb": 678.2,
+      "codes": {
+        "200": 77168
+      }
+    },
+    {
+      "name": "stats_subs_varied",
+      "conc": 16,
+      "n": 33,
+      "variants": 52,
+      "rps": 1.4,
+      "p50_ms": 8678.8,
+      "p99_ms": 15480.61,
+      "p999_ms": 15480.61,
+      "max_ms": 15480.61,
+      "peak_rss_mb": 816,
+      "codes": {
+        "200": 33
+      }
+    },
+    {
+      "name": "search_db_varied",
+      "conc": 16,
+      "n": 207,
+      "variants": 52,
+      "rps": 19.2,
+      "p50_ms": 789.91,
+      "p99_ms": 2152.65,
+      "p999_ms": 2259.75,
+      "max_ms": 2259.75,
+      "peak_rss_mb": 740.1,
+      "codes": {
+        "200": 207
+      }
+    },
+    {
+      "name": "search_coll_varied",
+      "conc": 16,
+      "n": 18450,
+      "variants": 52,
+      "rps": 1843.7,
+      "p50_ms": 8.11,
+      "p99_ms": 26.93,
+      "p999_ms": 51.45,
+      "max_ms": 93.96,
+      "peak_rss_mb": 624.2,
+      "codes": {
+        "200": 18450
+      }
+    }
+  ]
+}
