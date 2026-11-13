@@ -64,7 +64,11 @@ function once(s, base, path) {
     const u = new URL(path ?? s.path, base);
     const body = s.body ? JSON.stringify(s.body) : null;
     const n = ipSeq++;
-    const headers = { ...(s.headers || {}), 'x-forwarded-for': `10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}` };
+    // 198.18.0.0/15 (RFC 2544 benchmarking range): MUST stay untrusted under
+    // the Rust front's TRUST_PROXY="loopback, uniquelocal" — rotating into
+    // 10.x made every synthetic IP a "trusted proxy" there, collapsing all
+    // bench traffic onto the socket IP's single search bucket (429 storm).
+    const headers = { ...(s.headers || {}), 'x-forwarded-for': `198.${18 + ((n >> 16) & 1)}.${(n >> 8) & 255}.${n & 255}` };
     if (body) { headers['content-type'] = 'application/json'; headers['content-length'] = Buffer.byteLength(body); }
     const t0 = process.hrtime.bigint();
     const req = http.request(u, { method: s.method || 'GET', headers, agent }, (res) => {
@@ -177,7 +181,7 @@ function fastRequestBytes(s, xffPath) {
   let m = `${s.method || 'GET'} ${p} HTTP/1.1\r\nHost: ${FAST_HOST}:${FAST_PORT}\r\n`;
   if (s.headers) for (const [k, v] of Object.entries(s.headers)) m += `${k}: ${v}\r\n`;
   const n = ipSeq++;
-  m += `x-forwarded-for: 10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}\r\nconnection: keep-alive\r\n\r\n`;
+  m += `x-forwarded-for: 198.${18 + ((n >> 16) & 1)}.${(n >> 8) & 255}.${n & 255}\r\nconnection: keep-alive\r\n\r\n`;
   return Buffer.from(m, 'latin1');
 }
 
@@ -195,7 +199,7 @@ function putTrade(v) {
     const n = ipSeq++;
     const req = http.request(new URL(`/api/collection/${writeId}`, writeBase), {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), Authorization: writeAuth, 'x-forwarded-for': `10.9.${(n >> 8) & 255}.${n & 255}` },
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), Authorization: writeAuth, 'x-forwarded-for': `198.19.${(n >> 8) & 255}.${n & 255}` },
     }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
     req.on('error', () => resolve(0));
     req.write(body); req.end();
