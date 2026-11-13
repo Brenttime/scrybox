@@ -71,6 +71,7 @@ pub mod secheaders;
 pub mod scry_jobs;
 pub mod search;
 pub mod secret_lair;
+pub mod seed_cards;
 pub mod sets;
 pub mod sidecar;
 pub mod stats;
@@ -723,6 +724,14 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/admin/users", any(admin_users::route_users))
             .route("/api/admin/users/{id}", any(admin_users::route_user))
+    } else {
+        router
+    };
+    // Lane A iter-49: POST /api/admin/seed-cards (admin.js:19 — the last
+    // Lane-A route) under `seed_cards`. Non-POST rides the proxy verbatim
+    // (Node's router.use auth + final-handler 404 chain).
+    let router = if state.owns("seed_cards") {
+        router.route("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
     } else {
         router
     };

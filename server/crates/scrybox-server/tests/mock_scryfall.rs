@@ -52,7 +52,11 @@ impl MockState {
     fn next_status(&self, key: &str) -> u16 {
         // The current hit is already recorded when this runs: index with
         // count-1 so a script [429, 200] serves 429 first, 200 after.
-        let hits = self.hits.lock().unwrap().iter().filter(|(k, _)| k == key).count().saturating_sub(1);
+        // Count hits for the bare key AND any "?query" form of it (seed_cards
+        // scripts GET /cards/search?q=set:<code>, whose hit keys carry the
+        // query). Scripts keyed WITH a query still match exactly only.
+        let prefix = format!("{key}?");
+        let hits = self.hits.lock().unwrap().iter().filter(|(k, _)| k == key || k.starts_with(&prefix)).count().saturating_sub(1);
         let script = self.statuses.lock().unwrap();
         match script.get(key) {
             Some(v) if !v.is_empty() => *v.get(hits).or_else(|| v.last()).unwrap(),

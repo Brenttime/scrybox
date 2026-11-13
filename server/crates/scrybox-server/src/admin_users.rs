@@ -141,7 +141,7 @@ fn fail(context: &str, status: StatusCode, msg: &str) -> Response {
 /// only — stats bodies depend solely on (user, data_revision), none of
 /// these four routes touch the requester's collection, so it can never
 /// change a byte parity compares.
-async fn authorize(
+pub(crate) async fn authorize(
     st: &AppState,
     pool: &DbPool,
     headers: &HeaderMap,

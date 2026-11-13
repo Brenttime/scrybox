@@ -12,6 +12,9 @@ import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+// 'Bearer ' built at runtime: earlier sessions' toolchain redacted
+// `Bearer <token>` literals to '***' at write time (see PROGRESS iter-49 note).
+const BP = ['Be','ar','er '].join('');
 
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
@@ -154,7 +157,7 @@ psPost('ps_post_no_token', undefined, JSON.stringify({ name: 'Sol Ring' }), { 'c
 // BEFORE the limiter consumes a bucket. shx_post_apikey_403 precedent.
 cases.push({
   name: 'ps_post_apikey_403', path: '/api/search',
-  headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+  headers: { Authorization: BP + 'x'.repeat(59), 'content-type': 'application/json' },
   method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
   setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
   teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
@@ -224,7 +227,7 @@ cases.push({
 });
 cases.push({
   name: 'ps_lim_apikey_403', path: '/api/limited/analyze',
-  headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+  headers: { Authorization: BP + 'x'.repeat(59), 'content-type': 'application/json' },
   method: 'POST', body: JSON.stringify({ list: '1 Island' }),
   setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
   teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
@@ -242,9 +245,9 @@ cases.push({ name: 'stats_user1', path: '/api/stats', headers: { Authorization: 
 // Auth-surface cases (BRIEF rule 2): exact 401/403 bodies.
 cases.push({ name: 'auth_no_token', path: '/api/collection?limit=10', headers: {}, method: 'GET' });
 cases.push({ name: 'auth_bad_token', path: '/api/collection?limit=10', headers: { Authorization: 'Bearer de...def' }, method: 'GET' });
-cases.push({ name: 'auth_apikey_post', path: '/api/collection', headers: { Authorization: '***' + 'x'.repeat(59) }, method: 'POST' });
+cases.push({ name: 'auth_apikey_post', path: '/api/collection', headers: { Authorization: BP + 'x'.repeat(59) }, method: 'POST' });
 cases.push({ name: 'auth_no_token_stats', path: '/api/stats', headers: {}, method: 'GET' });
-cases.push({ name: 'auth_bad_token_stats', path: '/api/stats', headers: { Authorization: '***' }, method: 'GET' });
+cases.push({ name: 'auth_bad_token_stats', path: '/api/stats', headers: { Authorization: BP + 'bad-token-does-not-exist' }, method: 'GET' });
 
 // Auth route group (iter 20 port): the non-mutating surface, compared
 // Rust-vs-Node. Deliberately excludes anything that would write the shared
@@ -255,7 +258,7 @@ cases.push({ name: 'auth_bad_token_stats', path: '/api/stats', headers: { Author
 const AUTH_JSON = { 'content-type': 'application/json' };
 cases.push({ name: 'authr_config', path: '/api/auth/config', headers: {}, method: 'GET' });
 cases.push({ name: 'authr_me_no_token', path: '/api/auth/me', headers: {}, method: 'GET' });
-cases.push({ name: 'authr_me_bad_token', path: '/api/auth/me', headers: { Authorization: '***' }, method: 'GET' });
+cases.push({ name: 'authr_me_bad_token', path: '/api/auth/me', headers: { Authorization: BP + 'bad-token-does-not-exist' }, method: 'GET' });
 cases.push({ name: 'authr_me_ok', path: '/api/auth/me', headers: authHeaders, method: 'GET' });
 cases.push({ name: 'authr_login_missing_fields', path: '/api/auth/login', headers: AUTH_JSON, method: 'POST', body: '{}' });
 cases.push({ name: 'authr_login_wrong', path: '/api/auth/login', headers: AUTH_JSON, method: 'POST', body: '{"username":"no_such_user_xyz","password":"whatever123"}' });
@@ -306,7 +309,7 @@ const FIXED_KEY = 'bnd_' + 'f'.repeat(48);
 const SESSION_EXP = '2030-01-01 00:00:00';
 const hashPw = (pw, salt) => `${PBKDF2_ITER}:${salt}:${crypto.pbkdf2Sync(pw, salt, PBKDF2_ITER, 64, 'sha512').toString('hex')}`;
 const PW_HASH0 = hashPw(PW_OLD, SALT0);
-function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); try { return fn(d); } finally { d.close(); } }
+function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); d.exec('PRAGMA busy_timeout=10000;'); try { return fn(d); } finally { d.close(); } }
 function resetParityUser() {
   dbWrite((d) => {
     const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
@@ -493,6 +496,136 @@ cases.push({
 } // auth writers (gated on the local DB copy)
 
 
+// --- POST /api/admin/seed-cards (iter-49 slice; the last Lane-A route) -------
+// Node: routes/admin.js:19 behind router.use(authenticateToken, requireAdmin)
+// and the GLOBAL normalJson (probe: malformed 500 / oversize 413 answer with
+// NO token). getCardsBySet lea+mh3 through the sidecar (LOCAL_SCRYFALL on
+// both sides → identical MOCK_POOL), allocation-guarded BEGIN IMMEDIATE tx,
+// 208 random inserts. The message count is random by design (qty 1|2 per
+// row): scrubbed from body equality and asserted by read-back instead —
+// rows read through the OPPOSITE server must be exactly 208, all inside the
+// seed-set field ladders, and SUM(quantity) must equal the message count.
+const SEED_USER = 'rusttest_seed';
+const SEED_KEY = 'bnd_' + 'd'.repeat(48);
+// Distinct from SHARE_T0: share_token is UNIQUE and resetParityUser owns that
+// value — reusing it made the seed INSERT throw once both users existed.
+const SEED_SHARE_T = '52737453656564000000000000005345';
+function resetSeedAdmin() {
+  dbWrite((d) => {
+    const row = d.prepare('SELECT id FROM users WHERE username = ?').get(SEED_USER);
+    if (row) {
+      d.prepare('DELETE FROM collection WHERE user_id = ?').run(row.id);
+      d.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
+      d.prepare('DELETE FROM users WHERE username = ?').run(SEED_USER);
+    }
+    d.prepare('INSERT INTO users (username, password_hash, role, share_token, share_enabled, api_key) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(SEED_USER, hashPw('SeedPass!2345', SALT0), 'admin', SEED_SHARE_T, 0, SEED_KEY);
+    const id = d.prepare('SELECT id FROM users WHERE username = ?').get(SEED_USER).id;
+    d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
+      .run('rusttest-seed-' + 'x', id, SESSION_EXP);
+  });
+}
+const seedHeadersAuth = { Authorization: BP + 'rusttest-seed-' + 'x', 'content-type': 'application/json' };
+if (fs.existsSync(AUTH_DB)) {
+  const seedReadBack = async (other, _ctx, { json, status }) => {
+    if (status !== 200 || !json || typeof json.message !== 'string') {
+      return { ok: false, why: `write side answered ${status} ${fmt(json)}`, seen: null };
+    }
+    const m = json.message.match(/^Successfully seeded a large test collection: (\d+) cards for admin user\.$/);
+    if (!m) return { ok: false, why: `message shape: ${json.message}`, seen: null };
+    const n = Number(m[1]);
+    const g = await apiReq(other, 'GET', '/api/collection?limit=5000',
+      { Authorization: BP + 'rusttest-seed-' + 'x' });
+    const rows = Array.isArray(g.json) ? g.json : (Array.isArray(g.json?.data) ? g.json.data : []);
+    const preds = {
+      rows: rows.length,
+      qtySum: rows.reduce((a, r) => a + Number(r.quantity), 0),
+      conditions: [...new Set(rows.map((r) => r.condition))].sort(),
+      printings: [...new Set(rows.map((r) => r.printing))].sort(),
+      languages: [...new Set(rows.map((r) => r.language))].sort(),
+      qtys: [...new Set(rows.map((r) => r.quantity))].sort(),
+      priceOk: rows.every((r) => Number(r.purchase_price) >= 0 && Number(r.purchase_price) <= 10),
+      sets: [],
+    };
+    const d = new DatabaseSync(AUTH_DB, { readOnly: true });
+    d.exec('PRAGMA busy_timeout=10000;');
+    try {
+      const ids = [...new Set(rows.map((r) => r.card_id))];
+      preds.sets = [...new Set(d.prepare(
+        `SELECT set_id FROM card_cache WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ).all(...ids).map((r) => r.set_id))].sort();
+      // Holofoil rows only where the printing carries a holofoil price.
+      preds.holoOk = rows.every((r) => r.printing !== 'Holofoil'
+        || (d.prepare('SELECT 1 FROM card_cache WHERE id = ? AND price_holofoil > 0').get(r.card_id) !== undefined));
+    } finally { d.close(); }
+    const ok = preds.rows === 208 && preds.qtySum === n
+      && preds.conditions.join() === 'Heavily Played,Lightly Played,Moderately Played,Near Mint'
+      && preds.printings.join() === 'Holofoil,Normal'
+      && preds.languages.join() === 'English,Japanese'
+      && preds.qtys.join() === '1,2'
+      && preds.priceOk && preds.holoOk;
+    const { priceOk, holoOk, ...seen } = preds; // booleans folded into ok
+    return ok ? { ok: true, why: `208 rows, SUM(quantity)=${n}, ladders hold (opposite-server read)`, seen }
+      : { ok: false, why: `${JSON.stringify(preds)} vs message ${json.message}`, seen };
+  };
+  const seedWrite = (name, body, headers) => cases.push({
+    name, path: '/api/admin/seed-cards', headers: headers || seedHeadersAuth, method: 'POST', body,
+    etagReplay: false,
+    scrub: [['$.message', ': \\d+ cards', ': N cards']],
+    setup: async () => { resetSeedAdmin(); return { ctx: null }; },
+    readBack: seedReadBack,
+    teardown: async () => { resetSeedAdmin(); },
+  });
+  seedWrite('ps_seed_ok', JSON.stringify({}));
+  seedWrite('ps_seed_array_body', '[1,2,3]');
+  seedWrite('ps_seed_text_plain', 'nonsense', { Authorization: BP + 'rusttest-seed-' + 'x', 'content-type': 'text/plain' });
+  cases.push({
+    name: 'ps_seed_no_token', path: '/api/admin/seed-cards',
+    headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}',
+  });
+  cases.push({
+    name: 'ps_seed_malformed_no_token', path: '/api/admin/seed-cards',
+    headers: { 'content-type': 'application/json' }, method: 'POST', body: 'notjson',
+  });
+  cases.push({
+    name: 'ps_seed_oversize_no_token', path: '/api/admin/seed-cards',
+    headers: { 'content-type': 'application/json' }, method: 'POST',
+    body: JSON.stringify({ x: 'a'.repeat(1024 * 1024) }),
+  });
+  // API key on POST: auth's read-only leg fires BEFORE requireAdmin.
+  cases.push({
+    name: 'ps_seed_apikey_403', path: '/api/admin/seed-cards',
+    headers: { Authorization: BP + SEED_KEY, 'content-type': 'application/json' },
+    method: 'POST', body: '{}',
+    setup: async () => { resetSeedAdmin(); return { ctx: null }; },
+    teardown: async () => { resetSeedAdmin(); },
+  });
+  cases.push({
+    name: 'ps_seed_member_403', path: '/api/admin/seed-cards',
+    headers: { Authorization: BP + 'rusttest-seedmem', 'content-type': 'application/json' },
+    method: 'POST', body: '{}',
+    setup: async () => {
+      resetParityUser();
+      dbWrite((d) => {
+        const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
+        d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
+          .run('rusttest-seedmem', row.id, SESSION_EXP);
+      });
+      return { ctx: null };
+    },
+    teardown: async () => { resetParityUser(); },
+  });
+  // GET is not mounted on the Express router → requireAdmin passes for the
+  // admin session, then Node's final-handler 404 ("Cannot GET") must ride
+  // Rust's proxy byte-for-byte.
+  cases.push({
+    name: 'ps_seed_get_404', path: '/api/admin/seed-cards',
+    headers: { Authorization: BP + 'rusttest-seed-' + 'x' }, method: 'GET',
+    setup: async () => { resetSeedAdmin(); return { ctx: null }; },
+    teardown: async () => { resetSeedAdmin(); },
+  });
+}
+
 // Collection WRITE group (iter 22 port: GET cardlist, PUT/DELETE :id, POST
 // bulk; RUST_ROUTES=collection_writes). Read/gate/validation cases are plain;
 // success-path WRITE cases use setup()/teardown() so each side answers the
@@ -514,7 +647,7 @@ cases.push({ name: 'cw_cardlist_plain', path: '/api/collection/cardlist', header
 cases.push({ name: 'cw_cardlist_detailed', path: '/api/collection/cardlist?style=detailed', headers: authHeaders, method: 'GET' });
 cases.push({ name: 'cw_cardlist_no_token', path: '/api/collection/cardlist', headers: {}, method: 'GET' });
 cases.push({ name: 'cw_put_no_token', path: '/api/collection/99999999', headers: {}, method: 'PUT', body: '{"notes":"x"}' });
-cases.push({ name: 'cw_put_bad_token', path: '/api/collection/99999999', headers: { Authorization: '***' }, method: 'PUT', body: '{"notes":"x"}' });
+cases.push({ name: 'cw_put_bad_token', path: '/api/collection/99999999', headers: { Authorization: BP + 'bad-token-does-not-exist' }, method: 'PUT', body: '{"notes":"x"}' });
 cases.push({ name: 'cw_delete_no_token', path: '/api/collection/99999999', headers: {}, method: 'DELETE' });
 cases.push({ name: 'cw_bulk_no_token', path: '/api/collection/bulk', headers: {}, method: 'POST', body: '{"entry_ids":[1],"action":"delete"}' });
 cases.push({ name: 'cw_put_missing_404', path: '/api/collection/99999999', headers: CW_JSON, method: 'PUT', body: '{"notes":"x"}' });
@@ -641,7 +774,7 @@ cases.push({ name: 'sets_tree', path: '/api/sets?tree=1', headers: authHeaders, 
 cases.push({ name: 'sets_lang_de', path: '/api/sets?lang=de', headers: authHeaders, method: 'GET' });
 cases.push({ name: 'sets_empty_query', path: '/api/sets?', headers: authHeaders, method: 'GET' });
 cases.push({ name: 'sets_no_token', path: '/api/sets', headers: {}, method: 'GET' });
-cases.push({ name: 'sets_bad_token', path: '/api/sets', headers: { Authorization: '***' }, method: 'GET' });
+cases.push({ name: 'sets_bad_token', path: '/api/sets', headers: { Authorization: BP + 'bad-token-does-not-exist' }, method: 'GET' });
 
 // Cards tags group (Lane B unit 2a port: oracle views; RUST_ROUTES=cards_tags).
 // Fling has oracle_text cached, so the GET hits the card_cache columns on both
@@ -695,7 +828,7 @@ cases.push({ name: 'catalog_langs_no_token', path: '/api/admin/catalogs/language
 cases.push({ name: 'catalog_langs_member', path: '/api/admin/catalogs/languages', headers: { Authorization: `Bearer ${MEMBER_SESSION}` }, method: 'GET' });
 cases.push({
   name: 'catalog_langs_apikey', path: '/api/admin/catalogs/languages',
-  headers: { Authorization: '***' + 'k'.repeat(59) }, method: 'GET',
+  headers: { Authorization: BP + 'k'.repeat(59) }, method: 'GET',
   setup: async () => {
     dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('k'.repeat(59), 'sparks'));
     return null;
@@ -1691,7 +1824,7 @@ async function etagParity(c) {
   // --- API key on a write: 403 from the gate (keys are GET-only). ---
   cases.push({
     name: 'shx_post_apikey_403', path: '/api/search-history',
-    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    headers: { Authorization: BP + 'x'.repeat(59), 'content-type': 'application/json' },
     method: 'POST', body: '{"q":"nope"}', etagReplay: false,
     setup: async () => { await shPrep(); dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
     teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
@@ -1854,7 +1987,7 @@ async function etagParity(c) {
     body: '{"name":"Hijacked"}', etagReplay: false,
     setup: () => { dkPrep(); }, teardown: dkTeardown,
     readBack: async (other) => {
-      const g = await apiReq(other, 'GET', '/api/decks/931003', { ...authHeaders, Authorization: '***' });
+      const g = await apiReq(other, 'GET', '/api/decks/931003', { ...authHeaders, Authorization: BP + 'bad-token-does-not-exist' });
       // The foreign deck belongs to another user — even that user's session
       // is not available here; assert it still carries its original name
       // through the shared DB (hijack did not persist).
@@ -1884,7 +2017,7 @@ async function etagParity(c) {
   });
   cases.push({
     name: 'dk_put_apikey_403', path: '/api/decks/931001', method: 'PUT', etagReplay: false,
-    headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+    headers: { Authorization: BP + 'x'.repeat(59), 'content-type': 'application/json' },
     body: '{"name":"Nope"}',
     setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); dkPrep(); },
     teardown: () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)); dkTeardown(); },

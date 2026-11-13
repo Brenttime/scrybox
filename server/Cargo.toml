@@ -53,3 +53,13 @@ lto = "thin"
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+# Orchestrator ruling 2026-11-11 21:40: fast profile for the test instances
+# (restart-rust.sh builds --profile iter). Real `release` stays for final
+# benches and the Docker image only.
+[profile.iter]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = 0
