@@ -1059,22 +1059,38 @@ fn build_deck_list_cached(
     user_id: i64,
     store: &std::sync::Mutex<HashMap<i64, (i64, Vec<u8>)>>,
 ) -> Result<(Vec<u8>, bool), rusqlite::Error> {
-    if cache_enabled() {
-        if let Some(revision) = current_revision(conn)? {
-            if let Some(hit) = store.lock().unwrap().get(&user_id) {
-                if hit.0 == revision {
-                    return Ok((hit.1.clone(), true));
-                }
+    build_deck_list_cached_with(conn, user_id, store, |c| build_deck_list(c, user_id))
+}
+
+/// Literal port of deckListCache.js getOrBuild (Node lines 19-24): the
+/// revision is captured ONCE before the build; the body is stored only if
+/// that same pre-build revision is still current afterwards. Reading the
+/// revision twice after the build (the pre-fix shape) would happily cache a
+/// body that was assembled while the data moved under it (H2). `build` is
+/// injectable so tests can race a real revision-bumping write against the
+/// build; production passes build_deck_list.
+fn build_deck_list_cached_with(
+    conn: &Connection,
+    user_id: i64,
+    store: &std::sync::Mutex<HashMap<i64, (i64, Vec<u8>)>>,
+    build: impl Fn(&Connection) -> Result<Vec<u8>, rusqlite::Error>,
+) -> Result<(Vec<u8>, bool), rusqlite::Error> {
+    // Node: `const revision = await currentRevision(conn);` before build().
+    let revision = if cache_enabled() { current_revision(conn)? } else { None };
+    if let Some(revision) = revision {
+        if let Some(hit) = store.lock().unwrap().get(&user_id) {
+            if hit.0 == revision {
+                return Ok((hit.1.clone(), true));
             }
         }
     }
-    let body = build_deck_list(conn, user_id)?;
-    if cache_enabled() {
-        // "Only store if nothing moved while building."
-        if let Some(revision) = current_revision(conn)? {
-            if current_revision(conn)?.is_none_or(|after| after == revision) {
-                store.lock().unwrap().insert(user_id, (revision, body.clone()));
-            }
+    let body = build(conn)?;
+    // "Only store if nothing moved while building": compare against the
+    // PRE-build revision (Node: `revision != null && (await
+    // currentRevision(conn)) === revision`), so a mid-build bump drops the body.
+    if let Some(revision) = revision {
+        if current_revision(conn)? == Some(revision) {
+            store.lock().unwrap().insert(user_id, (revision, body.clone()));
         }
     }
     Ok((body, false))
@@ -1534,6 +1550,65 @@ mod tests {
         assert_eq!(out.get("current_printing_value"), Some(&json!(1.8)));
         assert_eq!(out.get("current_unpriced_cards"), Some(&json!(1)));
         assert_eq!(out.get("current_estimated_cards"), Some(&json!(2)));
+    }
+
+    /// H2 (review/REVIEW-concurrency-jobs.md): getOrBuild must capture the
+    /// revision BEFORE the build and only store if it is still current
+    /// afterwards (Node deckListCache.js:19-24). Pre-fix, the store decision
+    /// re-read the revision twice AFTER the build, so a build that raced a
+    /// revision-bumping write cached its mixed body under the new revision.
+    #[test]
+    fn deck_list_store_requires_revision_unchanged_across_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("h2.db")).unwrap();
+        conn.execute_batch(include_str!("../tests/schema_fixture.sql")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (id, username, password_hash, role, share_token) VALUES (1,'u1','x','member','tok-h2');
+             INSERT INTO decks (id, user_id, name, created_at) VALUES (101, 1, 'D', '2026-01-01 00:00:00');
+             INSERT OR IGNORE INTO deck_list_revision (id, revision) VALUES (1, 0);",
+        )
+        .unwrap();
+        let store: std::sync::Mutex<HashMap<i64, (i64, Vec<u8>)>> =
+            std::sync::Mutex::new(HashMap::new());
+
+        // 1) Quiet build: stored under the current revision; second call hits
+        //    without running the builder.
+        let quiet = |_: &Connection| Ok(b"body-A".to_vec());
+        let (b1, hit1) = build_deck_list_cached_with(&conn, 1, &store, quiet).unwrap();
+        assert!(!hit1 && b1 == b"body-A");
+        let rev1 = current_revision(&conn).unwrap().unwrap();
+        assert_eq!(store.lock().unwrap().get(&1), Some(&(rev1, b"body-A".to_vec())));
+        let (b2, hit2) =
+            build_deck_list_cached_with(&conn, 1, &store, |_: &Connection| -> Result<Vec<u8>, rusqlite::Error> {
+                unreachable!()
+            })
+            .unwrap();
+        assert!(hit2 && b2 == b"body-A");
+
+        // 2) The race: builder bumps deck_list_revision mid-build (simulates
+        //    the concurrent deck write the body never fully observed). Node
+        //    drops such a body; pre-fix Rust stored it under the NEW revision.
+        let racy = |c: &Connection| -> Result<Vec<u8>, rusqlite::Error> {
+            c.execute_batch(
+                "INSERT INTO deck_cards (deck_id, card_id, quantity) VALUES (101, 'z-etali', 1);",
+            )
+            .unwrap(); // deck_list_rev_deck_cards_insert fires
+            Ok(b"body-B-mixed".to_vec())
+        };
+        let (b3, hit3) = build_deck_list_cached_with(&conn, 2, &store, racy).unwrap();
+        assert!(!hit3 && b3 == b"body-B-mixed"); // fresh body is still served once
+        let after = current_revision(&conn).unwrap().unwrap();
+        assert!(after > rev1, "builder must have bumped the revision");
+        assert!(
+            !store.lock().unwrap().contains_key(&2),
+            "H1/H2: body built while the revision moved must NOT be cached (would serve stale until the next bump)"
+        );
+
+        // 3) After the dropped build, a clean build stores under the new revision.
+        let (b4, hit4) =
+            build_deck_list_cached_with(&conn, 2, &store, |_: &Connection| Ok(b"body-C".to_vec())).unwrap();
+        assert!(!hit4 && b4 == b"body-C");
+        assert_eq!(store.lock().unwrap().get(&2), Some(&(after, b"body-C".to_vec())));
     }
 
     #[test]

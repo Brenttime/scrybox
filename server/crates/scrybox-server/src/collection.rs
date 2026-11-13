@@ -897,6 +897,18 @@ impl From<i64> for RevPair {
     }
 }
 
+/// Single-flight slot key: cache key + validity pair (review 2026-11-13 H1,
+/// same pattern as search.rs's `format!("{key}\u{0}{rev_i}")`). Without the
+/// revision in the slot key, a build started at R1 owns the coalescing cell;
+/// a request that already probed R2 calls `slot(key)`, gets handed the R1
+/// cell by `get_or_try_init`, and can serve the stale R1 body under the
+/// route ETag computed from R2 — sticky in the browser cache until the next
+/// write. Keying the slot by the pair makes each revision a separate
+/// coalescing group; stale in-flight builds simply lose the race.
+fn slot_key(key: &str, rp: RevPair) -> String {
+    format!("{key}\u{0}{}\u{0}{}", rp.coll, rp.deck)
+}
+
 pub struct CacheEntry {
     rev: i64,
     deck_rev: i64,
@@ -1281,16 +1293,21 @@ pub fn spawn_refresher(state: &AppState) {
                 if cache.is_current(&key, rp) || cache.on_cooldown(&key) {
                     continue;
                 }
-                if cache.inflight_contains(&key) {
-                    // An older build owns the slot; it lands shortly and the
+                let skey = slot_key(&key, rp);
+                if cache.inflight_contains(&skey) {
+                    // A build for THIS revision is already in flight (request
+                    // path or an earlier tick); it lands shortly and the
                     // is_current check skips it next tick (or we fire then).
+                    // Old-revision in-flights have their own slot key and no
+                    // longer mask this one (H1).
                     retry_next_tick = true;
                     continue;
                 }
-                let slot = cache.slot(&key);
+                let slot = cache.slot(&skey);
                 let cache2 = Arc::clone(&cache);
                 let pool3 = Arc::clone(&pool);
                 let key2 = key.clone();
+                let skey2 = skey.clone();
                 tokio::spawn(async move {
                     let init_cache = Arc::clone(&cache2);
                     let init_pool = Arc::clone(&pool3);
@@ -1323,7 +1340,7 @@ pub fn spawn_refresher(state: &AppState) {
                             cache2.refresh_failed(&key2);
                         }
                     }
-                    cache2.finish(&key2);
+                    cache2.finish(&skey2);
                 });
             }
             if !retry_next_tick {
@@ -1469,7 +1486,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             // miss on this key awaits ONE build_body_parallel through a
             // shared OnceCell slot, gated by the cross-key build semaphore.
             let cache = Arc::clone(&st.collection_cache);
-            let slot = cache.slot(&key);
+            let skey = slot_key(&key, rp);
+            let slot = cache.slot(&skey);
             let init_cache = Arc::clone(&cache);
             let init_pool = Arc::clone(&pool);
             let init_key = key.clone();
@@ -1487,7 +1505,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     Ok(r)
                 })
                 .await;
-            cache.finish(&key);
+            cache.finish(&skey);
             // get_or_try_init nests: outer Err carries a clone of the init
             // error, outer Ok wraps the stored Result<Arc<CacheEntry>, String>.
             match res {
@@ -2001,5 +2019,35 @@ mod store_budget {
         );
         // Unmoved counter still hits.
         assert!(cache.get(&ka, RevPair::for_shape(&a, Some(1), Some(1))).is_some());
+    }
+
+    // --- review 2026-11-13 H1: single-flight slots keyed by revision --------
+
+    #[test]
+    fn in_flight_slot_is_keyed_by_revision() {
+        let cache = CollectionCache::new();
+        let p = params(0);
+        let key = p.cache_key();
+        let rp1 = RevPair::for_shape(&p, Some(1), Some(7));
+        let rp2 = RevPair::for_shape(&p, Some(2), Some(7));
+        let old_build = cache.slot(&slot_key(&key, rp1));
+        // The refresher's guard: a build in flight for a DIFFERENT revision
+        // must not mask this revision (checked before slot() creates the cell).
+        assert!(
+            !cache.inflight_contains(&slot_key(&key, rp2)),
+            "old-revision in-flight must not mask a new-revision build (H1)"
+        );
+        assert!(cache.inflight_contains(&slot_key(&key, rp1)));
+        // A write bumped coll 1->2 while the R1 build owns the coalescing
+        // cell: the new-revision probe must NOT be handed the R1 cell by
+        // get_or_try_init (that serves the R1 body under the R2 ETag).
+        let fresh = cache.slot(&slot_key(&key, rp2));
+        assert!(
+            !Arc::ptr_eq(&old_build, &fresh),
+            "stale-revision in-flight must not be shared with a new-revision request (H1)"
+        );
+        // Same revision still coalesces onto one cell.
+        let same = cache.slot(&slot_key(&key, rp1));
+        assert!(Arc::ptr_eq(&old_build, &same), "same-revision misses must coalesce");
     }
 }
