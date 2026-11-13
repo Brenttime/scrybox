@@ -1647,6 +1647,87 @@ async fn collq_durable_hit_serves_native_shape_and_headers() {
     assert!(h.get("x-total-count").is_none());
 }
 
+/// iter-16: the walk leg's `readCatalogSnapshot` expectedSnapshot contract.
+/// Node verifies the caller's token against the CURRENT
+/// `remote:{membershipVersion}:{revision}` on EVERY request (fresh build or
+/// cached replay — the token is not part of the response-cache key) and
+/// throws CATALOG_SNAPSHOT_CHANGED on mismatch; the route answers
+/// 409 `{error: 'CATALOG_SNAPSHOT_CHANGED'}` (collection.js:221). Falsy
+/// `snapshot` (route line 140: typeof !== 'string' for a duplicated key →
+/// null) skips the check and never proxies.
+#[tokio::test]
+async fn collq_walk_snapshot_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    seed_cqc(path.as_path(), "sol ring", "en", r#"["sol ring"]"#, 4, 1, now_ms());
+    let upstream = spawn_fake_node().await;
+    let r = router_for_sidecar_mode(path.clone(), &["search"], &format!("http://{upstream}"));
+
+    let good = "remote:29e29f45850c995b7b8a:4";
+    let base = "/api/search?scope=collection&q=sol%20ring&limit=60&page=1";
+
+    // Cold build, no snapshot: the token the caller would echo next.
+    let (s, h, _) = get_json(&r, base).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["x-catalog-snapshot"], good);
+
+    // Matching token (warm replay path — same response-cache key) answers
+    // natively with the full walk-leg contract.
+    let (s, h, b) = get_json(&r, &format!("{base}&snapshot={good}")).await;
+    assert_eq!(s, StatusCode::OK, "matching snapshot must answer natively");
+    assert!(h.get("x-node").is_none(), "snapshot match must not proxy");
+    assert_eq!(h["x-catalog-snapshot"], good);
+    assert_eq!(h["x-total-count"], "3");
+    assert_eq!(h["x-source"], "sidecar");
+    assert_eq!(b.as_array().unwrap().len(), 3);
+
+    // Mismatch → 409 with Node's exact body, answered natively.
+    let (s, h, b) = get_json(&r, &format!("{base}&snapshot=x")).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(h.get("x-node").is_none(), "409 is answered natively, not proxied");
+    assert_eq!(b, serde_json::json!({ "error": "CATALOG_SNAPSHOT_CHANGED" }));
+    // ...and the check never poisons the shared cache entry.
+    let (s, _, _) = get_json(&r, base).await;
+    assert_eq!(s, StatusCode::OK, "a 409 must not evict the cached body");
+
+    // Falsy snapshot skips the check (Node `if (expectedSnapshot && ...)`).
+    let (s, h, _) = get_json(&r, &format!("{base}&snapshot=")).await;
+    assert_eq!(s, StatusCode::OK, "empty snapshot is falsy → no check");
+    assert!(h.get("x-node").is_none());
+
+    // Duplicated key parses as a qs array: typeof !== 'string' → Node passes
+    // expectedSnapshot null — no check anywhere, no proxy.
+    let (s, h, _) = get_json(&r, &format!("{base}&snapshot=x&snapshot=y")).await;
+    assert_eq!(s, StatusCode::OK, "array snapshot is null in Node → no check");
+    assert!(h.get("x-node").is_none());
+
+    // A real collection mutation bumps BOTH revision counters via triggers:
+    // the pre-bump token must now 409, and the fresh token mint at the new
+    // revision must 200 (header + check agree, like Node's single txn).
+    {
+        let conn = Connection::open(path.as_path()).unwrap();
+        conn.execute(
+            "INSERT INTO collection (id, card_id, quantity, condition, printing, language, purchase_price, added_at, notes, is_trade, user_id, is_proxy)
+             VALUES (9, 'cc1', 1, 'Near Mint', 'Normal', 'English', NULL, '2024-02-01 00:00:00', '', 0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        let rev: i64 = conn
+            .query_row("SELECT revision FROM collection_snapshot WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rev, 5, "collection trigger bumps the catalog revision");
+    }
+    let (s, h, b) = get_json(&r, &format!("{base}&snapshot={good}")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "token minted at the old revision is stale");
+    assert_eq!(b, serde_json::json!({ "error": "CATALOG_SNAPSHOT_CHANGED" }));
+    let fresh = "remote:29e29f45850c995b7b8a:5";
+    let (s, h, b) = get_json(&r, &format!("{base}&snapshot={fresh}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.get("x-node").is_none());
+    assert_eq!(h["x-catalog-snapshot"], fresh);
+    assert_eq!(b.as_array().unwrap().len(), 4, "the new owned row is in the answer");
+}
+
 #[tokio::test]
 async fn collq_structured_queries_and_params_proxy() {
     let dir = tempfile::tempdir().unwrap();
@@ -1669,7 +1750,9 @@ async fn collq_structured_queries_and_params_proxy() {
         "/api/search?scope=collection&q=t%3A%22big%20creature%22",       // quoted operator value
         "/api/search?scope=collection&q=t%3Dcreature",                   // '=' comparator
         "/api/search?scope=collection&q=unique%3Acards",                 // smuggled sidecar param
-        "/api/search?scope=collection&q=sol%20ring&snapshot=x",          // expectedSnapshot contract
+        // (iter-16: `&snapshot=…` is no longer a proxy pin — the walk-leg
+        // readCatalogSnapshot check is native; pinned in
+        // collq_walk_snapshot_contract.)
         "/api/search?scope=collection&q=sol%20ring&count=0&count=1",     // qs array
         "/api/search?scope=database&q=sol%20ring",                       // other scope
     ] {
