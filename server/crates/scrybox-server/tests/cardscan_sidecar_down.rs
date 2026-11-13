@@ -1,13 +1,13 @@
-//! LANE B unit 6a — the sidecar-down arms (separate binary: CARDSCAN_URL
-//! is a boot snapshot, so the unreachable URL must not leak into the main
-//! cardscan_route suite). Two arms from upstreamError():
-//!   refused/DNS  → 503 {ok:false,unavailable:true,error:'Scanner service
-//!                  is not running'}
-//!   everything else (timeout, junk gateway body) → 502 {ok:false,
-//!                  unavailable:false,error:'Scanner service error'}
-//! (the junk-body 502 arm lives in the main suite via the mock's 502 route.)
+//! LANE B unit 6a — the sidecar-down arms. CARDSCAN_URL is a process-wide
+//! boot snapshot (cardscan.rs base_url OnceLock mirrors Node's module-load
+//! const), so each URL gets its OWN test binary: a second test in the same
+//! binary would silently reuse whichever URL snapshotted first.
+//! This binary: refused (bound-but-not-listening port) → 503
+//! {ok:false,unavailable:true,error:'Scanner service is not running'}.
+//! The DNS arm lives in cardscan_dns_down.rs; the junk-body 502 arm lives in
+//! the main cardscan_route suite via the mock's 502 route.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::OnceLock};
+use std::{collections::BTreeSet, path::PathBuf};
 
 use axum::{
     body::Body,
@@ -22,23 +22,28 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn seeded_db(dir: &std::path::Path) -> PathBuf {
-    static ONCE: OnceLock<PathBuf> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let path = dir.join("t.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(include_str!("schema_fixture.sql")).unwrap();
-        conn.execute_batch(
-            "INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, api_key)
-               VALUES (1,'u1','x','member','tok-1',1,NULL);
-             INSERT INTO sessions (token, user_id, expires_at) VALUES ('sess-1', 1, '2099-01-01 00:00:00');",
-        )
-        .unwrap();
-        path
-    })
-    .clone()
+    let path = dir.join("t.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("schema_fixture.sql")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, api_key)
+           VALUES (1,'u1','x','member','tok-1',1,NULL);
+         INSERT INTO sessions (token, user_id, expires_at) VALUES ('sess-1', 1, '2099-01-01 00:00:00');",
+    )
+    .unwrap();
+    path
 }
 
-async fn harness(url: &str) -> Router {
+struct Harness {
+    router: Router,
+    _dir: tempfile::TempDir,
+    // Holds the bound-but-not-listening fd: dropping it frees the port and
+    // a bind(0) mock in a sibling binary could claim it (the original
+    // port-cursor flake shape).
+    _fd: i32,
+}
+
+async fn harness(url: &str, fd: i32) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let db = seeded_db(dir.path());
     std::env::set_var("CARDSCAN_URL", url);
@@ -52,14 +57,18 @@ async fn harness(url: &str) -> Router {
         });
         a
     };
-    app(AppState::new(Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        node_upstream: format!("http://{node}"),
-        static_dir: None,
-        rust_routes: ["cardscan"].into_iter().map(String::from).collect::<BTreeSet<_>>(),
-        db_path: Some(db),
-        sidecar_url: None,
-    }))
+    Harness {
+        router: app(AppState::new(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            node_upstream: format!("http://{node}"),
+            static_dir: None,
+            rust_routes: ["cardscan"].into_iter().map(String::from).collect::<BTreeSet<_>>(),
+            db_path: Some(db),
+            sidecar_url: None,
+        })),
+        _dir: dir,
+        _fd: fd,
+    }
 }
 
 async fn post(r: &Router, path: &str, ct: &str, body: String) -> (StatusCode, Value) {
@@ -115,25 +124,16 @@ async fn refused_sidecar_is_503_unavailable() {
     // test's lifetime. The old bind-then-drop freed the port, and a bind(0)
     // mock in a sibling test binary used to steal it and answer 200 — the
     // workspace-run flake (std::net::TcpSocket is unstable, hence libc).
-    let (_fd, port) = bound_unlistening_port();
-    let r = harness(&format!("http://127.0.0.1:{port}")).await;
-    let (st, v) = post(&r, "/api/cardscan", "application/json", r#"{"cards":[{"a":1}]}"#.to_string()).await;
+    // The tempdir/DB now live in the Harness too: iter-19 root-caused the
+    // residual flake to a dropped tempdir deleting the shared OnceLock DB
+    // path under workspace scheduling → DbPool::open Err → Rust routes
+    // disabled → the proxy answered the fake node's 200.
+    let (fd, port) = bound_unlistening_port();
+    let h = harness(&format!("http://127.0.0.1:{port}"), fd).await;
+    let (st, v) = post(&h.router, "/api/cardscan", "application/json", r#"{"cards":[{"a":1}]}"#.to_string()).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v, json!({"ok":false,"unavailable":true,"error":"Scanner service is not running"}));
-    let (st, v) = post(&r, "/api/cardscan/detect", "image/jpeg", "J".repeat(200)).await;
+    let (st, v) = post(&h.router, "/api/cardscan/detect", "image/jpeg", "J".repeat(200)).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v["unavailable"], true);
-}
-
-#[tokio::test]
-async fn dns_failure_is_503_unavailable() {
-    let r = harness("http://cardscan-does-not-exist.invalid:8321").await;
-    let req = Request::builder().method("GET").uri("/api/cardscan/status").header("authorization", "Bearer sess-1").body(Body::empty()).unwrap();
-    let resp = r.clone().oneshot(req).await.unwrap();
-    let st = resp.status();
-    let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-    // status GET also maps through upstreamError on DNS failure.
-    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(v, json!({"ok":false,"unavailable":true,"error":"Scanner service is not running"}));
 }

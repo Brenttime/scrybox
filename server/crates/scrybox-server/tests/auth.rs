@@ -132,13 +132,60 @@ fn client_ip_key_rules_gate_xff_on_socket_trust() {
     // Trusted right-hand hop is walked; the untrusted client stays.
     h.insert("x-forwarded-for", "198.18.0.7, 172.18.0.2".parse().unwrap());
     assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "198.18.0.7");
-    // All hops trusted → proxy-addr's walk finds no untrusted hop and falls
-    // back to the socket (every actor in the chain is a proxy we trust).
+    // All hops trusted → proxy-addr's forwarded() hands back the whole
+    // chain and req.ip takes the leftmost XFF token, NOT the socket.
+    // (iter-18 asserted the socket here from a source read; the live
+    // proxy-addr 2.0.7 / express req.ip oracle below disproved it.)
     h.insert("x-forwarded-for", "10.0.0.5, 127.0.0.1".parse().unwrap());
-    assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "127.0.0.1");
+    assert_eq!(client_ip_key(Some(peer.ip()), &h, &trust), "10.0.0.5");
     // No XFF at all → socket.
     let h3 = HeaderMap::new();
     assert_eq!(client_ip_key(Some(peer.ip()), &h3, &trust), "127.0.0.1");
+}
+
+#[test]
+fn client_ip_key_matches_proxy_addr_live_oracle() {
+    // Every case below was measured 2026-11-13 against the REAL stack in
+    // scrybox-rusttest-node (express req.ip => proxy-addr 2.0.7 forwarded),
+    // socket 127.0.0.1 — the iter-18 "unverified corner" item. Trust shape
+    // mirrors the harness TRUST_PROXY=loopback,uniquelocal.
+    let trust = Trust::from_env_value("loopback, uniquelocal");
+    let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let key = |xff: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", xff.parse().unwrap());
+        client_ip_key(Some(peer.ip()), &h, &trust)
+    };
+    // C_all_hops_trusted: '10.0.0.9, 127.0.0.1' -> req.ip 10.0.0.9.
+    assert_eq!(key("10.0.0.9, 127.0.0.1"), "10.0.0.9");
+    // D_all_loopback: indistinguishable shape, must stay 127.0.0.1.
+    assert_eq!(key("127.0.0.1, 127.0.0.1"), "127.0.0.1");
+    // S1_single_trusted_hop: one trusted hop = LAN client behind a
+    // loopback front — must bucket per client, not per socket.
+    assert_eq!(key("10.0.0.9"), "10.0.0.9");
+    // S2_single_trusted_loop.
+    assert_eq!(key("127.0.0.1"), "127.0.0.1");
+    // S3_leftmost_untrusted_far: walk stops at the right-most untrusted
+    // hop; anything further left is irrelevant.
+    assert_eq!(key("203.0.113.1, 198.18.0.7, 10.0.0.9"), "198.18.0.7");
+    // E_garbage_hop: proxy-addr keeps unparseable tokens verbatim.
+    assert_eq!(key("garbage"), "garbage");
+    // F_trusted_then_garbage: garbage left of a trusted hop is the client.
+    assert_eq!(key("garbage, 10.0.0.9"), "garbage");
+    // H: empty XFF header value → socket.
+    assert_eq!(key(""), "127.0.0.1");
+    // Trust::All (trust proxy = true): T1 leftmost token verbatim,
+    // T2 leftmost parsed, T3 no XFF → socket.
+    let all = Trust::from_env_value("true");
+    let key_all = |xff: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", xff.parse().unwrap());
+        client_ip_key(Some(peer.ip()), &h, &all)
+    };
+    assert_eq!(key_all("garbage, 10.0.0.9"), "garbage");
+    assert_eq!(key_all("203.0.113.1, 198.18.0.7"), "203.0.113.1");
+    let none = HeaderMap::new();
+    assert_eq!(client_ip_key(Some(peer.ip()), &none, &all), "127.0.0.1");
 }
 
 #[test]
