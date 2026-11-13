@@ -1325,3 +1325,92 @@ async fn bulk_add_ownership_and_auth_gates() {
     assert_eq!(body["entries"][0]["card_id"], "c2");
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection WHERE card_id = 'c2' AND user_id = 2"), 2);
 }
+
+// ---------------------------------------------------------------------------
+// REVIEW-writes.md H4 (lane-B iter 33): a hostile `quantity` must not
+// pre-allocate. Node's non-stack path (collection.js:569-582) is a plain
+// `for (let i = 0; i < count; i++)` of autocommit INSERTs — unbounded but
+// allocation-free. The Rust port materialised `vec![1; count as usize]`
+// first, so POST {"quantity":"4000000000"} tried a 32 GiB Vec<i64> before
+// any SQL ran and the failed allocation abort-killed the WHOLE process.
+// RED before the fix: these two tests crash the test binary with
+// "memory allocation of 32000000000 bytes failed" before reaching any
+// assert; the loop form answers Node's own verdict instead.
+// ---------------------------------------------------------------------------
+
+/// AFTER INSERT trip-wire: once collection holds `max_rows`, every further
+/// INSERT aborts. Bounds the copy loop's SQL work for any count, so the
+/// only thing separating "process abort" from "Node's 500" is whether the
+/// copies are iterated lazily.
+fn install_row_cap(db: &PathBuf, max_rows: i64) {
+    exec(
+        db,
+        &format!(
+            "CREATE TRIGGER coll_row_cap AFTER INSERT ON collection
+             WHEN (SELECT COUNT(*) FROM collection) > {max_rows}
+             BEGIN SELECT RAISE(ABORT, 'test row cap'); END;"
+        ),
+    );
+}
+
+#[tokio::test]
+async fn add_huge_quantity_nonstack_streams_copies() {
+    let (_d, db) = db(); // 5 seeded collection rows
+    install_row_cap(&db, 7); // 2 new rows land, the 3rd aborts
+    let (s, body) = add(db.clone(), r#"{"card_id":"c2","quantity":"4000000000"}"#).await;
+    // Node: the loop runs until an INSERT throws; the throw hits the route
+    // catch (collection.js:602) → 500 {"error":"Failed to add card"}.
+    // Pre-fix Rust never got that far — the Vec allocation aborted the
+    // process instead.
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, json!({ "error": "Failed to add card" }));
+    // The failed BEGIN IMMEDIATE tx rolled back: nothing landed.
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection"), 5);
+}
+
+#[tokio::test]
+async fn bulk_add_huge_quantity_fails_entries_not_process() {
+    let (_d, db) = db();
+    install_row_cap(&db, 6); // exactly 1 new row per attempt
+    let (s, body) = bulk_add(db.clone(), r#"{"card_ids":["c2","c3"],"quantity":"4000000000"}"#).await;
+    // Each entry's copy loop dies on the trip-wire → per-entry generic
+    // failure (collection.js bulkAddToCollection), process unharmed.
+    // Node's route (collection.js:673) answers 500 when everything failed
+    // (`failed.length && !added.length`) — the port matches.
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["added"], 0);
+    assert_eq!(body["failed"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(body["failed"][0]["error"], "Failed to add card");
+    assert_eq!(body["failed"][1]["error"], "Failed to add card");
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection"), 5);
+}
+
+// Positive controls — green before AND after the fix; they pin the two
+// iteration arms (stack = single qty-N row, non-stack = count qty-1 rows)
+// and the count >= 1 boundary so the streaming rewrite can't drift.
+
+#[tokio::test]
+async fn add_huge_quantity_stack_single_row_control() {
+    let (_d, db) = db();
+    // stackable → ONE row with quantity=count (collection.js:555-567); no
+    // per-copy iteration at all, so the eager Vec never formed here either.
+    let (s, body) = add(db.clone(), r#"{"card_id":"c4","quantity":"4000000000","stackable":true}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let id = body["id"].as_i64().unwrap();
+    assert_eq!(scalar(&db, &format!("SELECT quantity FROM collection WHERE id = {id}")), 4_000_000_000);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection"), 6);
+}
+
+#[tokio::test]
+async fn add_quantity_two_two_rows_control() {
+    let (_d, db) = db();
+    let (s, body) = add(db.clone(), r#"{"card_id":"c4","quantity":"2"}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    let ids = body["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM collection"), 7);
+    assert_eq!(
+        scalar(&db, &format!("SELECT COUNT(*) FROM collection WHERE quantity = 1 AND card_id = 'c4'")),
+        3 // 1 seeded + the two streamed copies
+    );
+}
