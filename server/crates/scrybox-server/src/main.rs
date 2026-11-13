@@ -148,9 +148,43 @@ async fn main() {
         }
     }
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server");
+    tracing::info!("scrybox-server stopped");
+}
+
+/// Review M1 (concurrency-jobs): Docker/systemd stop with SIGTERM, which
+/// tokio does not handle by default (the process died mid-response). Resolve
+/// on SIGTERM or Ctrl-C so axum drains in-flight requests; the drain is
+/// bounded by a hard exit after `SCRYBOX_SHUTDOWN_GRACE_MS` (default 10 s).
+/// Background jobs (backup timer, price sweep, moxfield scheduler) are
+/// aborted with the runtime: SQLite WAL keeps the DB consistent and backups
+/// write `*.bak.tmp` + rename, so no partial `*.bak` survives.
+async fn shutdown_signal() {
+    let term = async {
+        #[cfg(unix)]
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = term => {},
+    }
+    let grace_ms: u64 = std::env::var("SCRYBOX_SHUTDOWN_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    tracing::info!(grace_ms, "shutdown signal received; draining connections");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(grace_ms));
+        tracing::warn!("graceful drain exceeded {grace_ms} ms; exiting");
+        std::process::exit(0);
+    });
 }
