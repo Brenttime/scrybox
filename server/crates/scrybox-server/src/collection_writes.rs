@@ -347,7 +347,7 @@ pub(crate) fn get_row_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> 
     }
 }
 
-fn get_rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, WriteError> {
+pub(crate) fn get_rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, WriteError> {
     let mut stmt = conn.prepare_cached(sql)?;
     let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;

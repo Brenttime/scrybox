@@ -44,9 +44,18 @@ fn hits() -> &'static Mutex<Vec<Hit>> {
     H.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Poison-tolerant lock. An assert that fails WHILE holding the hits guard
+/// (the iter-11 frame_hydrates cascade) poisoned the shared mutex and every
+/// sibling test's lock().unwrap() died with it — the recorded hits are still
+/// valid state after a panic, so unwrap_or_else(into_inner) keeps one
+/// failure from cascading into a suite-wide 502 storm.
+fn hits_lock() -> std::sync::MutexGuard<'static, Vec<Hit>> {
+    hits().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 async fn hit_matches(pred: impl Fn(&Hit) -> bool) -> bool {
     for _ in 0..150 {
-        if hits().lock().unwrap().iter().any(&pred) {
+        if hits_lock().iter().any(&pred) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -55,7 +64,7 @@ async fn hit_matches(pred: impl Fn(&Hit) -> bool) -> bool {
 }
 
 fn no_hit(pred: impl Fn(&Hit) -> bool) -> bool {
-    !hits().lock().unwrap().iter().any(&pred)
+    !hits_lock().iter().any(&pred)
 }
 
 fn img(n: usize) -> String {
@@ -84,7 +93,7 @@ fn mock_sidecar() -> &'static str {
                         let body_str = String::from_utf8_lossy(&bytes).into_owned();
                         let path = parts.uri.path_and_query().map(|s| s.as_str().to_string()).unwrap_or_default();
                         let g = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-                        hits().lock().unwrap().push(Hit {
+                        hits_lock().push(Hit {
                             method: parts.method.as_str().to_string(),
                             path: path.clone(),
                             ct: g("content-type"),
@@ -381,7 +390,18 @@ async fn frame_hydrates_and_shapes_reply() {
         .collect();
     assert_eq!(expect_client.chars().count(), 102, "sanity of the ladder");
     let pred_client = expect_client.clone();
-    if let Some(h) = hits().lock().unwrap().iter().find(|h| h.path == "/api/scan-frame") {
+    // Clone-then-drop-guard: NEVER assert across the hits() guard (the
+    // iter-11 root-cause — a failing assert while the guard is live poisoned
+    // the shared mutex for every sibling test).
+    // Path-only find is NOT unique: sibling tests proxy /api/scan-frame to
+    // fake-node without the scan headers, and whichever hit lands first used
+    // to win the race (scan_client None flake). Select on the full identity
+    // (path + session), same predicate as hit_matches below.
+    let frame_hit = hits_lock()
+        .iter()
+        .find(|h| h.path == "/api/scan-frame" && h.scan_session.as_deref() == Some("1-sess123"))
+        .cloned();
+    if let Some(h) = frame_hit {
         assert_eq!(h.scan_client, Some(expect_client.clone()), "client header mismatch");
         assert_eq!(h.scan_session, Some("1-sess123".to_string()), "session header mismatch");
     }

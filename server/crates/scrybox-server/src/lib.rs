@@ -594,6 +594,17 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
+    // Lane A iter-49: POST /api/admin/seed-cards (admin.js:19 — the last
+    // Lane-A route) under `seed_cards`. Non-POST rides the proxy verbatim
+    // (Node's router.use auth + final-handler 404 chain). (Iter-50: after
+    // the 22:25 adjudication, lane B's seed_cards failed parity on
+    // ps_seed_oversize_no_token — global normalJson 413 above auth — so the
+    // Lane-A twin is authoritative; see PROGRESS.)
+    let router = if state.owns("seed_cards") {
+        router.route("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
+    } else {
+        router
+    };
     // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
     // `decks_writes`) and deck reads (GET list / detail / locations,
     // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
@@ -724,14 +735,6 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/admin/users", any(admin_users::route_users))
             .route("/api/admin/users/{id}", any(admin_users::route_user))
-    } else {
-        router
-    };
-    // Lane A iter-49: POST /api/admin/seed-cards (admin.js:19 — the last
-    // Lane-A route) under `seed_cards`. Non-POST rides the proxy verbatim
-    // (Node's router.use auth + final-handler 404 chain).
-    let router = if state.owns("seed_cards") {
-        router.route("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
     } else {
         router
     };

@@ -309,7 +309,13 @@ const FIXED_KEY = 'bnd_' + 'f'.repeat(48);
 const SESSION_EXP = '2030-01-01 00:00:00';
 const hashPw = (pw, salt) => `${PBKDF2_ITER}:${salt}:${crypto.pbkdf2Sync(pw, salt, PBKDF2_ITER, 64, 'sha512').toString('hex')}`;
 const PW_HASH0 = hashPw(PW_OLD, SALT0);
-function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB); d.exec('PRAGMA busy_timeout=10000;'); try { return fn(d); } finally { d.close(); } }
+// Busy timeout: the servers write the shared DB copy too (seed-cards'
+// BEGIN IMMEDIATE + 208 inserts, bulk adds, collection writes). Without a
+// timeout DatabaseSync returns SQLITE_BUSY immediately — the pre-documented
+// harness race family (iter-10 printing-identity, iter-12 dr_* crash). 5 s
+// of waiting rides out any server-side transaction; a real deadlock still
+// surfaces as an error.
+function dbWrite(fn) { const d = new DatabaseSync(AUTH_DB, { timeout: 5000 }); try { return fn(d); } finally { d.close(); } }
 function resetParityUser() {
   dbWrite((d) => {
     const row = d.prepare('SELECT id FROM users WHERE username = ?').get(PARITY_USER);
@@ -3600,6 +3606,105 @@ cases.push({ name: 'spa_apifoo_proxied_404', path: '/apifoo', headers: {}, metho
     body: MP_ORDER_BODY(),
     setup: async () => { mpSeed(MP_OFF_UID, 'rusttest_mp_off', { configured: true, enabled: 0 }); },
     teardown: async () => { mpPurge(); } });
+}
+
+// --- LANE-B iteration 12: POST /api/admin/seed-cards (admin.js dev seed) ----
+// The write targets the CALLER's own collection, so the write case runs as a
+// dedicated admin user (own 9313xx id block + fixed session token), never as
+// the bench admin — wiping brenttime's seeded rows would poison every
+// downstream case on the shared DB copy. The response message carries
+// Σ-quantity (random, ∈ [208,416]) → stripped; the readBack re-pins the
+// message SHAPE (from this side's own json), the exact 208-row count, the
+// randomEntry value domains, the seed-set purge and the foreign-row survival
+// — all booleans, so the cross-side `seen` fold is deterministic despite the
+// per-side RNG. Both legs ride the SAME scryfall-local snapshot as the
+// search parity (restart-rust-b.sh pins LOCAL_SCRYFALL_URL identically).
+{
+  const SEED_UID = 931391;
+  const SEED_TOK = 'rusttest-seed-session-4f2a91c6b8d3e70519ac82fd6e0b3c7415d9af2e6c8b041f7a2d5e9c3b6f8012';
+  const SEED_T0 = '2024-01-01 00:00:00';
+  function seedPurge() {
+    dbWrite((d) => {
+      d.prepare('DELETE FROM sessions WHERE token = ?').run(SEED_TOK);
+      d.prepare('DELETE FROM collection WHERE user_id = ?').run(SEED_UID);
+      d.prepare('DELETE FROM users WHERE id = ?').run(SEED_UID);
+    });
+  }
+  function seedPrep() {
+    seedPurge();
+    return dbWrite((d) => {
+      d.prepare('INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)')
+        .run(SEED_UID, 'rusttest_seed_admin', '210000:00000000000000000000000000000000:00', 'admin', 'rusttest-seed-shr', SEED_T0);
+      d.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(SEED_TOK, SEED_UID, SESSION_EXP);
+      const lea = d.prepare("SELECT id FROM card_cache WHERE set_id = 'lea' ORDER BY id LIMIT 1").get();
+      const mh3 = d.prepare("SELECT id FROM card_cache WHERE set_id = 'mh3' ORDER BY id LIMIT 1").get();
+      const other = d.prepare("SELECT id FROM card_cache WHERE set_id NOT IN ('lea','mh3') AND set_id IS NOT NULL ORDER BY id LIMIT 1").get();
+      if (!lea || !mh3 || !other) return null;
+      // condition='Damaged' is legal in the schema but NEVER produced by
+      // the seed — it marks the pre-seeded rows so the purge/survival
+      // checks survive a random re-draw of the very same card ids.
+      d.prepare("INSERT INTO collection (card_id, quantity, user_id, condition) VALUES (?, 2, ?, 'Damaged')").run(lea.id, SEED_UID);
+      d.prepare("INSERT INTO collection (card_id, quantity, user_id, condition) VALUES (?, 3, ?, 'Damaged')").run(mh3.id, SEED_UID);
+      d.prepare("INSERT INTO collection (card_id, quantity, user_id, condition) VALUES (?, 1, ?, 'Damaged')").run(other.id, SEED_UID);
+      return { leaId: lea.id, mh3Id: mh3.id, otherId: other.id };
+    });
+  }
+  const SEED_HDR = () => ({ Authorization: `Bearer ${SEED_TOK}`, 'content-type': 'application/json' });
+  const MSG_RE = /^Successfully seeded a large test collection: \d+ cards for admin user\.$/;
+
+  cases.push({
+    name: 'seed_ok', path: '/api/admin/seed-cards', headers: SEED_HDR(), method: 'POST', body: '{}',
+    strip: ['$.message'],
+    setup: async () => {
+      const ctx = seedPrep();
+      if (!ctx) throw new Error('parity DB copy carries no lea/mh3/other card_cache rows — reseed from prod');
+      return { ctx };
+    },
+    readBack: async (other, ctx, { json, status }) => {
+      const v = dbWrite((d) => {
+        // Fresh rows only: everything the seed wrote carries a
+        // non-Damaged condition (see seedPrep's marker).
+        const agg = d.prepare("SELECT COUNT(*) AS rows, SUM(quantity) AS qty FROM collection WHERE user_id = ? AND condition != 'Damaged'").get(SEED_UID);
+        const bad = d.prepare(
+          `SELECT COUNT(*) AS n FROM collection WHERE user_id = ? AND condition != 'Damaged' AND (
+             quantity NOT IN (1,2)
+             OR condition NOT IN ('Near Mint','Lightly Played','Moderately Played','Heavily Played')
+             OR printing NOT IN ('Normal','Holofoil')
+             OR language NOT IN ('English','Japanese')
+             OR purchase_price IS NULL OR purchase_price < 0 OR purchase_price > 10
+             OR ABS(ROUND(purchase_price * 100) - purchase_price * 100) > 1e-6
+           )`).get(SEED_UID).n;
+        const purged = d.prepare(
+          "SELECT COUNT(*) AS n FROM collection WHERE user_id = ? AND condition = 'Damaged' AND card_id IN (?, ?)").get(SEED_UID, ctx.leaId, ctx.mh3Id).n;
+        const keep = d.prepare("SELECT quantity AS q FROM collection WHERE user_id = ? AND card_id = ? AND condition = 'Damaged'").get(SEED_UID, ctx.otherId);
+        return { rows: agg.rows, qty: agg.qty, bad, purged, keepQ: keep ? keep.q : null };
+      });
+      const added = (() => {
+        const m = String(json?.message || '').match(/collection: (\d+) cards/);
+        return m ? Number(m[1]) : -1;
+      })();
+      const ok = status === 200 && MSG_RE.test(String(json?.message || ''))
+        && added >= 208 && added <= 416 && added === v.qty
+        && v.rows === 208 && v.bad === 0 && v.purged === 0 && v.keepQ === 1;
+      return {
+        ok,
+        why: `rows=${v.rows} Σqty=${v.qty} msgAdded=${added} bad=${v.bad} purged=${v.purged} keepQ=${v.keepQ}`,
+        seen: { rows: v.rows, bad: v.bad, purged: v.purged, keepQ: v.keepQ, qtyInRange: v.qty >= 208 && v.qty <= 416 },
+      };
+    },
+    teardown: async () => { seedPurge(); },
+  });
+  // Gate ladder (deterministic, no writes reach seed()).
+  cases.push({ name: 'seed_no_token', path: '/api/admin/seed-cards', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+  cases.push({ name: 'seed_bad_token', path: '/api/admin/seed-cards', headers: { Authorization: 'Bearer '.concat('dead'.repeat(4)), 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+  cases.push({ name: 'seed_member', path: '/api/admin/seed-cards', headers: { Authorization: `Bearer ${MEMBER_SESSION}`, 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+  cases.push({ name: 'seed_apikey_readonly', path: '/api/admin/seed-cards', headers: { Authorization: 'Bearer '.concat(FIXED_KEY), 'content-type': 'application/json' }, method: 'POST', body: '{}' });
+  // Body-parser-before-auth and the POST-only router: both answers belong to
+  // Node (Rust Forwards), so this pins the forward branches.
+  cases.push({ name: 'seed_badjson_preauth', path: '/api/admin/seed-cards', headers: { 'content-type': 'application/json' }, method: 'POST', body: '{oops' });
+  cases.push({ name: 'seed_get_forwards', path: '/api/admin/seed-cards', headers: { Authorization: `Bearer ${SEED_TOK}` }, method: 'GET',
+    setup: async () => { const ctx = seedPrep(); return { ctx }; },
+    teardown: async () => { seedPurge(); } });
 }
 
 
