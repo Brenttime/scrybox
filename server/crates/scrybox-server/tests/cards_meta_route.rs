@@ -65,7 +65,7 @@ fn seeded_db(dir: &std::path::Path, name: &str) -> PathBuf {
     conn.execute_batch(
         "INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, api_key)
            VALUES (1,'adm','x','admin','tok-a',0,NULL),
-                  (2,'mem','x','member','tok-m',0,NULL);
+                  (2,'mem','x','member','tok-m',0,'apikey-member');
          INSERT INTO sessions (token, user_id, expires_at) VALUES
            ('sess-admin', 1, '2099-01-01 00:00:00'),
            ('sess-member', 2, '2099-01-01 00:00:00');
@@ -303,6 +303,49 @@ async fn highlight_validation_and_gate() {
     let (s, _, _) = request(&f.router, "POST", "/api/cards/highlight", &[("authorization", "Bearer sess-member"), ("content-type", "text/plain")], Some("q=a")).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(f.scry.hits_for("GET /cards/search").is_empty());
+}
+
+// REVIEW-auth.md H2: API keys are GET-only (middleware/auth.js:24-26).
+// gate_core must hand authenticate() `want == GET`, not a hardcoded true.
+#[tokio::test]
+async fn highlight_rejects_api_key_on_post() {
+    let f = fixture(&["cards_meta"]).await;
+    *f.scry.search.lock().unwrap() =
+        json!({"data": [{"name": "Goblin Racketeer"}], "has_more": false});
+    // RED before the fix: gate_core authenticated with want ignored, so the
+    // API key sailed through and the route answered natively with 200.
+    let (s, _, b) = request(
+        &f.router,
+        "POST",
+        "/api/cards/highlight",
+        &[("authorization", "Bearer apikey-member"), ("content-type", "application/json")],
+        Some("{\"q\":\"goblin\",\"names\":[\"Goblin Racketeer\"]}"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "POST with an API key must 403 like Node");
+    assert_eq!(
+        json_body(&b),
+        json!({"error": "API keys are read-only. Use a login session for this request."})
+    );
+    // The rejection happens at the gate — the engine is never touched.
+    assert!(f.scry.hits_for("GET /cards/search").is_empty());
+
+    // Positive controls (green both sides): the same key on the GET legs
+    // of the module still authenticates (native /api/suggest answers)…
+    let (s, _, b) = request(&f.router, "GET", "/api/suggest?q=goblin", &[("authorization", "Bearer apikey-member")], None).await;
+    assert_eq!(s, StatusCode::OK, "GET with an API key stays allowed");
+    assert!(json_body(&b)["suggestions"].is_array());
+    // …and a login session still answers the POST natively.
+    let (s, _, b) = request(
+        &f.router,
+        "POST",
+        "/api/cards/highlight",
+        &MEMBER_JSON,
+        Some("{\"q\":\"goblin\",\"names\":[\"Goblin Racketeer\"]}"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_body(&b), json!({"names": ["Goblin Racketeer"]}));
 }
 
 #[tokio::test]

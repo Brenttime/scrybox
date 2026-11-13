@@ -1886,7 +1886,17 @@ pub(crate) fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Re
     };
     let mut tx = Tx::begin(conn)?;
     let mut ids: Vec<i64> = Vec::new();
-    let quantities: Vec<i64> = if *stack { vec![*count] } else { vec![1; *count as usize] };
+    // H4 (REVIEW-writes.md): iterate the copies lazily. The previous
+    // `vec![1; count as usize]` materialised 8·quantity bytes BEFORE any
+    // SQL ran, so {"quantity":"4000000000"} was a 32 GiB allocation that
+    // OOM-aborted the whole process (Node's for-loop at collection.js:569
+    // is unbounded but allocation-free). The unbounded loop itself is
+    // Node-parity; a sane cap needs the same change in Node — owner call.
+    let quantities: Box<dyn Iterator<Item = i64> + '_> = if *stack {
+        Box::new(std::iter::once(*count))
+    } else {
+        Box::new(std::iter::repeat(1i64).take(*count as usize))
+    };
     let mut last = 0i64;
     for q in quantities {
         conn.execute(

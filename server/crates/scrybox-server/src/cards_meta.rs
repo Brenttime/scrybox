@@ -374,11 +374,14 @@ fn sqlv_json(v: rusqlite::types::Value) -> Value {
 
 /// The (db, auth) prefix every route needs after the owns/method check.
 /// Returns (pool, headers, cond, user id); auth errors return as Err.
+/// `want` drives Node's GET-only API-key rule (middleware/auth.js:24-26:
+/// `req.method !== 'GET'` + API key → 403 'API keys are read-only') —
+/// REVIEW-auth.md H2.
 fn gate_core(st: &AppState, headers: &HeaderMap, want: &Method) -> Result<(std::sync::Arc<DbPool>, Cond, i64), Response> {
     let pool = st.db.clone().ok_or_else(|| Response::new(Body::empty()))?;
     let cond = if *want == Method::GET { get_cond(headers) } else { Cond::Post };
     let token = bearer_token(headers).map(str::to_string);
-    let user = authenticate(&pool, token.as_deref(), true).map_err(|res| res)?;
+    let user = authenticate(&pool, token.as_deref(), *want == Method::GET).map_err(|res| res)?;
     Ok((pool, cond, user.id))
 }
 
