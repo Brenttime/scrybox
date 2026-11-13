@@ -1000,6 +1000,41 @@ impl CollectionCache {
         }
         hit
     }
+    /// LRU-evict until stored bytes (raw + any gz copy) fit `max_bytes`;
+    /// never evicts the last entry. Returns bytes freed.
+    fn evict_over_budget(&self, e: &mut Inner) -> u64 {
+        let mut freed: u64 = 0;
+        let budget = self.max_bytes.load(Ordering::Relaxed);
+        let mut total_bytes: u64 = e.entries.values().map(|v| v.bytes()).sum();
+        while total_bytes > budget && e.entries.len() > 1 {
+            let victim = e
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.seen.load(Ordering::Relaxed))
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    if let Some(v) = e.entries.remove(&k) {
+                        total_bytes -= v.bytes();
+                        freed += v.bytes();
+                    }
+                }
+                None => break,
+            }
+        }
+        freed
+    }
+    /// Review M3: the gz copy is filled lazily after `put`'s budget check, so
+    /// re-run eviction once it lands to keep raw+gz inside `max_bytes`.
+    fn account_encoded(&self) {
+        let freed = {
+            let mut e = self.inner.lock().unwrap();
+            self.evict_over_budget(&mut e)
+        };
+        if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) && freed > 0 {
+            self.trim_dirty.store(true, Ordering::Relaxed);
+        }
+    }
     /// Store a freshly built entry and return it. `cost` is the measured
     /// build time (permit acquired → body complete), recorded for the
     /// pre-warm cost gate (iter 15).
@@ -1044,24 +1079,7 @@ impl CollectionCache {
                     true
                 }
             });
-            let budget = self.max_bytes.load(Ordering::Relaxed);
-            let mut total_bytes: u64 = e.entries.values().map(|v| v.bytes()).sum();
-            while total_bytes > budget && e.entries.len() > 1 {
-                let victim = e
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, v)| v.seen.load(Ordering::Relaxed))
-                    .map(|(k, _)| k.clone());
-                match victim {
-                    Some(k) => {
-                        if let Some(v) = e.entries.remove(&k) {
-                            total_bytes -= v.bytes();
-                            freed += v.bytes();
-                        }
-                    }
-                    None => break,
-                }
-            }
+            freed += self.evict_over_budget(&mut e);
         }
         if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) {
             self.trim_dirty.store(true, Ordering::Relaxed);
@@ -1520,6 +1538,9 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                 }
             })
             .await;
+        if gz.is_ok() {
+            st.collection_cache.account_encoded();
+        }
         match gz {
             Ok(gz) => (gz.clone(), Some("gzip")),
             Err(e) => {
@@ -1897,6 +1918,20 @@ mod store_budget {
         cache.put(params(200).cache_key(), 1, body, None, Duration::from_millis(50));
         assert!(cache.take_trim(), "evicting >= trim_dirty_bytes must arm the trim");
         assert!(!cache.take_trim(), "take_trim swaps the flag off");
+    }
+
+    #[test]
+    fn lazily_built_gz_copy_counts_toward_budget() {
+        let cache = CollectionCache::new();
+        cache.max_bytes.store(2500, Ordering::Relaxed);
+        let a = cache.put(params(0).cache_key(), 1, vec![1u8; 1000], None, Duration::from_millis(50));
+        cache.put(params(100).cache_key(), 1, vec![2u8; 1000], None, Duration::from_millis(50));
+        // gz for offset-0 lands after put (as in the serve path): 2000 + 800 > 2500.
+        a.gz.set(Bytes::from(vec![0u8; 800])).unwrap();
+        cache.account_encoded();
+        let inner = cache.inner.lock().unwrap();
+        let stored: u64 = inner.entries.values().map(|e| e.bytes()).sum();
+        assert!(stored <= 2500, "raw+gz must fit the budget: {stored}");
     }
 
     #[test]

@@ -1,9 +1,13 @@
-//! Read-only SQLite access shared by the ported Rust routes.
+//! SQLite connection pool shared by the ported Rust routes.
 //!
-//! Node owns writes (it is still the backend for everything unported and it
-//! also writes to this same DB copy). Rust therefore never issues a write;
-//! it reads through a small pool of independent connections so SQLite can
-//! serve them concurrently out of WAL mode. The PRAGMAs mirror
+//! Pooled connections are READERS AND WRITERS: Rust owns many write routes
+//! (collection/deck/list writes, settings, auth sessions, backups, price
+//! sweeps, migrations) and Node may still write the same DB file for
+//! unported routes. Independent connections let SQLite serve reads
+//! concurrently out of WAL mode; writers serialize on SQLite's lock (and the
+//! route-level locks). Do NOT open the pool READ_ONLY / `query_only`.
+//! `foreign_keys` is OFF on pooled connections, so any ON DELETE CASCADE
+//! Node relies on must be performed explicitly by the Rust write path. The PRAGMAs mirror
 //! `backend/src/db.js` so readers get the same page-cache/mmap behaviour
 //! Node configured.
 
@@ -66,14 +70,14 @@ impl DbPool {
 
     fn connect(path: &PathBuf, cfg: PoolConfig) -> rusqlite::Result<Connection> {
         // READ_WRITE (not READ_ONLY): WAL readers need the -shm file and
-        // busy_timeout must cover the brief shared-lock window. We still
-        // never issue writes from Rust.
+        // busy_timeout must cover the brief shared-lock window. Pooled
+        // connections also serve Rust's write routes.
         let conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        // Same set as backend/src/db.js on open (foreign_keys is irrelevant
-        // for reads; optimize/analysis_limit are writer-side planner hints),
+        // Same set as backend/src/db.js on open (foreign_keys stays OFF —
+        // cascades are explicit in Rust write paths; optimize/analysis_limit are writer-side planner hints),
         // with the page-cache/mmap sizes taken from the pool budget instead
         // of Node's single-connection values.
         conn.execute_batch(
