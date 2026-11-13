@@ -998,14 +998,18 @@ async fn checkout_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
         tracing::error!("decks checkout: {e:?}");
         json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED)
     };
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => return fail(&e),
-    };
+    // H3/M3: no pool checkout is held while waiting on alloc_lock below.
     // withAllocationLock wraps only the guarded mutation; the diagnostics
-    // below run outside it, like Node's.
+    // below run outside it, like Node's. The checkout query's connection is
+    // taken INSIDE the lock — pre-fix a single connection was taken up
+    // front and held across the alloc_lock wait, so under the pool's live
+    // cap queued writers could starve the lock holder (deadlock).
     let checked_out = {
         let _guard = alloc_lock().lock().await;
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => return fail(&e),
+        };
         rows_map(
             &conn,
             &checkout_sql(),
@@ -1027,6 +1031,12 @@ async fn checkout_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
     if !checked_out.is_empty() {
         return json_response(StatusCode::OK, &json!({ "message": "Deck checked out successfully" }));
     }
+    // Diagnostics + mutation run outside the lock, like Node's — this
+    // checkout is taken only on the slow path, after every alloc_lock wait.
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
     let deck = match get_row_map(
         &conn,
         "SELECT id, checked_out FROM decks WHERE id = ?1 AND user_id = ?2",
@@ -1209,5 +1219,67 @@ mod tests {
         assert!(matches!(desc_or_empty(Some(&json!(""))), SqlValue::Text(s) if s.is_empty()));
         assert!(matches!(desc_or_empty(Some(&json!("d"))), SqlValue::Text(s) if s == "d"));
         assert!(matches!(desc_or_empty(Some(&json!(true))), SqlValue::Integer(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkout_deck_never_holds_a_checkout_across_alloc_lock() {
+        // H3/M3 (REVIEW-writes): pre-fix, checkout_deck took the pool's
+        // only connection BEFORE awaiting alloc_lock. A lock holder that
+        // then needed a connection (the bulk_delete/delete_inner lock-then-
+        // get shape) starved forever — deadlock under the pool's live cap.
+        // Red-before-fix: with the get-before-lock pattern the holder join
+        // below times out. Positive control: pre-fix (and post-fix) a
+        // writer with no competing lock holder completes normally — see
+        // tests/decks_writes.rs checkout coverage.
+        let dir = std::env::temp_dir().join(format!("scrybox-checkout-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        {
+            let setup = rusqlite::Connection::open(&path).unwrap();
+            setup.execute_batch(include_str!("../tests/schema_fixture.sql")).unwrap();
+        }
+        // Exactly one connection may be LIVE.
+        let pool = std::sync::Arc::new(
+            crate::db::DbPool::open_with(
+                &path,
+                crate::db::PoolConfig { max: 1, cache_kb: 2048, mmap_kb: 0, live_max: 1 },
+            )
+            .unwrap(),
+        );
+
+        // Lock holder: takes alloc_lock, waits until the writer is queued,
+        // THEN needs a connection (lock-then-get, like bulk_delete).
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let hp = std::sync::Arc::clone(&pool);
+        let holder = tokio::spawn(async move {
+            let _g = alloc_lock().lock().await;
+            let _ = held_tx.send(());
+            // Wait until the queued writer has had time to reach its
+            // (pre-fix) get-before-lock block, then demand a connection.
+            let _ = go_rx.await;
+            let c = hp.get().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(c);
+        });
+        held_rx.await.unwrap();
+
+        // Queued writer: must not be holding a checkout while it waits on
+        // the lock. Deck 999 does not exist → 404 after the lock section.
+        let cp = std::sync::Arc::clone(&pool);
+        let writer = tokio::spawn(async move { checkout_deck(&cp, "999", 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = go_tx.send(());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), holder)
+            .await
+            .expect("M3: alloc_lock holder starved — checkout held across the lock wait")
+            .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("M3: checkout_deck deadlocked behind the pool cap")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(pool.live_count(), 0);
     }
 }

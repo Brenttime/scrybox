@@ -1034,7 +1034,13 @@ async fn put_inner(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Resul
     }
 
     // withAllocationLock(saveEntry): in-process mutex + BEGIN IMMEDIATE.
+    // H3/M3 (REVIEW-writes): never hold a pool connection across the
+    // alloc_lock wait — under the pool's live cap a queue of writers each
+    // holding a checkout would starve the lock holder (deadlock). `entry`
+    // is materialised; current_entry is re-read under the lock anyway.
+    drop(conn);
     let _guard = alloc_lock().lock().await;
+    let conn = pool.get()?;
     let mut tx = Tx::begin(&conn)?;
 
     let current_entry = match get_row_map(
