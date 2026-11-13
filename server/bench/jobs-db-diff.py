@@ -21,8 +21,26 @@ Flow:
      app_settings.mtg_prices_swept_at — the latter is separately asserted to
      have been written on BOTH sides).
 
-Usage: python3 jobs-db-diff.py [--keep] [--cards 225]
-Exit 0 = byte-identical affected tables; 1 = diffs (samples printed); 2 = setup failure.
+Review-gate hardening (lane-B iter-29, orchestrator 13:03 ruling):
+  * prune now SEEDS a deterministic deck (decks + deck_cards rows) instead of
+    dropping all deck_cards. The sweep query (scry_jobs.rs SWEEP_SQL and
+    refresh_price_estimates' unpriced check, scryfallApi.js twin) unions in
+    every cached printing of a logical card used by a deck; with deck_cards
+    empty that arm was dead on both sides — a twin that dropped the UNION
+    would have PASSed forever. Deck names are chosen cache-wide with <=2
+    printings and NOT owned, so the deck arm must add sweep rows beyond the
+    collection arm (asserted by the deck-arm-rows guard).
+  * Positive-write guards: both copies must end with sets > 0,
+    price_history > 0 and price_history rows for cards nobody owns
+    (deck-arm-only rows). Empty-vs-empty MATCHes are no longer a PASS.
+  * Negative controls (--no-negative-control to skip): after the honest PASS,
+    poison the Rust copy (one targeted mutation per compared table) and
+    require EVERY compared table to report a DIFF. A harness that cannot
+    fail cannot gate. Exit 0 requires verdict PASS AND every control fired.
+
+Usage: python3 jobs-db-diff.py [--keep] [--cards 225] [--no-negative-control]
+Exit 0 = byte-identical affected tables AND negative controls all detected;
+1 = diffs (samples printed) or a control went undetected; 2 = setup failure.
 """
 import argparse
 import json
@@ -75,7 +93,41 @@ def prune(path, keep_cards):
         sys.exit(2)
     qmarks = ",".join("?" * len(keep))
     c.execute(f"DELETE FROM collection WHERE card_id NOT IN ({qmarks})", keep)
+    # Review-gate fix (lane-B iter-29): do NOT leave deck_cards empty. The
+    # sweep query unions in every cached printing whose logical key matches a
+    # DECK-used card (scry_jobs.rs SWEEP_SQL, scryfallApi.js twin), and
+    # refresh_price_estimates adds `UNION SELECT card_id FROM deck_cards
+    # WHERE quantity > 0`. With deck_cards pruned to zero that arm was dead
+    # on BOTH sides — a twin dropping the UNION would PASS forever. Seed one
+    # deterministic deck: names with 2..4 cached printings, none owned, so
+    # the deck arm must sweep sibling printings nobody owns (asserted by the
+    # deck-only-rows guard in main).
     c.execute("DELETE FROM deck_cards")
+    c.execute("DELETE FROM decks")
+    names = [r[0] for r in c.execute(
+        """SELECT name FROM card_cache
+            WHERE name IS NOT NULL
+              AND LOWER(TRIM(name)) NOT IN (
+                SELECT DISTINCT LOWER(TRIM(cc.name)) FROM collection col
+                JOIN card_cache cc ON cc.id = col.card_id
+                WHERE col.quantity > 0 AND cc.name IS NOT NULL)
+            GROUP BY LOWER(TRIM(name))
+            HAVING COUNT(*) BETWEEN 2 AND 4
+            ORDER BY LOWER(TRIM(name)) LIMIT 8""")]
+    deck_rows = 0
+    if names:
+        c.execute("INSERT INTO decks (id, user_id, name, source) VALUES (90042, 42, 'dbdiff-deck', 'manual')")
+        for i, nm in enumerate(names):
+            row = c.execute(
+                "SELECT id FROM card_cache WHERE LOWER(TRIM(name))=LOWER(TRIM(?)) ORDER BY id LIMIT 1",
+                (nm,)).fetchone()
+            if row:
+                c.execute("INSERT OR IGNORE INTO deck_cards (deck_id, card_id, quantity) VALUES (90042, ?, ?)",
+                          (row[0], i + 1))
+                deck_rows += 1
+    if deck_rows == 0:
+        print("prune: no eligible deck cards seeded — deck-arm coverage lost", file=sys.stderr)
+        sys.exit(2)
     c.execute("DELETE FROM sets")
     c.execute("DELETE FROM price_history")
     # Deterministic sweep gate: interval 1 day + NULL swept_at = due now.
@@ -174,6 +226,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep the DB copies for inspection")
     ap.add_argument("--cards", type=int, default=225, help="distinct owned cards to sweep (75/batch)")
+    ap.add_argument("--no-negative-control", action="store_true",
+                    help="skip the poison-the-Rust-copy self-check (NOT for gate runs)")
     args = ap.parse_args()
 
     if not os.path.exists(JOBS_BIN):
@@ -208,11 +262,52 @@ def main():
             print("   ", line)
     # Both sides must have stamped the sweep checkpoint (the excluded column).
     for side, p in (("node", ndb), ("rust", rdb)):
-        v = sqlite3.connect(p).execute(
+        conn = sqlite3.connect(p)
+        v = conn.execute(
             "SELECT mtg_prices_swept_at FROM app_settings WHERE id=1").fetchone()[0]
-        print(f"{side}: mtg_prices_swept_at = {v!r}")
-        if not v:
+        # Positive-write guards (iter-29 review gate): an emptied-and-refetched
+        # table that stayed empty on BOTH sides would diff as MATCH. Require
+        # the full write paths to have produced rows: sets repopulated,
+        # price_history written, and at least one price_history row for a
+        # card nobody owns — proof the deck-union arm of the sweep ran and
+        # priced sibling printings (see the deck seeding in prune()).
+        n_sets = conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0]
+        n_ph = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+        n_deck = conn.execute(
+            "SELECT COUNT(*) FROM price_history WHERE card_id NOT IN "
+            "(SELECT card_id FROM collection)").fetchone()[0]
+        conn.close()
+        print(f"{side}: mtg_prices_swept_at = {v!r}, sets={n_sets}, "
+              f"price_history={n_ph}, deck-only-priced={n_deck}")
+        if not v or n_sets == 0 or n_ph == 0 or n_deck == 0:
             ok = False
+
+    # Negative controls (iter-29 review gate): poison the Rust copy with one
+    # targeted mutation per compared table; EVERY table must then report a
+    # DIFF. Proves the diff machinery can fail — a harness that never fails
+    # gates nothing. Skippable only for debugging via --no-negative-control.
+    if ok and not args.no_negative_control:
+        poisons = {
+            "sets": "UPDATE sets SET name = name || '!' WHERE set_code = "
+                    "(SELECT set_code FROM sets ORDER BY id LIMIT 1)",
+            "card_cache": "UPDATE card_cache SET price_normal = COALESCE(price_normal, 0) + 1 WHERE id = "
+                          "(SELECT card_id FROM collection ORDER BY card_id LIMIT 1)",
+            "price_history": "UPDATE price_history SET price = price + 1 WHERE card_id = "
+                             "(SELECT card_id FROM price_history ORDER BY card_id LIMIT 1)",
+            "app_settings": "UPDATE app_settings SET price_refresh_days = "
+                            "COALESCE(price_refresh_days, 0) + 1 WHERE id = 1",
+        }
+        pc = sqlite3.connect(rdb)
+        for t, sql in poisons.items():
+            pc.execute(sql)
+        pc.commit()
+        pc.close()
+        for t in TABLES:
+            d = diff(ndb, rdb, t, limit=1)
+            fired = bool(d)
+            print(f"negative-control {t}: {'DETECTED' if fired else 'UNDETECTED'}")
+            if not fired:
+                ok = False
 
     if not args.keep:
         for p in (seed, ndb, rdb):

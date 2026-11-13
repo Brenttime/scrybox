@@ -333,6 +333,8 @@ def cleanup(keep, procs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep DB copies + server log")
+    ap.add_argument("--no-negative-control", action="store_true",
+                    help="skip the poison-the-Rust-copy self-check (NOT for gate runs)")
     args = ap.parse_args()
 
     procs = []
@@ -388,11 +390,70 @@ def main():
 
         # 3. Both sides actually stamped a run row (the diff would MATCH on 0=0).
         for side, p in (("node", ndb), ("rust", rdb)):
-            n = sqlite3.connect(p).execute(
+            conn = sqlite3.connect(p)
+            n = conn.execute(
                 "SELECT COUNT(*) FROM manabox_sync_runs WHERE user_id=?", (uid,)).fetchone()[0]
-            print(f"{side}: manabox_sync_runs rows = {n}")
+            # Positive-write guards (iter-29 review gate): require each plan
+            # arm to have ACTUALLY written — summary numbers alone could in
+            # principle be echoed by a no-op engine; the tables must show it.
+            n_coll = conn.execute(
+                "SELECT COUNT(*) FROM collection WHERE user_id=?", (uid,)).fetchone()[0]
+            n_holo = conn.execute(
+                "SELECT COUNT(*) FROM collection WHERE user_id=? AND printing='Holofoil'",
+                (uid,)).fetchone()[0]
+            hand = conn.execute(
+                "SELECT quantity FROM collection WHERE user_id=? AND condition='Lightly Played'",
+                (uid,)).fetchone()
+            redated = conn.execute(
+                "SELECT added_at FROM collection WHERE user_id=? AND condition='Near Mint'",
+                (uid,)).fetchone()
+            n_lists = conn.execute(
+                "SELECT COUNT(*) FROM card_lists WHERE user_id=?", (uid,)).fetchone()[0]
+            n_lc = conn.execute(
+                "SELECT COUNT(*) FROM list_cards WHERE list_id IN "
+                "(SELECT id FROM card_lists WHERE user_id=?)", (uid,)).fetchone()[0]
+            conn.close()
+            print(f"{side}: runs={n} collection={n_coll} holofoil-removed={1 - n_holo} "
+                  f"hand={hand} redated={redated[0] if redated else None} "
+                  f"lists={n_lists} list_cards={n_lc}")
             if n != 1:
                 ok = False
+            if n_coll != 3 or n_holo != 0 or hand != (1,) or n_lists != 3 or n_lc != 3:
+                ok = False
+            if not redated or redated[0] == "2023-05-01 00:00:00":
+                ok = False  # redate arm did not move the kept row's date
+
+        # 4. Negative controls (iter-29 review gate): poison the Rust copy
+        # with one targeted mutation per compared table and require EVERY
+        # compared table to report a DIFF. Proves the table_rows/diff
+        # machinery can actually fail on each write path — a harness that
+        # cannot fail gates nothing. (The response-vs-EXPECTED arm is
+        # self-controlled: EXPECTED_SUMMARY is harness-owned, so both-sides-
+        # wrong already fails.)
+        if not args.no_negative_control:
+            lc_poison = (
+                "UPDATE list_cards SET quantity = quantity + 1 WHERE card_id=? AND list_id = "
+                "(SELECT id FROM card_lists WHERE user_id=? AND name='ThirdList')", (CARD, uid))
+            poisons = [
+                ("collection", "UPDATE collection SET quantity = quantity + 5 "
+                               "WHERE user_id=? AND condition='Near Mint'", (uid,)),
+                ("list_cards", *lc_poison),
+                ("card_lists", "UPDATE card_lists SET name = name || '!' "
+                               "WHERE user_id=? AND name='ThirdList'", (uid,)),
+                ("manabox_sync_runs", "UPDATE manabox_sync_runs SET report = report || 'X' "
+                                      "WHERE user_id=?", (uid,)),
+            ]
+            pc = sqlite3.connect(rdb)
+            for _, sql, prm in poisons:
+                pc.execute(sql, prm)
+            pc.commit()
+            pc.close()
+            for t, _, _ in poisons:
+                d = diff(ndb, rdb, t, uid)
+                fired = bool(d)
+                print(f"negative-control {t}: {'DETECTED' if fired else 'UNDETECTED'}")
+                if not fired:
+                    ok = False
 
         if args.keep:
             print(f"kept: {ndb} {rdb} {os.path.join(DATA, 'mbx_rust_server.log')}")
