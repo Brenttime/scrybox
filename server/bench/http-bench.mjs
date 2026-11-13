@@ -189,7 +189,15 @@ function fastRequestBytes(s, xffPath) {
 // Worker 0 only (rotOffset 0): N workers each firing the edit/revert pair
 // every 2 s would multiply the write pressure by N.
 const writeMixMs = isChild && rotOffset !== 0 ? 0 : Number(opt('--write-mix', 0));
-const writeBase = opt('--write-base', base.replace(':3310', ':3312'));
+// Same foot-gun class as parity.mjs's old NODE default (lane-B queue):
+// replacing ':3310' in a non-default --base silently no-ops and the write
+// mix lands on the bench target itself instead of the Node twin. Derive
+// from the scenario base, and refuse a same-target write mix.
+const writeBase = opt('--write-base', scenarios.base.replace(':3310', ':3312'));
+if (writeMixMs > 0 && writeBase === base) {
+  console.error(`http-bench: write-base resolves to the bench base (${base}) — writes would hit the measured server. Pass --write-base explicitly.`);
+  process.exit(2);
+}
 const writeId = opt('--write-id', '4');
 const writeAuth = scenarios.scenarios.find(s => s.headers?.Authorization)?.headers?.Authorization;
 let mixTicks = 0, mixErrors = 0, mixInFlight = null;

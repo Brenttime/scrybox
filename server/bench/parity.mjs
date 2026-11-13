@@ -77,7 +77,16 @@ const scenPath = args.find(a => a.endsWith('.json')) ||
   new URL('.', import.meta.url).pathname + '../../../scen-rust.json';
 const scen = JSON.parse(fs.readFileSync(scenPath, 'utf8'));
 const RUST = opt('--rust', scen.base);
-const NODE = opt('--node', RUST.replace(':3310', ':3312'));
+// Lane-B queue item (iter-21..25 notes): the old default
+// `RUST.replace(':3310', ':3312')` silently compared Rust against ITSELF
+// whenever --rust used any port other than 3310 (e.g. lane-B's :3320),
+// producing an all-green run that proved nothing. Derive the twin from the
+// scenario's own base instead, and hard-fail on an identical pair.
+const NODE = opt('--node', scen.base.replace(':3310', ':3312'));
+if (RUST === NODE) {
+  console.error(`parity: RUST and NODE resolve to the same base (${RUST}) — the suite would compare a server with itself. Pass --node explicitly.`);
+  process.exit(2);
+}
 const VERBOSE = args.includes('--verbose');
 
 // --- cases -------------------------------------------------------------------
@@ -232,7 +241,11 @@ cases.push({
   name: 'ps_post_no304', path: '/api/search',
   headers: PS_JSON, method: 'POST', body: JSON.stringify({ name: 'Sol Ring' }),
   setup: async (base) => {
-    const r = await fetch(base + '/api/search?name=Sol%20Ring', { headers: { ...authHeaders, 'cache-control': 'no-cache' } });
+    // XFF rotation on setup/replay fetches (lane-B queue): without it these
+    // legs share the socket's single limiter bucket with everything else the
+    // harness does, making solo-vs-concurrent battery runs bucket-contention
+    // sensitive (iter-18 boot-429 family).
+    const r = await fetch(base + '/api/search?name=Sol%20Ring', { headers: { ...authHeaders, 'x-forwarded-for': xff(), 'cache-control': 'no-cache' } });
     const etag = r.headers.get('etag');
     return { headers: { ...PS_JSON, ...(etag ? { 'if-none-match': etag } : {}) } };
   },
@@ -1008,7 +1021,10 @@ cases.push({
   setup: async () => ({ ctx: { snap: setSnap() } }),
   teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
   readBack: async (other) => {
-    const r = await fetch(other + '/api/settings', { headers: authHeaders });
+    // XFF rotation on read-back fetches (lane-B queue): keep every harness
+    // leg in its own limiter bucket — no-XFF legs share the socket bucket
+    // with concurrent batteries (bucket-contention family).
+    const r = await fetch(other + '/api/settings', { headers: { ...authHeaders, 'x-forwarded-for': xff() } });
     const j = await r.json();
     return { ok: j.price_refresh_days === 7, why: `price read-back ${j.price_refresh_days}`, seen: j.price_refresh_days };
   },
@@ -1025,7 +1041,8 @@ cases.push({
   setup: async () => ({ ctx: { snap: setSnap() } }),
   teardown: async (_b, ctx) => { if (ctx?.snap) setRestore(ctx.snap); },
   readBack: async (other) => {
-    const r = await fetch(other + '/api/settings', { headers: authHeaders });
+    // XFF rotation on read-back fetches (lane-B queue), same as above.
+    const r = await fetch(other + '/api/settings', { headers: { ...authHeaders, 'x-forwarded-for': xff() } });
     const j = await r.json();
     return { ok: j.public_base_url === 'https://parity.test:9', why: `base_url read-back ${JSON.stringify(j.public_base_url)}`, seen: j.public_base_url };
   },
@@ -1553,7 +1570,10 @@ function rawGet(base, path, headers) {
   return new Promise((resolve, reject) => {
     const u = new URL(base);
     const req = http.request(
-      { host: u.hostname, port: u.port, path, method: 'GET', headers },
+      // XFF rotation on the ETag-replay leg too (lane-B queue): replay
+      // fetches without it share one limiter bucket — the same
+      // bucket-contention family as the iter-18 boot-429 note.
+      { host: u.hostname, port: u.port, path, method: 'GET', headers: { ...headers, 'x-forwarded-for': xff() } },
       (res) => {
         let bytes = 0;
         res.on('data', (c) => { bytes += c.length; });
