@@ -133,13 +133,28 @@ pub struct SearchQuery {
     /// proxying: the name-only English field-filter branch (no number/set —
     /// the specific-query and set-browse legs stay on Node).
     walkable: bool,
+    /// Raw `lang` query param as Node's merge block keeps it: `langSearch`'s
+    /// resolve input and the rawPageCache key's language element
+    /// (`lang || ''`). `None` = param absent (Node's destructured null).
+    lang: Option<String>,
+    /// scope=internet: Node skips queryLocal (upstream first), the route
+    /// mergeSearchPrices the page before send, and the merge catch re-queries
+    /// the cache. The response-cache key must separate the two scopes.
+    internet: bool,
 }
 
 impl SearchQuery {
     fn cache_key(&self) -> String {
         format!(
-            "s|{}|{}|{}|{}|{}|{}|{}",
-            self.user_id, self.name, self.number, self.set, self.lang_name, self.page, self.limit
+            "s|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.user_id,
+            self.name,
+            self.number,
+            self.set,
+            self.lang_name,
+            self.page,
+            self.limit,
+            if self.internet { "i" } else { "d" }
         )
     }
 }
@@ -263,9 +278,11 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
             limit,
         }));
     }
-    if scope == "internet" {
-        return Plan::Proxy;
-    }
+    // scope=internet skips queryLocal (Node's `if (scope !== 'internet')`
+    // gate at scryfallApi.js:752) and answers from the live merge block
+    // below — lane-B iter-10 ported that leg, so internet rides Native with
+    // the internet flag set. prints/image stay proxied for both scopes.
+    let internet = scope == "internet";
     if first("prints").as_deref() == Some("1") {
         return Plan::Proxy; // allPrints can reach the live printing walk
     }
@@ -296,6 +313,8 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
             && clean_number(first("number").as_deref().unwrap_or("")).is_empty()
             && first("set").unwrap_or_default().is_empty()
             && to_name(first("lang").as_deref()) == "English",
+        lang: first("lang"),
+        internet,
     })
 }
 
@@ -1206,6 +1225,585 @@ impl SearchCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live specific/broad/fallback merge leg (runSearch scryfallApi.js:776-881,
+// lane-B iter-10): the field-filter branch once queryLocal came back empty
+// (scope=database) or without ever consulting it (scope=internet). Same
+// helpers Node uses — langSearch, the shared scryGetRetried client (sidecar
+// swap + pacing + 429-requeue inherited from src/scryfall.rs), the
+// 175-card page windows with the process-wide 5-min rawPageCache, the
+// exact/broad/fallback merge with the numberPinnedIt short-circuit, the
+// stable exact-first/cn sort, and the awaited cacheCards write — so "Rust
+// answers this request" means the bytes Node would have produced.
+// ---------------------------------------------------------------------------
+
+/// `SCRY_PAGE_SIZE` — Scryfall pages are a fixed 175 cards.
+const SCRY_PAGE_SIZE: i64 = 175;
+/// `RAW_PAGE_TTL_MS` — repeat searches cost zero upstream budget.
+const RAW_PAGE_TTL_MS: i64 = 5 * 60 * 1000;
+/// `PRINTS` — every printing, no MTGO/Arena-only rebalances.
+const LIVE_PRINTS: &str = " unique:prints -is:digital";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+struct RawPage {
+    data: Vec<Value>,
+    total: Option<u64>,
+    has_more: bool,
+}
+
+/// Module-level `rawPageCache`: (scoped q, lang, page, order) → page,
+/// 5-min TTL, reaped past 400. Failures are never cached — a retry pays
+/// the wire again, exactly like Node.
+fn raw_pages() -> &'static Mutex<HashMap<String, (i64, RawPage)>> {
+    static C: OnceLock<Mutex<HashMap<String, (i64, RawPage)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The merge block's failure mode: a real upstream error (transport,
+/// post-retry 429, non-404/422 status). Node routes it through the big
+/// catch; Rust answers the scope=internet cache fallback itself and proxies
+/// everything else (Node owns that answer).
+struct LiveErr;
+
+/// `langSearch(q, lang)`: English adds nothing (the old query string stays
+/// byte-identical); anything else appends ` lang:code` and requires
+/// include_multilingual.
+fn lang_search(q: &str, code: &str) -> (String, bool) {
+    if code == "en" {
+        (q.to_string(), false)
+    } else {
+        (format!("{q} lang:{code}"), true)
+    }
+}
+
+enum PageFetch {
+    Page(RawPage),
+    /// tryQuery's 404/422 catch: the window is empty, meta.total untouched.
+    Mismatch,
+    Failed,
+}
+
+/// `scryPage` — one /cards/search page through the shared Scry client.
+/// Node builds `/cards/search?q=…&page=N[&include_multilingual=true][&order=…]`
+/// relative to SCRYFALL_BASE_URL and lets scryUrl swap to the sidecar; the
+/// Scry client's `resolve` performs the same swap for a relative path.
+async fn scry_page_live(
+    st: &AppState,
+    scoped_q: &str,
+    lang_key: &str,
+    multilingual: bool,
+    page: i64,
+    order: Option<&str>,
+) -> PageFetch {
+    let key = format!("{scoped_q}\u{0}{lang_key}\u{0}{page}\u{0}{}", order.unwrap_or(""));
+    if let Some((exp, p)) = raw_pages().lock().unwrap().get(&key) {
+        if *exp > now_ms() {
+            return PageFetch::Page(RawPage { data: p.data.clone(), total: p.total, has_more: p.has_more });
+        }
+    }
+    let mut url = format!(
+        "/cards/search?q={}&page={}{}",
+        sidecar::encode_uri_component(scoped_q),
+        page,
+        if multilingual { "&include_multilingual=true" } else { "" }
+    );
+    if let Some(o) = order {
+        url.push_str(&format!("&order={o}"));
+    }
+    match st.scry.get_retried(&url, &crate::scryfall::ScryOpts::default(), 4).await {
+        Ok(v) => {
+            let value = RawPage {
+                data: v
+                    .as_ref()
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                total: v
+                    .as_ref()
+                    .and_then(|v| v.get("total_cards"))
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| v.as_u64()),
+                has_more: v
+                    .as_ref()
+                    .and_then(|v| v.get("has_more"))
+                    .map(|v| truthy(v))
+                    .unwrap_or(false),
+            };
+            let mut c = raw_pages().lock().unwrap();
+            c.insert(
+                key,
+                (now_ms() + RAW_PAGE_TTL_MS, RawPage { data: value.data.clone(), total: value.total, has_more: value.has_more }),
+            );
+            if c.len() > 400 {
+                let now = now_ms();
+                c.retain(|_, (exp, _)| *exp > now);
+            }
+            PageFetch::Page(value)
+        }
+        Err(e) if e.status == Some(404) || e.status == Some(422) => PageFetch::Mismatch,
+        Err(_) => PageFetch::Failed,
+    }
+}
+
+/// `fetchWindow` — the [offset, offset+limit) window over the 175-card
+/// pages, RAW cards (tryQuery normalizes on the way out).
+async fn fetch_window(
+    st: &AppState,
+    q: &str,
+    lang_key: &str,
+    code: &str,
+    offset: i64,
+    limit: i64,
+    order: Option<&str>,
+) -> Result<(Vec<Value>, Option<u64>), LiveErr> {
+    let (scoped, multilingual) = lang_search(q, code);
+    let mut page = offset.div_euclid(SCRY_PAGE_SIZE) + 1;
+    let mut skip = offset.rem_euclid(SCRY_PAGE_SIZE) as usize;
+    let mut out: Vec<Value> = Vec::new();
+    let mut total: Option<u64> = None;
+    while (out.len() as i64) < limit {
+        let p = match scry_page_live(st, &scoped, lang_key, multilingual, page, order).await {
+            PageFetch::Page(p) => p,
+            PageFetch::Mismatch => return Ok((Vec::new(), None)),
+            PageFetch::Failed => return Err(LiveErr),
+        };
+        if p.total.is_some() {
+            total = p.total;
+        }
+        out.extend(p.data.into_iter().skip(skip));
+        skip = 0;
+        if !p.has_more {
+            break;
+        }
+        page += 1;
+    }
+    out.truncate(limit as usize);
+    Ok((out, total))
+}
+
+/// The merge block's `tryQuery`: a window, normalized, with the catch
+/// rules. `meta` is meta.total — only the broad query's non-null total
+/// reaches it (the specific set+cn probe would report its own tiny count),
+/// and an errored/404 window leaves it untouched.
+#[allow(clippy::too_many_arguments)]
+async fn try_query_live(
+    st: &AppState,
+    q: &str,
+    lang_key: &str,
+    code: &str,
+    lang_name: &str,
+    off: i64,
+    limit: i64,
+    order: Option<&str>,
+    broad_q: &Option<String>,
+    meta: &mut Option<u64>,
+) -> Result<Vec<Map<String, Value>>, LiveErr> {
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (raw, total) = fetch_window(st, q, lang_key, code, off, limit, order).await?;
+    if broad_q.as_deref() == Some(q) && total.is_some() {
+        *meta = total;
+    }
+    Ok(raw.iter().map(|r| sidecar::normalize_card(r, lang_name)).collect())
+}
+
+/// id of a normalized card, as the JS dedup/sort sees it (`c.id`).
+fn card_id_of(c: &Map<String, Value>) -> String {
+    c.get("id").map(|v| crate::precons::js_string(v)).unwrap_or_default()
+}
+
+pub struct LiveOutcome {
+    pub cards: Vec<Value>,
+    pub total: Option<u64>,
+    pub source: &'static str,
+    /// Whether the caller must cacheCards() the subset: Node writes on the
+    /// success path only — never for the merged-empty cache answer nor for
+    /// the catch fallback's rows.
+    pub cache: bool,
+}
+
+/// The merge block itself. `meta` (meta.total) is threaded through so the
+/// caller's error path still sees the total a successful broad fetch
+/// reported before a later window threw, like Node's shared `meta`.
+async fn live_merge(
+    st: &AppState,
+    p: &SearchQuery,
+    meta: &mut Option<u64>,
+) -> Result<LiveOutcome, LiveErr> {
+    let set_list: Vec<String> =
+        p.set.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let scry_set = if set_list.len() == 1 {
+        format!("set:{}", set_list[0])
+    } else {
+        format!("({})", set_list.iter().map(|s| format!("set:{s}")).collect::<Vec<_>>().join(" or "))
+    };
+    // `cleanNumber.replace(/^0+/, '') || cleanNumber`
+    let stripped = {
+        let t = p.number.trim_start_matches('0').to_string();
+        if t.is_empty() {
+            p.number.clone()
+        } else {
+            t
+        }
+    };
+    let specific: Option<String> = if !set_list.is_empty() && !stripped.is_empty() {
+        Some(format!("{scry_set} cn:{stripped}"))
+    } else if !p.name.is_empty() && !stripped.is_empty() {
+        Some(format!("{} cn:{stripped}", p.name))
+    } else {
+        None
+    };
+    let set_constraint = if !set_list.is_empty() { format!(" {scry_set}") } else { String::new() };
+    let broad: Option<String> = if !p.name.is_empty() {
+        Some(format!("{}{set_constraint}{LIVE_PRINTS}", p.name))
+    } else if !set_list.is_empty() {
+        Some(format!("{scry_set}{LIVE_PRINTS}"))
+    } else {
+        None
+    };
+    // Last resort: first word only ("Adamant" from "Adamant Will").
+    let first_word = sidecar::first_word(&p.name).to_string();
+    let fallback: Option<String> = if !first_word.is_empty() && first_word != p.name {
+        Some(format!("{first_word}{set_constraint}{LIVE_PRINTS}"))
+    } else {
+        None
+    };
+    // A set browse pages by collector number; a name search keeps Scryfall's
+    // relevance order so the typed card stays on page 1.
+    let order: Option<&str> =
+        if p.name.is_empty() && !set_list.is_empty() { Some("set") } else { None };
+    let code = lang_codes(p.lang.as_deref()).1;
+    let lang_key = p.lang.as_deref().unwrap_or("");
+    let offset = (p.page - 1).saturating_mul(p.limit);
+
+    let mut exact: Vec<Map<String, Value>> = Vec::new();
+    if p.page == 1 {
+        if let Some(sq) = &specific {
+            exact =
+                try_query_live(st, sq, lang_key, &code, &p.lang_name, 0, p.limit, order, &broad, meta)
+                    .await?;
+        }
+    }
+    // A set + collector number identifies ONE card: pairing it with the
+    // broad set browse would bury it, so the browse only runs as a fallback.
+    let number_pinned = p.name.is_empty() && !stripped.is_empty() && !exact.is_empty();
+    let mut broad_cards: Vec<Map<String, Value>> = Vec::new();
+    if !number_pinned {
+        if let Some(bq) = &broad {
+            if specific.as_deref() != Some(bq.as_str()) {
+                broad_cards = try_query_live(
+                    st, bq, lang_key, &code, &p.lang_name, offset, p.limit, order, &broad, meta,
+                )
+                .await?;
+            }
+        }
+    }
+    if number_pinned {
+        *meta = Some(exact.len() as u64);
+    }
+    if exact.is_empty() && broad_cards.is_empty() {
+        if let Some(fq) = &fallback {
+            broad_cards = try_query_live(
+                st, fq, lang_key, &code, &p.lang_name, offset, p.limit, order, &broad, meta,
+            )
+            .await?;
+        }
+    }
+    // `merged = [...exact, ...broad.filter(c => !seen.has(c.id))]` — `seen`
+    // is built from exact ONLY and never extended during the filter (broad
+    // rows duplicating each other survive; Node's filter closes over the
+    // exact set).
+    let seen: std::collections::HashSet<String> = exact.iter().map(card_id_of).collect();
+    let mut merged: Vec<Map<String, Value>> = exact.clone();
+    merged.extend(broad_cards.into_iter().filter(|c| !seen.contains(&card_id_of(c))));
+    if merged.is_empty() {
+        // Node returns `localResults.map(parseCardRow)` — [] for both scopes
+        // that can reach this leg (database answered nothing from the cache,
+        // internet never queried it). An empty result IS the answer.
+        return Ok(LiveOutcome { cards: Vec::new(), total: *meta, source: "cache", cache: false });
+    }
+    let mut cards: Vec<Value> =
+        merged.into_iter().take(p.limit as usize).map(Value::Object).collect();
+    if !p.name.is_empty() || !stripped.is_empty() {
+        // Stable sort (V8's sort is stable; Rust's sort_by is too): exact
+        // matches first, then alternatives by `parseInt(number, 10) || 0`.
+        let exact_ids: std::collections::HashSet<String> = exact.iter().map(card_id_of).collect();
+        cards.sort_by(|a, b| {
+            let rank = |c: &Value| {
+                if c.as_object().map(card_id_of).map(|id| exact_ids.contains(&id)).unwrap_or(false)
+                {
+                    0
+                } else {
+                    1
+                }
+            };
+            let num = |c: &Value| {
+                c.as_object()
+                    .and_then(|m| m.get("number"))
+                    .and_then(|v| v.as_str())
+                    .and_then(js_parse_int)
+                    .unwrap_or(0)
+            };
+            rank(a).cmp(&rank(b)).then(num(a).cmp(&num(b)))
+        });
+    }
+    Ok(LiveOutcome { cards, total: *meta, source: "scryfall", cache: true })
+}
+
+/// The merge catch's scope=internet fallback: `await queryLocal()` rows in
+/// parseCardRow shape (owned_qty is attached by the caller, as the route
+/// does for every non-collection response).
+fn query_local_rows(pool: &DbPool, p: &SearchQuery) -> Result<Vec<Value>, String> {
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let (sql, params) = local_cache_query(p, None);
+    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+    let mut rows =
+        stmt.query(rusqlite::params_from_iter(params.iter())).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        out.push(Value::Object(row_to_object(row)?));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// mergeSearchPrices (utils/searchPrices.js) — the scope=internet route leg.
+// The sidecar answers price-less; fill each price-less printing from
+// card_cache (the last real quote), and only for printings never priced ask
+// the REAL Scryfall API through bulkFetchByIdentifier({upstream: true}).
+// ---------------------------------------------------------------------------
+
+const PRICE_FIELDS: [&str; 7] = [
+    "price_trend",
+    "price_normal",
+    "price_holofoil",
+    "price_etched",
+    "price_currency",
+    "price_source",
+    "price_estimated",
+];
+const PRICE_UPSTREAM_CAP: usize = 150;
+/// A cached row can carry price_source with no number (quoted before the
+/// market had one). Still "never priced" — but don't re-ask every page view.
+const EMPTY_RETRY_MS: i64 = 6 * 60 * 60 * 1000;
+/// How long a search page may wait for upstream quotes before it is
+/// returned with what card_cache had; the fetch keeps running for next time.
+const UPSTREAM_WAIT_MS: u64 = 1500;
+
+fn empty_checked_at() -> &'static Mutex<HashMap<String, i64>> {
+    static M: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `Number(v) > 0` for the price fields (null/undefined → 0/NaN → false).
+fn num_gt0(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Number(n)) => n.as_f64().map(|f| f > 0.0).unwrap_or(false),
+        Some(Value::String(s)) => sidecar::js_parse_float(s).map(|f| f > 0.0).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// `hasQuote`: an estimate (a sibling's quote) is not this printing's quote.
+fn has_quote(r: &Map<String, Value>) -> bool {
+    let est_truthy = match r.get("price_estimated") {
+        Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Some(Value::String(s)) => sidecar::js_parse_float(s).map(|f| f != 0.0).unwrap_or(false),
+        _ => false,
+    };
+    let some_quote = ["price_normal", "price_holofoil", "price_etched"]
+        .iter()
+        .any(|k| num_gt0(r.get(*k)));
+    !est_truthy && (some_quote || num_gt0(r.get("price_trend")))
+}
+
+/// `copyPrices`: `if (src[f] !== undefined)` over the seven price fields.
+/// Driver rows carry all seven (NULL → null, which JS copies too).
+fn copy_prices(target: &mut Map<String, Value>, src: &Map<String, Value>) {
+    for f in PRICE_FIELDS {
+        if let Some(v) = src.get(f) {
+            target.insert(f.to_string(), v.clone());
+        }
+    }
+}
+
+async fn merge_search_prices(st: &AppState, pool: &Arc<DbPool>, cards: &mut [Value]) {
+    if cards.is_empty() {
+        return;
+    }
+    // `need = cards.filter(c => c && c.id && c.price_source == null)` —
+    // == null covers both absent and JSON null.
+    let need_ids: Vec<(usize, String)> = cards
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let m = c.as_object()?;
+            let id = m.get("id").filter(|v| truthy(v))?;
+            let ps_absent = matches!(m.get("price_source"), None | Some(Value::Null));
+            if ps_absent {
+                Some((i, crate::precons::js_string(id)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if need_ids.is_empty() {
+        return;
+    }
+    // `[...new Set(need.map(c => c.id))]` — first-seen order.
+    let mut ids: Vec<String> = Vec::new();
+    for (_, id) in &need_ids {
+        if !ids.iter().any(|x| x == id) {
+            ids.push(id.clone());
+        }
+    }
+    let rows: Vec<Map<String, Value>> = {
+        let Ok(conn) = pool.get() else { return };
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, {} FROM card_cache WHERE id IN ({placeholders}) AND price_source IS NOT NULL",
+            PRICE_FIELDS.join(", ")
+        );
+        let mut stmt = match conn.prepare_cached(&sql) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut qres = match stmt
+            .query(rusqlite::params_from_iter(
+                ids.iter().map(|s| rusqlite::types::Value::Text(s.clone())),
+            ))
+            .map_err(|e| e.to_string())
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut out: Vec<Map<String, Value>> = Vec::new();
+        while let Ok(Some(row)) = qres.next() {
+            if let Ok(m) = row_to_object(row) {
+                out.push(m);
+            }
+        }
+        out
+    };
+    let by_id: HashMap<String, Map<String, Value>> =
+        rows.into_iter().map(|r| (card_id_of(&r), r)).collect();
+    let now = now_ms();
+    let mut missing_idx: Vec<usize> = Vec::new();
+    for (i, id) in &need_ids {
+        let r = by_id.get(id);
+        if let Some(r) = r {
+            if has_quote(r) {
+                if let Some(m) = cards[*i].as_object_mut() {
+                    copy_prices(m, r);
+                }
+                continue;
+            }
+            // Show the empty quote unless upstream has a real one.
+            if let Some(m) = cards[*i].as_object_mut() {
+                copy_prices(m, r);
+            }
+            let checked = empty_checked_at().lock().unwrap().get(id).copied();
+            if let Some(checked) = checked {
+                if now - checked < EMPTY_RETRY_MS {
+                    continue;
+                }
+            }
+        }
+        missing_idx.push(*i);
+    }
+    if missing_idx.is_empty() {
+        return;
+    }
+    // `[...new Map(missing.map(c => [c.id, c])).values()].slice(0, 150)`
+    // — last entry wins per id, then cap.
+    let mut uniq: Vec<(String, usize)> = Vec::new();
+    for i in &missing_idx {
+        let id = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()).unwrap();
+        match uniq.iter().position(|(u, _)| *u == id) {
+            Some(pos) => uniq[pos].1 = *i,
+            None => uniq.push((id, *i)),
+        }
+    }
+    uniq.truncate(PRICE_UPSTREAM_CAP);
+    let bulk_rows: Vec<Map<String, Value>> = uniq
+        .iter()
+        // Node hands bulkFetchByIdentifier the CARD rows themselves — the
+        // identifier builder picks set/collector_number/name off them.
+        .filter_map(|(_, i)| cards[*i].as_object().cloned())
+        .collect();
+    // Scryfall rate-limited us: the queue is paused (60 s), so waiting
+    // would only stall the page. Answer now; the queued fetch prices the
+    // next view.
+    let cooling = st.scry.cooldown_until().await.map(|u| u > now).unwrap_or(false);
+    let st_bg = st.clone();
+    let uniq_bg = uniq.clone();
+    let work = tokio::spawn(async move {
+        let out = crate::precons::bulk_fetch_by_identifier_opts(
+            &st_bg,
+            &bulk_rows,
+            &crate::scryfall::ScryOpts { upstream: true, breaker: false },
+        )
+        .await
+        .ok()?;
+        let priced: Vec<Map<String, Value>> = out
+            .cards
+            .into_iter()
+            .filter_map(|v| v.as_object().cloned())
+            .filter(|f| !matches!(f.get("price_source"), None | Some(Value::Null)) && has_quote(f))
+            .collect();
+        let priced_ids: std::collections::HashSet<String> = priced.iter().map(card_id_of).collect();
+        {
+            let mut m = empty_checked_at().lock().unwrap();
+            for (id, _) in &uniq_bg {
+                if !priced_ids.contains(id) {
+                    m.insert(id.clone(), now);
+                }
+            }
+        }
+        if !priced.is_empty() {
+            let pool_bg = st_bg.db.clone();
+            let maps = priced.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let Some(pool_bg) = pool_bg else { return };
+                let Ok(conn) = pool_bg.get() else { return };
+                if let Err(e) = crate::card_cache::cache_normalized_cards(&conn, &maps) {
+                    tracing::error!("search price cache write failed: {e}");
+                }
+            })
+            .await;
+        }
+        Some(priced)
+    });
+    if cooling {
+        return; // detached work keeps running; the page answers from cache.
+    }
+    let priced = match tokio::time::timeout(std::time::Duration::from_millis(UPSTREAM_WAIT_MS), work).await
+    {
+        Ok(Ok(Some(p))) => p,
+        // Timed out (or the fetch failed): the spawned task keeps running
+        // so the next page view is priced from card_cache.
+        _ => return,
+    };
+    let fresh_by_id: HashMap<String, Map<String, Value>> =
+        priced.into_iter().map(|f| (card_id_of(&f), f)).collect();
+    for i in &missing_idx {
+        let id = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()).unwrap();
+        if let Some(f) = fresh_by_id.get(&id) {
+            if let Some(m) = cards[*i].as_object_mut() {
+                copy_prices(m, f);
+            }
+        }
+    }
+}
+
 fn json_error(status: StatusCode, msg: &str) -> Response {
     (
         status,
@@ -1389,7 +1987,13 @@ pub async fn handle(
                     let build_idx = Arc::clone(&init_st.name_index);
                     let build_owned = Arc::clone(&init_st.owned_index);
                     let p2 = init_p.clone();
-                    let built = tokio::task::spawn_blocking(move || {
+                    // scope=internet skips queryLocal entirely (Node's
+                    // `if (scope !== 'internet')` gate at scryfallApi.js:752)
+                    // — the live merge below is its first leg.
+                    let built = if init_p.internet {
+                        None
+                    } else {
+                        let built = tokio::task::spawn_blocking(move || {
                         let Some((body, _total, stale)) =
                             build_body(&build_pool, &build_idx, &build_owned, &p2)?
                         else {
@@ -1402,6 +2006,8 @@ pub async fn handle(
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("build task panicked: {e}")))?;
+                        built
+                    };
 
                     let (body, gz, etag, total, source, entry_rev, stale) = match built {
                         Some(v) => v,
@@ -1411,34 +2017,42 @@ pub async fn handle(
                         // answers Ok(None): every waiter then proxies and
                         // Node answers verbatim, upserts/503s and all.
                         None => {
-                            let Some(base) = init_st
+                            let offset = (init_p.page - 1).saturating_mul(init_p.limit);
+                            let walked = match init_st
                                 .cfg
                                 .sidecar_url
                                 .as_deref()
                                 .filter(|_| init_p.walkable && init_st.owns("search_sidecar"))
-                            else {
-                                return Ok(Ok(None));
-                            };
-                            let offset = (init_p.page - 1).saturating_mul(init_p.limit);
-                            let outcome = match sidecar::walk_name(
-                                &init_st,
-                                base,
-                                &init_p.name,
-                                &init_p.lang_name,
-                                offset,
-                                init_p.limit,
-                            )
-                            .await
                             {
-                                Ok(o) => o,
-                                Err(_) => {
-                                    tracing::debug!(
-                                        name = %init_p.name,
-                                        "sidecar walk failed → proxy"
-                                    );
-                                    return Ok(Ok(None));
+                                Some(base) => {
+                                    match sidecar::walk_name(
+                                        &init_st,
+                                        base,
+                                        &init_p.name,
+                                        &init_p.lang_name,
+                                        offset,
+                                        init_p.limit,
+                                    )
+                                    .await
+                                    {
+                                        Ok(o) => Some(o),
+                                        // Node's merge catch is the fall-
+                                        // through when a window throws; for
+                                        // this branch the walk IS that merge,
+                                        // so a failed walk lands in the same
+                                        // next leg below, not on the proxy.
+                                        Err(_) => {
+                                            tracing::debug!(
+                                                name = %init_p.name,
+                                                "sidecar walk failed → live merge"
+                                            );
+                                            None
+                                        }
+                                    }
                                 }
+                                None => None,
                             };
+                            if let Some(outcome) = walked {
                             let walk_pool = Arc::clone(&init_pool);
                             let walk_owned = Arc::clone(&init_st.owned_index);
                             let p3 = init_p.clone();
@@ -1500,6 +2114,131 @@ pub async fn handle(
                                 .and_then(|c| crate::db::current_revision(&c).ok().flatten())
                                 .unwrap_or(rev_i);
                             (body, gz, etag, total, source, post_rev, Vec::new())
+                            } else {
+                                // ---- live merge leg (iter-10) ----
+                                // Node's runSearch specific/broad/fallback
+                                // merge: database scope arrives here with an
+                                // EMPTY queryLocal (that's why built is
+                                // None), internet scope skipped queryLocal
+                                // entirely. Upstream errors that Node answers
+                                // itself (503/429) keep proxying; the one
+                                // catch outcome Rust can reproduce exactly —
+                                // scope=internet served from queryLocal rows
+                                // — is served natively.
+                                let mut meta: Option<u64> = None;
+                                let outcome = match live_merge(&init_st, &init_p, &mut meta).await {
+                                    Ok(o) => o,
+                                    Err(LiveErr) => {
+                                        if !init_p.internet {
+                                            tracing::debug!(
+                                                name = %init_p.name,
+                                                "live merge upstream error → proxy"
+                                            );
+                                            return Ok(Ok(None));
+                                        }
+                                        let rows_pool = Arc::clone(&init_pool);
+                                        let rows_p = init_p.clone();
+                                        let rows = tokio::task::spawn_blocking(move || {
+                                            query_local_rows(&rows_pool, &rows_p)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            format!("local rows task panicked: {e}")
+                                        })??;
+                                        if rows.is_empty() {
+                                            tracing::debug!(
+                                                name = %init_p.name,
+                                                "live merge failed, no cache rows → proxy"
+                                            );
+                                            return Ok(Ok(None));
+                                        }
+                                        LiveOutcome {
+                                            cards: rows,
+                                            total: meta,
+                                            source: "cache",
+                                            cache: false,
+                                        }
+                                    }
+                                };
+                                let LiveOutcome {
+                                    cards: input_cards,
+                                    total: live_total,
+                                    source: live_source,
+                                    cache: do_cache,
+                                } = outcome;
+                                let pool3 = Arc::clone(&init_pool);
+                                let owned3 = Arc::clone(&init_st.owned_index);
+                                let p3 = init_p.clone();
+                                let internet = init_p.internet;
+                                let st4 = init_st.clone();
+                                let pool4 = Arc::clone(&init_pool);
+                                let mut cards = tokio::task::spawn_blocking(
+                                    move || -> Result<Vec<Value>, String> {
+                                        let mut cards = input_cards;
+                                        let conn = pool3.get().map_err(|e| e.to_string())?;
+                                        if do_cache {
+                                            // Node's runSearch awaits
+                                            // cacheCards(cards) before the
+                                            // merge block returns — the same
+                                            // twin every writer uses.
+                                            let maps: Vec<Map<String, Value>> = cards
+                                                .iter()
+                                                .filter_map(|c| c.as_object().cloned())
+                                                .collect();
+                                            if let Err(e) =
+                                                crate::card_cache::cache_normalized_cards(
+                                                    &conn, &maps,
+                                                )
+                                            {
+                                                tracing::error!(
+                                                    "search merge cache write failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        // The route attaches owned_qty to
+                                        // every non-collection answer.
+                                        let mut attached = false;
+                                        if rev_i >= 0 {
+                                            if let Some(map) =
+                                                owned3.owned_map(&pool3, p3.user_id, rev_i)
+                                            {
+                                                attached =
+                                                    name_index::attach_owned_from_snapshot(
+                                                        &mut cards, &map,
+                                                    );
+                                            }
+                                        }
+                                        if !attached {
+                                            attach_owned_qty(&conn, &mut cards[..], p3.user_id)?;
+                                        }
+                                        Ok(cards)
+                                    },
+                                )
+                                .await
+                                .map_err(|e| format!("merge attach task panicked: {e}"))??;
+                                // The route mergeSearchPrices on
+                                // scope=internet: the sidecar answers
+                                // price-less, card_cache holds the last real
+                                // quote, upstream (mocked in tests) fills
+                                // printings never priced.
+                                if internet {
+                                    merge_search_prices(&st4, &pool4, &mut cards).await;
+                                }
+                                let body = Bytes::from(
+                                    serde_json::to_vec(&cards).map_err(|e| e.to_string())?,
+                                );
+                                let etag = body_etag(&body);
+                                let gz = gzip_bytes(&body);
+                                // Post-write rev stamp (see the walk arm):
+                                // re-read AFTER the merge's own cacheCards /
+                                // price writes so the entry survives them.
+                                let post_rev = init_pool
+                                    .get()
+                                    .ok()
+                                    .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                                    .unwrap_or(rev_i);
+                                (body, gz, etag, live_total, live_source, post_rev, Vec::new())
+                            }
                         }
                     };
                     // Stamp with the POST-build revision: the walk's own
