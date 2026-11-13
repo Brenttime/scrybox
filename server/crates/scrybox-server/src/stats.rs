@@ -968,6 +968,79 @@ pub fn spawn_refresher(state: &AppState) {
     });
 }
 
+/// Boot warm (iter-58 cold-start attribution): pre-build the `/stats` body
+/// for a bounded set of users at process start. Measurement: single-shot cold
+/// compute is 573 ms (matches Node's ~0.6 s aggregate), but the cold-start
+/// storm probe records ~1360 ms — the extra ~800 ms is the build queueing
+/// behind the simultaneous first-200 storm on the other hot routes (4 cores;
+/// the 27MB collection_full response alone pins a gzip thread). A body built
+/// at boot takes the first real client off the compute path entirely, exactly
+/// like the collection prewarm this complements. Costs are bounded the same
+/// way: at most BOOT_WARM_MAX_USERS serial builds on blocking threads, keys
+/// exact-for-current-rev (a write that lands mid-warm bumps gen/rev and the
+/// request simply recomputes), builds go through the request-path
+/// single-flight slot (a request already building the key is joined, never
+/// double-computed), and `SCRYBOX_STATS_PREWARM=0` restores the lazy shape.
+const BOOT_WARM_MAX_USERS: usize = 4;
+
+/// Kill-switch for the boot warm (mirrors cvscan's warm_requested shape):
+/// on by default; SCRYBOX_STATS_PREWARM=0/false restores the lazy shape.
+pub fn boot_warm_requested() -> bool {
+    std::env::var("SCRYBOX_STATS_PREWARM")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+pub fn spawn_boot_warm(state: &AppState) {
+    let Some(pool) = state.db.clone() else { return };
+    if !boot_warm_requested() {
+        return;
+    }
+    let cache = Arc::clone(&state.stats_cache);
+    tokio::spawn(async move {
+        let pool2 = Arc::clone(&pool);
+        let users = match tokio::task::spawn_blocking(move || {
+            let conn = pool2.get().ok()?;
+            let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id LIMIT 4").ok()?;
+            let ids: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0)).ok()?.filter_map(|r| r.ok()).collect();
+            Some(ids)
+        })
+        .await
+        {
+            Ok(Some(u)) => u,
+            _ => return,
+        };
+        for user_id in users.into_iter().take(BOOT_WARM_MAX_USERS) {
+            let p = Arc::clone(&pool);
+            let rev = tokio::task::spawn_blocking(move || p.get().ok().and_then(|c| StatsCache::db_revision(&c)))
+                .await
+                .ok()
+                .flatten();
+            let key = StatsCache::key_for(user_id, cache.gen_of(user_id), rev.as_deref());
+            if cache.get_entry(&key).is_some() {
+                continue;
+            }
+            let slot = cache.slot(&key);
+            let cache2 = Arc::clone(&cache);
+            let pool3 = Arc::clone(&pool);
+            let key2 = key.clone();
+            let init = move || async move {
+                let c = Arc::clone(&cache2);
+                let p = Arc::clone(&pool3);
+                let k = key2.clone();
+                tokio::task::spawn_blocking(move || compute_and_store(&c, &p, user_id, k))
+                    .await
+                    .map_err(|e| format!("boot warm join: {e}"))
+            };
+            // Join-or-build through the SAME single-flight slot as the
+            // request path; a warm failure is silently left for the request
+            // path to retry (no backoff needed — this runs once).
+            let _ = slot.get_or_try_init(init).await;
+            cache.finish(&key);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -1451,6 +1524,28 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
 //   (1/8)*100 → 13; 99.5 → 100; 98.5 → 99; Math.round(-0.4) === -0.
 //   JSON.stringify(-0) === "0"; JSON.stringify(21.0) === "21".
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod boot_warm_gate {
+    use super::*;
+
+    #[test]
+    fn boot_warm_is_on_by_default_with_kill_switch() {
+        // Iter-58 shape: the boot warm is ON unless the operator opts out —
+        // the mirror of cvscan's opt-in guard (boot warm for stats is cheap
+        // DB work the collection prewarm already does for pages; the ONNX
+        // assets are the expensive ones that stay opt-in).
+        std::env::remove_var("SCRYBOX_STATS_PREWARM");
+        assert!(boot_warm_requested(), "default must pre-warm");
+        std::env::set_var("SCRYBOX_STATS_PREWARM", "1");
+        assert!(boot_warm_requested());
+        std::env::set_var("SCRYBOX_STATS_PREWARM", "0");
+        assert!(!boot_warm_requested(), "0 must restore pure lazy");
+        std::env::set_var("SCRYBOX_STATS_PREWARM", "false");
+        assert!(!boot_warm_requested());
+        std::env::remove_var("SCRYBOX_STATS_PREWARM");
+    }
+}
 
 #[cfg(test)]
 mod js_number_tests {

@@ -164,10 +164,19 @@ for (const s of scen.scenarios) {
   // gen-scen-varied.mjs fans scenarios out into a `paths` array (the hot
   // bench's contract). Flatten them into numbered parity cases; a single
   // `path` stays a single case.
+  // networth restamps $.asOf = new Date().toISOString() on EVERY response
+  // (routes/stats.js onHit), so two servers can never be byte-equal there —
+  // the named ss_networth cases already strip it (see ss_networth above);
+  // the fanned-out gen-scen-varied arms must carry the same strip (iter-24
+  // parity run: 8 stats_subs_varied FAILs, all 1 ms asOf skew, both sides
+  // otherwise byte-identical). etagReplay:false for the same reason: a new
+  // asOf means a new ETag every hit, so conditional replay legitimately
+  // answers 200-with-body on BOTH servers (the named cases opt out too).
+  const opt = (p) => (p.includes('/api/stats/networth') ? { strip: ['$.asOf'], etagReplay: false } : {});
   if (Array.isArray(s.paths)) {
-    s.paths.forEach((p, i) => cases.push({ name: `${s.name}#${i + 1}`, path: p, headers: s.headers || {}, method: s.method || 'GET' }));
+    s.paths.forEach((p, i) => cases.push({ name: `${s.name}#${i + 1}`, path: p, headers: s.headers || {}, method: s.method || 'GET', ...opt(p) }));
   } else {
-    cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET' });
+    cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET', ...opt(s.path) });
   }
 }
 const authHeaders = scen.scenarios.find(s => s.headers?.Authorization)?.headers || {};

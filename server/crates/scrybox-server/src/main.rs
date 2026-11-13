@@ -95,6 +95,14 @@ async fn main() {
     if state.owns("scan_match") && scrybox_server::cvscan::warm_requested() {
         scrybox_server::cvscan::spawn_warm();
     }
+    // Iter-58 cold-start attribution (single-shot cold stats 573 ms vs storm
+    // probe 1360 ms — the gap is queueing behind the start-of-process storm):
+    // pre-build /stats bodies at boot like the collection prewarm does for
+    // pages. Kept in main (NOT app()) so Router-building tests keep their
+    // cold-cache contracts. SCRYBOX_STATS_PREWARM=0 restores pure lazy.
+    if state.owns("stats") {
+        scrybox_server::stats::spawn_boot_warm(&state);
+    }
     let router = scrybox_server::app(state);
     // Lane B unit 5c: optional HTTPS listener (utils/tls.js twin). A failure
     // — unreadable operator pair, no DB path, bind error — logs Node's line

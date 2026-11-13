@@ -60,12 +60,26 @@ const lastStatus = new Map();
 // since-start deltas). Only start latching after we've SEEN the restart
 // (first ECONNREFUSED during stop/build).
 let sawDown = false;
+// Iter-58 fix: the old process can still have 27MB responses in flight when
+// the first ECONNREFUSED flips sawDown — those arrived AFTER the new unit
+// exec'd but were served by the DYING process, producing sub-bind or even
+// negative "first 200" deltas (iter-57 sweep showed stats=-20, arms pinned at
+// a suspicious 200). Only latch an arm once MainPID belongs to the NEW unit:
+// systemd sets MainPID at exec (before bind), so a 200 seen while the live
+// pid is still the pre-restart pid (or 0 during stop) is old-process noise.
+const oldPid = mainPid();
+let livePid = oldPid, pidPollAt = 0;
+const isLive = () => {
+  const n = Date.now();
+  if (n - pidPollAt > 20) { pidPollAt = n; livePid = mainPid(); }
+  return livePid > 0 && livePid !== oldPid;
+};
 
 function fire(s) {
   const req = http.request({ host: base.hostname, port: base.port, path: s.path, method: 'GET', headers: s.headers }, (res) => {
     res.resume();
     if (sawDown) lastStatus.set(s.name, res.statusCode);
-    if (res.statusCode === 200 && sawDown && !first200.has(s.name)) first200.set(s.name, uptimeSec());
+    if (res.statusCode === 200 && sawDown && !first200.has(s.name) && isLive()) first200.set(s.name, uptimeSec());
   });
   req.on('error', () => { sawDown = true; });
   req.end();
