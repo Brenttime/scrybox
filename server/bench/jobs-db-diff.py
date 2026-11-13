@@ -93,7 +93,14 @@ def prune(path, keep_cards):
 def run_node(db_rel, job):
     js = {
         "sets": "a.fetchAndCacheSets(true).then(n=>{console.log(JSON.stringify({job:'sets',sets:n??'ok'}));process.exit(0)}).catch(e=>{console.error(String(e));process.exit(1)})",
-        "sweep": "a.updateCollectionPrices(true).then(()=>{console.log(JSON.stringify({job:'sweep',done:true}));process.exit(0)}).catch(e=>{console.error(String(e));process.exit(1)})",
+        # Full price_sweep job, not just the collection leg: Node's boot
+        # catch-up (server.js ~352-366) runs updateCollectionPrices() and then
+        # await refreshPriceEstimates(), and the Rust jobs binary chains
+        # refresh_price_estimates inside price-sweep (scry_jobs.rs). Running
+        # only updateCollectionPrices left the estimates arms (fill_missing_
+        # floors + refresh_all_estimates -> card_cache.price_estimated etc)
+        # compared Rust-wrote vs Node-unrun. lane-B iter-28.
+        "sweep": "a.updateCollectionPrices(true).then(()=>a.refreshPriceEstimates()).then(()=>{console.log(JSON.stringify({job:'sweep',done:true}));process.exit(0)}).catch(e=>{console.error(String(e));process.exit(1)})",
     }[job]
     out = sh("docker", "exec", "-e", f"DB_PATH=/app/database/{db_rel}", NODE_CONTAINER,
              "node", "-e", f"const a=require('/app/backend/src/scryfallApi'); {js}")

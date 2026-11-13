@@ -572,3 +572,75 @@ fn retired_catalog_name_vs_js_regex() {
     assert!(!retired_catalog_name("xmilo-pokemon.npz"));
     assert!(!retired_catalog_name("milo-pokemon.npz.tmpx"));
 }
+
+#[test]
+fn boot_tail_splits_stacked_collection_copies() {
+    // server.js boot twin of splitStackedEntries (utils/collectionHelpers.js),
+    // ported lane-B iter-28 (found by bench/manabox-db-diff.py: a qty>1 row
+    // survived the Rust boot that Node would have split — unit 7 Node-free
+    // installs would drift). main.rs calls this at EVERY startup, outside the
+    // migrate()/initDb twin (mirrors server.js 274-277), so the test drives
+    // the public entry point directly on a migrated DB.
+    let dir = tmp_dir("split");
+    let db = dir.join("bindarr.db");
+    run_migrate(&db, &MigOpts::default());
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, share_token) VALUES ('u','x','member','t1')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO card_cache (id, name) VALUES ('mtg-a','A')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO collection (card_id, quantity, condition, printing, language, purchase_price, user_id, source, added_at)
+             VALUES ('mtg-a', 3, 'Near Mint', 'Normal', 'English', 2.5, 1, 'manabox', '2020-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO collection (card_id, quantity, user_id) VALUES ('mtg-a', 1, 1)", [])
+            .unwrap();
+        let created = scrybox_server::migrations::split_stacked_entries(&conn).unwrap();
+        assert_eq!(created, 2, "quantity 3 must yield two qty-1 siblings");
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<f64>)> = conn
+            .prepare("SELECT quantity, source, added_at, purchase_price FROM collection ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|(q, ..)| *q == 1));
+        // Original keeps source/added_at; siblings are born source NULL with
+        // CURRENT_TIMESTAMP added_at — faithful to Node's INSERT column list.
+        assert_eq!(rows[0].1.as_deref(), Some("manabox"));
+        assert_eq!(rows[0].2.as_deref(), Some("2020-01-01 00:00:00"));
+        // ids: original=1, second-seeded=2, then the two siblings (3, 4).
+        for sib in &rows[2..4] {
+            assert_eq!(sib.1, None);
+            assert!(sib.2.as_deref().map(|s| !s.is_empty()).unwrap_or(false));
+            assert_eq!(sib.3, Some(2.5)); // purchase_price carried over
+        }
+        // Idempotent: nothing stacked left, the next boot splits zero.
+        let again = scrybox_server::migrations::split_stacked_entries(&conn).unwrap();
+        assert_eq!(again, 0);
+    }
+    // migrate() (the initDb twin) must NOT split — the Node goldens were
+    // generated from initDb alone, split included in the boot or not.
+    let db2 = dir.join("nogoldenshift.db");
+    std::fs::write(&db2, []).unwrap();
+    run_migrate(&db2, &MigOpts::default());
+    let conn = Connection::open(&db2).unwrap();
+    conn.execute("INSERT INTO card_cache (id, name) VALUES ('mtg-b','B')", []).unwrap();
+    conn.execute("INSERT INTO collection (card_id, quantity) VALUES ('mtg-b', 3)", []).unwrap();
+    drop(conn);
+    let rep = run_migrate(&db2, &MigOpts::default());
+    assert!(rep.skipped);
+    let conn = Connection::open(&db2).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM collection WHERE card_id='mtg-b' AND quantity=3", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "migrate() must leave stacked rows alone (boot step only)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

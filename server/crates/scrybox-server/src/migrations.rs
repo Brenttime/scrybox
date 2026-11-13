@@ -595,6 +595,51 @@ fn run_boot_tail(
     Ok(())
 }
 
+/// `splitStackedEntries` (utils/collectionHelpers.js 179-203), called by
+/// server.js on EVERY boot — deliberately NOT part of migrate()/run_boot_tail:
+/// the Node goldens capture initDb alone, and the split lives in the server
+/// boot sequence outside initDb. main.rs calls this at startup (unconditional,
+/// idempotent), mirroring server.js 274-277. One card = one row: each stacked
+/// row is reduced to quantity 1 and gains (quantity - 1) sibling rows. The
+/// INSERT column list deliberately mirrors Node's — source/added_at/notes/
+/// is_proxy are NOT carried over, so the siblings are born source NULL with
+/// CURRENT_TIMESTAMP added_at (the split converts stacked ManaBox rows into
+/// hand rows; faithful, not pretty). Not wrapped in a transaction, like
+/// Node. JS numeric semantics: the loop is `for (i = 1; i < copies; i++)`,
+/// so a non-integer quantity 2.5 yields 2 siblings — mirrored with the same
+/// float loop instead of integer arithmetic. Ported lane-B iter-28 (found by
+/// bench/manabox-db-diff.py; unit 7 Node-free installs would drift otherwise).
+pub fn split_stacked_entries(conn: &Connection) -> rusqlite::Result<i64> {
+    let stacked: Vec<(i64, f64)> = {
+        let mut stmt = conn.prepare("SELECT id, quantity FROM collection WHERE quantity > 1")?;
+        let x = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        x
+    };
+    let mut created = 0i64;
+    for (id, copies) in stacked {
+        conn.execute("UPDATE collection SET quantity = 1 WHERE id = ?", params![id])?;
+        // Node reuses the fields from its pre-update `SELECT *`; only
+        // quantity changed on the row, so re-reading is equivalent.
+        let row: (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i64>, Option<i64>) =
+            conn.query_row(
+                "SELECT card_id, user_id, condition, printing, language, purchase_price, is_trade, favorite FROM collection WHERE id = ?",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            )?;
+        let mut i = 1.0f64;
+        while i < copies {
+            conn.execute(
+                "INSERT INTO collection (card_id, user_id, quantity, condition, printing, language, purchase_price, is_trade, favorite)
+                 VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7],
+            )?;
+            created += 1;
+            i += 1.0;
+        }
+    }
+    Ok(created)
+}
+
 /// `adoptOrphanRows` (db.js 1363-1365).
 pub fn adopt_orphan_rows(conn: &Connection, user_id: i64) -> rusqlite::Result<()> {
     conn.execute("UPDATE collection SET user_id = ? WHERE user_id IS NULL", params![user_id])?;

@@ -66,6 +66,25 @@ async fn main() {
             None => tracing::warn!("RUST_MIGRATIONS set but SCRYBOX_DB_PATH missing; migrations not run"),
         }
     }
+    // server.js 274-277 boot twin of splitStackedEntries (lane-B iter-28,
+    // found by bench/manabox-db-diff.py): Node un-stacks every quantity>1
+    // collection row into qty-1 rows on EVERY boot, OUTSIDE initDb — so this
+    // runs unconditionally here, not under RUST_MIGRATIONS (pair mode: both
+    // boots perform it, idempotent; Node-free installs: Rust must). Failure
+    // is logged, not fatal — mirrors Node treating the split as a boot step.
+    if let Some(path) = cfg.db_path.clone() {
+        match rusqlite::Connection::open(&path)
+            .and_then(|c| {
+                c.busy_timeout(std::time::Duration::from_millis(5000))?;
+                Ok(c)
+            })
+            .and_then(|c| scrybox_server::migrations::split_stacked_entries(&c))
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Split {n} stacked collection copies into individual rows."),
+            Err(e) => tracing::error!("Boot collection split failed: {e}"),
+        }
+    }
     // Lane B background jobs (BRIEF-B): RUST_JOBS=scryfall takes the
     // weekly set-sync / hourly price-sweep timers from Node's server.js
     // (which the test container disables via SCRYBOX_DISABLE_SETS_REFRESH /
