@@ -185,8 +185,11 @@ pub fn client_ip_key(peer: Option<IpAddr>, headers: &HeaderMap, trust: &Trust) -
             }
         }
         Trust::Rules(_) => {
-            // hops from the socket outward: socket, XFF right-to-left.
-            if xff.is_empty() {
+            // proxy-addr's forwarded(): the XFF chain is consulted only when
+            // the SOCKET itself is trusted. An untrusted socket ignores XFF
+            // entirely — otherwise any direct (non-proxy) client could mint
+            // fresh limiter buckets by spoofing the header.
+            if xff.is_empty() || !trust.trusts(&socket) {
                 return key_for(socket);
             }
             for entry in xff.iter().rev() {
