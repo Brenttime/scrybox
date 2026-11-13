@@ -485,7 +485,9 @@
     "tests": "tests/export_route.rs (+ src unit tests) get_export_csv/json/ecosystem, etag 304 replay, post view order+dedup+validation, import validation rejections, game/printing gates, cache-hit write, uncached bulk, unrecognized/non-mtg, bulk-error forward, off-switch; parity.mjs ex_get_*, ex_post_*, ex_import_*"
   },
   "POST /api/limited/analyze": {
-    "status": "node"
+    "status": "verified",
+    "module": "scrybox-server::limited (lib.rs /api/limited/analyze any() under RUST_ROUTES=limited; non-POST proxies verbatim so Node's final-handler 404 rides through)",
+    "tests": "tests/limited.rs parseDecklist/costPips/analyzeCards twins + route order (normalJson 1mb 500/413 before auth), auth gates, BATCH=75 chunking, 429 ladder, 502 leg, key order + ETag; parity.mjs ps_lim_*"
   },
   "POST /api/lists": {
     "module": "scrybox-server::lists_writes (lib.rs /api/lists POST under RUST_ROUTES=lists_writes; parseListLine/parseListText twins Node-oracle-pinned, findCachedCard fold, cleanIcon, qty stack, whole-request forward before any local write when a line is unresolved)",

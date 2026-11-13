@@ -103,7 +103,14 @@ const EXTRA_STATS = [
 
 const cases = [];
 for (const s of scen.scenarios) {
-  cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET' });
+  // gen-scen-varied.mjs fans scenarios out into a `paths` array (the hot
+  // bench's contract). Flatten them into numbered parity cases; a single
+  // `path` stays a single case.
+  if (Array.isArray(s.paths)) {
+    s.paths.forEach((p, i) => cases.push({ name: `${s.name}#${i + 1}`, path: p, headers: s.headers || {}, method: s.method || 'GET' }));
+  } else {
+    cases.push({ name: s.name, path: s.path, headers: s.headers || {}, method: s.method || 'GET' });
+  }
 }
 const authHeaders = scen.scenarios.find(s => s.headers?.Authorization)?.headers || {};
 for (const [i, p] of EXTRA_COLLECTION.entries()) {
@@ -163,6 +170,68 @@ cases.push({
     return { headers: { ...PS_JSON, ...(etag ? { 'if-none-match': etag } : {}) } };
   },
 });
+
+// --- POST /api/limited/analyze (iter-48 slice) --------------------------------
+// Node: routes/limited.js behind the GLOBAL normalJson (1mb, server.js:205-211)
+// which runs BEFORE authenticateToken (probe: malformed 500 / oversize 413
+// with no token), then invalidateOnWrite, then 413>20000 UTF-16 / 400-no-
+// entries / 400>120-distinct gates and BATCH=75 chunks through the sidecar's
+// /cards/collection (LOCAL_SCRYFALL on both sides → deterministic). GET is
+// not mounted → Node's final-handler 404 HTML must ride through Rust's proxy.
+const psLim = (name, body, extra = {}) =>
+  cases.push({ name, path: '/api/limited/analyze', headers: PS_JSON, method: 'POST', body, ...extra });
+psLim('ps_lim_ok', JSON.stringify({ list: '2 Doom Blade\n1 Scoured Barrens\n4 Island\n1 Not A Real Card\n1 Fire' }));
+// Front-face aliasing: "Fire // Ice" is FOUND (registers its front key),
+// "Fire" then resolves through that alias even though the sidecar itself
+// never returns it, and "Ice" stays missing. The sidecar's own not_found
+// still lists "Fire" — the quirk both sides must share.
+psLim('ps_lim_front_only', JSON.stringify({ list: '1 Fire // Ice\n1 Fire\n1 Ice' }));
+psLim('ps_lim_empty', JSON.stringify({ list: '' }));
+psLim('ps_lim_list_number', JSON.stringify({ list: 5 }));
+psLim('ps_lim_array_body', '["1 Island"]');
+psLim('ps_lim_dedup_case', JSON.stringify({ list: '1 sol ring\n2 SOL RING\nIsland' }));
+// Set-code strip runs before foil strip: the foil tail defeats the anchored
+// set regex, so "(LEA) 1a" survives into the lookup name (faithful quirk).
+psLim('ps_lim_foil_setcode', JSON.stringify({ list: '2 Doom Blade (M10) 88\n1 Sol Ring (LEA) 1a *F*' }));
+psLim('ps_lim_sideboard_break', JSON.stringify({ list: '1 Island\n\nSideboard\n1 Sol Ring' }));
+// 20000 UTF-16 units is NOT over; 20002 is (10001 astral chars). Boundary is
+// the JS string length — chars/bytes would disagree on the emoji ladder.
+psLim('ps_lim_20000_boundary', JSON.stringify({ list: '\u{1F600}'.repeat(10000) }));
+psLim('ps_lim_20001_emoji', JSON.stringify({ list: '\u{1F600}'.repeat(10001) }));
+psLim('ps_lim_121_distinct', JSON.stringify({ list: Array.from({ length: 121 }, (_, i) => `${i + 1} Fake Card ${i}`).join('\n') }));
+// 120 distinct = two 75-chunks; every lookup misses the sidecar, pinning the
+// batch order and the notFound concatenation order across chunks.
+psLim('ps_lim_120_batch', JSON.stringify({ list: Array.from({ length: 120 }, (_, i) => `1 fake card ${i}\nFake Card ${i}`).join('\n') }));
+cases.push({
+  name: 'ps_lim_text_plain', path: '/api/limited/analyze',
+  headers: { ...authHeaders, 'content-type': 'text/plain' }, method: 'POST',
+  body: JSON.stringify({ list: '1 Island' }),
+});
+// Parser-above-auth order: both of these carry NO token on purpose.
+cases.push({
+  name: 'ps_lim_malformed_no_token', path: '/api/limited/analyze',
+  headers: { 'content-type': 'application/json' }, method: 'POST', body: 'notjson',
+});
+cases.push({
+  name: 'ps_lim_oversize_no_token', path: '/api/limited/analyze',
+  headers: { 'content-type': 'application/json' }, method: 'POST',
+  body: JSON.stringify({ list: 'a'.repeat(1024 * 1024) }),
+});
+cases.push({
+  name: 'ps_lim_no_token', path: '/api/limited/analyze',
+  headers: { 'content-type': 'application/json' }, method: 'POST',
+  body: JSON.stringify({ list: '1 Island' }),
+});
+cases.push({
+  name: 'ps_lim_apikey_403', path: '/api/limited/analyze',
+  headers: { Authorization: '***' + 'x'.repeat(59), 'content-type': 'application/json' },
+  method: 'POST', body: JSON.stringify({ list: '1 Island' }),
+  setup: async () => { dbWrite((d) => d.prepare('UPDATE users SET api_key = ? WHERE username = ?').run('x'.repeat(59), PARITY_USER)); return { ctx: null }; },
+  teardown: () => dbWrite((d) => d.prepare('UPDATE users SET api_key = NULL WHERE username = ?').run(PARITY_USER)),
+});
+// GET is not mounted on the Express router → Node's final-handler HTML 404
+// ("Cannot GET") must survive Rust's proxy byte-for-byte.
+cases.push({ name: 'ps_lim_get_404', path: '/api/limited/analyze', headers: authHeaders, method: 'GET' });
 for (const [i, p] of EXTRA_STATS.entries()) {
   cases.push({ name: `stats${i + 1}_${p.slice('/api/stats'.length + 1) || 'full'}`, path: p, headers: authHeaders, method: 'GET' });
 }

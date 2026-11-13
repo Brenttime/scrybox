@@ -51,6 +51,7 @@ pub mod decks_combos;
 pub mod export;
 pub mod npz;
 pub mod settings;
+pub mod limited;
 pub mod lists_body_writes;
 pub mod lists_reads;
 pub mod lists_writes;
@@ -665,6 +666,14 @@ pub fn app(state: AppState) -> Router {
         router
             .route("/api/rules", any(rules::route_rules))
             .route("/api/rules/keywords", any(rules::route_keywords))
+    } else {
+        router
+    };
+    // Lane A iter-48: POST /api/limited/analyze (routes/limited.js) under
+    // `limited`. The handler self-checks the method; anything else rides the
+    // proxy so Node's final-handler 404 (router.post does not match) is kept.
+    let router = if state.owns("limited") {
+        router.route("/api/limited/analyze", any(limited::handle))
     } else {
         router
     };
