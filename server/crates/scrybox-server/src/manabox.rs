@@ -104,19 +104,45 @@ const REQUIRED: [&str; 11] = [
 // ---------------------------------------------------------------------------
 
 pub fn parse_csv(text: &str) -> Vec<HashMap<String, String>> {
-    let stripped = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    let chars: Vec<char> = stripped.chars().collect();
+    let t = parse_csv_table(text);
+    t.rows
+        .iter()
+        .map(|r| t.cols.iter().map(|(h, &i)| (h.clone(), r.get(i).cloned().unwrap_or_default())).collect())
+        .collect()
+}
+
+/// Header-indexed CSV (review exec-sync M2): rows stay `Vec<String>`, the
+/// header maps to its LAST column index (Object.fromEntries: last dup wins).
+pub struct CsvTable {
+    cols: HashMap<String, usize>,
+    rows: Vec<Vec<String>>,
+}
+
+impl CsvTable {
+    fn has(&self, k: &str) -> bool {
+        self.cols.contains_key(k)
+    }
+    fn cell(&self, r: usize, k: &str) -> Option<String> {
+        self.cols.get(k).map(|&i| self.rows[r].get(i).cloned().unwrap_or_default())
+    }
+}
+
+/// Single linear pass over the bytes. Every delimiter is ASCII, so fields
+/// split only on char boundaries and each field is valid UTF-8.
+fn parse_csv_table(text: &str) -> CsvTable {
+    let b = text.strip_prefix('\u{FEFF}').unwrap_or(text).as_bytes();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
+    let mut field: Vec<u8> = Vec::new();
+    let take = |f: &mut Vec<u8>| String::from_utf8(std::mem::take(f)).unwrap_or_default();
     let mut q = false;
     let mut i = 0usize;
-    while i < chars.len() {
-        let ch = chars[i];
+    while i < b.len() {
+        let ch = b[i];
         if q {
-            if ch == '"' {
-                if i + 1 < chars.len() && chars[i + 1] == '"' {
-                    field.push('"');
+            if ch == b'"' {
+                if i + 1 < b.len() && b[i + 1] == b'"' {
+                    field.push(b'"');
                     i += 2;
                     continue;
                 }
@@ -124,15 +150,15 @@ pub fn parse_csv(text: &str) -> Vec<HashMap<String, String>> {
             } else {
                 field.push(ch);
             }
-        } else if ch == '"' {
+        } else if ch == b'"' {
             q = true;
-        } else if ch == ',' {
-            row.push(std::mem::take(&mut field));
-        } else if ch == '\n' || ch == '\r' {
-            if ch == '\r' && i + 1 < chars.len() && chars[i + 1] == '\n' {
+        } else if ch == b',' {
+            row.push(take(&mut field));
+        } else if ch == b'\n' || ch == b'\r' {
+            if ch == b'\r' && i + 1 < b.len() && b[i + 1] == b'\n' {
                 i += 1;
             }
-            row.push(std::mem::take(&mut field));
+            row.push(take(&mut field));
             if row.len() > 1 || row[0] != "" {
                 rows.push(std::mem::take(&mut row));
             }
@@ -142,27 +168,19 @@ pub fn parse_csv(text: &str) -> Vec<HashMap<String, String>> {
         }
         i += 1;
     }
-    if field != "" || !row.is_empty() {
-        row.push(field);
+    if !field.is_empty() || !row.is_empty() {
+        row.push(take(&mut field));
         rows.push(row);
     }
     if rows.is_empty() {
-        return Vec::new();
+        return CsvTable { cols: HashMap::new(), rows: Vec::new() };
     }
-    let header: Vec<String> = rows[0].iter().map(|h| h.trim().to_string()).collect();
-    rows[1..]
-        .iter()
-        .map(|r| {
-            let mut m = HashMap::new();
-            for (i, h) in header.iter().enumerate() {
-                // Object.fromEntries keeps LAST occurrence of a dup header:
-                // later entries overwrite, so iterate forward (HashMap insert
-                // overwrites = last wins).
-                m.insert(h.clone(), r.get(i).cloned().unwrap_or_default());
-            }
-            m
-        })
-        .collect()
+    let mut cols = HashMap::new();
+    for (i, h) in rows[0].iter().enumerate() {
+        cols.insert(h.trim().to_string(), i);
+    }
+    rows.remove(0);
+    CsvTable { cols, rows }
 }
 
 fn to_sql_date(iso: Option<&String>) -> Option<String> {
@@ -299,11 +317,11 @@ fn sid_ok(sid: &str) -> bool {
 }
 
 pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
-    let rows = parse_csv(text);
-    if rows.is_empty() {
+    let table = parse_csv_table(text);
+    if table.rows.is_empty() {
         return Err("The file is empty.".to_string());
     }
-    let missing: Vec<&str> = REQUIRED.iter().copied().filter(|h| !rows[0].contains_key(*h)).collect();
+    let missing: Vec<&str> = REQUIRED.iter().copied().filter(|h| !table.has(h)).collect();
     if !missing.is_empty() {
         return Err(format!(
             "This is not a ManaBox collection export (missing {}).",
@@ -316,10 +334,13 @@ pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
     let mut owned: Vec<OwnedRow> = Vec::new();
     let mut owned_idx: HashMap<String, usize> = HashMap::new();
     let mut lists: Vec<(String, Vec<(String, ListEntry)>)> = Vec::new();
+    // First-seen order lives in the Vecs; these maps only index into them.
+    let mut list_idx: HashMap<String, usize> = HashMap::new();
+    let mut entry_idx: Vec<HashMap<String, usize>> = Vec::new();
     let mut errors: Vec<Rejected> = Vec::new();
-    for (i, r) in rows.iter().enumerate() {
+    for i in 0..table.rows.len() {
         let line = i as i64 + 2;
-        let cell = |k: &str| r.get(k).cloned();
+        let cell = |k: &str| table.cell(i, k);
         let sid = cell("Scryfall ID").unwrap_or_default().trim().to_lowercase();
         let qty = js_parse_int(Some(&Value::String(cell("Quantity").unwrap_or_default())));
         if !sid_ok(&sid) {
@@ -352,20 +373,25 @@ pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
                 Some(v) if !v.is_empty() => v,
                 _ => "ManaBox list".to_string(),
             };
-            let li = match lists.iter().position(|(n, _)| *n == name) {
-                Some(x) => x,
+            let li = match list_idx.get(&name) {
+                Some(x) => *x,
                 None => {
                     lists.push((name.clone(), Vec::new()));
+                    entry_idx.push(HashMap::new());
+                    list_idx.insert(name, lists.len() - 1);
                     lists.len() - 1
                 }
             };
             let entries = &mut lists[li].1;
-            match entries.iter_mut().find(|(cid, _)| *cid == card_id) {
-                Some((_, e)) => e.quantity += qty,
-                None => entries.push((
-                    card_id.clone(),
-                    ListEntry { card_id: card_id.clone(), quantity: qty, expect: expect.clone() },
-                )),
+            match entry_idx[li].get(&card_id) {
+                Some(&ei) => entries[ei].1.quantity += qty,
+                None => {
+                    entry_idx[li].insert(card_id.clone(), entries.len());
+                    entries.push((
+                        card_id.clone(),
+                        ListEntry { card_id: card_id.clone(), quantity: qty, expect: expect.clone() },
+                    ))
+                }
             }
             continue;
         }
@@ -428,7 +454,7 @@ pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
             ka.cmp(&kb)
         });
     }
-    Ok(Parsed { rows: rows.len(), owned, lists, errors })
+    Ok(Parsed { rows: table.rows.len(), owned, lists, errors })
 }
 
 // ---------------------------------------------------------------------------
@@ -810,9 +836,11 @@ pub async fn build_plan(st: &AppState, user_id: i64, csv: Value, include_lists: 
         Value::String(s) => s,
         other => js_to_string(&other),
     };
-    let parsed = match parse_manabox_export(&csv_text) {
-        Ok(p) => p,
-        Err(e) => return BuildOutcome::BadRequest(e),
+    // Review exec-sync M2: a 40 MB parse must not pin a runtime worker.
+    let parsed = match tokio::task::spawn_blocking(move || parse_manabox_export(&csv_text)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return BuildOutcome::BadRequest(e),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     };
     let mut entry_ids: Vec<String> = parsed.owned.iter().map(|o| o.card_id.clone()).collect();
     for (_, m) in &parsed.lists {
@@ -1275,16 +1303,20 @@ pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response 
     }
     let md = report(&plan, true, body.get("fileName"));
     let summary_json = serde_json::to_string(&plan.summary.value()).unwrap_or_else(|_| "{}".into());
-    let pool = st.db.as_ref().unwrap();
-    let applied = {
-        let conn = match pool.get() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("[manabox-sync] apply {e}");
-                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &err_body("Sync failed; nothing was changed."));
-            }
+    let pool = st.db.as_ref().unwrap().clone();
+    let uid = user.id;
+    // Review exec-sync M2: thousands of synchronous writes run off the runtime.
+    let (applied, plan, md) = match tokio::task::spawn_blocking(move || {
+        let r = match pool.get() {
+            Ok(conn) => apply_plan(&conn, uid, &plan, &summary_json, &md),
+            Err(e) => Err(e.to_string()),
         };
-        apply_plan(&conn, user.id, &plan, &summary_json, &md)
+        (r, plan, md)
+    })
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     };
     if let Err(e) = applied {
         tracing::error!("[manabox-sync] apply {e}");
