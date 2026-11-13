@@ -558,13 +558,25 @@ if (fs.existsSync(AUTH_DB)) {
       preds.holoOk = rows.every((r) => r.printing !== 'Holofoil'
         || (d.prepare('SELECT 1 FROM card_cache WHERE id = ? AND price_holofoil > 0').get(r.card_id) !== undefined));
     } finally { d.close(); }
+    // Printings ladder: sidecar-only. Node's normalizeCard (scryfallApi.js
+    // hasPrices guard) leaves price fields UNDEFINED on the price-less
+    // sidecar /cards/search answers, so printsForCard (admin.js:78-82) sees
+    // no price_normal/price_holofoil > 0 and EVERY entry falls back to
+    // 'Normal' — the Node oracle itself cannot produce a Holofoil row here.
+    // The ladder pins that (an unpriced-pool regression on the Rust side
+    // would leak 'Holofoil' rows and fail this). holoOk still validates the
+    // card_cache holo query for any row that ever is Holofoil.
     const ok = preds.rows === 208 && preds.qtySum === n
       && preds.conditions.join() === 'Heavily Played,Lightly Played,Moderately Played,Near Mint'
-      && preds.printings.join() === 'Holofoil,Normal'
+      && preds.printings.join() === 'Normal'
       && preds.languages.join() === 'English,Japanese'
       && preds.qtys.join() === '1,2'
       && preds.priceOk && preds.holoOk;
-    const { priceOk, holoOk, ...seen } = preds; // booleans folded into ok
+    // qtySum stays OUT of the cross-side $persisted seen: the seed message
+    // count is Math.random by design (Node sums qty 1|2 over 208 entries),
+    // so it cannot match ACROSS the two writes — it is asserted per-side
+    // against that write's OWN message (preds.qtySum === n) above.
+    const { priceOk, holoOk, qtySum, ...seen } = preds; // booleans folded into ok
     return ok ? { ok: true, why: `208 rows, SUM(quantity)=${n}, ladders hold (opposite-server read)`, seen }
       : { ok: false, why: `${JSON.stringify(preds)} vs message ${json.message}`, seen };
   };
