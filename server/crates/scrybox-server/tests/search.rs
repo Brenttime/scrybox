@@ -424,7 +424,10 @@ async fn gated_queries_proxy_to_node() {
 
     for q in [
         "/api/search?q=t%3Acreature%20c%3Ag",          // raw query → parser/sidecar
-        "/api/search?scope=collection&q=sol%20ring",   // collection catalog path
+        // scope=collection + q is NO LONGER a proxy case in upstream mode:
+        // Node answers data-backed queries from the owned rows (answerLocally)
+        // and Rust now does too — pinned natively below and in
+        // tests/collq_local.rs.
         // scope=internet no longer proxies: the iter-10 live merge leg
         // answers it natively — see the live_merge_* tests below.
         "/api/search?name=Sol%20Ring&prints=1",        // allPrints walk
@@ -856,6 +859,7 @@ fn router_for_idx_owned_sidecar(
     owned: OwnedCache,
     sidecar_url: Option<String>,
 ) -> Router {
+    let is_sidecar = sidecar_url.is_some();
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         node_upstream: upstream.to_string(),
@@ -866,6 +870,11 @@ fn router_for_idx_owned_sidecar(
     };
     let mut st = AppState::new(cfg);
     st.stale_refresh = false;
+    // Sidecar URL set = the parity harness's sidecar mode (LOCAL_SCRYFALL on
+    // both sides): the engine answers EVERY collection-q, card_cache SQL is
+    // outage-fallback only. Upstream mode (no sidecar) gets the SQLite answer
+    // legs (collq local rows / Oracle-Tag-local).
+    st.local_scrayfall = is_sidecar;
     st.name_index = Arc::new(idx);
     st.owned_index = Arc::new(owned);
     app(st)

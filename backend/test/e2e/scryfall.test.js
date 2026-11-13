@@ -468,5 +468,7 @@ runTests()
     process.exit(0);
   })
   .catch(err => {
+    console.error('FAIL: scryfall.test -', err && err.message ? err.message : String(err));
+    console.error(err && err.stack ? err.stack : '');
     process.exit(1);
   });

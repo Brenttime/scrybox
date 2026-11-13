@@ -200,6 +200,16 @@ pub enum Plan {
     CollectionQ(Arc<collq::CollectionQ>),
     /// Collection-scope field-filter leg (this file, collection_owned_sql).
     CollectionOwned(Box<CollectionOwned>),
+    /// resolveCollectionQuery's answerLocally (mode 'local', upstream mode
+    /// only): every term is data-backed, the owned rows ARE the answer.
+    CollectionLocalRows(Arc<collq::LocalQ>),
+    /// supportsLocalCollectionQuery: otag + LOCAL_COLLECTION_OPERATORS only,
+    /// answered from the tag index when isReady holds — `walk` is the walk
+    /// path Node falls through to when the readiness gate fails.
+    CollectionLocalTags { tags: Arc<collq::LocalQ>, walk: Arc<collq::CollectionQ> },
+    /// Upstream mode only: a query Node's own parser provably rejects
+    /// (route: classifyQuery throw → 400 INVALID_QUERY).
+    InvalidQuery,
     Proxy,
 }
 
@@ -226,7 +236,7 @@ pub(crate) fn lang_codes(input: Option<&str>) -> (String, String) {
 /// that could reach Scryfall/the sidecar (raw `q`, `prints`, `image`, other
 /// scopes) or that uses query-param shapes too odd to model (repeated keys
 /// → qs produces arrays) is left to Node.
-pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
+pub fn plan(user_id: i64, raw_query: Option<&str>, local_scrayfall: bool) -> Plan {
     let pairs: Vec<(String, String)> = raw_query
         .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
         .unwrap_or_default();
@@ -244,8 +254,67 @@ pub fn plan(user_id: i64, raw_query: Option<&str>) -> Plan {
         // everything else (any operator syntax, other scopes) proxies.
         let scope0 = first("scope").unwrap_or_else(|| "database".to_string());
         if scope0 == "collection" {
-            if let Some(cq) = plan_collection_q(user_id, &pairs, &qraw, first) {
-                return Plan::CollectionQ(Arc::new(cq));
+            // Route order: classifyQuery pre-reject → answerLocally (mode
+            // 'local', upstream mode only) → supportsLocalCollectionQuery →
+            // walk. All three Rust-served legs live in collq.rs; anything
+            // outside their accepted subsets keeps the walk/proxy contract.
+            if !local_scrayfall && collq::definitely_invalid(&qraw) {
+                return Plan::InvalidQuery;
+            }
+            let dup_count = pairs.iter().filter(|(kk, _)| kk == "count").count() > 1;
+            if !dup_count {
+                // maxLimit for the collection+q path is 2000 (route line 91).
+                let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+                let page = if page == 0 { 1 } else { page }.max(1);
+                let limit = first("limit").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+                let limit = if limit == 0 { 60 } else { limit }.clamp(1, 2000);
+                let has_window =
+                    pairs.iter().any(|(kk, _)| kk == "page" || kk == "limit");
+                let include_total = first("count").as_deref() != Some("0");
+                let expected_snapshot = first("snapshot");
+                if !local_scrayfall {
+                    if let Some(lq) = collq::local_plan(
+                        user_id, &qraw, has_window, page, limit, include_total,
+                        expected_snapshot.clone(), false,
+                    ) {
+                        return Plan::CollectionLocalRows(Arc::new(lq));
+                    }
+                }
+                if let Some(walk) = plan_collection_q(user_id, &pairs, &qraw, first) {
+                    if let Some(tags) = collq::local_plan(
+                        user_id, &qraw, has_window, page, limit, include_total,
+                        expected_snapshot.clone(), true,
+                    ) {
+                        return Plan::CollectionLocalTags {
+                            tags: Arc::new(tags),
+                            walk: Arc::new(walk),
+                        };
+                    }
+                    return Plan::CollectionQ(Arc::new(walk));
+                }
+                // snapshot-only walk rejection: the tag leg verifies the
+                // snapshot itself (per-request read txn, no durable cache —
+                // Node's readCatalogSnapshot), so retry the walk fallback
+                // with the param stripped. A NotReady tag leg with a snapshot
+                // in hand proxies instead (the walk leg's own snapshot check
+                // stays Node's).
+                let npairs: Vec<(String, String)> =
+                    pairs.iter().filter(|(k, _)| k != "snapshot").cloned().collect();
+                if npairs.len() != pairs.len() {
+                    if let Some(tags) = collq::local_plan(
+                        user_id, &qraw, has_window, page, limit, include_total,
+                        expected_snapshot, true,
+                    ) {
+                        let nfirst =
+                            |k: &str| npairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+                        if let Some(walk) = plan_collection_q(user_id, &npairs, &qraw, nfirst) {
+                            return Plan::CollectionLocalTags {
+                                tags: Arc::new(tags),
+                                walk: Arc::new(walk),
+                            };
+                        }
+                    }
+                }
             }
         }
         return Plan::Proxy;
@@ -1933,7 +2002,7 @@ pub async fn handle(
     let p = match if is_post {
         plan_post(user.id, raw_query.as_deref(), body_map.as_ref())
     } else {
-        plan(user.id, raw_query.as_deref())
+        plan(user.id, raw_query.as_deref(), st.local_scrayfall)
     } {
         Plan::Native(p) => p,
         Plan::CollectionQ(cq) => {
@@ -1943,6 +2012,20 @@ pub async fn handle(
             let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
             let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
             return with_rl(serve_owned(st, pool, o, inm, ae).await);
+        }
+        Plan::CollectionLocalRows(lq) => {
+            let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            return with_rl(serve_local(st, pool, lq, inm, ae, None).await);
+        }
+        Plan::CollectionLocalTags { tags, walk } => {
+            let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let req = crate::collection_writes::rebuild(parts, &bytes);
+            return with_rl(serve_local(st, pool, tags, inm, ae, Some((req, walk))).await);
+        }
+        Plan::InvalidQuery => {
+            return with_rl(json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY"));
         }
         Plan::Proxy => return to_node(&st, parts, bytes).await,
     };
@@ -2343,7 +2426,14 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
         }
     };
     let expose: Option<&'static str> = if entry.catalog.is_some() {
-        Some("X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source")
+        if entry.x_source {
+            Some("X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot, X-Source")
+        } else {
+            // The local answer legs (answerLocally / local Oracle Tags):
+            // Node's route only appends ', X-Source' when source is
+            // 'sidecar'/'local-fallback' — 'local' responses stay without it.
+            Some("X-Total-Count, X-Catalog-Complete, X-Catalog-Upstream-Total, X-Catalog-Cache, X-Catalog-Snapshot")
+        }
     } else if entry.x_source {
         Some("X-Total-Count, X-Source")
     } else {
@@ -2546,4 +2636,89 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
         }
     }
+}
+
+/// One of Node's two SQLite answer legs (collq::build_local), served per
+/// request without touching the response cache: Node runs a dedicated read
+/// transaction every time, so snapshot/pinning semantics are per-request
+/// there. `fallback` carries the rebuilt request + walk plan for the tag
+/// leg's isReady fall-through (Node's `if (local) return local;` else walk).
+async fn serve_local(
+    st: AppState,
+    pool: Arc<DbPool>,
+    lq: Arc<collq::LocalQ>,
+    inm: Option<String>,
+    ae: Option<String>,
+    fallback: Option<(Request, Arc<collq::CollectionQ>)>,
+) -> Response {
+    let outcome = {
+        let pool = Arc::clone(&pool);
+        let lq = Arc::clone(&lq);
+        match tokio::task::spawn_blocking(move || collq::build_local(&pool, &lq)).await {
+            Ok(o) => o,
+            Err(e) => collq::LocalOutcome::Failed(format!("local build task panicked: {e}")),
+        }
+    };
+    let (cards, total, snapshot) = match outcome {
+        collq::LocalOutcome::Built { cards, total, snapshot } => (cards, total, snapshot),
+        collq::LocalOutcome::NotReady => {
+            // supportsLocalCollectionQuery passed but isReady failed — Node
+            // continues to the walk below resolveCollectionQuery's local
+            // branch and pays for the engine.
+            match fallback {
+                Some((req, cq)) => {
+                    // A snapshot-carrying request must not ride the walk leg
+                    // (its own snapshot check is not ported): Node answers.
+                    if lq.expected_snapshot.is_some() {
+                        return crate::proxy(axum::extract::State(st), req).await;
+                    }
+                    return serve_collq(st, req, pool, cq).await;
+                }
+                None => {
+                    tracing::error!("local tag leg NotReady without a walk fallback");
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+                }
+            }
+        }
+        collq::LocalOutcome::Mismatch { actual } => {
+            // readCatalogSnapshot throw → route 409 twin (Node logs the
+            // expected/actual pair on the error object, not the body).
+            tracing::debug!(expected = %lq.expected_snapshot.as_deref().unwrap_or(""), actual = %actual, "catalog snapshot mismatch");
+            return json_error(StatusCode::CONFLICT, "CATALOG_SNAPSHOT_CHANGED");
+        }
+        collq::LocalOutcome::Failed(e) => {
+            tracing::error!(error = %e, "local answer build failed");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    };
+    // res.json(cards): compact JSON body, ETag over it, the catalog header
+    // set with cacheStatus 'local' and no X-Source (route line 158 only
+    // adds it for 'sidecar'/'local-fallback').
+    let raw = match serde_json::to_vec(&cards) {
+        Ok(v) => bytes::Bytes::from(v),
+        Err(e) => {
+            tracing::error!(error = %e, "local answer serialize failed");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    };
+    let etag = body_etag(&raw);
+    let gz = gzip_bytes(&raw);
+    let entry = Arc::new(SearchEntry {
+        rev: 0,
+        raw,
+        gz,
+        etag,
+        total: None,
+        source: "local",
+        x_source: false,
+        catalog: Some(CatalogMeta {
+            total,
+            complete: true,
+            upstream_total: None,
+            status: "local",
+            snapshot,
+        }),
+        stale: Arc::new(Vec::new()),
+    });
+    respond_entry(&entry, inm.as_deref(), ae.as_deref(), Some(("local", "local")))
 }
