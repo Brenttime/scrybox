@@ -24,7 +24,20 @@
 //
 // Usage: node cardscan-stress.mjs [--token TOK] [--concurrency N]
 //        [--duration S] [--legs node,rust] [--xff-base 127.0.0.]
+//        [--bodies synthetic|corpus] [--corpus-dir DIR]
+//
+// --bodies corpus (iter-62, sidecar-queue attribution): the detect bodies are
+// the REAL eval-corpus images (scan*.jpg + card*.png, 100-520 KB each) sent
+// as application/octet-stream — the one content-type BOTH proxies accept raw
+// (express.raw image/jpeg|octet-stream; Rust cardscan.rs mirrors it) and that
+// the sidecar sniffs regardless. Unlike the 230-byte synthetic body (which
+// the sidecar rejects fast — "Truncated File Read"), real images make the
+// sidecar run full detection per request, so the window measures the proxy
+// legs queued behind real sidecar work. Bodies rotate per request over the
+// sorted file list.
 import { spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import zlib from 'node:zlib';
 
 const NODE_BASE = process.env.NODE_BASE || 'http://127.0.0.1:3312';
@@ -51,10 +64,26 @@ function img(n) { // same synthetic jpeg the A/B harness uses
 }
 const DETECT_BODY = img(230);
 
+// corpus mode: real images make the sidecar do real work per request.
+const BODIES_MODE = arg('bodies', 'synthetic');
+const CORPUS_DIR = arg('corpus-dir', '/home/brenttime/projects/scrybox-rusttest/data/scan-eval-corpus');
+let CORPUS = [];
+if (BODIES_MODE === 'corpus') {
+  CORPUS = readdirSync(CORPUS_DIR)
+    .filter((f) => /\.(jpe?g|png)$/i.test(f))
+    .sort()
+    .map((f) => ({ name: f, buf: readFileSync(path.join(CORPUS_DIR, f)) }));
+  if (CORPUS.length < 10) {
+    console.error(`corpus mode: only ${CORPUS.length} images in ${CORPUS_DIR} — refusing`);
+    process.exit(2);
+  }
+}
+const detectBody = (i) => (BODIES_MODE === 'corpus' ? CORPUS[i % CORPUS.length] : { name: 'synthetic', buf: DETECT_BODY });
+
 // Workload mix: mirrors a live scanner client — mostly frames of detect with
 // a status poll every ~10th request (the client polls status between scans).
 const MIX = [
-  { name: 'detect', method: 'POST', path: '/api/cardscan/detect', ct: 'image/jpeg', body: DETECT_BODY, w: 9 },
+  { name: 'detect', method: 'POST', path: '/api/cardscan/detect', ct: BODIES_MODE === 'corpus' ? 'application/octet-stream' : 'image/jpeg', rotate: BODIES_MODE === 'corpus', body: DETECT_BODY, w: 9 },
   { name: 'status', method: 'GET', path: '/api/cardscan/status', w: 1 },
 ];
 const MIX_EXPANDED = MIX.flatMap((m) => Array(m.w).fill(m));
@@ -66,22 +95,30 @@ async function leg(base, mix, i, saw) {
   };
   const m = mix[i % mix.length];
   if (m.ct) h['content-type'] = m.ct;
+  const body = m.rotate ? detectBody(i).buf : m.body;
   const t0 = process.hrtime.bigint();
   try {
     const r = await fetch(base + m.path, {
-      method: m.method, headers: h, body: m.body ?? undefined, redirect: 'manual',
+      method: m.method, headers: h, body: body ?? undefined, redirect: 'manual',
     });
     const buf = Buffer.from(await r.arrayBuffer());
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     let cls = `${r.status}`;
     if (m.name === 'detect' && r.status === 200) {
-      // classify the payload so a degenerate 200 (empty/err body) is visible
+      // classify the payload so a degenerate 200 (empty/err body) is visible;
+      // for real images also record the first top-level array's size (the
+      // candidate-card count the sidecar found) so both legs must agree on
+      // the workload actually having run, not just on the status line.
       let b = buf;
       const enc = r.headers.get('content-encoding');
       if (enc === 'gzip' && buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) b = zlib.gunzipSync(buf);
       try {
         const j = JSON.parse(b.toString('utf8'));
-        cls = j.error ? '200-error-body:' + String(j.error).slice(0, 40) : '200-ok';
+        if (j.error) cls = '200-error-body:' + String(j.error).slice(0, 40);
+        else {
+          const arr = Object.values(j).find((v) => Array.isArray(v));
+          cls = arr ? `200-ok[arr=${arr.length}]` : '200-ok';
+        }
       } catch { cls = '200-unparseable'; }
     }
     saw.push({ name: m.name, ms, cls });
@@ -138,7 +175,7 @@ async function sidecarProbe() {
 
 async function main() {
   const legs = arg('legs', 'node,rust').split(',');
-  console.log(`# cardscan sidecar stress  sidecar=${await sidecarIp()}  concurrency=${CONC} duration=${DUR_MS / 1000}s mix=detect:9/status:1`);
+  console.log(`# cardscan sidecar stress  sidecar=${await sidecarIp()}  concurrency=${CONC} duration=${DUR_MS / 1000}s mix=detect:9/status:1 bodies=${BODIES_MODE}${BODIES_MODE === 'corpus' ? `(${CORPUS.length} imgs)` : ''}`);
   const pre = await sidecarProbe();
   console.log('sidecar pre-stress:', JSON.stringify(pre));
   if (!pre.ok) { console.error('REFUSING to stress: sidecar not healthy pre-flight'); process.exit(3); }
