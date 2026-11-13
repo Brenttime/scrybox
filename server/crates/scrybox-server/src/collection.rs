@@ -835,7 +835,7 @@ fn store_max_bytes() -> u64 {
 /// asked to return heap to the OS (`malloc_trim`). Small churn is left for
 /// the allocator to reuse; the refresher swaps this flag off the request
 /// path so the trim never lands on a serving thread.
-const TRIM_DIRTY_BYTES: u64 = 64 << 20; // 64 MiB
+pub(crate) const TRIM_DIRTY_BYTES: u64 = 64 << 20; // 64 MiB
 /// Cost gate for the pre-warm fan-out (iter 15). Unbudgeted fan-out over
 /// every recent shape — cheap paged builds included — kept 2 of the 4 cores
 /// busy on every write-mix tick, starved the search_db request path
@@ -1109,7 +1109,7 @@ impl CollectionCache {
 /// allocations ≥ 64 MB always go through mmap (munmapped on free — covers
 /// gz members concatenated and future bigger bodies), and the trim threshold
 /// is pinned so `malloc_trim` can return the rest.
-fn tune_allocator() {
+pub(crate) fn tune_allocator() {
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
@@ -1119,7 +1119,7 @@ fn tune_allocator() {
 
 /// Return free heap pages to the OS. Runs on the refresher timer only
 /// (never a serving thread); armed by `put` freeing ≥ `TRIM_DIRTY_BYTES`.
-fn trim_heap() {
+pub(crate) fn trim_heap() {
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::malloc_trim(0);
