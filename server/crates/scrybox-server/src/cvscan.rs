@@ -1725,6 +1725,31 @@ mod tests {
     const ABS_SCORE: f64 = 5e-4;
     const ABS_SHARP: f64 = 5e-3;
 
+    // brain-SKIP guard (lane-B iter-27): remote-cargo mirrors the worktree to
+    // brain.local and runs cargo there after `touch ~/<mirror>/server/.rc-stamp`
+    // (tools/remote-cargo/cargo:21). brain has no ORT dylib / models / corpus /
+    // lane DB, so this test used to self-SKIP and the remote run still printed
+    // `ok` — misleading recognition-parity evidence. Under a detected remote
+    // run a SKIP is now a FAILURE unless SCRYBOX_ALLOW_EVAL_SKIP=1 is set
+    // explicitly (e.g. for the pre-commit full-workspace run on brain).
+    // Recognition-parity evidence must come from a LOCAL cargo run
+    // (SCRYBOX_LOCAL_CARGO=1), where a missing-artifact SKIP stays soft.
+    fn eval_skip(what: &str) {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let remote = manifest.ancestors().any(|a| a.file_name() == Some(std::ffi::OsStr::new("rustbuild")))
+            || manifest.join("../..").join(".rc-stamp").exists();
+        let opt_out = std::env::var("SCRYBOX_ALLOW_EVAL_SKIP").map(|v| v == "1").unwrap_or(false);
+        if remote && !opt_out {
+            panic!(
+                "node_truth_parity_on_eval_corpus SKIPPED under remote-cargo ({what}) — \
+                 recognition-parity evidence must come from a local run \
+                 (SCRYBOX_LOCAL_CARGO=1). Set SCRYBOX_ALLOW_EVAL_SKIP=1 for a \
+                 deliberate remote run that does not need this evidence."
+            );
+        }
+        eprintln!("SKIP node_truth_parity_on_eval_corpus: {what}");
+    }
+
     fn lane_artifacts() -> Option<(PathBuf, PathBuf, PathBuf)> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
         let dylib = std::env::var_os("ORT_DYLIB_PATH")
@@ -1756,7 +1781,7 @@ mod tests {
     #[test]
     fn node_truth_parity_on_eval_corpus() {
         let Some((dylib, models, corpus)) = lane_artifacts() else {
-            eprintln!("SKIP node_truth_parity_on_eval_corpus: lane artifacts absent");
+            eval_skip("lane artifacts absent");
             return;
         };
         if std::env::var("ORT_DYLIB_PATH").unwrap_or_default().is_empty() {
@@ -1780,7 +1805,7 @@ mod tests {
         let lane_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../data/bindarr.db");
         if !lane_db.exists() {
-            eprintln!("SKIP node_truth_parity_on_eval_corpus: lane DB absent");
+            eval_skip("lane DB absent");
             return;
         }
         let pool = crate::db::DbPool::open(lane_db, 2).unwrap();
