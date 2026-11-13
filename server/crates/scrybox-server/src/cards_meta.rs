@@ -460,15 +460,21 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
     //    undefined → same 400);
     //  - malformed JSON or a strict-rejected scalar → body-parser's
     //    error-middleware path → replay the raw bytes to Node verbatim.
-    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let (_parts, bytes, oversize) =
+        crate::collection_writes::read_parts(req, crate::collection_writes::BODY_NORMAL).await;
     let is_json_ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase().replace(' ', "").starts_with("application/json"))
         .unwrap_or(false);
+    if oversize && is_json_ct {
+        // normalJson (1mb) ceiling exceeded: body-parser's entity.too.large
+        // error-middleware answer — the same 413 the raw-bytes replay would
+        // have produced from Node, minus buffering the whole stream first
+        // (REVIEW-auth.md H1). Non-JSON content-types skip the parser: the
+        // abandoned (empty) body parses as `req.body === undefined` below.
+        return crate::collection_writes::too_large();
+    }
     let parsed: Option<Value> = if is_json_ct && !bytes.is_empty() {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v @ (Value::Object(_) | Value::Array(_))) => Some(v),

@@ -341,7 +341,7 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 /// the response. hyper instead drops the unread body and RSTs — a client
 /// still mid-upload sees EPIPE instead of the 401. Drain (never parse) with
 /// Node-comparable bounds before answering early.
-async fn drain_request_body(body: &mut Body) {
+pub(crate) async fn drain_request_body(body: &mut Body) {
     // Node has no request cap at the http layer; the bigJson route parsers
     // top out at 15–40 MB. 100 MB read-and-discard bounds hostile input.
     const CAP: u64 = 100 * 1024 * 1024;
@@ -953,5 +953,15 @@ pub fn app(state: AppState) -> Router {
     };
     router
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // REVIEW-auth H1 backstop: DefaultBodyLimit at the largest route
+        // parser ceiling (manabox-sync 40mb, server.js:464). Raw to_bytes
+        // reads already cap themselves per-route (collection_writes::
+        // read_parts / cards_tags::read_body); this guards any future
+        // extractor-based (Json/Form/Bytes) route against unbounded
+        // buffering. Note axum's extractor-only semantics: it does NOT
+        // touch the raw proxy path — correct, Node streams those.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            40 * 1024 * 1024,
+        ))
         .with_state(state)
 }

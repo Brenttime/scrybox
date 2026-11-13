@@ -111,7 +111,10 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -291,7 +294,10 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -398,7 +404,10 @@ pub async fn handle_bulk_remove(Path(id): Path<String>, State(st): State<AppStat
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -483,7 +492,10 @@ pub async fn handle_remove_from_collection(Path(id): Path<String>, State(st): St
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -638,7 +650,10 @@ pub async fn handle_cheapest_printings(Path(id): Path<String>, State(st): State<
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -749,7 +764,10 @@ pub async fn handle_printing(
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -846,7 +864,10 @@ pub async fn handle_remove_card(Path((id, card_id)): Path<(String, String)>, Sta
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),

@@ -232,7 +232,10 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
 
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     // body-parser BEFORE auth (server.js mount order).
-    let (parts, bytes) = crate::collection_writes::read_parts(req).await;
+    let (parts, bytes, oversize) = crate::collection_writes::read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),
@@ -327,7 +330,10 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
 
 async fn handle_put(State(st): State<AppState>, id: String, req: Request) -> Response {
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = crate::collection_writes::read_parts(req).await;
+    let (parts, bytes, oversize) = crate::collection_writes::read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),

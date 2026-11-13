@@ -567,7 +567,7 @@ pub(crate) enum BodyOutcome {
     TooLarge,
 }
 
-fn is_json_ct(headers: &HeaderMap) -> bool {
+pub(crate) fn is_json_ct(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -615,10 +615,33 @@ pub(crate) fn internal_error() -> Response {
 // Router entries
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn read_parts(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
+/// Node's body-parser ceilings (backend/src/server.js:204-205,460-464,
+/// routes/cardscan.js:148). read_parts/read_body stream AT MOST cap+1 bytes:
+/// a hostile (or broken) client can never grow the front's RSS by streaming
+/// an unbounded body — the old `to_bytes(.., usize::MAX)` reads buffered
+/// everything before the size-check arms ran (REVIEW-auth.md H1).
+pub(crate) const BODY_NORMAL: usize = 1024 * 1024; // express.json 1mb (pre-auth global)
+pub(crate) const BODY_BIG: usize = 15 * 1024 * 1024; // bigJson 15mb (post-auth)
+pub(crate) const BODY_MANABOX: usize = 40 * 1024 * 1024; // manabox-sync 40mb
+pub(crate) const BODY_TELEMETRY: usize = 512 * 1024; // cardscan telemetry
+
+/// Buffer the request body with the route's Node-parser ceiling. Returns
+/// `(parts, bytes, oversize)`. On oversize the stream was abandoned at the
+/// cap (body-parser does the same), bytes is empty, and `content-length` is
+/// removed from the parts so a replay/proxy leg never forwards a short body
+/// under the original length (Node's parser abandons the stream here too;
+/// a downstream that ignores the body — Node's behaviour for a content-type
+/// its parser skips — sees an equivalent body-less request).
+pub(crate) async fn read_parts(req: Request, cap: usize) -> (axum::http::request::Parts, Vec<u8>, bool) {
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default().to_vec();
-    (parts, bytes)
+    match axum::body::to_bytes(body, cap.saturating_add(1)).await {
+        Ok(b) => (parts, b.to_vec(), false),
+        Err(_) => {
+            let mut parts = parts;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            (parts, Vec::new(), true)
+        }
+    }
 }
 
 pub(crate) fn rebuild(parts: axum::http::request::Parts, bytes: &[u8]) -> Request {
@@ -631,7 +654,10 @@ pub async fn handle_cardlist(State(st): State<AppState>, req: Request) -> Respon
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let uri = parts.uri.clone();
 
@@ -765,7 +791,10 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
 
     let body = match parse_body(&headers, &bytes) {
@@ -809,7 +838,10 @@ pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
 
     let body = match parse_body(&headers, &bytes) {
@@ -1954,7 +1986,10 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
     };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::Parsed(b) => b,
@@ -2047,7 +2082,10 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
     };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::Parsed(b) => b,

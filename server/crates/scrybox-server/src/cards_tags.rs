@@ -133,13 +133,19 @@ fn active_generation(conn: &rusqlite::Connection) -> Result<Option<i64>, String>
     }
 }
 
-pub(crate) async fn read_body(req: Request) -> (axum::http::request::Parts, Vec<u8>) {
+/// Capped sibling of `collection_writes::read_parts` (REVIEW-auth.md H1):
+/// streams at most `cap+1` bytes, reports oversize instead of buffering the
+/// whole stream, and clears `content-length` on the oversize parts.
+pub(crate) async fn read_body(req: Request, cap: usize) -> (axum::http::request::Parts, Vec<u8>, bool) {
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_default()
-        .to_vec();
-    (parts, bytes)
+    match axum::body::to_bytes(body, cap.saturating_add(1)).await {
+        Ok(b) => (parts, b.to_vec(), false),
+        Err(_) => {
+            let mut parts = parts;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            (parts, Vec::new(), true)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +574,10 @@ pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Respo
     // route body — a no-token request answers 401 even with a bad-shape body,
     // and an api key on POST answers 403 (read-only rule) — and only then the
     // route's 400 shape check.
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::TooLarge => {
@@ -757,7 +766,10 @@ pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Respo
     };
     // Same global middleware order as role-tags: parse errors, then the
     // /api authenticateToken gate, then the route's 400 shape check.
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::TooLarge => {

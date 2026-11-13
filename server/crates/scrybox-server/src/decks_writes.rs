@@ -266,7 +266,10 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
 
     // express.json runs globally ahead of the auth gate: parse failures
@@ -299,7 +302,10 @@ pub async fn handle_card(
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
 
     let body = match parse_body(headers, &bytes) {
@@ -342,7 +348,10 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -504,7 +513,10 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     let body = match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -701,7 +713,10 @@ pub async fn handle_register(Path(id): Path<String>, State(st): State<AppState>,
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     // The route ignores the body but express.json parsed it ahead of auth,
     // so a malformed one still 500s before the 401.
@@ -875,7 +890,10 @@ pub async fn handle_checkout(Path(id): Path<String>, State(st): State<AppState>,
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
@@ -1109,7 +1127,10 @@ pub async fn handle_return(Path(id): Path<String>, State(st): State<AppState>, r
         return crate::proxy(State(st), req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers: &HeaderMap = &parts.headers;
     match parse_body(headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),

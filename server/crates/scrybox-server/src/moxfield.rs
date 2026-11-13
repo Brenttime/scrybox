@@ -2023,7 +2023,10 @@ pub async fn handle_add_author(State(st): State<AppState>, req: Request) -> Resp
     if req.method() != Method::POST || !st.owns("moxfield") || st.db.is_none() {
         return crate::proxy(State(st), req).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::TooLarge => {
@@ -2196,7 +2199,10 @@ pub async fn handle_deck_update(
     if req.method() != Method::PUT || !st.owns("moxfield") || st.db.is_none() {
         return crate::proxy(State(st), req).await;
     }
-    let (parts, bytes) = read_body(req).await;
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::TooLarge => {

@@ -1186,7 +1186,10 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     // express.json sits above the router: malformed JSON answers the generic
     // 500 and oversize the 413 BEFORE auth (collection_writes convention).
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::Parsed(b) => b,
@@ -2184,7 +2187,10 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
 
 async fn handle_preview(st: AppState, req: Request) -> Response {
     let headers: HeaderMap = req.headers().clone();
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let _ = parts;
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::Parsed(b) => b,
@@ -2218,7 +2224,10 @@ async fn handle_preview(st: AppState, req: Request) -> Response {
 
 async fn handle_add(st: AppState, req: Request) -> Response {
     let headers: HeaderMap = req.headers().clone();
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let _ = parts;
     let body = match parse_body(&headers, &bytes) {
         BodyOutcome::Parsed(b) => b,

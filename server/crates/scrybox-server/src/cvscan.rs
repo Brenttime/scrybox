@@ -1331,9 +1331,11 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
     let user = match authenticate(&pool, token.as_deref(), false) {
         Ok(u) => u,
         Err(res) => {
-            let (parts, body) = req.into_parts();
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-            let _ = parts;
+            // Auth failed with a body still queued: drain-and-discard with
+            // Node-comparable bounds (REVIEW-auth.md H1 — the old
+            // to_bytes(.., usize::MAX) "drain" buffered the whole stream).
+            let (_parts, mut body) = req.into_parts();
+            crate::drain_request_body(&mut body).await;
             return res;
         }
     };
@@ -1343,7 +1345,13 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         st.stats_cache.bump(user.id);
     }
 
-    let (parts, bytes) = read_body(req).await;
+    // authenticateToken has passed; this is a bigJson path (server.js:461) —
+    // the post-auth parser 413s on >15mb JSON, everything else rides the
+    // parser-skip semantics with an empty body.
+    let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     let headers = parts.headers.clone();
     let body = match cardscan::parse_outer_json(&headers, &bytes) {
         Ok(v) => v,

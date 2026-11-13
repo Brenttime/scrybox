@@ -898,12 +898,31 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
     // auth gate — parse first, Forward the untouched request on a parse
     // failure (Node's SyntaxError/413 page is authoritative).
     let body_val: Value = if is_post_build {
-        let (parts, body) = req.into_parts();
-        let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let (mut parts, body) = req.into_parts();
+        // Capped at normalJson's 1mb (REVIEW-auth.md H1): content-length
+        // above the cap answers the parser's 413 here for JSON (Node's
+        // normalJson runs before the auth gate); non-JSON skips the parser
+        // (empty body, cleared content-length); a chunked stream error
+        // past the cap forwards body-less for Node's own verdict.
+        let cl_over_cap = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n > crate::collection_writes::BODY_NORMAL)
+            .unwrap_or(false);
+        let bytes = match axum::body::to_bytes(body, crate::collection_writes::BODY_NORMAL + 1).await {
             Ok(b) => b,
+            Err(_) if cl_over_cap && crate::collection_writes::is_json_ct(&parts.headers) => {
+                return crate::collection_writes::too_large();
+            }
+            Err(_) if cl_over_cap => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                axum::body::Bytes::new()
+            }
             Err(_) => {
-                let fwd = Request::from_parts(parts, Body::empty());
-                return crate::proxy(State(st), fwd).await;
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
             }
         };
         match parse_outer_json(&parts.headers, &bytes) {
@@ -919,8 +938,31 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
     } else if req.method() == axum::http::Method::POST || req.method() == axum::http::Method::PUT {
         // POST/PUT to stop (or anything else): Node's router ignores the
         // body there (express.json still ran — empty parse), forward-safe.
-        let (parts, body) = req.into_parts();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        // Capped read (REVIEW-auth.md H1) — same 413/skip arms as above;
+        // Node's parser runs BEFORE the router, so even body-ignoring
+        // routes 413 on oversize JSON.
+        let (mut parts, body) = req.into_parts();
+        let cl_over_cap = parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n > crate::collection_writes::BODY_NORMAL)
+            .unwrap_or(false);
+        let bytes = match axum::body::to_bytes(body, crate::collection_writes::BODY_NORMAL + 1).await {
+            Ok(b) => b,
+            Err(_) if cl_over_cap && crate::collection_writes::is_json_ct(&parts.headers) => {
+                return crate::collection_writes::too_large();
+            }
+            Err(_) if cl_over_cap => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                axum::body::Bytes::new()
+            }
+            Err(_) => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
+            }
+        };
         match parse_outer_json(&parts.headers, &bytes) {
             Ok(v) => {
                 req = Request::from_parts(parts, Body::from(bytes.to_vec()));

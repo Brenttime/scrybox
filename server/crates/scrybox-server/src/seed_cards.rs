@@ -177,7 +177,10 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
     // Global normalJson above auth: oversize → 413, malformed → generic 500,
     // both with NO token. The handler ignores the parsed body entirely
     // (arrays/objects included — Node never touches req.body here).
-    let (parts, bytes) = read_parts(req).await;
+    let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
     match parse_body(&parts.headers, &bytes) {
         BodyOutcome::TooLarge => return too_large(),
         BodyOutcome::Invalid => return internal_error(),

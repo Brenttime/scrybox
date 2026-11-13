@@ -14,7 +14,7 @@ hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio", "service"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { version = "1", features = ["preserve_order"] }
