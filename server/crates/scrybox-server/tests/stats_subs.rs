@@ -501,3 +501,51 @@ async fn auth_failures_match_node_bodies() {
         assert!(h.get("x-node").is_none(), "{path} api-key GET must stay native");
     }
 }
+
+/// Gate D iter-25: the stats_subs cold compute shares the /stats build
+/// budget (same store, same working set). Saturate the budget, fire one
+/// cold networth request, assert it queues until a permit frees. Works on
+/// both the cached slot leg and the STATS_CACHE=0 direct leg — both take
+/// the permit.
+#[tokio::test]
+async fn cold_build_waits_for_the_build_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: format!("http://{upstream}"),
+        static_dir: None,
+        rust_routes: ["stats_subs".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(seeded_stats_db(dir.path(), "budget.db")),
+        sidecar_url: None,
+    };
+    let st = AppState::new(cfg);
+    let cache = std::sync::Arc::clone(&st.stats_cache);
+    let r = app(st);
+    assert_eq!(cache.build_permits_available(), 2);
+
+    let p1 = cache.build_permit().await;
+    let p2 = cache.build_permit().await;
+    assert_eq!(cache.build_permits_available(), 0);
+
+    let h = {
+        let r = r.clone();
+        tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/stats/networth")
+                .header("authorization", "Bearer tok-stats-rich")
+                .body(Body::empty())
+                .unwrap();
+            r.oneshot(req).await.unwrap().status()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!h.is_finished(), "cold networth build must queue while the budget is saturated");
+    drop((p1, p2));
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), h)
+        .await
+        .expect("request must complete once the budget frees")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+}
