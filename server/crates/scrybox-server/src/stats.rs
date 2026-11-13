@@ -996,12 +996,36 @@ pub fn spawn_boot_warm(state: &AppState) {
     if !boot_warm_requested() {
         return;
     }
+    // Iter-64 boot-RSS attribution (Gate D): running the warm through the
+    // SERVING pool pre-faulted its 32 MB/conn mmap windows — boot RSS 144 MB
+    // vs 14 MB with the warm off, ~85 MB of it clean file-backed pages that
+    // stay in RSS as long as the mapping lives. Run the whole warm on a
+    // mmap-off scratch twin instead: same DB, same queries, same bodies
+    // (request-path parity untouched), but the reads go the read() path and
+    // the pages leave RSS when the twin drops. The serving pool's windows
+    // stay clean until real traffic faults them on demand.
+    let Ok(scratch) = pool.scratch() else {
+        return; // best-effort warm: a scratch-open failure leaves pure lazy
+    };
+    let pool = Arc::new(scratch);
     let cache = Arc::clone(&state.stats_cache);
     tokio::spawn(async move {
         let pool2 = Arc::clone(&pool);
         let users = match tokio::task::spawn_blocking(move || {
             let conn = pool2.get().ok()?;
-            let mut stmt = conn.prepare("SELECT id FROM users ORDER BY id LIMIT 4").ok()?;
+            // Users WITH collection rows first, id order within tiers: /stats
+            // is meaningful for collectors (the storm/bench token belongs to
+            // the 25k-row user), while a zero-collection user's body is
+            // near-empty and cheap-but-pointless as a warm target. Same
+            // BOOT_WARM_MAX_USERS cap; parity untouched (bodies identical).
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM users ORDER BY
+                        EXISTS(SELECT 1 FROM collection c WHERE c.user_id = users.id) DESC,
+                        id
+                     LIMIT 4",
+                )
+                .ok()?;
             let ids: Vec<i64> = stmt.query_map([], |r| r.get::<_, i64>(0)).ok()?.filter_map(|r| r.ok()).collect();
             Some(ids)
         })

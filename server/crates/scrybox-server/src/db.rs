@@ -120,6 +120,22 @@ impl DbPool {
         }
         // else: drop the connection
     }
+
+    /// One-shot twin of this pool with the mmap window OFF (iter-64 boot-RSS
+    /// attribution): for background/boot scans whose touched pages must not
+    /// pin the SERVING pool's mmap windows in RSS. SQLite `mmap_size` pages,
+    /// once faulted, stay mapped (and in RSS) as long as the mapping lives;
+    /// a boot stats warm pre-faulting the pool's 32 MB windows cost ~85 MB
+    /// of file-backed RSS at idle (144 MB boot vs 14 MB warm-off). Reads
+    /// through this twin go the read() path — kernel page cache keeps them
+    /// cheap and the pages leave RSS when the twin (and its conns) drop.
+    /// Same path + per-conn page-cache budget; max 1 connection.
+    pub fn scratch(&self) -> rusqlite::Result<DbPool> {
+        Self::open_with(
+            &self.path,
+            PoolConfig { max: 1, cache_kb: self.cfg.cache_kb, mmap_kb: 0 },
+        )
+    }
 }
 
 pub struct PooledConn<'a> {
@@ -170,6 +186,25 @@ mod tests {
 
     fn pragmas(conn: &Connection, name: &str) -> i64 {
         conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0)).unwrap()
+    }
+
+    #[test]
+    fn scratch_twin_disables_mmap_and_keeps_page_cache_budget() {
+        // Iter-64 boot-warm gate: the scratch twin must never open an mmap
+        // window (that's the whole RSS point) and must keep the serving
+        // pool's per-conn page-cache budget so boot scans stay fast.
+        let p = temp_db("scratch");
+        let pool = DbPool::open_with(&p, PoolConfig { max: 4, cache_kb: 8192, mmap_kb: 32768 }).unwrap();
+        let scratch = pool.scratch().unwrap();
+        let conn = scratch.get().unwrap();
+        assert_eq!(pragmas(&conn, "mmap_size"), 0);
+        assert_eq!(pragmas(&conn, "cache_size"), -8192);
+        // Same DB, readable through the twin.
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+        drop(conn);
+        // Serving pool untouched.
+        let serving = pool.get().unwrap();
+        assert_eq!(pragmas(&serving, "mmap_size"), 32768 * 1024);
     }
 
     #[test]
