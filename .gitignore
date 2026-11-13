@@ -78,3 +78,7 @@ asckey.b64
 # CollectorVision models and onnxruntime-web wasm (fetched, not authored)
 frontend/public/ort/
 REVIEW-pr3.md
+
+.integrate.lock
+.parity.lock
+.loop.lock
