@@ -168,8 +168,15 @@ pub fn client_ip_key(peer: Option<IpAddr>, headers: &HeaderMap, trust: &Trust) -
     let xff = xff_values(headers);
     match trust {
         Trust::None => key_for(socket),
-        Trust::All => match xff.first().and_then(|s| s.parse::<IpAddr>().ok()) {
-            Some(ip) => key_for(ip),
+        Trust::All => match xff.first() {
+            // trust-proxy-true: req.ip is the leftmost XFF token VERBATIM —
+            // proxy-addr 2.0.7 keeps unparseable entries in the chain
+            // (verified live: XFF 'garbage, 10.0.0.9' -> req.ip 'garbage'),
+            // so an unparseable first hop is the bucket key, not the socket.
+            Some(entry) => match entry.parse::<IpAddr>().ok() {
+                Some(ip) => key_for(ip),
+                None => entry.clone(),
+            },
             None => key_for(socket),
         },
         Trust::Hops(n) => {
@@ -197,11 +204,24 @@ pub fn client_ip_key(peer: Option<IpAddr>, headers: &HeaderMap, trust: &Trust) -
                     Ok(ip) if trust.trusts(&ip) => continue,
                     Ok(ip) => return key_for(ip),
                     // Non-parseable hop: proxy-addr stops the trusted walk
-                    // there — this entry is the client.
+                    // there — this entry is the client (live oracle:
+                    // 'garbage, 10.0.0.9' -> req.ip 'garbage').
                     Err(_) => return entry.clone(),
                 }
             }
-            key_for(socket)
+            // Every XFF hop trusted (socket already checked): proxy-addr's
+            // forwarded() hands back the whole chain and req.ip takes the
+            // FURTHEST entry — the LEFTMOST XFF token, not the socket
+            // (verified live against proxy-addr 2.0.7 via express req.ip,
+            // LANE-B iter-19: '10.0.0.9, 127.0.0.1' from 127.0.0.1 ->
+            // req.ip 10.0.0.9; single hop '10.0.0.9' -> 10.0.0.9).
+            // Returning the socket here collapsed an entire trusted subnet
+            // of clients behind a loopback front into one limiter bucket.
+            // The walk above guarantees xff[0] parses.
+            match xff.first().and_then(|s| s.parse::<IpAddr>().ok()) {
+                Some(ip) => key_for(ip),
+                None => key_for(socket),
+            }
         }
     }
 }
