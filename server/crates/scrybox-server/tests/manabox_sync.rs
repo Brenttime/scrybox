@@ -1113,3 +1113,29 @@ async fn backup_routes_body() {
     let err = create_backup(&bogus, &conn).unwrap_err();
     assert!(!err.is_empty());
 }
+
+/// Review exec-sync M2: list grouping must be linear in rows, and keep
+/// first-seen order for lists and entries (Node Map insertion order).
+#[test]
+fn parse_export_large_list_is_linear_and_ordered() {
+    let n = 60_000usize;
+    let mut s = String::with_capacity(n * 120);
+    s.push_str(HEADER);
+    s.push('\n');
+    for i in 0..n {
+        let list = if i % 2 == 0 { "Even" } else { "Odd" };
+        s.push_str(&format!("{list},list,Card {i},abc,{i},normal,1,{:08x}-0000-4000-8000-000000000000,near_mint,en,\n", i));
+    }
+    // a repeat of the first card adds to its quantity, in place.
+    s.push_str("Even,list,Card 0,abc,0,normal,2,00000000-0000-4000-8000-000000000000,near_mint,en,\n");
+    let t = std::time::Instant::now();
+    let p = parse_manabox_export(&s).unwrap();
+    let el = t.elapsed();
+    assert_eq!(p.lists.len(), 2);
+    assert_eq!(p.lists[0].0, "Even");
+    assert_eq!(p.lists[1].0, "Odd");
+    assert_eq!(p.lists[0].1.len(), n / 2);
+    assert_eq!(p.lists[0].1[0].1.quantity, 3);
+    assert_eq!(p.lists[1].1[0].0, "mtg-00000001-0000-4000-8000-000000000000");
+    assert!(el < std::time::Duration::from_secs(3), "parse took {el:?} (quadratic?)");
+}
