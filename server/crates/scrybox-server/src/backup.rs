@@ -105,8 +105,19 @@ pub fn create_backup(db_path: &Path, conn: &rusqlite::Connection) -> Result<Back
         .unwrap_or_else(|| "db".to_string());
     let base = base.strip_suffix(".db").unwrap_or(&base).to_string();
     let dest = dir.join(format!("{base}.{stamp}.bak"));
-    conn.execute("VACUUM INTO ?", rusqlite::params![dest.to_string_lossy().to_string()])
-        .map_err(|e| e.to_string())?;
+    // Review M1: VACUUM INTO a `.bak.tmp` sibling and rename on success, so an
+    // interrupted/failed backup (shutdown, I/O error) never leaves a partial
+    // `*.bak` that list_backups would count toward KEEP_LAST.
+    let tmp = dir.join(format!("{base}.{stamp}.bak.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = conn.execute("VACUUM INTO ?", rusqlite::params![tmp.to_string_lossy().to_string()]) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     let keep = keep_last();
     let all = list_backups(&dir);
     // listBackups().slice(KEEP_LAST): JS slice semantics (negative counts from
@@ -218,6 +229,40 @@ mod float_env_tests {
     use super::js_parse_float_env as f;
 
     // Expectations are node `parseFloat` output (verified with node -e).
+    #[test]
+    fn interrupted_backup_leaves_no_partial_bak() {
+        let root = std::env::temp_dir().join(format!("scry-bak-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("live.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(x BLOB); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<40000) INSERT INTO t SELECT randomblob(1000) FROM c;",
+        )
+        .unwrap();
+        // Interrupt the VACUUM INTO mid-copy (stands in for a kill/abort).
+        let h = conn.get_interrupt_handle();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let th = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                h.interrupt();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        });
+        let r = super::create_backup(&db, &conn);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        th.join().unwrap();
+        let dir = super::backup_dir(&db);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(r.is_err(), "VACUUM INTO must have been interrupted");
+        assert!(names.is_empty(), "no partial backup files may remain: {names:?}");
+    }
+
     #[test]
     fn parse_float_env_matches_parsfloat() {
         assert_eq!(f("  12.5abc"), 12.5);

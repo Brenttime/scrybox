@@ -30,9 +30,12 @@ pub struct AuthUser {
 /// Extract the Bearer token exactly like Node: only an `Authorization`
 /// header starting with `Bearer ` qualifies.
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    // Node: `req.headers.authorization?.split(' ')[1]` — index 1 of a
-    // space-split, no prefix check, empty ⇒ falsy (no token).
+    // Node (middleware/auth.js:7-9): `authHeader.startsWith('Bearer ')`
+    // (case-sensitive, single space) then `split(' ')[1]`; empty ⇒ falsy.
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    if !raw.starts_with("Bearer ") {
+        return None;
+    }
     raw.split(' ').nth(1).filter(|s| !s.is_empty())
 }
 

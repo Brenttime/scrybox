@@ -1611,7 +1611,10 @@ pub async fn remove_author(st: &AppState, user_id: i64, author_id: Option<i64>) 
             exec(&conn, "DELETE FROM decks WHERE id = ? AND source = 'moxfield'", &params_of(vec![bind.into()])).map_err(SyncError::plain)?;
         }
     }
-    // CASCADE removes the moxfield_decks rows.
+    // Node relies on ON DELETE CASCADE, but the Rust pool never turns
+    // foreign_keys on — delete the tracked rows explicitly, same tx.
+    exec(&conn, "DELETE FROM moxfield_decks WHERE author_id = ?", &params_of(vec![row_i64(&author, "id").into()]))
+        .map_err(SyncError::plain)?;
     exec(&conn, "DELETE FROM moxfield_authors WHERE id = ?", &params_of(vec![row_i64(&author, "id").into()]))
         .map_err(SyncError::plain)?;
     tx.commit().map_err(|e| SyncError::plain(format!("{e:?}")))?;
@@ -1741,6 +1744,42 @@ fn sched_state() -> &'static Mutex<SchedState> {
     }))
 }
 
+/// Poison-tolerant lock: a panic elsewhere must not wedge the scheduler.
+fn sched() -> std::sync::MutexGuard<'static, SchedState> {
+    sched_state().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII marker for `in_flight`: removes the author on drop, so an error or
+/// a panic mid-sync never leaves the author skipped forever.
+pub struct InFlightGuard(i64);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        sched().in_flight.remove(&self.0);
+    }
+}
+
+/// Mark `author_id` in flight unless it already is.
+pub fn try_in_flight(author_id: i64) -> Option<InFlightGuard> {
+    if sched().in_flight.insert(author_id) {
+        Some(InFlightGuard(author_id))
+    } else {
+        None
+    }
+}
+
+/// Wait until no scheduler/boot pass is running for `author_id`, then mark
+/// it in flight. Manual sync routes use this (wait-then-run keeps the Node
+/// response shape — no new status code).
+pub async fn wait_in_flight(author_id: i64) -> InFlightGuard {
+    loop {
+        if let Some(g) = try_in_flight(author_id) {
+            return g;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1763,10 +1802,14 @@ fn read_intervals(conn: &Connection) -> (i64, i64) {
 }
 
 pub async fn tick(st: &AppState) {
+    let Some(pool) = st.db.as_ref() else { return };
     let authors = {
-        let conn = match st.db.as_ref().unwrap().get() {
+        let conn = match pool.get() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!("Moxfield scheduler: no DB connection ({err})");
+                return;
+            }
         };
         match query_rows(
             &conn,
@@ -1784,18 +1827,24 @@ pub async fn tick(st: &AppState) {
         return; // nobody tracks Moxfield — nothing to do
     }
     let (decklist_min, content_min) = {
-        let conn = st.db.as_ref().unwrap().get().unwrap();
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!("Moxfield scheduler: no DB connection ({err})");
+                return;
+            }
+        };
         read_intervals(&conn)
     };
     let now = now_ms();
 
     for author in &authors {
         let author_id = row_i64(author, "id").unwrap_or(0);
-        if sched_state().lock().unwrap().in_flight.contains(&author_id) {
+        if sched().in_flight.contains(&author_id) {
             continue; // one sync per author at a time
         }
         let (last_deck, last_content) = {
-            let s = sched_state().lock().unwrap();
+            let s = sched();
             (
                 s.last_decklist_at.get(&author_id).copied().unwrap_or(0),
                 s.last_content_at.get(&author_id).copied().unwrap_or(0),
@@ -1812,14 +1861,14 @@ pub async fn tick(st: &AppState) {
         } else {
             continue;
         };
+        let Some(_in_flight) = try_in_flight(author_id) else { continue };
         {
-            let mut s = sched_state().lock().unwrap();
+            let mut s = sched();
             if mark_decklist {
                 s.last_decklist_at.insert(author_id, now);
             } else {
                 s.last_content_at.insert(author_id, now);
             }
-            s.in_flight.insert(author_id);
         }
         let uid = row_i64(author, "user_id");
         let muser = row_str(author, "moxfield_user").unwrap_or_default();
@@ -1849,7 +1898,7 @@ pub async fn tick(st: &AppState) {
             // Record it on the author row so the UI can show what went
             // wrong, and back off this tick only — the next due tick retries.
             tracing::warn!("Moxfield sync ({job}) for {muser} failed: {}", err.message);
-            if let Ok(conn) = st.db.as_ref().unwrap().get() {
+            if let Ok(conn) = pool.get() {
                 let _ = exec(
                     &conn,
                     "UPDATE moxfield_authors SET last_error = ? WHERE id = ?",
@@ -1857,15 +1906,18 @@ pub async fn tick(st: &AppState) {
                 );
             }
         }
-        sched_state().lock().unwrap().in_flight.remove(&author_id);
     }
 }
 
 async fn boot_catch_up(st: AppState) {
+    let Some(pool) = st.db.clone() else { return };
     let authors = {
-        let conn = match st.db.as_ref().unwrap().get() {
+        let conn = match pool.get() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(err) => {
+                tracing::warn!("Moxfield sync boot catch-up failed: {err}");
+                return;
+            }
         };
         match query_rows(
             &conn,
@@ -1881,7 +1933,13 @@ async fn boot_catch_up(st: AppState) {
         }
     };
     let decklist_min = {
-        let conn = st.db.as_ref().unwrap().get().unwrap();
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!("Moxfield sync boot catch-up failed: {err}");
+                return;
+            }
+        };
         read_intervals(&conn).0
     };
     let now = now_ms();
@@ -1892,30 +1950,33 @@ async fn boot_catch_up(st: AppState) {
         let author_id = row_i64(&a, "id").unwrap_or(0);
         let last = parse_sqlite_utc(row_str(&a, "last_decklist_sync_at").as_deref());
         let decklist_stale = last == 0 || now - last >= decklist_min * 60 * 1000;
-        if decklist_stale && !sched_state().lock().unwrap().in_flight.contains(&author_id) {
-            {
-                let mut s = sched_state().lock().unwrap();
-                s.in_flight.insert(author_id);
-                s.last_decklist_at.insert(author_id, now);
-            }
+        if !decklist_stale {
+            continue;
+        }
+        if let Some(in_flight) = try_in_flight(author_id) {
+            sched().last_decklist_at.insert(author_id, now);
             let st = st.clone();
             let uid = row_i64(&a, "user_id");
             let muser = row_str(&a, "moxfield_user").unwrap_or_default();
             // Fire-and-forget per author, like Node's .then/.catch chain.
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 match sync_decklist(&st, Some(author_id), uid).await {
                     Ok(_) => tracing::info!("Moxfield sync: boot decklist for {muser} complete"),
                     Err(err) => {
                         tracing::warn!("Moxfield sync: boot decklist for {muser} failed: {}", err.message)
                     }
                 }
-                sched_state().lock().unwrap().in_flight.remove(&author_id);
             });
         }
     }
 }
 
 pub fn spawn_scheduler(st: &AppState) {
+    if st.db.is_none() {
+        tracing::warn!("Moxfield scheduler not started: no database");
+        return;
+    }
     // Node's startMoxfieldScheduler fires boot_catch_up fire-and-forget and
     // arms the 20s interval immediately: two independent tasks, and the
     // interval's FIRST fire is one full tick after start (setInterval).
@@ -1929,7 +1990,12 @@ pub fn spawn_scheduler(st: &AppState) {
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         timer.tick().await; // consume the immediate first poll
         loop {
-            tick(&st).await;
+            // Own task per tick: a panic loses that tick only, like a
+            // rejected promise under Node's setInterval.
+            let st_tick = st.clone();
+            if let Err(e) = tokio::spawn(async move { tick(&st_tick).await }).await {
+                tracing::error!("Moxfield scheduler tick panicked: {e}");
+            }
             timer.tick().await;
         }
     });
@@ -2106,6 +2172,12 @@ async fn sync_author_route(
         Err(res) => return node_exact(res).await,
     };
     let author_id = js_int_param(&id);
+    // Share the scheduler's in_flight set: wait for a running tick/boot pass
+    // for this author instead of racing it (same response as Node).
+    let _in_flight = match author_id {
+        Some(a) => Some(wait_in_flight(a).await),
+        None => None,
+    };
     let result = if job == "decklist" {
         sync_decklist(st, author_id, Some(user_id)).await
     } else {

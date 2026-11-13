@@ -421,10 +421,10 @@ async fn handle_register(pool: &DbPool, body: &Value) -> Response {
         return json_error(StatusCode::BAD_REQUEST, "Username and password are required");
     };
     let clean = u.trim().to_lowercase();
-    if clean.chars().count() < 3 {
+    if clean.encode_utf16().count() < 3 {
         return json_error(StatusCode::BAD_REQUEST, "Username must be at least 3 characters");
     }
-    if p.chars().count() < 8 {
+    if p.encode_utf16().count() < 8 {
         return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
     }
     let existing = (|| -> Result<bool, rusqlite::Error> {
@@ -497,7 +497,7 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
     let Some(p) = password else {
         return json_error(StatusCode::BAD_REQUEST, "A password is required");
     };
-    if p.chars().count() < 8 {
+    if p.encode_utf16().count() < 8 {
         return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
     }
     match user_count(pool) {
@@ -597,23 +597,26 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
         return json_error(StatusCode::BAD_REQUEST, "Username and password are required");
     };
     let clean = u.trim().to_lowercase();
-    let row = (|| -> Result<Option<(i64, String, String, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
+    let row = (|| -> Result<Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
         let conn = pool.get()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, username, role, password_hash, share_token, share_enabled, api_key FROM users WHERE username = ?1",
         )?;
         let mut rows = stmt.query([clean.as_str()])?;
-        Ok(rows.next()?.map(|r| {
-            (
-                r.get(0).unwrap(),
-                r.get(1).unwrap(),
-                r.get(2).unwrap(),
+        // username/role may be NULL in a hand-edited DB: Node serialises
+        // null, so read them as Option instead of panicking.
+        Ok(match rows.next()? {
+            Some(r) => Some((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
                 r.get(3).ok().flatten(),
                 r.get(4).ok().flatten(),
                 r.get(5).ok().flatten(),
                 r.get(6).ok().flatten(),
-            )
-        }))
+            )),
+            None => None,
+        })
     })();
     let fail_401 = || json_error(StatusCode::UNAUTHORIZED, "Invalid username or password");
     let err_500 = |ctx: &str, e: &dyn std::fmt::Display| {
@@ -630,10 +633,14 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
     let ok = tokio::task::spawn_blocking({
         let p = p.to_string();
         let h = stored_hash.clone().unwrap_or_default();
-        move || verify_password(&p, &h)
+        move || verify_password_checked(&p, &h)
     })
     .await
-    .unwrap_or(false);
+    .unwrap_or(Ok(false));
+    let ok = match ok {
+        Ok(v) => v,
+        Err(()) => return err_500("verify", &"pbkdf2 rejected stored iteration count"),
+    };
     if !ok {
         return fail_401();
     }
@@ -735,8 +742,12 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
     if body.get("password").is_some() {
         let newpw = body_str(body, "password");
         let too_short = match newpw {
-            None => true, // JS undefined.length throws → catch → 500
-            Some(p) => p.chars().count() < 8,
+            // `password: null` → `null.length` throws → catch → 500.
+            None if body.get("password").is_some_and(Value::is_null) => {
+                return err_500("password-null", &"null.length");
+            }
+            None => true,
+            Some(p) => p.encode_utf16().count() < 8,
         };
         if too_short {
             return json_error(
@@ -757,16 +768,20 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
         };
         let current_password = body_str(body, "current_password");
         let ok = match current_password {
-            None | Some("") => false,
+            None | Some("") => Ok(false),
             Some(cp) => {
                 tokio::task::spawn_blocking({
                     let cp = cp.to_string();
                     let c = cur.clone();
-                    move || verify_password(&cp, &c)
+                    move || verify_password_checked(&cp, &c)
                 })
                 .await
-                .unwrap_or(false)
+                .unwrap_or(Ok(false))
             }
+        };
+        let ok = match ok {
+            Ok(v) => v,
+            Err(()) => return err_500("verify", &"pbkdf2 rejected stored iteration count"),
         };
         if !ok {
             return json_error(StatusCode::UNAUTHORIZED, "Current password is incorrect");
@@ -816,21 +831,22 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
         }
     }
 
-    let updated = (|| -> Result<Option<(String, String, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
+    let updated = (|| -> Result<Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
         let conn = pool.get()?;
         let mut stmt = conn.prepare_cached(
             "SELECT username, role, share_token, share_enabled, api_key FROM users WHERE id = ?1",
         )?;
         let mut rows = stmt.query([user.id])?;
-        Ok(rows.next()?.map(|r| {
-            (
-                r.get(0).unwrap(),
-                r.get(1).unwrap(),
+        Ok(match rows.next()? {
+            Some(r) => Some((
+                r.get(0)?,
+                r.get(1)?,
                 r.get(2).ok().flatten(),
                 r.get(3).ok().flatten(),
                 r.get(4).ok().flatten(),
-            )
-        }))
+            )),
+            None => None,
+        })
     })();
     match updated {
         Ok(Some((username, role, share_token, share_enabled, api_key))) => json_response(
