@@ -592,6 +592,16 @@ pub fn plan_post(
         page,
         limit,
         walkable,
+        // plan_post proxies scope=collection/internet wholesale, so the
+        // merge leg here is always the database scope. Raw lang for the
+        // langSearch resolve + rawPageCache key (`lang || ''`): Falsy shapes
+        // key as '' (== absent), Exotic already returned Plan::Proxy above.
+        internet: false,
+        lang: match mv("lang") {
+            Some(Merged::Query(s)) => Some(s.to_string()),
+            Some(Merged::Str(s)) => Some(s),
+            _ => None,
+        },
     })
 }
 

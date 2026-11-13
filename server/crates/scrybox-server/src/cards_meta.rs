@@ -880,16 +880,21 @@ pub fn eastern_day(now_ms: i64) -> String {
     format!("{yy:04}-{mo:02}-{d:02}")
 }
 
-/// edhrecSlug (stats.js:771): first face, NFD + strip U+0300–036F,
-/// lowercase, drop ['’,.], collapse non-alphanumerics to '-', trim '-'.
+/// edhrecSlug (stats.js:771): first face, lowercase, NFD, strip
+/// \p{Diacritic}, drop ['’,.], collapse non-alphanumerics to '-', trim '-'.
+/// JS order is toLowerCase() *before* normalize('NFD') (edhrecSynergy.js:10-12
+/// semantics via stats.js edhrecSlug) — mirrored here: to_lowercase first,
+/// then the generated NFD table (keyed by lowercase codepoint), then the
+/// generated \p{Diacritic} strip.
 pub fn edhrec_slug(n: &str) -> String {
     let first = n.split(" // ").next().unwrap_or("");
     let decomposed: String = first
         .chars()
+        .flat_map(|c| c.to_lowercase())
         .flat_map(nfd_decompose)
-        .filter(|c| !('\u{0300}'..='\u{036f}').contains(c))
+        .filter(|c| !is_diacritic(*c))
         .collect();
-    let lowered = decomposed.to_lowercase();
+    let lowered = decomposed;
     let mut out = String::new();
     let mut pending_dash = false;
     for c in lowered.chars() {
@@ -899,7 +904,10 @@ pub fn edhrec_slug(n: &str) -> String {
             }
             pending_dash = false;
             out.push(c);
-        } else if c != '\'' && c != '’' && c != ',' && c != '.' {
+        } else if c != '\'' && c != '’' {
+            // Node drops ONLY ['’] outright (edhrecSynergy.js:12), then every
+            // other non-[a-z0-9\s] run — commas and dots included — becomes a
+            // single separator ('C.A.M.P.' → 'c-a-m-p').
             pending_dash = !out.is_empty();
         }
     }
@@ -909,67 +917,179 @@ pub fn edhrec_slug(n: &str) -> String {
     out
 }
 
-/// Canonical NFD for the precomposed Latin blocks realistic card names use
-/// (Latin-1 Supplement + Latin Extended-A); anything else passes through
-/// and is then dropped by the [^a-z0-9] collapse — identical to Node
-/// leaving an un-decomposing character (e.g. 'Æ' → 'thersprens').
+/// Canonical NFD for the slug twin, GENERATED from the Node runtime that
+/// answers :3312 (Unicode 17.0): every codepoint whose
+/// String(c).toLowerCase().normalize('NFD') keeps an ASCII [a-z0-9] base
+/// after the \p{Diacritic} strip — the only codepoints that can change a
+/// slug; anything else passes through unchanged and hits the [^a-z0-9]
+/// collapse, exactly like Node leaving an un-decomposing character
+/// ('Æ' → 'thersprens', 'Tıbir Tamı' → 't-bir-tam' — ı/Đđ/Ħħ/Łł/Ŋŋ/Ŧŧ have
+/// NO canonical decomposition and are not \p{Diacritic}, so they become
+/// separators; the old hand table's fake stroke decompositions mapped them
+/// to base letters and built the wrong EDHREC URLs). Keys are LOWERCASE
+/// codepoints: edhrec_slug lowercases first, JS-style, and the only
+/// multi-char lowercase with a decomposition (U+0130 → i + U+0307) is
+/// reproduced identically by char::to_lowercase before the lookup.
+/// Regenerate with the node snippet in PROGRESS-B (iter-11) if the pin set
+/// changes; do not hand-edit.
 fn nfd_decompose(c: char) -> Vec<char> {
-    static M: OnceLock<HashMap<char, &'static str>> = OnceLock::new();
-    let m = M.get_or_init(|| {
-        let table: &[(char, &str)] = &[
-            ('\u{c0}', "A\u{300}"), ('\u{c1}', "A\u{301}"), ('\u{c2}', "A\u{302}"), ('\u{c3}', "A\u{303}"),
-            ('\u{c4}', "A\u{308}"), ('\u{c5}', "A\u{30a}"), ('\u{c7}', "C\u{327}"), ('\u{c8}', "E\u{300}"),
-            ('\u{c9}', "E\u{301}"), ('\u{ca}', "E\u{302}"), ('\u{cb}', "E\u{308}"), ('\u{cc}', "I\u{300}"),
-            ('\u{cd}', "I\u{301}"), ('\u{ce}', "I\u{302}"), ('\u{cf}', "I\u{308}"), ('\u{d1}', "N\u{303}"),
-            ('\u{d2}', "O\u{300}"), ('\u{d3}', "O\u{301}"), ('\u{d4}', "O\u{302}"), ('\u{d5}', "O\u{303}"),
-            ('\u{d6}', "O\u{308}"), ('\u{d9}', "U\u{300}"), ('\u{da}', "U\u{301}"), ('\u{db}', "U\u{302}"),
-            ('\u{dc}', "U\u{308}"), ('\u{dd}', "Y\u{301}"), ('\u{e0}', "a\u{300}"), ('\u{e1}', "a\u{301}"),
-            ('\u{e2}', "a\u{302}"), ('\u{e3}', "a\u{303}"), ('\u{e4}', "a\u{308}"), ('\u{e5}', "a\u{30a}"),
-            ('\u{e7}', "c\u{327}"), ('\u{e8}', "e\u{300}"), ('\u{e9}', "e\u{301}"), ('\u{ea}', "e\u{302}"),
-            ('\u{eb}', "e\u{308}"), ('\u{ec}', "i\u{300}"), ('\u{ed}', "i\u{301}"), ('\u{ee}', "i\u{302}"),
-            ('\u{ef}', "i\u{308}"), ('\u{f1}', "n\u{303}"), ('\u{f2}', "o\u{300}"), ('\u{f3}', "o\u{301}"),
-            ('\u{f4}', "o\u{302}"), ('\u{f5}', "o\u{303}"), ('\u{f6}', "o\u{308}"), ('\u{f9}', "u\u{300}"),
-            ('\u{fa}', "u\u{301}"), ('\u{fb}', "u\u{302}"), ('\u{fc}', "u\u{308}"), ('\u{fd}', "y\u{301}"),
-            ('\u{ff}', "y\u{308}"),
-            ('\u{100}', "A\u{304}"), ('\u{101}', "a\u{304}"), ('\u{102}', "A\u{306}"), ('\u{103}', "a\u{306}"),
-            ('\u{104}', "A\u{307}"), ('\u{105}', "a\u{307}"), ('\u{106}', "C\u{301}"), ('\u{107}', "c\u{301}"),
-            ('\u{108}', "C\u{302}"), ('\u{109}', "c\u{302}"), ('\u{10a}', "C\u{307}"), ('\u{10b}', "c\u{307}"),
-            ('\u{10c}', "C\u{30c}"), ('\u{10d}', "c\u{30c}"), ('\u{10e}', "D\u{30c}"), ('\u{10f}', "d\u{30c}"),
-            ('\u{110}', "D\u{333}"), ('\u{112}', "E\u{304}"), ('\u{113}', "e\u{304}"), ('\u{114}', "E\u{306}"),
-            ('\u{115}', "e\u{306}"), ('\u{116}', "E\u{307}"), ('\u{117}', "e\u{307}"), ('\u{118}', "E\u{328}"),
-            ('\u{119}', "e\u{328}"), ('\u{11a}', "E\u{30c}"), ('\u{11b}', "e\u{30c}"), ('\u{11c}', "G\u{302}"),
-            ('\u{11d}', "g\u{302}"), ('\u{11e}', "G\u{30c}"), ('\u{11f}', "g\u{30c}"), ('\u{120}', "G\u{307}"),
-            ('\u{121}', "g\u{307}"), ('\u{122}', "G\u{312}"), ('\u{123}', "g\u{312}"), ('\u{124}', "H\u{302}"),
-            ('\u{125}', "h\u{302}"), ('\u{126}', "H\u{332}"), ('\u{128}', "I\u{303}"), ('\u{129}', "i\u{303}"),
-            ('\u{12a}', "I\u{304}"), ('\u{12b}', "i\u{304}"), ('\u{12c}', "I\u{306}"), ('\u{12d}', "i\u{306}"),
-            ('\u{12e}', "I\u{328}"), ('\u{12f}', "i\u{328}"), ('\u{130}', "I\u{307}"), ('\u{131}', "i"),
-            ('\u{134}', "J\u{302}"), ('\u{135}', "j\u{302}"), ('\u{136}', "K\u{327}"), ('\u{137}', "k\u{327}"),
-            ('\u{139}', "L\u{301}"), ('\u{13a}', "l\u{301}"), ('\u{13b}', "L\u{327}"), ('\u{13c}', "l\u{327}"),
-            ('\u{13d}', "L\u{30c}"), ('\u{13e}', "l\u{30c}"), ('\u{141}', "L\u{338}"), ('\u{143}', "N\u{301}"),
-            ('\u{144}', "n\u{301}"), ('\u{145}', "N\u{327}"), ('\u{146}', "n\u{327}"), ('\u{147}', "N\u{30c}"),
-            ('\u{148}', "n\u{30c}"), ('\u{14a}', "N\u{325}"), ('\u{14b}', "n\u{325}"), ('\u{14c}', "O\u{304}"),
-            ('\u{14d}', "o\u{304}"), ('\u{14e}', "O\u{306}"), ('\u{14f}', "o\u{306}"), ('\u{150}', "O\u{30b}"),
-            ('\u{151}', "o\u{30b}"), ('\u{154}', "R\u{301}"), ('\u{155}', "r\u{301}"), ('\u{156}', "R\u{327}"),
-            ('\u{157}', "r\u{327}"), ('\u{158}', "R\u{30c}"), ('\u{159}', "r\u{30c}"), ('\u{15a}', "S\u{301}"),
-            ('\u{15b}', "s\u{301}"), ('\u{15c}', "S\u{302}"), ('\u{15d}', "s\u{302}"), ('\u{15e}', "S\u{327}"),
-            ('\u{15f}', "s\u{327}"), ('\u{160}', "S\u{30c}"), ('\u{161}', "s\u{30c}"), ('\u{162}', "T\u{327}"),
-            ('\u{163}', "t\u{327}"), ('\u{164}', "T\u{30c}"), ('\u{165}', "t\u{30c}"), ('\u{166}', "T\u{332}"),
-            ('\u{168}', "U\u{303}"), ('\u{169}', "u\u{303}"), ('\u{16a}', "U\u{304}"), ('\u{16b}', "u\u{304}"),
-            ('\u{16c}', "U\u{306}"), ('\u{16d}', "u\u{306}"), ('\u{16e}', "U\u{30a}"), ('\u{16f}', "u\u{30a}"),
-            ('\u{170}', "U\u{30b}"), ('\u{171}', "u\u{30b}"), ('\u{172}', "U\u{328}"), ('\u{173}', "u\u{328}"),
-            ('\u{174}', "W\u{302}"), ('\u{175}', "w\u{302}"), ('\u{176}', "Y\u{302}"), ('\u{177}', "y\u{302}"),
-            ('\u{178}', "Y\u{308}"), ('\u{179}', "Z\u{301}"), ('\u{17a}', "z\u{301}"), ('\u{17b}', "Z\u{307}"),
-            ('\u{17c}', "z\u{307}"), ('\u{17d}', "Z\u{30c}"), ('\u{17e}', "z\u{30c}"),
-        ];
-        let mut m: HashMap<char, &'static str> = HashMap::with_capacity(table.len());
-        for (k, v) in table {
-            m.insert(*k, v);
-        }
-        m
-    });
-    match m.get(&c) {
-        Some(s) => s.chars().collect(),
-        None => vec![c],
+    static TABLE: &[(u32, &[u32])] = &[
+        (0xe0, &[0x61, 0x300]), (0xe1, &[0x61, 0x301]), (0xe2, &[0x61, 0x302]),
+        (0xe3, &[0x61, 0x303]), (0xe4, &[0x61, 0x308]), (0xe5, &[0x61, 0x30a]),
+        (0xe7, &[0x63, 0x327]), (0xe8, &[0x65, 0x300]), (0xe9, &[0x65, 0x301]),
+        (0xea, &[0x65, 0x302]), (0xeb, &[0x65, 0x308]), (0xec, &[0x69, 0x300]),
+        (0xed, &[0x69, 0x301]), (0xee, &[0x69, 0x302]), (0xef, &[0x69, 0x308]),
+        (0xf1, &[0x6e, 0x303]), (0xf2, &[0x6f, 0x300]), (0xf3, &[0x6f, 0x301]),
+        (0xf4, &[0x6f, 0x302]), (0xf5, &[0x6f, 0x303]), (0xf6, &[0x6f, 0x308]),
+        (0xf9, &[0x75, 0x300]), (0xfa, &[0x75, 0x301]), (0xfb, &[0x75, 0x302]),
+        (0xfc, &[0x75, 0x308]), (0xfd, &[0x79, 0x301]), (0xff, &[0x79, 0x308]),
+        (0x101, &[0x61, 0x304]), (0x103, &[0x61, 0x306]), (0x105, &[0x61, 0x328]),
+        (0x107, &[0x63, 0x301]), (0x109, &[0x63, 0x302]), (0x10b, &[0x63, 0x307]),
+        (0x10d, &[0x63, 0x30c]), (0x10f, &[0x64, 0x30c]), (0x113, &[0x65, 0x304]),
+        (0x115, &[0x65, 0x306]), (0x117, &[0x65, 0x307]), (0x119, &[0x65, 0x328]),
+        (0x11b, &[0x65, 0x30c]), (0x11d, &[0x67, 0x302]), (0x11f, &[0x67, 0x306]),
+        (0x121, &[0x67, 0x307]), (0x123, &[0x67, 0x327]), (0x125, &[0x68, 0x302]),
+        (0x129, &[0x69, 0x303]), (0x12b, &[0x69, 0x304]), (0x12d, &[0x69, 0x306]),
+        (0x12f, &[0x69, 0x328]), (0x135, &[0x6a, 0x302]), (0x137, &[0x6b, 0x327]),
+        (0x13a, &[0x6c, 0x301]), (0x13c, &[0x6c, 0x327]), (0x13e, &[0x6c, 0x30c]),
+        (0x144, &[0x6e, 0x301]), (0x146, &[0x6e, 0x327]), (0x148, &[0x6e, 0x30c]),
+        (0x14d, &[0x6f, 0x304]), (0x14f, &[0x6f, 0x306]), (0x151, &[0x6f, 0x30b]),
+        (0x155, &[0x72, 0x301]), (0x157, &[0x72, 0x327]), (0x159, &[0x72, 0x30c]),
+        (0x15b, &[0x73, 0x301]), (0x15d, &[0x73, 0x302]), (0x15f, &[0x73, 0x327]),
+        (0x161, &[0x73, 0x30c]), (0x163, &[0x74, 0x327]), (0x165, &[0x74, 0x30c]),
+        (0x169, &[0x75, 0x303]), (0x16b, &[0x75, 0x304]), (0x16d, &[0x75, 0x306]),
+        (0x16f, &[0x75, 0x30a]), (0x171, &[0x75, 0x30b]), (0x173, &[0x75, 0x328]),
+        (0x175, &[0x77, 0x302]), (0x177, &[0x79, 0x302]), (0x17a, &[0x7a, 0x301]),
+        (0x17c, &[0x7a, 0x307]), (0x17e, &[0x7a, 0x30c]), (0x1a1, &[0x6f, 0x31b]),
+        (0x1b0, &[0x75, 0x31b]), (0x1ce, &[0x61, 0x30c]), (0x1d0, &[0x69, 0x30c]),
+        (0x1d2, &[0x6f, 0x30c]), (0x1d4, &[0x75, 0x30c]), (0x1d6, &[0x75, 0x308, 0x304]),
+        (0x1d8, &[0x75, 0x308, 0x301]), (0x1da, &[0x75, 0x308, 0x30c]), (0x1dc, &[0x75, 0x308, 0x300]),
+        (0x1df, &[0x61, 0x308, 0x304]), (0x1e1, &[0x61, 0x307, 0x304]), (0x1e7, &[0x67, 0x30c]),
+        (0x1e9, &[0x6b, 0x30c]), (0x1eb, &[0x6f, 0x328]), (0x1ed, &[0x6f, 0x328, 0x304]),
+        (0x1f0, &[0x6a, 0x30c]), (0x1f5, &[0x67, 0x301]), (0x1f9, &[0x6e, 0x300]),
+        (0x1fb, &[0x61, 0x30a, 0x301]), (0x201, &[0x61, 0x30f]), (0x203, &[0x61, 0x311]),
+        (0x205, &[0x65, 0x30f]), (0x207, &[0x65, 0x311]), (0x209, &[0x69, 0x30f]),
+        (0x20b, &[0x69, 0x311]), (0x20d, &[0x6f, 0x30f]), (0x20f, &[0x6f, 0x311]),
+        (0x211, &[0x72, 0x30f]), (0x213, &[0x72, 0x311]), (0x215, &[0x75, 0x30f]),
+        (0x217, &[0x75, 0x311]), (0x219, &[0x73, 0x326]), (0x21b, &[0x74, 0x326]),
+        (0x21f, &[0x68, 0x30c]), (0x227, &[0x61, 0x307]), (0x229, &[0x65, 0x327]),
+        (0x22b, &[0x6f, 0x308, 0x304]), (0x22d, &[0x6f, 0x303, 0x304]), (0x22f, &[0x6f, 0x307]),
+        (0x231, &[0x6f, 0x307, 0x304]), (0x233, &[0x79, 0x304]), (0x1e01, &[0x61, 0x325]),
+        (0x1e03, &[0x62, 0x307]), (0x1e05, &[0x62, 0x323]), (0x1e07, &[0x62, 0x331]),
+        (0x1e09, &[0x63, 0x327, 0x301]), (0x1e0b, &[0x64, 0x307]), (0x1e0d, &[0x64, 0x323]),
+        (0x1e0f, &[0x64, 0x331]), (0x1e11, &[0x64, 0x327]), (0x1e13, &[0x64, 0x32d]),
+        (0x1e15, &[0x65, 0x304, 0x300]), (0x1e17, &[0x65, 0x304, 0x301]), (0x1e19, &[0x65, 0x32d]),
+        (0x1e1b, &[0x65, 0x330]), (0x1e1d, &[0x65, 0x327, 0x306]), (0x1e1f, &[0x66, 0x307]),
+        (0x1e21, &[0x67, 0x304]), (0x1e23, &[0x68, 0x307]), (0x1e25, &[0x68, 0x323]),
+        (0x1e27, &[0x68, 0x308]), (0x1e29, &[0x68, 0x327]), (0x1e2b, &[0x68, 0x32e]),
+        (0x1e2d, &[0x69, 0x330]), (0x1e2f, &[0x69, 0x308, 0x301]), (0x1e31, &[0x6b, 0x301]),
+        (0x1e33, &[0x6b, 0x323]), (0x1e35, &[0x6b, 0x331]), (0x1e37, &[0x6c, 0x323]),
+        (0x1e39, &[0x6c, 0x323, 0x304]), (0x1e3b, &[0x6c, 0x331]), (0x1e3d, &[0x6c, 0x32d]),
+        (0x1e3f, &[0x6d, 0x301]), (0x1e41, &[0x6d, 0x307]), (0x1e43, &[0x6d, 0x323]),
+        (0x1e45, &[0x6e, 0x307]), (0x1e47, &[0x6e, 0x323]), (0x1e49, &[0x6e, 0x331]),
+        (0x1e4b, &[0x6e, 0x32d]), (0x1e4d, &[0x6f, 0x303, 0x301]), (0x1e4f, &[0x6f, 0x303, 0x308]),
+        (0x1e51, &[0x6f, 0x304, 0x300]), (0x1e53, &[0x6f, 0x304, 0x301]), (0x1e55, &[0x70, 0x301]),
+        (0x1e57, &[0x70, 0x307]), (0x1e59, &[0x72, 0x307]), (0x1e5b, &[0x72, 0x323]),
+        (0x1e5d, &[0x72, 0x323, 0x304]), (0x1e5f, &[0x72, 0x331]), (0x1e61, &[0x73, 0x307]),
+        (0x1e63, &[0x73, 0x323]), (0x1e65, &[0x73, 0x301, 0x307]), (0x1e67, &[0x73, 0x30c, 0x307]),
+        (0x1e69, &[0x73, 0x323, 0x307]), (0x1e6b, &[0x74, 0x307]), (0x1e6d, &[0x74, 0x323]),
+        (0x1e6f, &[0x74, 0x331]), (0x1e71, &[0x74, 0x32d]), (0x1e73, &[0x75, 0x324]),
+        (0x1e75, &[0x75, 0x330]), (0x1e77, &[0x75, 0x32d]), (0x1e79, &[0x75, 0x303, 0x301]),
+        (0x1e7b, &[0x75, 0x304, 0x308]), (0x1e7d, &[0x76, 0x303]), (0x1e7f, &[0x76, 0x323]),
+        (0x1e81, &[0x77, 0x300]), (0x1e83, &[0x77, 0x301]), (0x1e85, &[0x77, 0x308]),
+        (0x1e87, &[0x77, 0x307]), (0x1e89, &[0x77, 0x323]), (0x1e8b, &[0x78, 0x307]),
+        (0x1e8d, &[0x78, 0x308]), (0x1e8f, &[0x79, 0x307]), (0x1e91, &[0x7a, 0x302]),
+        (0x1e93, &[0x7a, 0x323]), (0x1e95, &[0x7a, 0x331]), (0x1e96, &[0x68, 0x331]),
+        (0x1e97, &[0x74, 0x308]), (0x1e98, &[0x77, 0x30a]), (0x1e99, &[0x79, 0x30a]),
+        (0x1ea1, &[0x61, 0x323]), (0x1ea3, &[0x61, 0x309]), (0x1ea5, &[0x61, 0x302, 0x301]),
+        (0x1ea7, &[0x61, 0x302, 0x300]), (0x1ea9, &[0x61, 0x302, 0x309]), (0x1eab, &[0x61, 0x302, 0x303]),
+        (0x1ead, &[0x61, 0x323, 0x302]), (0x1eaf, &[0x61, 0x306, 0x301]), (0x1eb1, &[0x61, 0x306, 0x300]),
+        (0x1eb3, &[0x61, 0x306, 0x309]), (0x1eb5, &[0x61, 0x306, 0x303]), (0x1eb7, &[0x61, 0x323, 0x306]),
+        (0x1eb9, &[0x65, 0x323]), (0x1ebb, &[0x65, 0x309]), (0x1ebd, &[0x65, 0x303]),
+        (0x1ebf, &[0x65, 0x302, 0x301]), (0x1ec1, &[0x65, 0x302, 0x300]), (0x1ec3, &[0x65, 0x302, 0x309]),
+        (0x1ec5, &[0x65, 0x302, 0x303]), (0x1ec7, &[0x65, 0x323, 0x302]), (0x1ec9, &[0x69, 0x309]),
+        (0x1ecb, &[0x69, 0x323]), (0x1ecd, &[0x6f, 0x323]), (0x1ecf, &[0x6f, 0x309]),
+        (0x1ed1, &[0x6f, 0x302, 0x301]), (0x1ed3, &[0x6f, 0x302, 0x300]), (0x1ed5, &[0x6f, 0x302, 0x309]),
+        (0x1ed7, &[0x6f, 0x302, 0x303]), (0x1ed9, &[0x6f, 0x323, 0x302]), (0x1edb, &[0x6f, 0x31b, 0x301]),
+        (0x1edd, &[0x6f, 0x31b, 0x300]), (0x1edf, &[0x6f, 0x31b, 0x309]), (0x1ee1, &[0x6f, 0x31b, 0x303]),
+        (0x1ee3, &[0x6f, 0x31b, 0x323]), (0x1ee5, &[0x75, 0x323]), (0x1ee7, &[0x75, 0x309]),
+        (0x1ee9, &[0x75, 0x31b, 0x301]), (0x1eeb, &[0x75, 0x31b, 0x300]), (0x1eed, &[0x75, 0x31b, 0x309]),
+        (0x1eef, &[0x75, 0x31b, 0x303]), (0x1ef1, &[0x75, 0x31b, 0x323]), (0x1ef3, &[0x79, 0x300]),
+        (0x1ef5, &[0x79, 0x323]), (0x1ef7, &[0x79, 0x309]), (0x1ef9, &[0x79, 0x303]),
+    ];
+    match TABLE.binary_search_by(|(k, _)| (*k as i64).cmp(&(c as i64))) {
+        Ok(i) => TABLE[i].1.iter().map(|&x| char::from_u32(x).unwrap_or(x as u8 as char)).collect(),
+        Err(_) => vec![c],
+    }
+}
+
+/// \p{Diacritic} (Unicode 17.0, as implemented by the Node runtime —
+/// includes the spacing-marks oddities like U+00B7/U+005E that JS strips to
+/// NOTHING, not a separator, and excludes in-range non-Diacritics such as
+/// U+034F/U+0363–036F that survive to become separators). Sorted ranges,
+/// generated from the same Node run as the NFD table.
+fn is_diacritic(c: char) -> bool {
+    static RANGES: &[(u32, u32)] = &[
+        (0x5e, 0x5e), (0x60, 0x60), (0xa8, 0xa8), (0xaf, 0xaf),
+        (0xb4, 0xb4), (0xb7, 0xb8), (0x2b0, 0x34e), (0x350, 0x357),
+        (0x35d, 0x362), (0x374, 0x375), (0x37a, 0x37a), (0x384, 0x385),
+        (0x483, 0x487), (0x559, 0x559), (0x591, 0x5bd), (0x5bf, 0x5bf),
+        (0x5c1, 0x5c2), (0x5c4, 0x5c5), (0x5c7, 0x5c7), (0x64b, 0x652),
+        (0x657, 0x658), (0x6df, 0x6e0), (0x6e5, 0x6e6), (0x6ea, 0x6ec),
+        (0x730, 0x74a), (0x7a6, 0x7b0), (0x7eb, 0x7f5), (0x818, 0x819),
+        (0x898, 0x89f), (0x8c9, 0x8d2), (0x8e3, 0x8fe), (0x93c, 0x93c),
+        (0x94d, 0x94d), (0x951, 0x954), (0x971, 0x971), (0x9bc, 0x9bc),
+        (0x9cd, 0x9cd), (0xa3c, 0xa3c), (0xa4d, 0xa4d), (0xabc, 0xabc),
+        (0xacd, 0xacd), (0xafd, 0xaff), (0xb3c, 0xb3c), (0xb4d, 0xb4d),
+        (0xb55, 0xb55), (0xbcd, 0xbcd), (0xc3c, 0xc3c), (0xc4d, 0xc4d),
+        (0xcbc, 0xcbc), (0xccd, 0xccd), (0xd3b, 0xd3c), (0xd4d, 0xd4d),
+        (0xdca, 0xdca), (0xe3a, 0xe3a), (0xe47, 0xe4c), (0xe4e, 0xe4e),
+        (0xeba, 0xeba), (0xec8, 0xecc), (0xf18, 0xf19), (0xf35, 0xf35),
+        (0xf37, 0xf37), (0xf39, 0xf39), (0xf3e, 0xf3f), (0xf82, 0xf84),
+        (0xf86, 0xf87), (0xfc6, 0xfc6), (0x1037, 0x1037), (0x1039, 0x103a),
+        (0x1063, 0x1064), (0x1069, 0x106d), (0x1087, 0x108d), (0x108f, 0x108f),
+        (0x109a, 0x109b), (0x135d, 0x135f), (0x1714, 0x1715), (0x1734, 0x1734),
+        (0x17c9, 0x17d3), (0x17dd, 0x17dd), (0x1939, 0x193b), (0x1a60, 0x1a60),
+        (0x1a75, 0x1a7c), (0x1a7f, 0x1a7f), (0x1ab0, 0x1abe), (0x1ac1, 0x1acb),
+        (0x1acf, 0x1add), (0x1ae0, 0x1aeb), (0x1b34, 0x1b34), (0x1b44, 0x1b44),
+        (0x1b6b, 0x1b73), (0x1baa, 0x1bab), (0x1be6, 0x1be6), (0x1bf2, 0x1bf3),
+        (0x1c36, 0x1c37), (0x1c78, 0x1c7d), (0x1cd0, 0x1ce8), (0x1ced, 0x1ced),
+        (0x1cf4, 0x1cf4), (0x1cf7, 0x1cf9), (0x1d2c, 0x1d6a), (0x1d9b, 0x1dbe),
+        (0x1dc4, 0x1dcf), (0x1df5, 0x1dff), (0x1fbd, 0x1fbd), (0x1fbf, 0x1fc1),
+        (0x1fcd, 0x1fcf), (0x1fdd, 0x1fdf), (0x1fed, 0x1fef), (0x1ffd, 0x1ffe),
+        (0x2cef, 0x2cf1), (0x2e2f, 0x2e2f), (0x302a, 0x302f), (0x3099, 0x309c),
+        (0x30fc, 0x30fc), (0xa66f, 0xa66f), (0xa67c, 0xa67d), (0xa67f, 0xa67f),
+        (0xa69c, 0xa69d), (0xa6f0, 0xa6f1), (0xa700, 0xa721), (0xa788, 0xa78a),
+        (0xa7f1, 0xa7f1), (0xa7f8, 0xa7f9), (0xa806, 0xa806), (0xa82c, 0xa82c),
+        (0xa8c4, 0xa8c4), (0xa8e0, 0xa8f1), (0xa92b, 0xa92e), (0xa953, 0xa953),
+        (0xa9b3, 0xa9b3), (0xa9c0, 0xa9c0), (0xa9e5, 0xa9e5), (0xaa7b, 0xaa7d),
+        (0xaabf, 0xaac2), (0xaaf6, 0xaaf6), (0xab5b, 0xab5f), (0xab69, 0xab6b),
+        (0xabec, 0xabed), (0xfb1e, 0xfb1e), (0xfe20, 0xfe2f), (0xff3e, 0xff3e),
+        (0xff40, 0xff40), (0xff70, 0xff70), (0xff9e, 0xff9f), (0xffe3, 0xffe3),
+        (0x102e0, 0x102e0), (0x10780, 0x10785), (0x10787, 0x107b0), (0x107b2, 0x107ba),
+        (0x10a38, 0x10a3a), (0x10a3f, 0x10a3f), (0x10ae5, 0x10ae6), (0x10d22, 0x10d27),
+        (0x10d4e, 0x10d4e), (0x10d69, 0x10d6d), (0x10efa, 0x10efa), (0x10efd, 0x10eff),
+        (0x10f46, 0x10f50), (0x10f82, 0x10f85), (0x11046, 0x11046), (0x11070, 0x11070),
+        (0x110b9, 0x110ba), (0x11133, 0x11134), (0x11173, 0x11173), (0x111c0, 0x111c0),
+        (0x111ca, 0x111cc), (0x11235, 0x11236), (0x112e9, 0x112ea), (0x1133b, 0x1133c),
+        (0x1134d, 0x1134d), (0x11366, 0x1136c), (0x11370, 0x11374), (0x113ce, 0x113d0),
+        (0x113d2, 0x113d3), (0x113e1, 0x113e2), (0x11442, 0x11442), (0x11446, 0x11446),
+        (0x114c2, 0x114c3), (0x115bf, 0x115c0), (0x1163f, 0x1163f), (0x116b6, 0x116b7),
+        (0x1172b, 0x1172b), (0x11839, 0x1183a), (0x1193d, 0x1193e), (0x11943, 0x11943),
+        (0x119e0, 0x119e0), (0x11a34, 0x11a34), (0x11a47, 0x11a47), (0x11a99, 0x11a99),
+        (0x11c3f, 0x11c3f), (0x11d42, 0x11d42), (0x11d44, 0x11d45), (0x11d97, 0x11d97),
+        (0x11dd9, 0x11dd9), (0x11f41, 0x11f42), (0x11f5a, 0x11f5a), (0x13447, 0x13455),
+        (0x1612f, 0x1612f), (0x16af0, 0x16af4), (0x16b30, 0x16b36), (0x16d6b, 0x16d6c),
+        (0x16f8f, 0x16f9f), (0x16ff0, 0x16ff1), (0x1aff0, 0x1aff3), (0x1aff5, 0x1affb),
+        (0x1affd, 0x1affe), (0x1cf00, 0x1cf2d), (0x1cf30, 0x1cf46), (0x1d167, 0x1d169),
+        (0x1d16d, 0x1d172), (0x1d17b, 0x1d182), (0x1d185, 0x1d18b), (0x1d1aa, 0x1d1ad),
+        (0x1e030, 0x1e06d), (0x1e130, 0x1e136), (0x1e2ae, 0x1e2ae), (0x1e2ec, 0x1e2ef),
+        (0x1e5ee, 0x1e5ef), (0x1e8d0, 0x1e8d6), (0x1e944, 0x1e946), (0x1e948, 0x1e94a),
+    ];
+    let cp = c as u32;
+    match RANGES.partition_point(|&(_, hi)| hi < cp) {
+        i if i < RANGES.len() && RANGES[i].0 <= cp => true,
+        _ => false,
     }
 }
 
@@ -1262,6 +1382,158 @@ mod tests {
         assert_eq!(edhrec_slug("Æthersprens"), "thersprens");
         assert_eq!(edhrec_slug("  Trim  Me  "), "trim-me");
         assert_eq!(edhrec_slug("Ür, Fëanor’s"), "ur-feanors");
+    }
+
+    #[test]
+    fn slug_matches_node_full_corpus() {
+        // Node-pinned corpus: every non-ASCII card name in the e2e DB copy
+        // plus adversarial shapes (stroke letters with NO canonical
+        // decomposition — ı Đđ Ħħ Łł Ŋŋ Ŧŧ — which Node drops to a
+        // separator; generated with node against
+        // backend/src/utils/edhrecSynergy.js commanderSlug). The earlier
+        // 10-case vector let cards_meta's NFD table ship fake decompositions
+        // for the stroke letters (U+0131 → "i" etc.); these pin the fix.
+        let vectors: &[(&str, &str)] = &[
+            ("Adéwalé, Breaker of Chains", "adewale-breaker-of-chains"),
+            ("Adéwalé, Breaker of Chains // Adéwalé, Breaker of Chains", "adewale-breaker-of-chains"),
+            ("Altaïr Ibn-La'Ahad", "altair-ibn-laahad"),
+            ("Andúril, Flame of the West", "anduril-flame-of-the-west"),
+            ("Andúril, Narsil Reforged", "anduril-narsil-reforged"),
+            ("Araña, Heart of the Spider", "arana-heart-of-the-spider"),
+            ("Arna Kennerüd, Skycaptain", "arna-kennerud-skycaptain"),
+            ("Arwen Undómiel", "arwen-undomiel"),
+            ("Aveline de Grandpré", "aveline-de-grandpre"),
+            ("Barad-dûr", "barad-dur"),
+            ("Bartolomé del Presidio", "bartolome-del-presidio"),
+            ("Bespoke Bō", "bespoke-bo"),
+            ("Bösium Strip", "bosium-strip"),
+            ("Chicken à la King", "chicken-a-la-king"),
+            ("Clavileño, First of the Blessed", "clavileno-first-of-the-blessed"),
+            ("Círdan the Shipwright", "cirdan-the-shipwright"),
+            ("Dandân", "dandan"),
+            ("Dáin Ironfoot", "dain-ironfoot"),
+            ("Dáin of the Ancient Halls", "dain-of-the-ancient-halls"),
+            ("Dáin's Company", "dains-company"),
+            ("Dáin, Lord of the Iron Hills", "dain-lord-of-the-iron-hills"),
+            ("Déjà Vu", "deja-vu"),
+            ("Dúnedain Blade", "dunedain-blade"),
+            ("Dúnedain Rangers", "dunedain-rangers"),
+            ("El-Hajjâj", "el-hajjaj"),
+            ("Everett K. Ross, Hapless Attaché", "everett-k-ross-hapless-attache"),
+            ("Fíli and Kíli, Joyous", "fili-and-kili-joyous"),
+            ("Fíli the Pathfinder", "fili-the-pathfinder"),
+            ("Galadriel of Lothlórien", "galadriel-of-lothlorien"),
+            ("Gilraen, Dúnedain Protector", "gilraen-dunedain-protector"),
+            ("Glóin the Mighty // Easy Pickings", "gloin-the-mighty"),
+            ("Glóin, Dwarf Emissary", "gloin-dwarf-emissary"),
+            ("Grishnákh, Brash Instigator", "grishnakh-brash-instigator"),
+            ("Gríma, Saruman's Footman", "grima-sarumans-footman"),
+            ("Hamato Ninpō", "hamato-ninpo"),
+            ("Ifh-Bíff Efreet", "ifh-biff-efreet"),
+            ("Khârn the Betrayer", "kharn-the-betrayer"),
+            ("Kíli the Resourceful", "kili-the-resourceful"),
+            ("Lim-Dûl the Necromancer", "lim-dul-the-necromancer"),
+            ("Lim-Dûl's Hex", "lim-duls-hex"),
+            ("Lim-Dûl's Paladin", "lim-duls-paladin"),
+            ("Lim-Dûl's Vault", "lim-duls-vault"),
+            ("Lord of the Nazgûl", "lord-of-the-nazgul"),
+            ("Lothlórien Blade", "lothlorien-blade"),
+            ("Lórien Revealed", "lorien-revealed"),
+            ("Mauhúr, Uruk-hai Captain", "mauhur-uruk-hai-captain"),
+            ("Mists of Lórien", "mists-of-lorien"),
+            ("Mjölnir's Might", "mjolnirs-might"),
+            ("Mjölnir, Hammer of Thor", "mjolnir-hammer-of-thor"),
+            ("Nazgûl", "nazgul"),
+            ("Nazgûl Battle-Mace", "nazgul-battle-mace"),
+            ("Oath of Lim-Dûl", "oath-of-lim-dul"),
+            ("Olórin's Searing Light", "olorins-searing-light"),
+            ("Palantír of Orthanc", "palantir-of-orthanc"),
+            ("Rasaad, Monk of Selûne", "rasaad-monk-of-selune"),
+            ("Ratonhnhaké꞉ton", "ratonhnhaketon"),
+            ("Robo-Piñata", "robo-pinata"),
+            ("Sauté", "saute"),
+            ("Sméagol, Helpful Guide", "smeagol-helpful-guide"),
+            ("Song of Eärendil", "song-of-earendil"),
+            ("Soothing of Sméagol", "soothing-of-smeagol"),
+            ("Surtr, Fiery Jötun", "surtr-fiery-jotun"),
+            ("Séance Board", "seance-board"),
+            ("The Balrog, Flame of Udûn", "the-balrog-flame-of-udun"),
+            ("The Ultimate Nightmare of Wizards of the Coast® Customer Service", "the-ultimate-nightmare-of-wizards-of-the-coast-customer-service"),
+            ("Thrór's Map", "thrors-map"),
+            ("Théoden, King of Rohan", "theoden-king-of-rohan"),
+            ("Troll of Khazad-dûm", "troll-of-khazad-dum"),
+            ("Uglúk of the White Hand", "ugluk-of-the-white-hand"),
+            ("Võx, Child of the Collective", "vox-child-of-the-collective"),
+            ("Éomer of the Riddermark", "eomer-of-the-riddermark"),
+            ("Éomer, King of Rohan", "eomer-king-of-rohan"),
+            ("Éomer, Marshal of Rohan", "eomer-marshal-of-rohan"),
+            ("Éowyn, Fearless Knight", "eowyn-fearless-knight"),
+            ("Éowyn, Lady of Rohan", "eowyn-lady-of-rohan"),
+            ("Éowyn, Shieldmaiden", "eowyn-shieldmaiden"),
+            ("Óin the Brave", "oin-the-brave"),
+            ("Tıbir Tamı", "t-bir-tam"),
+            ("Đavid", "avid"),
+            ("đ", ""),
+            ("Ħama", "ama"),
+            ("ħ", ""),
+            ("Łegend", "egend"),
+            ("ł", ""),
+            ("Ŋakira", "akira"),
+            ("ŋ", ""),
+            ("Ŧor", "or"),
+            ("ŧ", ""),
+            ("İstanbul", "istanbul"),
+            ("Æthersprens", "thersprens"),
+            ("ß", ""),
+            ("Giseïla, the Broken Blade", "giseila-the-broken-blade"),
+            ("Ür, Fëanor’s", "ur-feanors"),
+            ("Mox ± Diamond", "mox-diamond"),
+            ("Serra Ângel ™", "serra-angel"),
+            ("A // B", "a"),
+            ("  Trim  Me  ", "trim-me"),
+            ("---", ""),
+            ("", ""),
+            ("K’rrík, Son of Àndàn", "krrik-son-of-andan"),
+            ("Zoë, Player One", "zoe-player-one"),
+            ("Llanowar Auger", "llanowar-auger"),
+            ("Crucible of Worlds", "crucible-of-worlds"),
+            ("Ωmega", "mega"),
+            ("Ω", ""),
+            ("Naïve", "naive"),
+            ("Bosh, Iron Golem", "bosh-iron-golem"),
+            ("Léon", "leon"),
+            ("ÁB", "ab"),
+            ("a̧", "a"),
+            ("M’uıdart", "mu-dart"),
+            ("War™", "war"),
+            ("C.A.M.P.", "c-a-m-p"), // dots/commas are separators — only ['’] is dropped outright
+            ("R.A.X.O.S.", "r-a-x-o-s"),
+        ];
+        for (name, want) in vectors {
+            assert_eq!(&edhrec_slug(name), want, "edhrec_slug({name:?})");
+        }
+    }
+
+    /// Full-DB differential harness (lane-B iter-11): SCRYBOX_SLUG_CORPUS
+    /// points at a TSV of `name\texpected` generated with node from
+    /// backend/src/utils/edhrecSynergy.js commanderSlug over EVERY distinct
+    /// card_cache.name in a DB copy. Skipped unless the env var is set, so
+    /// the committed suite stays hermetic; run:
+    ///   node -e '…dump TSV…' && SCRYBOX_SLUG_CORPUS=/path cargo test --lib slug_matches_node_db_corpus_full
+    #[test]
+    fn slug_matches_node_db_corpus_full() {
+        let Ok(path) = std::env::var("SCRYBOX_SLUG_CORPUS") else {
+            eprintln!("SCRYBOX_SLUG_CORPUS unset — skipping full-DB slug diff");
+            return;
+        };
+        let data = std::fs::read_to_string(&path).expect("corpus file");
+        let mut n = 0;
+        for line in data.lines() {
+            let (name, want) = line.split_once('\t').expect("TSV line");
+            assert_eq!(&edhrec_slug(name), want, "edhrec_slug({name:?})");
+            n += 1;
+        }
+        assert!(n > 1000, "corpus too small ({n}) — wrong file?");
     }
 
     #[test]
