@@ -21,6 +21,11 @@ const opt = (k, d) => { const i = process.argv.indexOf(k); return i > -1 ? proce
 const scenPath = opt('--scenario', '../../../scen-rust.json');
 const outPath = opt('--out', 'coldstart.json');
 const durationMs = Number(opt('--duration-ms', 4000));
+// Iter-19 fix: the 4s/8s window can expire while a slow-to-first-200 arm is
+// still prewarming (iter-54: health recorded null, arms complete otherwise).
+// Keep firing past durationMs until EVERY arm has its first 200, capped by a
+// hard deadline so a genuinely dead route still terminates the probe.
+const hardDeadlineMs = Number(opt('--hard-deadline-ms', 30000));
 const HZ = 100; // USER_HZ on Linux; stable since 2.6
 
 const scen = JSON.parse(fs.readFileSync(scenPath, 'utf8'));
@@ -45,6 +50,10 @@ const mainPid = () => {
 };
 
 const first200 = new Map();
+// Iter-19: per-arm last observed status (post-sawDown) — if an arm never
+// reaches 200 before the hard deadline, the record shows WHAT it was getting
+// (503-prewarm vs 404 vs connection churn) instead of a bare null.
+const lastStatus = new Map();
 // Iter-15 fix: the probe starts while the OLD server is still answering —
 // without this latch the recorded "first 200" are warm responses from the
 // dying process (iter-14's coldstart JSON showed uptime-sized numbers, not
@@ -55,6 +64,7 @@ let sawDown = false;
 function fire(s) {
   const req = http.request({ host: base.hostname, port: base.port, path: s.path, method: 'GET', headers: s.headers }, (res) => {
     res.resume();
+    if (sawDown) lastStatus.set(s.name, res.statusCode);
     if (res.statusCode === 200 && sawDown && !first200.has(s.name)) first200.set(s.name, uptimeSec());
   });
   req.on('error', () => { sawDown = true; });
@@ -64,7 +74,8 @@ function fire(s) {
 const t0 = Date.now();
 const tick = setInterval(() => {
   for (const s of scenarios) fire(s);
-  if (Date.now() - t0 > durationMs) {
+  const elapsed = Date.now() - t0;
+  if (elapsed > durationMs && (first200.size === scenarios.length || elapsed > hardDeadlineMs)) {
     clearInterval(tick);
     // Let in-flight responses land their callbacks before reading.
     setTimeout(() => {
@@ -75,6 +86,7 @@ const tick = setInterval(() => {
         for (const s of scenarios) {
           const t = first200.get(s.name);
           out.routes[s.name] = t === undefined ? null : Math.round((t - pStart) * 1000);
+          if (t === undefined && lastStatus.has(s.name)) out.routes[`${s.name}__last_status`] = lastStatus.get(s.name);
         }
       }
       fs.writeFileSync(outPath, JSON.stringify(out, null, 1));
