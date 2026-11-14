@@ -1179,6 +1179,94 @@ fn compile_where(leaves: &[Leaf], p: &mut Vec<Sql>) -> String {
     }
 }
 
+/// rawQuerySql.compileRawQuery twin over the accepted local-leaf subset
+/// (runSearch's `answerLocally` for the database/internet raw-q leg):
+/// `SELECT cc.* FROM card_cache cc WHERE cc.language = ? AND <where>
+/// ORDER BY LOWER(cc.name), cc.set_id, cc.number, cc.id LIMIT ? OFFSET ?`
+/// plus the COUNT twin. Returns (sql, params, count_sql, count_params).
+pub fn compile_raw_query(leaves: &[Leaf], language: &str, limit: i64, offset: i64) -> (String, Vec<Sql>, String, Vec<Sql>) {
+    let mut p: Vec<Sql> = Vec::new();
+    let where_sql = compile_where(leaves, &mut p);
+    let base = "FROM card_cache cc WHERE cc.language = ?";
+    let sql = format!("SELECT cc.* {base}{where_sql} ORDER BY LOWER(cc.name), cc.set_id, cc.number, cc.id LIMIT ? OFFSET ?");
+    let count_sql = format!("SELECT COUNT(*) AS n {base}{where_sql}");
+    let mut params = vec![Sql::Text(language.to_string())];
+    params.extend(p.iter().cloned());
+    let mut count_params = params.clone();
+    params.push(Sql::Integer(limit));
+    params.push(Sql::Integer(offset));
+    count_params.truncate(1 + p.len());
+    (sql, params, count_sql, count_params)
+}
+
+/// The data-backed (analyze mode 'local') leaves of a raw query, when the
+/// whole query is inside the local-leaf subset; None otherwise (catalog
+/// operators, otag, or anything the subset cannot prove).
+pub fn raw_local_leaves(q: &str) -> Option<Vec<Leaf>> {
+    local_plan(0, q, false, 1, 1, false, None, false).map(|l| l.leaves)
+}
+
+/// toScryfall's `is:<TYPE_WORD>` → `t:` rewrite applied token-wise to a
+/// query outside walk_base's exact subset (the Scrybox extension Scryfall
+/// itself does not understand). Tokens inside quotes are left alone; a
+/// leading `-`/`(` and trailing `)` survive; hyphenated words become a
+/// quoted spaced type (`is:basic-land` → `t:"basic land"`).
+pub fn rewrite_is_types(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut in_q = false;
+    let mut tok = String::new();
+    let flush = |tok: &mut String, out: &mut String| {
+        if tok.is_empty() {
+            return;
+        }
+        let lead = tok.len() - tok.trim_start_matches(['-', '(']).len();
+        let body = &tok[lead..];
+        let trail = body.len() - body.trim_end_matches(')').len();
+        let core = &body[..body.len() - trail];
+        let mut done = false;
+        if core.len() > 3 && core[..3].eq_ignore_ascii_case("is:") && !core.contains('"') {
+            let v = core[3..].to_lowercase();
+            if TYPE_WORDS.contains(&v.as_str()) {
+                let r = v.replace('-', " ");
+                out.push_str(&tok[..lead]);
+                if r.contains(' ') {
+                    out.push_str(&format!("t:\"{r}\""));
+                } else {
+                    out.push_str(&format!("t:{r}"));
+                }
+                out.push_str(&body[body.len() - trail..]);
+                done = true;
+            }
+        }
+        if !done {
+            out.push_str(tok);
+        }
+        tok.clear();
+    };
+    for ch in q.chars() {
+        if in_q {
+            tok.push(ch);
+            if ch == '"' {
+                in_q = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_q = true;
+            tok.push(ch);
+            continue;
+        }
+        if is_js_ws(ch) {
+            flush(&mut tok, &mut out);
+            out.push(ch);
+        } else {
+            tok.push(ch);
+        }
+    }
+    flush(&mut tok, &mut out);
+    out
+}
+
 /// compileCollectionQuery's projection == Q_COLS (the walk leg's row order).
 const LOCAL_BASE: &str = "
     FROM collection c

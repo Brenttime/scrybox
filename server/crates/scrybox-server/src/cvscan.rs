@@ -1283,6 +1283,141 @@ fn parse_set_list(set: Option<&Value>) -> Result<Vec<String>, ()> {
     Ok(s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(String::from).collect())
 }
 
+/// cvScan.scoreCards twin (the image-ranked search leg of searchCards):
+/// embed the captured image once, then rankCardsByEmbedding — per card the
+/// max dot product over every catalog row whose id (with `_back` stripped)
+/// is the card's id / `mtg-`-less id / scryfall_id / tcgplayer ids, f32
+/// operands accumulated in f64 exactly like the JS loop. Scored cards gain
+/// `score` and `__match: {score}` (inserted BEFORE `owned_qty`, which Node
+/// attaches only after ranking); the list is then stably sorted by score
+/// desc (unscored = -Infinity), ties by image_url presence. Any failure
+/// returns the cards untouched (Node's catch → `return cards`).
+pub fn score_cards(buf: &[u8], game: &str, cards: Vec<Value>, lang: &str, cropped: bool) -> Vec<Value> {
+    if cards.len() <= 1 || buf.is_empty() || !is_built(game, lang) {
+        return cards;
+    }
+    let lang_opt = if lang.is_empty() { None } else { Some(lang) };
+    let run = || -> Result<Vec<f32>, String> {
+        touch_scan_use();
+        let cats = load_all(game, lang_opt)?;
+        if cats.is_empty() {
+            return Err("no catalogs".into());
+        }
+        let models = load_models()?;
+        let decoded = decode_rgb(buf)?;
+        let det = if cropped { use_client_crop(&decoded) } else { detect_and_dewarp(&models.corn, &decoded)? };
+        let mut outs = run_session(&models.milo, to_tensor(&det.rgb, EMBED_SIZE), EMBED_SIZE, &["embedding"])?;
+        if outs.is_empty() {
+            return Err("no embedding".into());
+        }
+        Ok(outs.remove(0))
+    };
+    let emb = match run() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("cvScan.scoreCards failed: {e}");
+            return cards;
+        }
+    };
+    let cats = match load_all(game, lang_opt) {
+        Ok(c) => c,
+        Err(_) => return cards,
+    };
+    // idMap per catalog: raw id (\_back stripped) → row indices.
+    let maps: Vec<HashMap<String, Vec<usize>>> = cats
+        .iter()
+        .map(|c| {
+            let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, id) in c.ids.iter().enumerate().take(c.n) {
+                let raw = id.strip_suffix("_back").unwrap_or(id).to_string();
+                m.entry(raw).or_default().push(i);
+            }
+            m
+        })
+        .collect();
+    let js_str = |v: &Value| -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            other => crate::precons::js_string(other),
+        }
+    };
+    let truthy = |v: Option<&Value>| crate::collection::truthy(v.unwrap_or(&Value::Null));
+    let mut scored: Vec<(Option<f64>, Value)> = Vec::with_capacity(cards.len());
+    for card in cards {
+        let mut ids: Vec<String> = Vec::new();
+        let mut add = |s: String| {
+            if !ids.contains(&s) {
+                ids.push(s);
+            }
+        };
+        if truthy(card.get("id")) {
+            let id = js_str(card.get("id").unwrap());
+            add(id.clone());
+            add(id.strip_prefix("mtg-").unwrap_or(&id).to_string());
+        }
+        for k in ["scryfall_id", "tcgplayer_id", "tcgplayer_product_id"] {
+            if truthy(card.get(k)) {
+                add(js_str(card.get(k).unwrap()));
+            }
+        }
+        let mut max: Option<f64> = None;
+        for (c, m) in cats.iter().zip(maps.iter()) {
+            for pid in &ids {
+                if let Some(idx) = m.get(pid) {
+                    for &i in idx {
+                        let off = i * c.dim;
+                        let mut dot = 0f64;
+                        for d in 0..c.dim {
+                            dot += (emb.get(d).copied().unwrap_or(f32::NAN) as f64) * (c.cat[off + d] as f64);
+                        }
+                        if max.map_or(true, |m| dot > m) {
+                            max = Some(dot);
+                        }
+                    }
+                }
+            }
+        }
+        let card = match (max, card) {
+            (Some(sc), Value::Object(obj)) => {
+                let mut out = serde_json::Map::with_capacity(obj.len() + 2);
+                let had_owned = obj.contains_key("owned_qty");
+                let mut owned: Option<Value> = None;
+                for (k, v) in obj {
+                    if k == "owned_qty" {
+                        owned = Some(v);
+                        continue;
+                    }
+                    if k == "score" || k == "__match" {
+                        continue;
+                    }
+                    out.insert(k, v);
+                }
+                let num = serde_json::Number::from_f64(sc).map(Value::Number).unwrap_or(Value::Null);
+                out.insert("score".into(), num.clone());
+                let mut mm = serde_json::Map::new();
+                mm.insert("score".into(), num);
+                out.insert("__match".into(), Value::Object(mm));
+                if had_owned {
+                    out.insert("owned_qty".into(), owned.unwrap_or(Value::Null));
+                }
+                Value::Object(out)
+            }
+            (_, c) => c,
+        };
+        scored.push((max, card));
+    }
+    scored.sort_by(|(a, ca), (b, cb)| {
+        let a = a.unwrap_or(f64::NEG_INFINITY);
+        let b = b.unwrap_or(f64::NEG_INFINITY);
+        if a != b {
+            return b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        let img = |c: &Value| if truthy(c.get("image_url")) { 1 } else { 0 };
+        img(cb).cmp(&img(ca))
+    });
+    scored.into_iter().map(|(_, c)| c).collect()
+}
+
 /// Full pipeline; returns the res.json body (pre-hydration) in Node's key order.
 pub fn match_scan(
     buf: &[u8],
