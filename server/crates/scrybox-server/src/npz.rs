@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 
+#[derive(Debug)]
 pub struct Npy {
     pub shape: Vec<usize>,
     pub descr: String,
@@ -15,6 +16,7 @@ pub struct Npy {
     pub data: NpyData,
 }
 
+#[derive(Debug)]
 pub enum NpyData {
     F32(Vec<f32>),
     F64(Vec<f64>),
@@ -104,6 +106,159 @@ fn read_zip_entries(buf: &[u8]) -> Result<Vec<Entry>, String> {
         off += 46 + name_len + extra_len + comment_len;
     }
     Ok(out)
+}
+
+/// Length-bounded Read over a seeked File: lets inflate stream straight from
+/// the npz on disk instead of materialising the whole file first (the 56 MB
+/// milo catalog npz used to sit in memory beside its decompressed members —
+/// iter-42 memory queue item 1).
+struct BoundedRead {
+    f: std::fs::File,
+    remaining: u64,
+}
+
+impl std::io::Read for BoundedRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let take = std::cmp::min(self.remaining, buf.len() as u64) as usize;
+        let got = self.f.read(&mut buf[..take])?;
+        self.remaining -= got as u64;
+        Ok(got)
+    }
+}
+
+fn inflate_read(r: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut d = flate2::read::DeflateDecoder::new(r);
+    let mut out = Vec::new();
+    d.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Central-directory entries needed to stream one member from disk.
+struct CdEntry {
+    name: String,
+    compress: u16,
+    header_offset: u64,
+    csize: u64,
+}
+
+/// Read the End-Of-Central-Directory record from the file tail; returns the
+/// absolute EOCD position and the member count.
+fn read_eocd(file: &mut std::fs::File) -> Result<(u64, u64, u64), String> {
+    use std::io::Seek;
+    let end = file.metadata().map_err(|e| e.to_string())?.len();
+    let win = std::cmp::min(end, 66_000);
+    let win_start = end - win;
+    file.seek(std::io::SeekFrom::Start(win_start)).map_err(|e| e.to_string())?;
+    let mut tail = Vec::with_capacity(win as usize);
+    file.read_to_end(&mut tail).map_err(|e| e.to_string())?;
+    let mut p = None;
+    if tail.len() >= 22 {
+        for i in (0..=tail.len() - 22).rev() {
+            if &tail[i..i + 4] == b"PK\x05\x06" {
+                p = Some(i);
+                break;
+            }
+        }
+    }
+    let p = p.ok_or("npz EOCD")?;
+    if &tail[p + 16..p + 20] == b"PK\x06\x07" || u32::from_le_bytes([tail[p + 16], tail[p + 17], tail[p + 18], tail[p + 19]]) == 0xFFFFFFFF {
+        return Err("npz zip64 EOCD locator unsupported".into());
+    }
+    let count = u16::from_le_bytes([tail[p + 10], tail[p + 11]]) as u64;
+    let cd_off = u32::from_le_bytes([tail[p + 16], tail[p + 17], tail[p + 18], tail[p + 19]]) as u64;
+    Ok((cd_off, win_start + p as u64, count))
+}
+
+fn read_cd(file: &mut std::fs::File) -> Result<Vec<CdEntry>, String> {
+    use std::io::Seek;
+    let (cd_off, eocd_pos, count) = read_eocd(file)?;
+    // The central directory sits exactly between cd_off and the EOCD.
+    let cd_start = cd_off;
+    file.seek(std::io::SeekFrom::Start(cd_start)).map_err(|e| e.to_string())?;
+    let mut cd = Vec::with_capacity((eocd_pos - cd_start) as usize);
+    file.take((eocd_pos - cd_start) as u64).read_to_end(&mut cd).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    let rd16 = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let rd32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    for _ in 0..count {
+        if i + 46 > cd.len() || &cd[i..i + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let compress = rd16(&cd, i + 10);
+        let csize = rd32(&cd, i + 20) as u64;
+        let name_len = rd16(&cd, i + 28) as usize;
+        let extra_len = rd16(&cd, i + 30) as usize;
+        let comment_len = rd16(&cd, i + 32) as usize;
+        let ho = rd32(&cd, i + 42) as u64;
+        let name = String::from_utf8_lossy(&cd[i + 46..i + 46 + name_len]).to_string();
+        entries.push(CdEntry { name, compress, header_offset: ho, csize });
+        i += 46 + name_len + extra_len + comment_len;
+    }
+    Ok(entries)
+}
+
+/// Read one member's raw stored bytes streaming from the file (local header
+/// at `header_offset` gives the data start; the central directory csize gives
+/// the compressed length).
+fn member_raw(file: &mut std::fs::File, e: &CdEntry) -> Result<Vec<u8>, String> {
+    use std::io::Seek;
+    let mut lh = [0u8; 30];
+    file.seek(std::io::SeekFrom::Start(e.header_offset)).map_err(|err| err.to_string())?;
+    file.read_exact(&mut lh).map_err(|err| err.to_string())?;
+    if &lh[0..4] != b"PK\x03\x04" {
+        return Err(format!("zip local header {}", e.name));
+    }
+    let name_len = u16::from_le_bytes([lh[26], lh[27]]) as u64;
+    let extra_len = u16::from_le_bytes([lh[28], lh[29]]) as u64;
+    let data_off = e.header_offset + 30 + name_len + extra_len;
+    file.seek(std::io::SeekFrom::Start(data_off)).map_err(|err| err.to_string())?;
+    let br = BoundedRead { f: file.try_clone().map_err(|err| err.to_string())?, remaining: e.csize };
+    match e.compress {
+        0 => {
+            let mut r = br;
+            let mut raw = Vec::new();
+            r.read_to_end(&mut raw).map_err(|err| err.to_string())?;
+            Ok(raw)
+        }
+        8 => inflate_read(br).map_err(|err| format!("zip inflate {}: {err}", e.name)),
+        _ => Err(format!("zip method {}", e.compress)),
+    }
+}
+
+/// Parse ONLY the wanted members, streaming each straight off disk: no
+/// whole-file buffer, no members kept that nobody asked for. Used by the
+/// scan catalog (embeddings + card_ids) — the npz is 56 MB compressed and
+/// loading every member (incl. the ~7 MB oracle_ids array nobody reads) plus
+/// the whole-file buffer was the iter-42 VmHWM hotspot. Same on-disk format
+/// and per-member error strings as load_npz.
+pub fn load_npz_members(file: &str, wanted: &[&str]) -> Result<HashMap<String, Result<Npy, String>>, String> {
+    let mut f = std::fs::File::open(file).map_err(|e| format!("read {file}: {e}"))?;
+    let entries = read_cd(&mut f)?;
+    let mut members: HashMap<String, Result<Npy, String>> = HashMap::new();
+    for e in entries {
+        let name = e.name.strip_suffix(".npy").unwrap_or(&e.name).to_string();
+        if !wanted.contains(&name.as_str()) || members.contains_key(&name) {
+            continue;
+        }
+        let raw = member_raw(&mut f, &e)?;
+        if raw.is_empty() {
+            members.insert(name, Err(format!("npz member '{}' is empty", e.name)));
+            continue;
+        }
+        match parse_npy(&raw) {
+            Ok(d) => {
+                members.insert(name, Ok(d));
+            }
+            Err(err) => {
+                members.insert(name, Err(err));
+            }
+        }
+    }
+    Ok(members)
 }
 
 fn entry_data(buf: &[u8], e: &Entry) -> Result<Vec<u8>, String> {
@@ -252,6 +407,199 @@ pub fn load_npz(file: &str) -> Result<HashMap<String, Result<Npy, String>>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = 0u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xEDB88320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// Minimal zip (npz) writer: STORED (method 0, what np.savez emits) or
+    /// DEFLATE (method 8, what the shipped milo catalog uses).
+    fn zip_build(entries: &[(&str, &[u8], u16)]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut central: Vec<u8> = Vec::new();
+        for (name, data, method) in entries {
+            let off = out.len() as u32;
+            let comp = if *method == 8 {
+                let mut e = flate2::write::DeflateEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::default(),
+                );
+                use std::io::Write;
+                e.write_all(data).unwrap();
+                e.finish().unwrap()
+            } else {
+                data.to_vec()
+            };
+            out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
+            out.extend_from_slice(&[20, 0, 0, 0]);
+            out.extend_from_slice(&method.to_le_bytes());
+            out.extend_from_slice(&[0u8; 4]); // time/date
+            out.extend_from_slice(&crc32(data).to_le_bytes());
+            out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&comp);
+            central.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02]);
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+            central.extend_from_slice(&method.to_le_bytes());
+            central.extend_from_slice(&[0u8; 4]);
+            central.extend_from_slice(&crc32(data).to_le_bytes());
+            central.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0u8; 12]);
+            central.extend_from_slice(&off.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06]);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn npy(descr: &str, shape: &str, payload: &[u8]) -> Vec<u8> {
+        let mut h = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
+        while (10 + 2 + h.len() + 1) % 64 != 0 {
+            h.push(' ');
+        }
+        h.push('\n');
+        let mut b = vec![0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0];
+        b.extend_from_slice(&(h.len() as u16).to_le_bytes());
+        b.extend_from_slice(h.as_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    fn memchr_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        if needle.is_empty() || hay.len() < needle.len() {
+            return out;
+        }
+        for i in 0..=hay.len() - needle.len() {
+            if &hay[i..i + needle.len()] == needle {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    fn tmp_npz(tag: &str, bytes: &[u8]) -> String {
+        let p = std::env::temp_dir().join(format!(
+            "scrybox-npz-{tag}-{}-{:?}.npz",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&p, bytes).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn load_npz_members_streams_wanted_only_and_matches_load_npz() {
+        // STORED embeddings, DEFLATE ids (like milo-mtg.npz), plus a
+        // deliberately-corrupt third member nobody asked for: load_npz fails
+        // the whole file only when the corrupt member is REQUESTED — with
+        // wanted-only parsing it never even gets decoded.
+        let emb = npy(
+            "<f4",
+            "(2, 2)",
+            &[1.5f32.to_le_bytes(), (-2.25f32).to_le_bytes(), 0.0f32.to_le_bytes(), 7.0f32.to_le_bytes()].concat(),
+        );
+        // <U4 x2: "ab\0\0" and "c\0\0\0" in UTF-32LE, wrapped as a real .npy.
+        let mut ids_raw = Vec::new();
+        for ch in ["ab\0", "c\0"] {
+            for c in ch.encode_utf16().chain(std::iter::once(0)) {
+                ids_raw.extend_from_slice(&(c as u32).to_le_bytes());
+            }
+        }
+        let ids = npy("<U4", "(2,)", &ids_raw);
+        let file = tmp_npz(
+            "ok",
+            &zip_build(&[
+                ("embeddings.npy", &emb, 0),
+                ("card_ids.npy", &ids, 8),
+                ("broken.npy", b"not-npy-bytes-at-all", 0),
+            ]),
+        );
+        let got = load_npz_members(&file, &["embeddings", "card_ids"]).unwrap();
+        assert!(!got.contains_key("broken"));
+        match &got["embeddings"] {
+            Ok(Npy { data: NpyData::F32(v), shape, .. }) => {
+                assert_eq!(v, &vec![1.5, -2.25, 0.0, 7.0]);
+                assert_eq!(shape, &vec![2, 2]);
+            }
+            other => panic!("bad embeddings: {other:?}"),
+        }
+        match &got["card_ids"] {
+            Ok(Npy { data: NpyData::Str(v), .. }) => assert_eq!(v, &vec!["ab".to_string(), "c".to_string()]),
+            other => panic!("bad ids: {other:?}"),
+        }
+        // load_npz (the whole-map twin) agrees on the requested members.
+        let all = load_npz(&file).unwrap();
+        assert!(matches!(all.get("broken"), Some(Err(_))));
+        std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn load_npz_members_error_semantics() {
+        let emb = npy("<f4", "(1,)", &1.0f32.to_le_bytes());
+        // Missing member => simply absent (caller's ok_or string fires).
+        let file = tmp_npz("missing", &zip_build(&[("embeddings.npy", &emb, 0)]));
+        let got = load_npz_members(&file, &["embeddings", "card_ids"]).unwrap();
+        assert!(got.contains_key("embeddings"));
+        assert!(!got.contains_key("card_ids"));
+        std::fs::remove_file(&file).ok();
+        // Empty member => per-member Err with the load_npz string.
+        let file = tmp_npz("empty", &zip_build(&[("card_ids.npy", &[], 0)]));
+        let got = load_npz_members(&file, &["card_ids"]).unwrap();
+        assert!(
+            matches!(&got["card_ids"], Err(e) if e == "npz member 'card_ids.npy' is empty"),
+            "{:?}",
+            got["card_ids"]
+        );
+        std::fs::remove_file(&file).ok();
+        // A corrupt member among wanted ones surfaces as an inflate error for
+        // THAT member only: store bytes that are not a valid deflate stream
+        // (0x07 => BFINAL=1, BTYPE=11 = invalid block type) and patch both
+        // method fields to 8 afterwards (zip_build itself always compresses).
+        let mut bytes = zip_build(&[
+            ("embeddings.npy", &emb, 0),
+            ("card_ids.npy", &[0x07u8; 8], 0),
+        ]);
+        for idx in memchr_all(&bytes, b"card_ids.npy") {
+            // name sits directly after the 30-byte local header / 46-byte central record
+            let (hdr, moff) = if idx >= 30 && bytes[idx - 30..idx - 26] == *b"PK\x03\x04" {
+                (idx - 30, 8)
+            } else if idx >= 46 && bytes[idx - 46..idx - 42] == *b"PK\x01\x02" {
+                (idx - 46, 10)
+            } else {
+                continue;
+            };
+            bytes[hdr + moff..hdr + moff + 2].copy_from_slice(&8u16.to_le_bytes());
+        }
+        let file = tmp_npz("corrupt", &bytes);
+        let got = load_npz_members(&file, &["embeddings", "card_ids"]);
+        match got {
+            Err(e) => assert!(e.starts_with("zip inflate card_ids.npy"), "{e}"),
+            Ok(m) => panic!("expected inflate error, got {:?}", m.get("card_ids")),
+        }
+        std::fs::remove_file(&file).ok();
+    }
 
     #[test]
     fn split_digits_shapes() {
