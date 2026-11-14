@@ -42,6 +42,7 @@ pub mod collq;
 pub mod cvscan;
 pub mod ip_limit;
 pub mod oidc;
+pub mod oracle_tags;
 pub mod collection;
 pub mod collection_writes;
 pub mod db;

@@ -512,6 +512,57 @@ fn urlencode(s: &str) -> String {
 /// current-thread runtime + LocalSet — the future is !Send by design and
 /// never crosses threads.
 pub fn start_job_timers(db_path: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo) {
+    start_job_timers_with(db_path, memo, JobSet { scryfall: true, oracle: false, sessions: false });
+}
+
+/// Which job families the jobs thread runs. `scryfall` = sets + prices
+/// (RUST_JOBS=scryfall); `oracle` = oracleTags.startOracleTagsService +
+/// the boot catch-up's runMaintenance leg; `sessions` = server.js's daily
+/// PRAGMA optimize + expired-session purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobSet {
+    pub scryfall: bool,
+    pub oracle: bool,
+    pub sessions: bool,
+}
+
+impl JobSet {
+    /// Parse RUST_JOBS (comma list). Explicit tokens: `scryfall`,
+    /// `oracle`, `sessions`, `all`. Node-free (standalone, empty
+    /// SCRYBOX_NODE_UPSTREAM) installs have no Node left to run oracle tags
+    /// or the session purge, so `scryfall` there implies both — the
+    /// Dockerfile.rust image sets only RUST_JOBS=scryfall. In pair mode
+    /// (Node upstream present) they stay with Node unless named.
+    pub fn parse(raw: &str, standalone: bool) -> Self {
+        let has = |t: &str| raw.split(',').any(|s| s.trim() == t || s.trim() == "all");
+        let scryfall = has("scryfall");
+        JobSet {
+            scryfall,
+            oracle: has("oracle") || (standalone && scryfall),
+            sessions: has("sessions") || (standalone && scryfall),
+        }
+    }
+    pub fn any(&self) -> bool {
+        self.scryfall || self.oracle || self.sessions
+    }
+}
+
+/// SCRYBOX_JOB_INTERVAL_SCALE (float, default 1): multiplies every jobs-
+/// thread delay/interval (30 s boot catch-up, hourly, daily, weekly). Ops/
+/// test knob only — Node has no equivalent; unset keeps Node's schedule.
+pub fn interval_scale() -> f64 {
+    std::env::var("SCRYBOX_JOB_INTERVAL_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0)
+}
+
+fn scaled(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs_f64((secs as f64 * interval_scale()).max(0.001))
+}
+
+pub fn start_job_timers_with(db_path: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo, jobs: JobSet) {
     std::thread::Builder::new()
         .name("scry-jobs".into())
         .spawn(move || {
@@ -525,13 +576,71 @@ pub fn start_job_timers(db_path: std::path::PathBuf, memo: crate::sets::Scryfall
             // a slow network exceed 225 s easily) can no longer overlap its
             // successor tick.
             let sweeping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            local.spawn_local(boot_sets_sync(db_path.clone()));
-            local.spawn_local(weekly_loop(db_path.clone(), memo));
-            local.spawn_local(hourly_loop(db_path.clone(), std::sync::Arc::clone(&sweeping)));
-            local.spawn_local(boot_catchup(db_path, sweeping));
+            let maint = std::rc::Rc::new(tokio::sync::Mutex::new(()));
+            if jobs.scryfall {
+                local.spawn_local(boot_sets_sync(db_path.clone()));
+                local.spawn_local(weekly_loop(db_path.clone(), memo));
+                local.spawn_local(hourly_loop(db_path.clone(), std::sync::Arc::clone(&sweeping)));
+            }
+            if jobs.oracle {
+                local.spawn_local(oracle_loop(db_path.clone(), std::rc::Rc::clone(&maint)));
+            }
+            if jobs.sessions {
+                local.spawn_local(sessions_loop(db_path.clone()));
+            }
+            if jobs.scryfall || jobs.oracle {
+                local.spawn_local(boot_catchup(db_path, sweeping, jobs, maint));
+            }
             rt.block_on(local);
         })
         .expect("spawn scry-jobs thread");
+}
+
+/// oracleTags.runMaintenance de-dup: a call while one is running waits for
+/// it and returns (Node hands back the in-flight promise) instead of
+/// running a second pass.
+async fn oracle_maintenance(db: &std::path::Path, maint: &tokio::sync::Mutex<()>) {
+    let _g = match maint.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            let _ = maint.lock().await;
+            return;
+        }
+    };
+    let scry = Scry::new(ScryEnv::from_env());
+    let http = crate::oracle_tags::BulkHttp::from_scry(&scry);
+    match open_conn(db) {
+        Ok(conn) => {
+            crate::oracle_tags::run_maintenance(&conn, &http, &scry).await;
+        }
+        Err(e) => tracing::error!("Oracle Tags maintenance: db open failed: {e}"),
+    }
+}
+
+/// startOracleTagsService: first run START_DELAY (30 s), then hourly.
+async fn oracle_loop(db: std::path::PathBuf, maint: std::rc::Rc<tokio::sync::Mutex<()>>) {
+    tokio::time::sleep(scaled(crate::oracle_tags::START_DELAY_MS / 1000)).await;
+    oracle_maintenance(&db, &maint).await;
+    loop {
+        tokio::time::sleep(scaled(crate::oracle_tags::MAINTENANCE_POLL_MS / 1000)).await;
+        oracle_maintenance(&db, &maint).await;
+    }
+}
+
+/// server.js daily timer: PRAGMA optimize + purge expired sessions.
+pub fn purge_sessions(conn: &Connection) -> rusqlite::Result<usize> {
+    let _ = conn.execute_batch("PRAGMA optimize");
+    conn.execute("DELETE FROM sessions WHERE expires_at <= DATETIME('now')", [])
+}
+
+async fn sessions_loop(db: std::path::PathBuf) {
+    loop {
+        tokio::time::sleep(scaled(24 * 3600)).await;
+        match open_conn(&db).and_then(|c| purge_sessions(&c).map_err(|e| e.to_string())) {
+            Ok(n) => tracing::info!("Session purge: {n} expired sessions removed."),
+            Err(e) => tracing::error!("Failed to purge expired sessions: {e}"),
+        }
+    }
 }
 
 /// Sweep-overlap guard (REVIEW concurrency-jobs L4). `swap` gives exactly
@@ -581,7 +690,7 @@ async fn weekly_loop(db: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo
     // is AppState's, not a fresh per-tick Mutex (REVIEW concurrency-jobs L4:
     // a new memo dropped the cache and cost an extra upstream fetch).
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(7 * 24 * 3600)).await;
+        tokio::time::sleep(scaled(7 * 24 * 3600)).await;
         let scry = Scry::new(ScryEnv::from_env());
         match open_conn(&db) {
             Ok(conn) => {
@@ -622,17 +731,60 @@ async fn hourly_loop(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync:
     // admin's price_refresh_days (the daily timer this replaced made that
     // setting dead code — server.js comment, ported verbatim).
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        tokio::time::sleep(scaled(3600)).await;
         sweep_once(&db, false, &sweeping).await;
+        // server.js: `.finally(() => oracleTags.checkpointWal())`.
+        if let Ok(c) = open_conn(&db) {
+            crate::oracle_tags::checkpoint_wal(&c);
+        }
     }
 }
 
-async fn boot_catchup(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    // Boot catch-up 30 s in (NOT forced, so a sweep inside the interval
-    // costs one indexed read). Node runs oracleTags.runMaintenance first —
-    // that job belongs to the catalog unit and still runs on Node.
-    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-    sweep_once(&db, false, &sweeping).await;
+/// server.js boot catch-up price leg: `await updateCollectionPrices()`
+/// (unforced) then `await refreshPriceEstimates()` — the estimates run even
+/// when the sweep is not due, so a restart re-derives estimates/floors for
+/// rows cached since the last sweep. When the sweep did run, its own tail
+/// already refreshed estimates; the second Node call is skipped here (it is
+/// idempotent and would only repeat floor-fill lookups).
+pub async fn boot_price_catchup(
+    conn: &Connection,
+    scry: &Scry,
+) -> Result<(SweepOutcome, Option<SweepOutcome>), String> {
+    let sweep = update_collection_prices(conn, scry, false).await?;
+    let est = if sweep.swept { None } else { Some(refresh_price_estimates(conn, scry).await?) };
+    Ok((sweep, est))
+}
+
+async fn boot_catchup(
+    db: std::path::PathBuf,
+    sweeping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: JobSet,
+    maint: std::rc::Rc<tokio::sync::Mutex<()>>,
+) {
+    // server.js boot catch-up, 30 s in: oracleTags.runMaintenance (de-duped
+    // with the service's own startup run), then the UNFORCED price sweep
+    // (+ price estimates, inside update_collection_prices), then a WAL
+    // checkpoint.
+    tokio::time::sleep(scaled(30)).await;
+    if jobs.oracle {
+        oracle_maintenance(&db, &maint).await;
+    }
+    if jobs.scryfall {
+        if let Some(_guard) = try_begin_sweep(&sweeping) {
+            let scry = Scry::new(ScryEnv::from_env());
+            match open_conn(&db) {
+                Ok(conn) => {
+                    if let Err(e) = boot_price_catchup(&conn, &scry).await {
+                        tracing::error!("MTG boot price catch-up failed: {e}");
+                    }
+                }
+                Err(e) => tracing::error!("MTG boot price catch-up: db open failed: {e}"),
+            }
+        }
+    }
+    if let Ok(c) = open_conn(&db) {
+        crate::oracle_tags::checkpoint_wal(&c);
+    }
 }
 
 #[cfg(test)]
