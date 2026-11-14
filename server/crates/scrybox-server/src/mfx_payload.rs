@@ -225,12 +225,15 @@ pub fn extract_maybe_cards(details: &Value) -> Vec<BoardEntry> {
 /// Sum of quantities per board, for the summary columns.
 pub fn board_counts(entries: &[BoardEntry]) -> [i64; 4] {
     let mut counts = [0i64; 4]; // mainboard, sideboard, maybeboard, commanders
+    // exec-sync L1: quantities are parseInt of untrusted JSON; saturate the
+    // summary sums instead of wrapping (release builds have no overflow
+    // checks; Node's float sum differs only in these absurd cases).
     for e in entries {
         match e.board {
-            "mainboard" => counts[0] += e.quantity,
-            "sideboard" => counts[1] += e.quantity,
-            "maybeboard" => counts[2] += e.quantity,
-            "commanders" => counts[3] += e.quantity,
+            "mainboard" => counts[0] = counts[0].saturating_add(e.quantity),
+            "sideboard" => counts[1] = counts[1].saturating_add(e.quantity),
+            "maybeboard" => counts[2] = counts[2].saturating_add(e.quantity),
+            "commanders" => counts[3] = counts[3].saturating_add(e.quantity),
             _ => {}
         }
     }
@@ -341,12 +344,14 @@ pub fn synthesize_moxfield_card(scrybox_id: &str, card: &Value) -> Map<String, V
     // present-but-empty `normal` falls through to `large`.
     let image = match c.get("image_uris") {
         Some(iu) if js_truthy(Some(iu)) => {
-            let normal = iu.get("normal");
-            let large = iu.get("large");
-            if js_truthy(normal) {
-                js_to_string(normal.unwrap())
-            } else if js_truthy(large) {
-                js_to_string(large.unwrap())
+            // errors-maint L1: bind in the truthy check instead of
+            // js_truthy(x) + x.unwrap() (same semantics, no panic edge).
+            // `(c.image_uris && (c.image_uris.normal || c.image_uris.large)) || ''` —
+            // present-but-empty `normal` falls through to `large`.
+            if let Some(n) = iu.get("normal").filter(|v| js_truthy(Some(v))) {
+                js_to_string(n)
+            } else if let Some(l) = iu.get("large").filter(|v| js_truthy(Some(v))) {
+                js_to_string(l)
             } else {
                 String::new()
             }

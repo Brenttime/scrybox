@@ -347,10 +347,18 @@ pub async fn handle_scan_sets(State(st): State<AppState>, req: Request) -> Respo
                     m.insert("embedded".into(), Value::from(0i64));
                     m
                 }));
-            let m = e.as_object_mut().unwrap();
-            m.insert("cached".into(), Value::from(m["cached"].as_i64().unwrap() + 1));
-            if embedded.as_ref().is_some_and(|s| s.contains(&id)) {
-                m.insert("embedded".into(), Value::from(m["embedded"].as_i64().unwrap() + 1));
+            // errors-maint L1: the entry is either the object we just
+            // built or one built the same way earlier, so bind it instead
+            // of unwrapping; bump reads defensively (no panic edge).
+            if let Some(m) = e.as_object_mut() {
+                let bump = |m: &mut Map<String, Value>, k: &str| {
+                    let cur = m.get(k).and_then(Value::as_i64).unwrap_or(0);
+                    m.insert(k.into(), Value::from(cur + 1));
+                };
+                bump(m, "cached");
+                if embedded.as_ref().is_some_and(|s| s.contains(&id)) {
+                    bump(m, "embedded");
+                }
             }
         }
         let local = embedded.is_some();

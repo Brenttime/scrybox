@@ -198,8 +198,10 @@ fn capitalize(s: &str) -> String {
 fn oracle_id_for(card: Option<&Value>) -> Option<String> {
     let card = card?;
     let o = card.as_object()?;
-    if truthy(o.get("oracle_id")) {
-        return Some(str_of(o.get("oracle_id").unwrap()));
+    // errors-maint L1: bind the value in the truthy check instead of
+    // checked-then-unwrap (same semantics, no panic edge).
+    if let Some(oid) = o.get("oracle_id").filter(|v| truthy(Some(v))) {
+        return Some(str_of(oid));
     }
     let faces = o.get("card_faces").and_then(|v| v.as_array())?;
     let mut ids: Vec<String> = Vec::new();

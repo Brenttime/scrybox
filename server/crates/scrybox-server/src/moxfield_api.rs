@@ -85,6 +85,9 @@ impl MoxfieldError {
 pub struct MfxApi {
     pub base_url: String,
     pub curl_bin: String,
+    /// execFile({ timeout: (TIMEOUT_S + 5) * 1000 }) — the wall the curl
+    /// child gets before Node's execFile kills it. Tests shrink it.
+    pub exec_timeout: Duration,
 }
 
 impl MfxApi {
@@ -100,25 +103,33 @@ impl MfxApi {
             .unwrap_or_else(|_| BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let repo_bin = format!(
-            "{}/../../../bin/curl-impersonate",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        // exec-sync L3: the repo-bundled candidate is resolved relative to
+        // the RUNNING binary (…/server/target/<profile>/scrybox-server →
+        // …/server/bin/curl-impersonate), not the builder's
+        // CARGO_MANIFEST_DIR baked in at compile time (a file at the stale
+        // build path on the host would otherwise get executed).
         let candidates: Vec<String> = std::env::var("MOXFIELD_CURL_BIN")
             .ok()
             .filter(|b| !b.is_empty())
             .into_iter()
-            .chain([
-                "/usr/local/bin/curl-impersonate".to_string(),
-                repo_bin,
-            ])
+            .chain(std::iter::once("/usr/local/bin/curl-impersonate".to_string()))
+            .chain(repo_bin_candidate())
             .collect();
         let curl_bin = candidates
             .iter()
             .find(|p| std::path::Path::new(p).exists())
             .cloned()
             .unwrap_or_else(|| "curl".to_string());
-        Self { base_url, curl_bin }
+        Self { base_url, curl_bin, exec_timeout: Duration::from_secs(TIMEOUT_S + 5) }
+    }
+
+    #[cfg(test)]
+    fn for_test(curl_bin: impl Into<String>, exec_timeout: Duration) -> Self {
+        Self {
+            base_url: "http://127.0.0.1:1".to_string(),
+            curl_bin: curl_bin.into(),
+            exec_timeout,
+        }
     }
 
     fn uses_impersonate(&self) -> bool {
@@ -170,43 +181,54 @@ impl MfxApi {
                     }
                     buf
                 };
-                let read_err = async {
-                    let mut buf = Vec::new();
+                // exec-sync L2: stderr accumulates in a shared buffer as it
+                // is read, so whatever the child wrote before an execFile
+                // timeout survives the cancellation of the reader future
+                // (Node's execFile hands the callback the partial stderr).
+                let err_shared: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+                let err_sink = err_shared.clone();
+                let read_err = async move {
                     if let Some(p) = err_pipe.as_mut() {
                         let mut chunk = [0u8; 4096];
                         loop {
                             match p.read(&mut chunk).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
+                                    let mut buf = err_sink
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let room = MAX_STDERR_BYTES.saturating_sub(buf.len());
                                     buf.extend_from_slice(&chunk[..n.min(room)]);
                                 }
                             }
                         }
                     }
-                    buf
                 };
-                let waited = tokio::time::timeout(Duration::from_secs(TIMEOUT_S + 5), async {
+                let waited = tokio::time::timeout(self.exec_timeout, async {
                     let out_fut = read_out;
                     tokio::pin!(out_fut);
                     let err_fut = read_err;
                     tokio::pin!(err_fut);
-                    let mut err_buf: Option<Vec<u8>> = None;
+                    let mut err_done = false;
                     let out = loop {
                         tokio::select! {
                             o = &mut out_fut => break o,
-                            e = &mut err_fut, if err_buf.is_none() => err_buf = Some(e),
+                            () = &mut err_fut, if !err_done => err_done = true,
                         }
                     };
+                    // exec-sync L2: the maxBuffer verdict must short-circuit
+                    // BEFORE draining stderr — Node's execFile kills the
+                    // child the instant stdout crosses maxBuffer and does
+                    // not wait for a still-open stderr pipe to EOF.
                     if out.len() > MAX_STDOUT_BYTES {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         return Ok((out, Vec::new(), None));
                     }
-                    let err = match err_buf {
-                        Some(e) => e,
-                        None => err_fut.await,
-                    };
+                    if !err_done {
+                        err_fut.await;
+                    }
+                    let err = err_shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     child.wait().await.map(|st| (out, err, Some(st)))
                 })
                 .await;
@@ -227,9 +249,19 @@ impl MfxApi {
                     }
                     Ok(Err(e)) => (String::new(), String::new(), Some(e.to_string())),
                     Err(_) => {
-                        // timeout: execFile kills the child; err message form
+                        // exec-sync L2: Node's execFile timeout surfaces as a
+                        // plain execFile failure — err "Command failed:
+                        // <bin> <args>" plus whatever stderr the child had
+                        // written — not a spawnSync ETIMEDOUT (visible in
+                        // last_error and 502 bodies). Partial stderr is read
+                        // from the shared sink the reader wrote into.
                         let _ = child.start_kill();
-                        (String::new(), String::new(), Some("spawnSync /bin/sh ETIMEDOUT".to_string()))
+                        let err = err_shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                        (
+                            String::new(),
+                            String::from_utf8_lossy(&err).to_string(),
+                            Some(format!("Command failed: {} {}", self.curl_bin, args.join(" "))),
+                        )
                     }
                 }
             }
@@ -402,8 +434,7 @@ impl MfxApi {
     ) -> Result<Vec<Value>, MoxfieldError> {
         let mut all: Vec<Value> = Vec::new();
         let mut page = 1i64;
-        let mut total_pages = 1i64;
-        while page <= total_pages {
+        loop {
             let params = [
                 ("authorUserNames", user_name.to_string()),
                 ("pageNumber", page.to_string()),
@@ -425,16 +456,41 @@ impl MfxApi {
             all.extend(rows.iter().cloned());
             // totalPages = parseInt(data.totalPages, 10) || page — NaN/0
             // collapses to the current page, so this is the last page.
-            total_pages = js_parse_int(data.get("totalPages")).unwrap_or(page);
-            if rows.is_empty() {
-                break;
+            let total_pages = js_parse_int(data.get("totalPages")).unwrap_or(page);
+            match next_page(page, total_pages, rows.is_empty()) {
+                Some(p) => page = p,
+                None => break,
             }
-            page += 1;
         }
         Ok(all)
     }
 }
 
+/// exec-sync L4: pagination step. Node trusts upstream `totalPages` with no
+/// bound — a hostile upstream returning endless non-empty pages with a huge
+/// totalPages never terminates the sync. Cap the walk at 100 pages (well
+/// above any real author's deck count; a truncated list only means fewer
+/// synced summaries, the old behavior here was an unbounded loop).
+fn next_page(page: i64, total_pages: i64, rows_empty: bool) -> Option<i64> {
+    const MAX_PAGES: i64 = 100;
+    if rows_empty || page >= MAX_PAGES || page >= total_pages {
+        None
+    } else {
+        Some(page + 1)
+    }
+}
+
+/// exec-sync L3: repo-bundled curl candidate relative to the running
+/// executable: …/server/target/<profile>/scrybox-server →
+/// …/server/bin/curl-impersonate. Pure over the exe path so it is testable.
+fn repo_bin_from_exe(exe: &std::path::Path) -> Option<String> {
+    let server_root = exe.parent()?.parent()?.parent()?;
+    Some(server_root.join("bin/curl-impersonate").to_string_lossy().into_owned())
+}
+
+fn repo_bin_candidate() -> Option<String> {
+    repo_bin_from_exe(&std::env::current_exe().ok()?)
+}
 /// getUser's resolved shape.
 #[derive(Clone, Debug)]
 pub struct MfxUserInfo {
@@ -480,4 +536,97 @@ fn encode_param(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod exec_sync_low_tests {
+    use super::*;
+    use crate::mfx_payload::{board_counts, BoardEntry};
+    use std::path::{Path, PathBuf};
+
+    fn script(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("mfx-{name}-{}.sh", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    // exec-sync L4: hostile upstream totalPages must stop at the page cap.
+    // Red before the fix (neuter next_page to the old `page < total_pages`
+    // only and the cap arm fails — old behavior looped forever).
+    #[test]
+    fn l4_next_page_caps_hostile_total_pages() {
+        assert_eq!(next_page(1, 2, false), Some(2));
+        assert_eq!(next_page(2, 2, false), None); // totalPages == page stops
+        assert_eq!(next_page(1, 1_000_000, true), None); // empty page stops
+        assert_eq!(next_page(99, i64::MAX, false), Some(100));
+        assert_eq!(next_page(100, i64::MAX, false), None); // THE CAP
+    }
+
+    // exec-sync L3: candidate resolves off the RUNNING exe, not the
+    // builder's CARGO_MANIFEST_DIR. Red before the fix: old code always
+    // produced the env!("CARGO_MANIFEST_DIR")/../../../bin path.
+    #[test]
+    fn l3_repo_bin_resolves_relative_to_running_exe() {
+        let exe = Path::new("/build/server/target/release/scrybox-server");
+        assert_eq!(
+            repo_bin_from_exe(exe).as_deref(),
+            Some("/build/server/bin/curl-impersonate")
+        );
+        assert_ne!(
+            repo_bin_from_exe(exe).unwrap(),
+            format!("{}/../../../bin/curl-impersonate", env!("CARGO_MANIFEST_DIR"))
+        );
+        // Too few components to derive a server root → no candidate at all.
+        assert!(repo_bin_from_exe(Path::new("scrybox")).is_none());
+    }
+
+    // exec-sync L2: execFile timeout surfaces like Node — the partial
+    // stderr the child had written survives the kill and wins over the
+    // error text (Node: String(stderr || err)). Red before the fix: the old
+    // arm dropped stderr and returned 'spawnSync /bin/sh ETIMEDOUT'.
+    #[tokio::test]
+    async fn l2_timeout_keeps_partial_stderr() {
+        let bin = script("err", "echo late-oops >&2\nexec sleep 30");
+        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(300));
+        let err = api.get("/v2/x", &[]).await.unwrap_err();
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(err.status, 0);
+        assert!(err.message.contains("late-oops"), "{:?}", err.message);
+        assert!(!err.message.contains("ETIMEDOUT"), "{:?}", err.message);
+    }
+
+    #[tokio::test]
+    async fn l2_timeout_without_stderr_reports_command_failed() {
+        let bin = script("silent", "exec sleep 30");
+        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(300));
+        let err = api.get("/v2/x", &[]).await.unwrap_err();
+        let _ = std::fs::remove_file(&bin);
+        assert!(
+            err.message.starts_with("Could not reach Moxfield: Command failed: "),
+            "{:?}",
+            err.message
+        );
+        assert!(err.message.contains(&bin.to_string_lossy().to_string()), "{:?}", err.message);
+    }
+
+    // exec-sync L1: i64::MAX quantities saturate instead of wrapping.
+    // Red before the fix: release build wrapped past i64::MAX; debug
+    // build panicked on overflow.
+    #[test]
+    fn l1_board_counts_saturate() {
+        let card = serde_json::json!({"scryfall_id": "x"});
+        let e = |board: &'static str, q: i64| BoardEntry { board, card: card.clone(), quantity: q };
+        let c = board_counts(&[
+            e("mainboard", i64::MAX),
+            e("mainboard", i64::MAX),
+            e("commanders", 1),
+        ]);
+        assert_eq!(c[0], i64::MAX);
+        assert_eq!(c[3], 1);
+    }
 }

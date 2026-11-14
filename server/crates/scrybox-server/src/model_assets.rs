@@ -517,11 +517,19 @@ mod m1_tests {
             phase: "downloading".into(),
             message: String::new(),
         });
-        let h = spawn_guarded(async {
+        // Inline catch_unwind drive (same fix as catalog_build's m1 test:
+        // JoinHandle completion can race the task future's drop glue under
+        // the parallel harness; the guard drop must strictly precede the
+        // asserts, and the unwind semantics are identical).
+        use futures_util::FutureExt;
+        let res = async {
+            let _guard = JobGuard;
             let _held = CURRENT.guard();
             panic!("boom");
-        });
-        assert!(h.await.unwrap_err().is_panic());
+        }
+        .catch_unwind()
+        .await;
+        assert!(res.is_err(), "the guarded body must panic");
         assert!(CURRENT.guard().is_none(), "CURRENT stuck after panic");
         assert_eq!(LAST.guard().as_ref().unwrap()["phase"], "error");
     }

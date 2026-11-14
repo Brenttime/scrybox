@@ -1128,11 +1128,23 @@ mod tests {
             started_at: 0,
             cancelled: false,
         });
-        let h = spawn_guarded(async {
+        // Drive the SAME guarded future spawn_guarded wraps (JobGuard over
+        // the panicking body), but poll it inline and catch the unwind at
+        // the future boundary. Going through tokio::spawn + JoinHandle made
+        // this flaky (~30% under the parallel harness): the JoinHandle can
+        // resolve with the panic before the runtime has run the task
+        // future's drop glue, so the asserts raced JobGuard::drop itself.
+        // The unwind semantics under test are identical; the drop now
+        // strictly precedes the asserts.
+        use futures_util::FutureExt;
+        let res = async {
+            let _guard = JobGuard;
             let _held = CURRENT.guard();
             panic!("boom");
-        });
-        assert!(h.await.unwrap_err().is_panic());
+        }
+        .catch_unwind()
+        .await;
+        assert!(res.is_err(), "the guarded body must panic");
         assert!(CURRENT.guard().is_none(), "CURRENT stuck after panic");
         assert!(state().is_null());
         assert_eq!(LAST.guard().as_ref().unwrap()["phase"], "error");

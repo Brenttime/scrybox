@@ -376,7 +376,10 @@ fn replace_maybeboard(
     let mut qty: HashMap<String, i64> = HashMap::new();
     for e in maybe_entries {
         let id = scrybox_card_id(&e.card);
-        qty.entry(id.clone()).and_modify(|q| *q += e.quantity).or_insert_with(|| {
+        // exec-sync L1: quantity is parseInt of untrusted JSON (up to
+        // i64::MAX); release builds have no overflow checks, so saturate
+        // instead of wrapping to a negative deck quantity.
+        qty.entry(id.clone()).and_modify(|q| *q = q.saturating_add(e.quantity)).or_insert_with(|| {
             order.push(id.clone());
             e.quantity
         });
@@ -1082,7 +1085,8 @@ pub async fn pull_deck_content(
     let mut raw_desired: HashMap<String, i64> = HashMap::new();
     for e in &entries {
         let id = scrybox_card_id(&e.card);
-        raw_desired.entry(id.clone()).and_modify(|q| *q += e.quantity).or_insert_with(|| {
+        // exec-sync L1: saturating sum (see above).
+        raw_desired.entry(id.clone()).and_modify(|q| *q = q.saturating_add(e.quantity)).or_insert_with(|| {
             raw_order.push(id.clone());
             e.quantity
         });
@@ -1120,7 +1124,8 @@ pub async fn pull_deck_content(
             }
         };
         match desired_index.get(&key) {
-            Some(&i) => desired[i].2 += quantity,
+            // exec-sync L1: saturating merge across printings.
+            Some(&i) => desired[i].2 = desired[i].2.saturating_add(quantity),
             None => {
                 desired_index.insert(key.clone(), desired.len());
                 desired.push((key, id.clone(), quantity));

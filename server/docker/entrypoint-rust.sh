@@ -10,7 +10,12 @@ mkdir -p /app/database
 
 if [ -n "$(find /app/database ! -user scrybox -print -quit)" ]; then
   echo "entrypoint: taking ownership of /app/database for scrybox user..."
-  find /app/database ! -user scrybox -exec chown scrybox:scrybox {} +
+  # exec-sync L5: chown -h — plain chown follows symlinks, so a planted
+  # /app/database/x -> /etc/shadow (or -> the curl-impersonate binary)
+  # would be re-owned to uid-1000 by root on the next boot. -h changes the
+  # link's own ownership, never its target. (Node's entrypoint.sh has the
+  # same pattern; per policy we do not change Node.)
+  find /app/database ! -user scrybox -exec chown -h scrybox:scrybox {} +
 fi
 
 exec gosu scrybox "$@"
