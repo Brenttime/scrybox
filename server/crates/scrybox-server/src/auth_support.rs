@@ -157,21 +157,9 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
 }
 
 /// `parseInt(s, 10)`: leading whitespace, optional sign, longest digit
-/// prefix; `None` = NaN. Saturates (any overflow is out of range anyway).
-fn js_parse_int(s: &str) -> Option<i64> {
-    let t = s.trim_start();
-    let (neg, t) = match t.as_bytes().first() {
-        Some(b'-') => (true, &t[1..]),
-        Some(b'+') => (false, &t[1..]),
-        _ => (false, t),
-    };
-    let digits: &str = &t[..t.bytes().take_while(u8::is_ascii_digit).count()];
-    if digits.is_empty() {
-        return None;
-    }
-    let v = digits.bytes().fold(0i64, |a, d| a.saturating_mul(10).saturating_add((d - b'0') as i64));
-    Some(if neg { -v } else { v })
-}
+/// prefix; `None` = NaN. Saturates magnitude-then-sign (overflow lands on
+/// ±i64::MAX) — shared implementation in `crate::util`.
+use crate::util::js_parse_int_unicode_sat as js_parse_int;
 
 fn verify_with(password: &str, salt: &str, hash: &str, iterations: u32) -> bool {
     // Node's Buffer.from(hash,'hex') — see hex_decode.

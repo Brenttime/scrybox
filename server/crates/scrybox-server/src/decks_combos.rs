@@ -180,12 +180,7 @@ async fn guard(st: &AppState, req: Request, group: &str) -> Result<Ctx, Response
     Ok(Ctx { pool, headers: parts.headers, user_id: user.id, query: parts.uri.query().map(str::to_string) })
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 // ---------------------------------------------------------------------------
 // GET /api/decks/:id/combos — Commander Spellbook find-my-combos proxy

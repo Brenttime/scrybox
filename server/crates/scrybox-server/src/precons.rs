@@ -289,12 +289,7 @@ pub struct PreconError {
     pub message: String,
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 /// `new Date().toISOString()` twin.
 fn now_iso() -> String {
@@ -684,11 +679,7 @@ pub(crate) fn json_response(status: StatusCode, map: &Map<String, Value>) -> Res
         .into_response()
 }
 
-pub(crate) fn json_error(status: StatusCode, msg: &str) -> Response {
-    let mut m = Map::new();
-    m.insert("error".into(), Value::String(msg.to_string()));
-    json_response(status, &m)
-}
+pub(crate) use crate::util::json_error;
 
 fn internal_error() -> Response {
     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")

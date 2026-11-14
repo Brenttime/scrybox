@@ -1235,12 +1235,7 @@ pub async fn handle_cotd(State(st): State<AppState>, req: Request) -> Response {
     res_json(&payload, &cond)
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
+use crate::util::now_ms;
 
 // ---------------------------------------------------------------------------
 // GET /api/suggest

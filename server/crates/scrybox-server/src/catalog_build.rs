@@ -60,12 +60,7 @@ use crate::poison::LockExt;
 /// bump both together.
 pub const SCRYBOX_UA: &str = "Scrybox/1.8.5 (+https://github.com/Brenttime/scrybox)";
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 // ---------------------------------------------------------------------------
 // Job state (catalog.js `current` / `last`)
@@ -587,6 +582,8 @@ async fn run_job(
 struct CacheSummary {
     cards: usize,
     gaps: Option<usize>,
+    // Node's cachePhase stats carry `failed` (provider failures logged, not
+    // surfaced in the job snapshot) — parity mirror.
     #[allow(dead_code)]
     failed: usize,
 }
@@ -653,6 +650,8 @@ struct EmbedSummary {
     built: usize,
     reused: usize,
     failed: usize,
+    // Node's embedPhase tracks a `wrote` flag the Rust path logs instead of
+    // returning — parity mirror.
     #[allow(dead_code)]
     wrote: bool,
     rows: Option<usize>,

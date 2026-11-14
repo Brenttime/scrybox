@@ -144,17 +144,7 @@ pub fn js_parse_int(v: Option<&Value>) -> Option<i64> {
 }
 
 fn parse_int_radix10(t: &str) -> Option<i64> {
-    let t = t.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-    let (sign, digits) = match t.as_bytes().first() {
-        Some(b'+') => (1i64, &t[1..]),
-        Some(b'-') => (-1i64, &t[1..]),
-        _ => (1i64, t),
-    };
-    let run: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if run.is_empty() {
-        return None; // NaN
-    }
-    run.parse::<i64>().ok().map(|n| sign * n)
+    crate::util::js_parse_int_unicode(t)
 }
 
 /// `Math.max(0, parseInt(entry.quantity, 10) || 0)` from extractDeckCards.

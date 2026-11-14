@@ -29,7 +29,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -522,14 +522,7 @@ async fn read_capped(mut body: Body) -> (Vec<u8>, bool) {
     (buf, false)
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 // ---------------------------------------------------------------------------
 // Unit tests (JS-semantics twins; live parity is bench/parity.mjs shx_*)

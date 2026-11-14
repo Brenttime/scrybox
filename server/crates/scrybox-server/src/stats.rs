@@ -24,14 +24,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use bytes::Bytes;
 use rusqlite::{types::Value as SqlValue, Connection, Row};
@@ -644,14 +644,7 @@ pub(crate) fn js_to_num(v: &Value) -> f64 {
     }
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(serde_json::json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 /// `JSON.parse(x || '[]')` plus a normalization pass: SQLite's json_*
 /// functions print integer-valued REALs as `12.0` while Node's
@@ -787,9 +780,7 @@ pub(crate) fn iso_utc_ms(ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{milli:03}Z")
 }
 
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
+pub(crate) use crate::util::now_ms;
 
 /// priceHelpers.parseSqliteUtc, ported for the formats SQLite produces. The
 /// /stats body itself never runs added_at through it (rows go out raw — see

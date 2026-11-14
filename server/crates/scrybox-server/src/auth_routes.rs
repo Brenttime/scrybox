@@ -23,7 +23,6 @@
 //!   Node writers would.
 
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -34,7 +33,6 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::{authenticate, bearer_token, AuthUser};
 use crate::auth_support::*;
-use crate::collection::body_etag;
 use crate::db::DbPool;
 use crate::ip_limit::client_ip_key;
 use crate::oidc;
@@ -44,22 +42,7 @@ use crate::{proxy, AppState};
 // Response helpers
 // ---------------------------------------------------------------------------
 
-fn json_response(status: StatusCode, value: &Value) -> Response {
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8")),
-            (header::ETAG, HeaderValue::from_str(&body_etag(&body)).unwrap()),
-        ],
-        Body::from(body),
-    )
-        .into_response()
-}
-
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    json_response(status, &json!({ "error": msg }))
-}
+use crate::util::{json_error_express as json_error, json_response};
 
 fn redirect(status: StatusCode, location: &str) -> Response {
     (
@@ -160,9 +143,7 @@ pub fn session_expiry_str(now_ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+use crate::util::now_ms_u64 as now_ms;
 
 /// `generateSession`: 32 random bytes hex, 7-day expiry, INSERT.
 fn generate_session(pool: &DbPool, user_id: i64) -> Result<String, rusqlite::Error> {

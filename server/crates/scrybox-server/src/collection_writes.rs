@@ -62,22 +62,7 @@ pub(crate) fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
 // application/json; charset=utf-8 + the Express default weak body ETag)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn json_response(status: StatusCode, value: &Value) -> Response {
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    (
-        status,
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8")),
-            (header::ETAG, HeaderValue::from_str(&body_etag(&body)).unwrap()),
-        ],
-        Body::from(body),
-    )
-        .into_response()
-}
-
-pub(crate) fn json_error(status: StatusCode, msg: &str) -> Response {
-    json_response(status, &json!({ "error": msg }))
-}
+pub(crate) use crate::util::{json_error_express as json_error, json_response};
 
 /// Re-stamp an error Response produced elsewhere (auth.rs builds axum::Json
 /// bodies without the Express charset/ETag) into Node's exact res.json form,

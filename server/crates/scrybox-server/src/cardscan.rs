@@ -32,7 +32,7 @@
 //! fetched sidecar reply, and Node re-runs the leg itself).
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -638,9 +638,7 @@ fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64, Respo
     Ok(id)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+use crate::util::now_ms_u64 as now_ms;
 
 // ---------------------------------------------------------------------------
 // res.json twin (etag package, weak form)
