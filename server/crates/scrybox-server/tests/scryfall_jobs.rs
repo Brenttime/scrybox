@@ -19,7 +19,7 @@ use scrybox_server::{
     },
     card_norm::{default_search_eligible, normalize_card, oracle_id_for_card, scryfall_uuid},
     scryfall::{wait_ms, ScryOpts},
-    scry_jobs::{fetch_and_cache_sets, sweep_rows, update_collection_prices},
+    scry_jobs::{fetch_and_cache_sets, refresh_price_estimates, sweep_rows, update_collection_prices},
 };
 
 fn seeded_db(dir: &std::path::Path, name: &str) -> Connection {
@@ -726,6 +726,56 @@ async fn retry_ladder_gives_up_after_budget() {
     let err = scry.get_retried("/sets", &ScryOpts::default(), 4).await.unwrap_err();
     assert!(err.is_status(500));
     assert_eq!(mock.hits_for("GET /sets").len(), before + 1);
+}
+
+// ---------------------------------------------------------------------------
+// askedOracle memo is PROCESS-wide (REVIEW concurrency-jobs L4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sweep_tick_shared_memo_survives_ticks() {
+    // Node's priceEstimates.js keeps `const askedOracle = new Set()` at
+    // MODULE scope — one set for the whole process. The Rust sweep timers
+    // build a FRESH `Scry` per tick (sweep_once), so a per-client memo
+    // resets between ticks and re-asks every never-priced card on every
+    // hourly sweep. Two sweeps through two separate Scry instances must
+    // cost the wire exactly one search round per floorless oracle.
+    let (addr, mock) = spawn_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded_db(dir.path(), "memo.db");
+    conn.execute("INSERT INTO users (id, username, password_hash, role, share_token) VALUES (1,'u','x','admin','share-u')", []).unwrap();
+    // Unique oracle ids: the memo is process-wide on purpose, so this test
+    // must not collide with any other test's marks in the same binary.
+    let seed_memo_card = |conn: &Connection, id: &str, oid: &str| {
+        conn.execute(
+            "INSERT INTO card_cache (id, name, supertype, subtypes, types, rarity, set_id, set_name, number, price_trend, price_normal, language, oracle_id)
+             VALUES (?1, ?2, 'Card', '[]', '[\"Creature\"]', 'Common', 'mst', 'MemoSet', '1', NULL, NULL, 'English', ?3)",
+            params![id, format!("Memo Neverprice {id}"), oid],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO collection (card_id, quantity, user_id) VALUES (?1, 1, 1)", params![id]).unwrap();
+    };
+    seed_memo_card(&conn, "mtg-memo-1", "oracle-memo-neverprice-1");
+    // The floor search answers nothing: the card stays price-less, so it
+    // remains in cards_missing_floor and the MEMO — not the price flag — is
+    // the only thing suppressing a second ask.
+    *mock.search.lock().unwrap() = json!({"data": [], "has_more": false});
+
+    let scry1 = scry_for(addr, 0.001);
+    let _ = refresh_price_estimates(&conn, &scry1).await.unwrap();
+    let hits1 = mock.hits_for("GET /cards/search").len();
+    assert_eq!(hits1, 1, "one search round for one floorless oracle");
+
+    // Second tick with a FRESH Scry (what sweep_once does every hour).
+    let scry2 = scry_for(addr, 0.001);
+    let _ = refresh_price_estimates(&conn, &scry2).await.unwrap();
+    assert_eq!(mock.hits_for("GET /cards/search").len(), hits1, "no re-ask for an already-asked oracle: the askedOracle memo must survive the tick (process static, like Node)");
+
+    // Control: the memo suppresses only ALREADY-ASKED oracles — a new
+    // floorless oracle is still asked by the same warm process.
+    seed_memo_card(&conn, "mtg-memo-2", "oracle-memo-neverprice-2");
+    let _ = refresh_price_estimates(&conn, &scry2).await.unwrap();
+    assert_eq!(mock.hits_for("GET /cards/search").len(), hits1 + 1, "unasked oracles still get their search round");
 }
 
 // ---------------------------------------------------------------------------

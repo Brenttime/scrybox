@@ -2025,6 +2025,11 @@ async fn auth_gate(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i
     let pool = st.db.as_ref().unwrap();
     let token = bearer_token(headers).map(|s| s.to_string());
     let auth = authenticate(pool, token.as_deref(), is_get).map_err(|res| res)?;
+    // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
+    // user's stats gen before the handler body (REVIEW-writes L1).
+    if !is_get {
+        crate::stats::on_native_write(st, auth.id);
+    }
     Ok(auth.id)
 }
 

@@ -427,7 +427,7 @@ pub async fn route_settings(State(st): State<AppState>, req: Request) -> Respons
                 }
             }
         }
-        Method::PUT => handle_put(pool, req).await,
+        Method::PUT => handle_put(&st, pool, req).await,
         _ => crate::proxy(State(st), req).await,
     }
 }
@@ -497,7 +497,7 @@ pub(crate) fn admin_gate(user: &auth::AuthUser) -> Option<Response> {
     None
 }
 
-async fn handle_put(pool: Arc<DbPool>, req: Request) -> Response {
+async fn handle_put(st: &crate::AppState, pool: Arc<DbPool>, req: Request) -> Response {
     // body-parser first (normalJson is mounted above the router): malformed
     // JSON answers the generic 500 before auth; >1 MiB the 413 shape. The
     // headers are cloned up front — body-parser consumes the stream only,
@@ -511,6 +511,10 @@ async fn handle_put(pool: Arc<DbPool>, req: Request) -> Response {
         Ok(u) => u,
         Err(res) => return res,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth (before the role gate and the handler body) — a PUT that
+    // later 400s/403s still bumped in Node. (REVIEW-writes L1.)
+    crate::stats::on_native_write(st, user.id);
     if let Some(res) = admin_gate(&user) {
         return res;
     }

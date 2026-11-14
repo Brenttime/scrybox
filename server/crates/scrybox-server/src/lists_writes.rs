@@ -106,6 +106,9 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     // Unit 7c: Node's batched hydration of names this install has never
     // seen (routes/lists.js:118) — probe the cache, resolve the misses
     // through /cards/collection (sidecar-swapped, cached), and let
@@ -157,6 +160,9 @@ pub async fn handle_order(State(st): State<AppState>, req: Request) -> Response 
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     reorder_lists(&pool, user.id, &body)
 }
 
@@ -180,6 +186,9 @@ pub async fn handle_update(Path(id): Path<String>, State(st): State<AppState>, r
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     update_list(&pool, &id, user.id, &body)
 }
 
@@ -205,6 +214,9 @@ pub async fn handle_delete(Path(id): Path<String>, State(st): State<AppState>, r
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     delete_list(&pool, &id, user.id)
 }
 

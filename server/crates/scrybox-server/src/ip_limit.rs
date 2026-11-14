@@ -44,8 +44,9 @@ impl Trust {
         if v == "true" {
             return Trust::All;
         }
-        if !v.is_empty() && v.parse::<usize>().is_ok() {
-            return Trust::Hops(v.parse::<usize>().unwrap());
+        if let Ok(hops) = v.parse::<usize>() {
+            // parse once, use the value (REVIEW errors-maint L3).
+            return Trust::Hops(hops);
         }
         let mut rules = Vec::new();
         for token in v.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {

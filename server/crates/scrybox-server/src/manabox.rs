@@ -1165,7 +1165,13 @@ fn js_number(v: &Value) -> f64 {
 fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<crate::auth::AuthUser, Response> {
     let pool = st.db.as_ref().ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
     let token = bearer_token(headers).map(|s| s.to_string());
-    authenticate(pool, token.as_deref(), is_get).map_err(|res| res)
+    let user = authenticate(pool, token.as_deref(), is_get).map_err(|res| res)?;
+    // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
+    // user's stats gen before the handler body (REVIEW-writes L1).
+    if !is_get {
+        crate::stats::on_native_write(st, user.id);
+    }
+    Ok(user)
 }
 
 /// The `express.json({ limit: '40mb' })` mounted on /api/manabox-sync AFTER

@@ -89,17 +89,19 @@ async fn main() {
     // weekly set-sync / hourly price-sweep timers from Node's server.js
     // (which the test container disables via SCRYBOX_DISABLE_SETS_REFRESH /
     // SCRYBOX_DISABLE_PRICE_SWEEP when this is on). Off unless set.
+    // Built before AppState so the weekly tick shares AppState.scryfall_sets
+    // (REVIEW concurrency-jobs L4: no fresh per-tick memo).
+    let state = scrybox_server::AppState::new(cfg.clone());
     if std::env::var("RUST_JOBS").unwrap_or_default().split(',').any(|s| s.trim() == "scryfall") {
         match cfg.db_path.clone() {
             Some(path) => {
                 tracing::info!(db = %path.display(), "Rust Scryfall jobs enabled (RUST_JOBS=scryfall)");
-                scrybox_server::scry_jobs::start_job_timers(path);
+                scrybox_server::scry_jobs::start_job_timers(path, state.scryfall_sets.clone());
             }
             None => tracing::warn!("RUST_JOBS=scryfall set but SCRYBOX_DB_PATH missing; jobs not started"),
         }
     }
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");
-    let state = scrybox_server::AppState::new(cfg.clone());
     // Lane B unit 6b: server.js cvScan.warm twin — preload models + English
     // catalog when the lane owns scan-match (no-op without ORT_DYLIB_PATH or
     // built catalogs, so it never pays costs the lane won't use).
@@ -128,8 +130,9 @@ async fn main() {
     // and the plain-HTTP front keeps serving; a TLS crash can never take it
     // down. HTTPS_PORT unset (test harness default) = no listener, matching
     // Node startHttps's early return.
-    if !std::env::var("HTTPS_PORT").unwrap_or_default().is_empty() {
-        let port: u16 = match std::env::var("HTTPS_PORT").unwrap().parse() {
+    if let Some(raw) = std::env::var("HTTPS_PORT").ok().filter(|v| !v.is_empty()) {
+        // One env read; Node's startHttps parses once as well.
+        let port: u16 = match raw.parse() {
             Ok(p) => p,
             Err(_) => {
                 tracing::error!("HTTPS listener failed to start: HTTPS_PORT is not a number");

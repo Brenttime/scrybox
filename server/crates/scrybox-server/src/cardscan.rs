@@ -629,7 +629,13 @@ fn owns(st: &AppState) -> bool {
 fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64, Response> {
     let pool = st.db.as_ref().ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
     let token = bearer_token(headers).map(|s| s.to_string());
-    authenticate(pool, token.as_deref(), is_get).map(|u| u.id).map_err(|res| res)
+    let id = authenticate(pool, token.as_deref(), is_get).map(|u| u.id).map_err(|res| res)?;
+    // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
+    // user's stats gen before the handler body (REVIEW-writes L1).
+    if !is_get {
+        crate::stats::on_native_write(st, id);
+    }
+    Ok(id)
 }
 
 fn now_ms() -> u64 {

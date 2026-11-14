@@ -354,6 +354,10 @@ pub async fn handle_backups_collection(State(st): State<AppState>, req: Request)
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps before requireAdmin.
+    if !is_get {
+        crate::stats::on_native_write(&st, user.id);
+    }
     if let Some(res) = admin_gate(&user) {
         return res;
     }

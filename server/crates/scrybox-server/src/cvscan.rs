@@ -1342,9 +1342,7 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
     };
     // Node bumps the user's stats generation on this authenticated POST
     // (invalidateOnWrite runs before the collection router).
-    if st.owns("stats") || st.owns("stats_subs") {
-        st.stats_cache.bump(user.id);
-    }
+    crate::stats::on_native_write(&st, user.id);
 
     // authenticateToken has passed; this is a bigJson path (server.js:461) —
     // the post-auth parser 413s on >15mb JSON, everything else rides the

@@ -228,9 +228,6 @@ struct Inner {
     /// under the lock), matching the Node promise-chain.
     queue: tokio::sync::Mutex<LimiterState>,
     breaker: Mutex<HashMap<String, i64>>,
-    /// priceEstimates.js `askedOracle`: floorless oracle ids already asked
-    /// this process, so a never-priced card is not re-asked every sweep.
-    asked_oracle: Mutex<HashSet<String>>,
 }
 
 impl Scry {
@@ -260,7 +257,6 @@ impl Scry {
                     cooldown_until: 0,
                 }),
                 breaker: Mutex::new(HashMap::new()),
-                asked_oracle: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -521,12 +517,22 @@ impl Scry {
             .unwrap_or(false)
     }
 
+    /// priceEstimates.js `askedOracle` (module-scope `const askedOracle =
+    /// new Set()`): floorless oracle ids already asked THIS PROCESS, so a
+    /// never-priced card is not re-asked every sweep. Deliberately a process
+    /// static, not per-`Scry`: the sweep timers build a fresh `Scry` each
+    /// tick (`sweep_once`), and a per-client set would reset between ticks.
     pub fn asked_oracle_taken(&self, oid: &str) -> bool {
-        self.inner.asked_oracle.guard().contains(oid)
+        asked_oracle_set().guard().contains(oid)
     }
     pub fn mark_asked_oracle(&self, oid: &str) {
-        self.inner.asked_oracle.guard().insert(oid.to_string());
+        asked_oracle_set().guard().insert(oid.to_string());
     }
+}
+
+fn asked_oracle_set() -> &'static Mutex<HashSet<String>> {
+    static ASKED_ORACLE: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    ASKED_ORACLE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn host_is_local(abs: &str) -> bool {

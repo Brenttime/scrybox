@@ -1015,6 +1015,10 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps before requireAdmin.
+    if !is_get {
+        crate::stats::on_native_write(&st, user.id);
+    }
     if user.via_api_key {
         return json_error(
             StatusCode::FORBIDDEN,
