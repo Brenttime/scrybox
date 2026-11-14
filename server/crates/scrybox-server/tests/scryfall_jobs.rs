@@ -19,7 +19,7 @@ use scrybox_server::{
     },
     card_norm::{default_search_eligible, normalize_card, oracle_id_for_card, scryfall_uuid},
     scryfall::{wait_ms, ScryOpts},
-    scry_jobs::{fetch_and_cache_sets, refresh_price_estimates, sweep_rows, update_collection_prices},
+    scry_jobs::{fetch_and_cache_sets, refresh_price_estimates, sweep_rows, update_collection_prices, update_collection_prices_chunked},
 };
 
 fn seeded_db(dir: &std::path::Path, name: &str) -> Connection {
@@ -789,4 +789,177 @@ fn scry_is_cheap_clone() {
     let a = scry_for("127.0.0.1:1".parse().unwrap(), 1.0);
     let _b = a.clone();
     let _shared: Arc<_> = Arc::new(a);
+}
+
+// ---------------------------------------------------------------------------
+// cj L3 (lane-B iter-48): SCRYBOX_SWEEP_CHUNK write-transaction grouping.
+// The opt-in path must end in EXACTLY the DB the Node-parity row-autocommit
+// path produces (end-state DB-diff), and a failed sub-chunk must roll back
+// whole — while the default (None) path keeps Node's partial-write shape.
+// ---------------------------------------------------------------------------
+
+/// N owned, deck-free printings with sn: pairable identity columns.
+fn seed_chunk_db(conn: &Connection, n: usize) {
+    conn.execute("INSERT INTO users (id, username, password_hash, role, share_token) VALUES (1,'u','x','admin','share-u')", []).unwrap();
+    for i in 0..n {
+        let id = format!("mtg-chunk-{i}");
+        conn.execute(
+            "INSERT INTO card_cache (id, name, supertype, set_id, set_name, number, language)
+             VALUES (?1, ?2, 'Card', 'bch', 'Chunks', ?3, 'English')",
+            params![id, format!("Chunk Card {i}"), i.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO collection (card_id, quantity, user_id) VALUES (?1, 1, 1)",
+            params![id],
+        )
+        .unwrap();
+    }
+}
+
+fn chunk_answers(n: usize) -> Value {
+    let data: Vec<Value> = (0..n)
+        .map(|i| {
+            raw_card(
+                &format!("chunk-{i}"),
+                &format!("Chunk Card {i}"),
+                "bch",
+                &i.to_string(),
+                Some(0.25 + i as f64 / 10.0),
+            )
+        })
+        .collect();
+    json!({"data": data, "not_found": []})
+}
+
+/// Row-wise table dump for the DB-diff (volatile timestamp columns excluded;
+/// REALs through printf so text conversion is deterministic).
+fn table_dump(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let cols = stmt.column_count();
+    stmt.query_map([], |r| {
+        Ok((0..cols)
+            .map(|i| r.get::<_, String>(i).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\u{1f}"))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sweep_chunk_tx_end_state_matches_autocommit() {
+    // DB-diff harness (brief §Jobs): same collection, same scripted Scryfall
+    // answers, two DB copies — one swept per-statement autocommit (the Node
+    // twin, the default), one swept with one BEGIN…COMMIT per 3 writes.
+    // Every affected table must end byte-equal bar wall-clock columns.
+    let (addr, mock) = spawn_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let n = 10usize;
+    let out = chunk_answers(n);
+    *mock.collection_batches.lock().unwrap() = vec![out.clone()];
+    *mock.search.lock().unwrap() = json!({"data": [], "has_more": false});
+    let scry = scry_for(addr, 0.001);
+
+    let a = seeded_db(dir.path(), "chunk-auto.db");
+    seed_chunk_db(&a, n);
+    let b = seeded_db(dir.path(), "chunk-tx.db");
+    seed_chunk_db(&b, n);
+
+    let oa = update_collection_prices_chunked(&a, &scry, true, None).await.unwrap();
+    let ob = update_collection_prices_chunked(&b, &scry, true, Some(3)).await.unwrap();
+    assert_eq!(oa.swept, ob.swept);
+    assert_eq!(oa.asked, ob.asked, "SweepOutcome.asked");
+    assert_eq!(oa.priced, ob.priced, "SweepOutcome.priced");
+    assert_eq!(oa.not_found, ob.not_found, "SweepOutcome.not_found");
+    assert_eq!(oa.estimates_changed, ob.estimates_changed, "SweepOutcome.estimates_changed");
+    assert_eq!(oa.floors_filled, ob.floors_filled, "SweepOutcome.floors_filled");
+
+    let cache_sql = "SELECT id, COALESCE(name,''), COALESCE(set_id,''), COALESCE(number,''),
+                            COALESCE(printf('%.10g', price_trend),'|'),
+                            COALESCE(printf('%.10g', price_estimated),'|'),
+                            COALESCE(price_source,'|')
+                     FROM card_cache ORDER BY id";
+    let ph_sql = "SELECT card_id, printf('%.10g', price) FROM price_history
+                  ORDER BY card_id, recorded_at";
+    assert_eq!(table_dump(&a, cache_sql), table_dump(&b, cache_sql), "card_cache end state");
+    let ph_a = table_dump(&a, ph_sql);
+    assert_eq!(ph_a, table_dump(&b, ph_sql), "price_history end state");
+    assert_eq!(ph_a.len(), n, "one movement row per priced card in both runs");
+
+    // Both runs stamped the sweep.
+    for conn in [&a, &b] {
+        let swept: Option<String> = conn
+            .query_row("SELECT mtg_prices_swept_at FROM app_settings WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(swept.is_some());
+    }
+}
+
+/// Poison recordPrice for one card: with chunked writes the WHOLE sub-chunk
+/// (its UPSERTs and its earlier recordPrice rows) must roll back.
+fn poison_price_history(conn: &Connection, card_id: &str) {
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER poison_ph BEFORE INSERT ON price_history
+         WHEN NEW.card_id = '{card_id}'
+         BEGIN SELECT RAISE(ABORT, 'poisoned price row'); END;"
+    ))
+    .unwrap();
+}
+
+async fn chunked_poison_run(write_tx_rows: Option<usize>) -> Connection {
+    let (addr, mock) = spawn_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded_db(dir.path(), "poison.db");
+    seed_chunk_db(&conn, 8);
+    // Poison card #5: under Some(4) it sits in the SECOND sub-chunk (pairs
+    // follow the mock's data order 0..8); under None it aborts the record
+    // loop after rows 0..4 have autocommitted.
+    poison_price_history(&conn, "mtg-chunk-5");
+    *mock.collection_batches.lock().unwrap() = vec![chunk_answers(8)];
+    *mock.search.lock().unwrap() = json!({"data": [], "has_more": false});
+    let scry = scry_for(addr, 0.001);
+    let res = update_collection_prices_chunked(&conn, &scry, true, write_tx_rows).await;
+    assert!(res.is_err(), "poisoned sweep must fail (write_tx_rows={write_tx_rows:?})");
+    conn
+}
+
+#[tokio::test]
+async fn sweep_chunk_tx_rolls_back_whole_failed_subchunk() {
+    let conn = chunked_poison_run(Some(4)).await;
+    let trend = |id: &str| -> Option<f64> {
+        conn.query_row("SELECT price_trend FROM card_cache WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap()
+    };
+    // Committed prefix: sub-chunk 1 (rows 0..4) survived…
+    for i in 0..4 {
+        assert_eq!(trend(&format!("mtg-chunk-{i}")), Some(0.25 + i as f64 / 10.0), "row {i} committed");
+    }
+    // …and the FAILED sub-chunk left NOTHING behind — including row 4's
+    // UPSERT and price row, which executed before the poison inside it.
+    for i in 4..8 {
+        assert_eq!(trend(&format!("mtg-chunk-{i}")), None, "row {i} must be rolled back");
+    }
+    let ph: i64 = conn.query_row("SELECT COUNT(*) FROM price_history", [], |r| r.get(0)).unwrap();
+    assert_eq!(ph, 4, "only the committed sub-chunk has price rows");
+    let swept: Option<String> = conn
+        .query_row("SELECT mtg_prices_swept_at FROM app_settings WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(swept, None, "aborted sweep must not stamp mtg_prices_swept_at");
+}
+
+#[tokio::test]
+async fn sweep_autocommit_default_keeps_node_partial_write_shape() {
+    // Parity guard for the DEFAULT path: Node's sweep autocommits each write,
+    // so a mid-loop failure leaves the bulk UPSERT + the earlier price rows
+    // committed. The chunked path above must not be silently made the
+    // default — this is exactly the shape Node produces.
+    let conn = chunked_poison_run(None).await;
+    let priced: i64 = conn
+        .query_row("SELECT COUNT(*) FROM card_cache WHERE price_trend IS NOT NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(priced, 8, "cacheNormalizedCards commits as one autocommit up front (Node twin)");
+    let ph: i64 = conn.query_row("SELECT COUNT(*) FROM price_history", [], |r| r.get(0)).unwrap();
+    assert_eq!(ph, 5, "price rows 0..=4 had autocommitted before the poison");
 }

@@ -5,6 +5,8 @@
 //! Node twin in the test container is disabled via
 //! SCRYBOX_DISABLE_SETS_REFRESH / SCRYBOX_DISABLE_PRICE_SWEEP (server.js).
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 
@@ -230,6 +232,43 @@ pub async fn update_collection_prices(
     scry: &Scry,
     force: bool,
 ) -> Result<SweepOutcome, String> {
+    update_collection_prices_chunked(
+        conn,
+        scry,
+        force,
+        parse_sweep_chunk(&std::env::var("SCRYBOX_SWEEP_CHUNK").unwrap_or_default()),
+    )
+    .await
+}
+
+/// Write-transaction size for the price sweep (cj L3), from
+/// SCRYBOX_SWEEP_CHUNK. Unset/0/garbage -> None: every write is its own
+/// autocommit statement, Node's exact `recordPrice` shape (REVIEW
+/// concurrency-jobs L3 — the row autocommits fire `stats_aux_revision`
+/// through the card_cache triggers plus the `collection_read_revision`
+/// bumps ~20k times per full sweep, churning every 250 ms cache tick).
+/// A positive value runs the per-chunk WRITE phase (cachePreparedCards +
+/// the recordPrice loop) inside one `BEGIN IMMEDIATE … COMMIT`, like Node's
+/// `db.withTransaction`. Intermediate revision values then advance per
+/// chunk instead of per row; the FINAL DB state is identical (verified by
+/// the end-state DB-diff test). The default is deliberately None —
+/// enabling this globally is an orchestrator decision, not a lane default.
+pub fn parse_sweep_chunk(raw: &str) -> Option<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(n),
+    }
+}
+
+/// `update_collection_prices` with the write-transaction shape injected
+/// (None = Node row-autocommit; Some(n) = one transaction per n writes).
+/// The fetch leg — batch sizes, identifier shapes, retries — never changes.
+pub async fn update_collection_prices_chunked(
+    conn: &Connection,
+    scry: &Scry,
+    force: bool,
+    write_tx_rows: Option<usize>,
+) -> Result<SweepOutcome, String> {
     let cards = sweep_rows(conn).map_err(|e| e.to_string())?;
     if cards.is_empty() {
         return Ok(SweepOutcome::default());
@@ -247,11 +286,81 @@ pub async fn update_collection_prices(
             return Err(e);
         }
     };
-    if !fresh.is_empty() {
-        cache_prepared_cards(conn, &fresh).map_err(|e| e.to_string())?;
-    }
-    for (row, price) in &pairs {
-        record_price(conn, &row.card_id, *price).map_err(|e| e.to_string())?;
+    if !fresh.is_empty() || !pairs.is_empty() {
+        match write_tx_rows {
+            // Node twin, verbatim: one autocommit UPSERT for the whole set
+            // (cachePreparedCards), then a per-row recordPrice autocommit.
+            None => {
+                if !fresh.is_empty() {
+                    cache_prepared_cards(conn, &fresh).map_err(|e| e.to_string())?;
+                }
+                for (row, price) in &pairs {
+                    record_price(conn, &row.card_id, *price).map_err(|e| e.to_string())?;
+                }
+            }
+            // cj L3: the same writes, grouped. One BEGIN IMMEDIATE … COMMIT
+            // (Node's db.withTransaction verb) per write_tx_rows priced rows:
+            // the chunk's card_cache UPSERTs + its recordPrice rows land
+            // atomically, so ~20k row autocommits — each firing the
+            // stats/collection revision triggers — collapse to ceil(n/chunk)
+            // commits. Final DB state is identical to the None path (end-state
+            // DB-diff test); intermediate revision values advance per chunk.
+            // A failed sub-chunk rolls back whole; committed prefix is
+            // chunk-granular. recordPrice runs in pair order, cache writes in
+            // data order per sub-chunk; cache-only cards (data rows that
+            // paired to no sweep row) commit last, in one transaction.
+            Some(n) => {
+                let mut by_idx: HashMap<&str, usize> = HashMap::with_capacity(fresh.len());
+                for (i, p) in fresh.iter().enumerate() {
+                    by_idx.entry(p.id.as_str()).or_insert(i);
+                }
+                let mut written = vec![false; fresh.len()];
+                for sub in pairs.chunks(n) {
+                    let mut group: Vec<usize> = Vec::with_capacity(sub.len());
+                    for (row, _) in sub {
+                        if let Some(&idx) = by_idx.get(row.card_id.as_str()) {
+                            if !written[idx] {
+                                written[idx] = true;
+                                group.push(idx);
+                            }
+                        }
+                    }
+                    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+                        .map_err(|e| e.to_string())?;
+                    let writes = || -> rusqlite::Result<()> {
+                        if !group.is_empty() {
+                            let group: Vec<PreparedCard> =
+                                group.iter().map(|i| fresh[*i].clone()).collect();
+                            cache_prepared_cards(conn, &group)?;
+                        }
+                        for (row, price) in sub {
+                            record_price(conn, &row.card_id, *price)?;
+                        }
+                        Ok(())
+                    };
+                    if let Err(e) = writes().and_then(|()| conn.execute_batch("COMMIT")) {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e.to_string());
+                    }
+                }
+                let leftover: Vec<PreparedCard> = fresh
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !written[*i])
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                if !leftover.is_empty() {
+                    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+                        .map_err(|e| e.to_string())?;
+                    if let Err(e) = cache_prepared_cards(conn, &leftover)
+                        .and_then(|()| conn.execute_batch("COMMIT"))
+                    {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e.to_string());
+                    }
+                }
+            }
+        }
     }
     mark_prices_swept(conn, "mtg").map_err(|e| e.to_string())?;
     tracing::info!("MTG price update complete: {} priced, {not_found} not found on Scryfall.", pairs.len());
@@ -528,9 +637,21 @@ async fn boot_catchup(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync
 
 #[cfg(test)]
 mod tests {
-    use super::try_begin_sweep;
+    use super::{parse_sweep_chunk, try_begin_sweep};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn sweep_chunk_env_parses_to_node_parity_default() {
+        // Unset/empty/0/garbage => None: per-row autocommit, Node's exact
+        // recordPrice shape. The chunked write path is strictly opt-in.
+        for raw in ["", "   ", "0", "abc", "-1", "1e3", "4.0"] {
+            assert_eq!(parse_sweep_chunk(raw), None, "SCRYBOX_SWEEP_CHUNK={raw:?}");
+        }
+        assert_eq!(parse_sweep_chunk(" 7 "), Some(7));
+        assert_eq!(parse_sweep_chunk("1"), Some(1), "1 = one transaction per write");
+        assert_eq!(parse_sweep_chunk("500"), Some(500));
+    }
 
     #[test]
     fn sweep_guard_serializes_ticks() {

@@ -77,6 +77,16 @@ const scenPath = args.find(a => a.endsWith('.json')) ||
   new URL('.', import.meta.url).pathname + '../../../scen-rust.json';
 const scen = JSON.parse(fs.readFileSync(scenPath, 'utf8'));
 const RUST = opt('--rust', scen.base);
+// Lane-B iter-47 guard: run from the wt-b worktree with the scen default,
+// scen.base is :3310 — the battery silently gated LANE A's instance and
+// printed a green "856/856" that proved nothing about :3320 (measured:
+// iter47-parity-off.log ended with rust=127.0.0.1:3310). The same-base guard
+// below cannot catch this (NODE then resolves to the distinct :3312). Fail
+// loudly instead: a lane-B run must name its Rust target explicitly.
+if (/\/wt-b\/server\/bench\//.test(import.meta.url) && RUST.includes(':3310')) {
+  console.error('parity: this is the LANE-B worktree (wt-b) but RUST targets :3310 (lane A). Pass --rust http://127.0.0.1:3320 (and --node :3312), or use scen-varied-rustb.json.');
+  process.exit(2);
+}
 // Lane-B queue item (iter-21..25 notes): the old default
 // `RUST.replace(':3310', ':3312')` silently compared Rust against ITSELF
 // whenever --rust used any port other than 3310 (e.g. lane-B's :3320),
