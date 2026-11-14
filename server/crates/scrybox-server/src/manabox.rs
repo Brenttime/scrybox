@@ -1216,8 +1216,11 @@ fn owns_manabox(st: &AppState) -> bool {
 }
 
 pub async fn handle_preview(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != Method::POST || !owns_manabox(&st) {
+    if !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
@@ -1269,8 +1272,11 @@ fn js_truthy_strict_ne_false(v: &Value) -> bool {
 }
 
 pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != Method::POST || !owns_manabox(&st) {
+    if !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
@@ -1421,8 +1427,11 @@ fn apply_plan(conn: &Connection, uid: i64, plan: &Plan, summary_json: &str, md: 
 }
 
 pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != Method::GET || !owns_manabox(&st) {
+    if !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::GET {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
@@ -1476,8 +1485,11 @@ pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
 }
 
 pub async fn handle_report(State(st): State<AppState>, Path(id): Path<String>, req: Request) -> Response {
-    if req.method() != Method::GET || !owns_manabox(&st) {
+    if !owns_manabox(&st) {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::GET {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
