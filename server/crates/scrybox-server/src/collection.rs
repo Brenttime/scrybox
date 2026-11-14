@@ -981,6 +981,13 @@ const RECENT_MAX: usize = 256;
 /// (SCRYBOX_COLLECTION_CACHE_MAX_MB) for hosts that want the old headroom.
 const STORE_MAX_BYTES_DEFAULT: u64 = 64 << 20; // 64 MiB
 
+/// Soft cap on the number of distinct cached shapes (review cj L5). The old
+/// implementation `clear()`ed the whole map above it — flushing hot shapes
+/// and inviting rebuild stampedes; `evict_over_count` now enforces the same
+/// bound by LRU. Kept in sync with the shape cap the map was designed for;
+/// the byte budget, not this, is the memory bound.
+const ENTRY_MAX: usize = 64;
+
 fn store_max_bytes() -> u64 {
     std::env::var("SCRYBOX_COLLECTION_CACHE_MAX_MB").ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1269,6 +1276,29 @@ impl CollectionCache {
         }
         hit
     }
+    /// Review cj L5: hold the map to `ENTRY_MAX` distinct shapes by evicting
+    /// the least-recently-served entries first — the same seen-clock victim
+    /// choice as the byte budget. Runs after the insert, so the newest shape
+    /// (highest seen) is never self-evicted.
+    fn evict_over_count(&self, e: &mut Inner) -> u64 {
+        let mut freed: u64 = 0;
+        while e.entries.len() > ENTRY_MAX {
+            let victim = e
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.seen.load(Ordering::Relaxed))
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(k) => {
+                    if let Some(v) = e.entries.remove(&k) {
+                        freed += v.bytes();
+                    }
+                }
+                None => break,
+            }
+        }
+        freed
+    }
     /// LRU-evict until stored bytes (raw + any gz copy) fit `max_bytes`;
     /// never evicts the last entry. Returns bytes freed.
     fn evict_over_budget(&self, e: &mut Inner) -> u64 {
@@ -1430,10 +1460,6 @@ impl CollectionCache {
         let mut freed: u64 = 0;
         {
             let mut e = self.inner.guard();
-            if e.entries.len() > 64 {
-                freed += e.entries.values().map(|v| v.bytes()).sum::<u64>();
-                e.entries.clear();
-            }
             e.cost.insert(key.clone(), cost.as_millis() as u64);
             e.entries.insert(key, entry.clone());
             e.entries.retain(|_, v| {
@@ -1444,6 +1470,12 @@ impl CollectionCache {
                     true
                 }
             });
+            // Review cj L5: the pre-insert unconditional clear() at >64
+            // shapes wiped hot entries too (periodic full-cache flushes +
+            // rebuild stampedes under varied-shape traffic). Evict by LRU
+            // count AFTER the insert instead — same seen-clock as the byte
+            // budget, so the newest shape is never self-evicted.
+            freed += self.evict_over_count(&mut e);
             freed += self.evict_over_budget(&mut e);
         }
         if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) {
@@ -2536,6 +2568,33 @@ mod store_budget {
         cache.put(params(200).cache_key(), 1, body, None, Duration::from_millis(50));
         assert!(cache.take_trim(), "evicting >= trim_dirty_bytes must arm the trim");
         assert!(!cache.take_trim(), "take_trim swaps the flag off");
+    }
+
+    #[test]
+    fn count_cap_evicts_lru_instead_of_wiping_hot_entries() {
+        // Review cj L5: crossing the 64-shape cap must NOT wipe the whole
+        // map (that flushed hot entries and set rebuild stampedes); it must
+        // evict least-recently-served shapes down to the cap.
+        let cache = CollectionCache::new();
+        let body = vec![5u8; 1000];
+        for i in 0..64 {
+            cache.put(params(i * 100).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        }
+        // Serve the FIRST shape so its LRU clock is fresher than every other
+        // stored shape. (Under the old unconditional clear() this get is the
+        // green half only; the breach below wipes everything.)
+        assert!(cache.get(&params(0).cache_key(), 1).is_some(), "at-cap shapes all survive");
+        for i in 64..71 {
+            cache.put(params(i * 100).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        }
+        let inner = cache.inner.guard();
+        assert!(inner.entries.contains_key(&params(0).cache_key()), "recently served survives the cap");
+        assert!(inner.entries.contains_key(&params(7000).cache_key()), "the new entry survives");
+        assert!(inner.entries.len() <= 64, "count cap holds: {}", inner.entries.len());
+        assert!(
+            !inner.entries.contains_key(&params(100).cache_key()),
+            "oldest serve (unrefreshed) is the victim"
+        );
     }
 
     #[test]
