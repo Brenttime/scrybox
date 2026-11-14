@@ -11,6 +11,22 @@
 # first. The frontend bundle is still built in Stage 1 with node:alpine —
 # a build-time tool, gone from the final layers.
 #
+# Size design (lane-B iter-50; Gate D ceiling: image < 150 MB uncompressed,
+# the `docker image inspect -f '{{.Size}}'` number build-rust-image.sh
+# prints). debian:12-slim alone is 116 MB, and a root `chown -R` over the
+# payload re-commits every byte it touches (the old final stage carried a
+# 61 MB ghost layer of duplicated ORT + dist bytes). So the final stage is
+# FROM scratch: stage 2 is a debian:12-slim *package donor* whose only
+# export is /staging — the ldd closure of every exec'd/dlopen'd binary plus
+# gosu, busybox-static and the CA roots — and scratch receives just those
+# files, with payload ownership baked in via COPY --chown (never chown -R).
+#
+# Payload budget (uncompressed): server 17.6 + ORT 38 + scryjpeg 0.2 +
+# curl-impersonate 4.9 (stripped: the published binary carries full debug
+# symbols, 30.8 -> 4.9 MB, same behaviour) + dist 22.5 + shared 0.2 +
+# glibc/libstdc++/libgcc closure ~11 + static gosu 2.9 + busybox 2.5 +
+# CA roots ~1.3 ≈ 101 MB.
+#
 #   docker build -f Dockerfile.rust -t scrybox-rust:local .
 # =========================================
 
@@ -29,55 +45,110 @@ COPY shared/ /app/shared/
 RUN npm run build
 
 # =========================================
-# Stage 2: Rust single binary + runtime deps
+# Stage 2: package donor (discarded — only /staging is COPY'd out)
 # =========================================
-FROM debian:12-slim AS production
-# glibc Debian, same reasoning as the Node image (issue #19): the ONNX
-# Runtime dylib and libscryjpeg are glibc-linked. apt installs only what the
-# Node image's equivalent layer had that Node itself did not provide:
-#   gosu            — entrypoint privilege drop (Gate D requirement)
-#   wget            — HEALTHCHECK (slim ships none)
+FROM debian:12-slim AS pkgroot
+# glibc Debian, same distro family the Node image runs (issue #19): the ONNX
+# Runtime dylib and libscryjpeg are glibc-linked and the server binary is
+# built against Debian glibc. Nothing apt installs here survives into the
+# final image — only the explicit ldd closure below is copied out.
+#   gosu            — entrypoint privilege drop (Gate D requirement), static
+#   busybox-static  — sh/find/chown/mkdir/echo for the entrypoint + wget for
+#                     HEALTHCHECK (replaces the slim-distro wget, -9 MB apt)
 #   ca-certificates — HTTPS to the card APIs (rustls-native-certs reads this)
+#   binutils+wget   — build tools for curl-impersonate staging, stay in donor
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      gosu wget ca-certificates \
+      gosu busybox-static ca-certificates binutils wget \
   && rm -rf /var/lib/apt/lists/*
 
 # curl-impersonate v2.1.0 (glibc build), pinned — Gate D requirement, and the
 # Moxfield sync genuinely needs the Chrome ClientHello (Cloudflare JA3).
 # backend/src/moxfieldApi.js and src/moxfield_api.rs both exec
-# /usr/local/bin/curl-impersonate and fall back to plain curl. wget+ca-certs
-# are installed above, so no curl package is pulled for the download.
+# /usr/local/bin/curl-impersonate and fall back to plain curl. The published
+# binary ships full debug symbols; strip --strip-all keeps behaviour identical
+# (verified: --version + a live decklist pull) at 4.9 MB instead of 30.8 MB.
 RUN wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/releases/download/v2.1.0/curl-impersonate-v2.1.0.x86_64-linux-gnu.tar.gz" \
   && tar xzf /tmp/ci.tgz -C /usr/local/bin curl-impersonate \
-  && chmod +x /usr/local/bin/curl-impersonate \
+  && chmod 0755 /usr/local/bin/curl-impersonate \
+  && strip --strip-all /usr/local/bin/curl-impersonate \
   && rm -f /tmp/ci.tgz \
   && /usr/local/bin/curl-impersonate --version | head -1
 
 # Staged inputs (see server/docker/build-rust-image.sh):
-#   bin/scrybox-server        — cargo --release, strip=true, ~16 MB
+#   bin/scrybox-server        — cargo --release, strip=true, ~17 MB
 #   lib/libonnxruntime.so.1   — MIT-licensed ORT dylib the Node image carries
 #                               inside onnxruntime-node; Rust dlopens it via
-#                               ORT_DYLIB_PATH (ort "load-dynamic").
+#                               ORT_DYLIB_PATH (ort "load-dynamic"). Already
+#                               symbol-stripped upstream (38 MB is real).
 #   lib/libscryjpeg.so        — mozjpeg-4.1.5 static shim (bit-identical JPEG
 #                               decode for the scan tensor path), SCRYBOX_JPEG_LIB.
-COPY server/docker/bin/scrybox-server /usr/local/bin/scrybox-server
-COPY server/docker/lib/libonnxruntime.so.1 /opt/ort/lib/libonnxruntime.so.1
-COPY server/docker/lib/libscryjpeg.so /opt/lib/libscryjpeg.so
+COPY server/docker/bin/scrybox-server /payload/bin/scrybox-server
+COPY server/docker/lib/libonnxruntime.so.1 /payload/ort/libonnxruntime.so.1
+COPY server/docker/lib/libscryjpeg.so /payload/lib/libscryjpeg.so
 
+# Build the final rootfs subset: every binary the runtime exec's or dlopen's
+# plus its FULL ldd closure (paths preserved so PT_INTERP and the loader's
+# search resolve verbatim under scratch), the NSS/resolv modules glibc
+# dlopens at runtime for getpwnam("scrybox") and getaddrinfo, the static
+# gosu + busybox (deliberately not ldd'd — no deps), the CA bundle, and
+# /etc/passwd|group for gosu. A missing closure member FAILS the build.
+RUN set -eu; \
+    mkdir -p /staging; \
+    ldd /payload/bin/scrybox-server /usr/local/bin/curl-impersonate \
+        /payload/ort/libonnxruntime.so.1 /payload/lib/libscryjpeg.so > /ldd.txt 2>/dev/null; \
+    if grep -q '=> not found' /ldd.txt; then \
+      echo 'UNRESOLVED DEPS:' >&2; grep '=> not found' /ldd.txt >&2; exit 1; \
+    fi; \
+    awk '!/weak version|not a dynamic/ { \
+           if ($0 ~ /^[[:space:]]*\/[^[:space:]]+:$/) next; \
+           for (i = 1; i <= NF; i++) { p = $i; sub(/:$/, "", p); \
+             if (p ~ /^\//) print p } \
+         }' /ldd.txt > /staging.list; \
+    printf '%s\n' \
+      /lib/x86_64-linux-gnu/libnss_files.so.2 \
+      /lib/x86_64-linux-gnu/libnss_dns.so.2 \
+      /lib/x86_64-linux-gnu/libnss_compat.so.2 \
+      /lib/x86_64-linux-gnu/libresolv.so.2 \
+      >> /staging.list; \
+    sort -u /staging.list | while read -r lib; do \
+      [ -e "$lib" ] || { echo "MISSING LIB: $lib" >&2; exit 1; }; \
+      mkdir -p "/staging$(dirname "$lib")"; \
+      cp -p "$lib" "/staging$lib"; \
+    done; \
+    mkdir -p /staging/opt/ort/lib /staging/opt/lib /staging/usr/local/bin /staging/bin \
+             /staging/etc/ssl/certs /staging/etc/ssl/private /staging/tmp; \
+    cp -p /payload/bin/scrybox-server /staging/usr/local/bin/scrybox-server; \
+    cp -p /payload/ort/libonnxruntime.so.1 /staging/opt/ort/lib/libonnxruntime.so.1; \
+    cp -p /payload/lib/libscryjpeg.so /staging/opt/lib/libscryjpeg.so; \
+    cp -p /usr/sbin/gosu /staging/usr/local/bin/gosu; \
+    cp -p /usr/local/bin/curl-impersonate /staging/usr/local/bin/curl-impersonate; \
+    cp -p /usr/bin/busybox /staging/bin/busybox; \
+    for a in sh find chown mkdir echo cat ls pgrep; do ln -s busybox "/staging/bin/$a"; done; \
+    cp -p /etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
+    echo 'root:x:0:0:root:/root:/bin/sh' > /staging/etc/passwd; \
+    echo 'scrybox:x:1000:1000:scrybox:/app:/bin/sh' >> /staging/etc/passwd; \
+    echo 'root:x:0:' > /staging/etc/group; \
+    echo 'scrybox:x:1000:' >> /staging/etc/group; \
+    du -sm /staging
+
+# =========================================
+# Stage 3: final image — scratch, assembled only from the donor subset
+# =========================================
+FROM scratch
+# Rootfs subset (loader, glibc + libstdc++/libgcc closure, NSS, static gosu
+# and busybox, CA roots, /etc/passwd|group, the three payload binaries).
+COPY --from=pkgroot /staging/ /
 # Layout mirrors the Node image so an existing named volume at /app/database
 # (bindarr.db, models/, ssl/, card-art/) drops in unchanged.
 WORKDIR /app
 # Shared JSON tables at the path the Node image used (/app/shared) — the
-# crate reads them through SCRYBOX_SHARED_DIR.
-COPY shared/ /app/shared/
-COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
-
-# Non-root runtime user. uid 1000 matches the Node image's `node` user so a
-# volume already handed over keeps its ownership; the entrypoint re-chowns
-# anything else, exactly like entrypoint.sh.
-RUN useradd -u 1000 -m -s /bin/sh scrybox \
-  && mkdir -p /app/database \
-  && chown -R scrybox:scrybox /app /opt/ort /opt/lib
+# crate reads them through SCRYBOX_SHARED_DIR. --chown bakes the uid-1000
+# ownership the old `chown -R` layer cost 61 MB to produce.
+COPY --chown=1000:1000 shared/ /app/shared/
+COPY --chown=1000:1000 --from=frontend-builder /app/frontend/dist /app/frontend/dist
+# entrypoint-rust.sh is LF in-tree (verified); --chmod bakes the exec bit
+# (scratch has no RUN shell for sed/chmod).
+COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -97,14 +168,18 @@ ENV PORT=3001 \
 # LOCAL_SCRYFALL_* / SCRYBOX_SIDECAR_URL / SCRYBOX_NODE_UPSTREAM stay unset:
 # the Node-free image has no Node to forward to; unset legs answer their
 # documented no-sidecar arms.
-
-COPY server/docker/entrypoint-rust.sh /entrypoint.sh
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+# NOTE: no USER directive on purpose — the container starts as root so
+# entrypoint-rust.sh can adopt a foreign-owned /app/database volume, then
+# gosu drops to uid 1000 (matching the Node image's `node` user) for the
+# server itself.
 
 EXPOSE 3001 3443
 
+# busybox wget stands in for the slim-distro wget (Gate D names glibc,
+# curl-impersonate and gosu; wget here is HEALTHCHECK duty only — NSS+CA are
+# staged so getaddrinfo works).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-  CMD wget -qO- http://localhost:3001/api/health || exit 1
+  CMD ["/bin/busybox", "wget", "-qO-", "http://localhost:3001/api/health"]
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/local/bin/scrybox-server"]

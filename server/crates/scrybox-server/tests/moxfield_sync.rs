@@ -1052,6 +1052,101 @@ async fn scheduler_tick_failure_stamps_author_last_error() {
 }
 
 // ---------------------------------------------------------------------------
+// boot_catch_up — Node's bootCatchUp(): authors with a NULL/older-than-
+// interval last_decklist_sync_at get a full decklist pass at boot; a fresh
+// author is skipped. Fresh author ids: sched() is process-global.
+// ---------------------------------------------------------------------------
+
+async fn poll_until<F: Fn() -> bool>(timeout_ms: u64, pred: F) -> bool {
+    for _ in 0..timeout_ms / 50 {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    pred()
+}
+
+#[tokio::test]
+async fn boot_catch_up_pulls_stale_authors_skips_fresh() {
+    let fx = seeded_db("bootcu.db");
+    let (maddr, mock) = spawn_mfx_mock().await;
+    let (saddr, smock) = spawn_mock().await;
+    set_user(&mock, json!([{"userName": "Stale"}, {"userName": "Fresh"}]));
+    set_pages(
+        &mock,
+        vec![json!({"data": [summary("bd1", "Boot Deck", "commander", "BSTAMP1")], "totalPages": 1})],
+    );
+    *smock.collection_batches.lock().unwrap() = vec![json!({"data": [], "not_found": []})];
+    let st = engine_state(&fx, mfx_client(maddr), Some(scry_for(saddr, 0.01)));
+
+    let conn = conn_of(&fx);
+    // NULL stamp (never synced) and a two-hours-old stamp are both stale at
+    // the default 60-min decklist interval; a pinned recent stamp is fresh.
+    let fresh_stamp = {
+        let base: String = conn
+            .query_row("SELECT datetime('now', '-30 minutes')", [], |r| r.get(0))
+            .unwrap();
+        // Far enough from "now" that the 60-min clamp can't flip mid-test.
+        base
+    };
+    conn.execute("INSERT INTO moxfield_authors (id, user_id, moxfield_user) VALUES (9601, 1, 'Stale')", []).unwrap();
+    conn.execute(
+        "INSERT INTO moxfield_authors (id, user_id, moxfield_user, last_decklist_sync_at)
+         VALUES (9602, 1, 'Older', datetime('now', '-2 hours'))",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO moxfield_authors (id, user_id, moxfield_user, last_decklist_sync_at)
+         VALUES (9603, 1, 'Fresh', ?)",
+        rusqlite::params![fresh_stamp.clone()],
+    )
+    .unwrap();
+    drop(conn);
+
+    moxfield::boot_catch_up(st.clone()).await;
+
+    // The two stale authors each ran a decklist pass (decklist pulls call
+    // the author lookup); the fresh one never touched the network.
+    let polled = poll_until(5000, || {
+        mock.hits_for("GET /v2/users/search-sfw").iter().filter(|h| h.contains("Stale")).count() == 1
+            && mock.hits_for("GET /v2/users/search-sfw").iter().filter(|h| h.contains("Older")).count() == 1
+    })
+    .await;
+    assert!(polled, "stale authors did not both run a boot decklist pass: {:?}", mock.hits_for("GET /v2/"));
+    // Give any (wrongly) scheduled Fresh pass a window to appear.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        mock.hits_for("GET /v2/users/search-sfw").iter().all(|h| !h.contains("Fresh")),
+        "fresh author was re-pulled at boot: {:?}",
+        mock.hits_for("GET /v2/users/search-sfw")
+    );
+
+    let conn = conn_of(&fx);
+    for id in [9601, 9602] {
+        let a = one_row(&conn, "SELECT last_decklist_sync_at FROM moxfield_authors WHERE id = ?", &[&id]).unwrap();
+        assert!(a["last_decklist_sync_at"] != Value::Null, "author {id} not stamped");
+    }
+    let a = one_row(&conn, "SELECT last_decklist_sync_at FROM moxfield_authors WHERE id = 9603", &[]).unwrap();
+    assert_eq!(a["last_decklist_sync_at"].as_str().unwrap(), fresh_stamp.as_str(), "fresh author's stamp must be untouched");
+}
+
+#[tokio::test]
+async fn boot_catch_up_without_db_is_a_noop() {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: "http://127.0.0.1:1".to_string(),
+        static_dir: None,
+        rust_routes: Default::default(),
+        db_path: None,
+        sidecar_url: None,
+    };
+    let st = AppState::new(cfg);
+    moxfield::boot_catch_up(st).await; // pre-fix None.unwrap() site sibling
+}
+
+// ---------------------------------------------------------------------------
 // get_status fold
 // ---------------------------------------------------------------------------
 

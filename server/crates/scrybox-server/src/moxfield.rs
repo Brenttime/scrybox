@@ -1909,7 +1909,11 @@ pub async fn tick(st: &AppState) {
     }
 }
 
-async fn boot_catch_up(st: AppState) {
+/// Node's bootCatchUp(): fire-and-forget full decklist pass for every author
+/// whose last decklist sync is NULL or older than the decklist interval.
+/// `pub` for the integration tests (same precedent as `tick`); production
+/// calls it only through `spawn_scheduler`.
+pub async fn boot_catch_up(st: AppState) {
     let Some(pool) = st.db.clone() else { return };
     let authors = {
         let conn = match pool.get() {
