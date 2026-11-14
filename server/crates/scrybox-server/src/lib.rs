@@ -473,6 +473,11 @@ pub fn app(state: AppState) -> Router {
     // warm so the handler answers from memory while fresh. SCRYBOX_HEALTH_CACHE=0
     // disables both the prober and the cache lookup (iter-16 live proxy).
     health::spawn_prober(&state);
+    // Heap hygiene (memory queue item 2, MEMORY.md #4): in-code glibc
+    // tuning (mmap threshold, arena cap) plus malloc_trim on an idle timer,
+    // independent of route-group ownership so the kill switches can't
+    // disable it. Idempotent with the collection/search paths.
+    collection::spawn_idle_trim_timer(&state);
     let router = Router::new().route("/api/health", get(health::handle));
     // Ported API routes behind the per-route kill switch. Non-GET methods on
     // an owned path still proxy to Node (the handler dispatches internally).
