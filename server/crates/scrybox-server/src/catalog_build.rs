@@ -358,27 +358,9 @@ pub(crate) fn js_to_string_pub(v: Option<&Value>) -> String {
 }
 
 fn js_to_string(v: Option<&Value>) -> String {
-    match v {
-        None => "undefined".into(),
-        Some(Value::Null) => "null".into(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Number(n)) => {
-            if let Some(i) = n.as_i64() {
-                i.to_string()
-            } else if let Some(u) = n.as_u64() {
-                u.to_string()
-            } else {
-                let f = n.as_f64().unwrap_or(0.0);
-                if f == f.trunc() && f.is_finite() {
-                    format!("{f:.0}")
-                } else {
-                    n.to_string()
-                }
-            }
-        }
-        Some(_) => "[object Object]".into(),
-    }
+    // Consolidated: JS ToString over JSON values lives in mfx_payload
+    // (value-kind matrix tests there); only the undefined case is local.
+    crate::mfx_payload::js_to_string_opt(v)
 }
 
 fn truthy(v: Option<&Value>) -> bool {

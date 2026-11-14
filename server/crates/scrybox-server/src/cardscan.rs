@@ -49,7 +49,8 @@ use serde_json::{Map, Value};
 use crate::auth::{authenticate, bearer_token};
 use crate::cards_tags::{json_error, read_body};
 use crate::collection::{body_etag, etag_matches};
-use crate::collection_writes::{js_to_string, node_exact};
+use crate::collection_writes::node_exact;
+use crate::mfx_payload::js_to_string;
 use crate::decks_reads::parse_card_row;
 use crate::AppState;
 
@@ -289,7 +290,7 @@ fn truthy(v: Option<&Value>) -> bool {
 fn scry_id_ok(v: &Value) -> bool {
     // /^[0-9a-f]{8}-...{12}$/i against String(x). String(id||'') semantics:
     // falsy → '' fails the regex anyway.
-    let s = js_to_string(Some(v));
+    let s = js_to_string(v);
     let bytes = s.as_bytes();
     let groups = [8usize, 4, 4, 4, 12];
     let mut i = 0usize;
@@ -486,7 +487,7 @@ fn hydrate(conn: &Connection, result: &Value, fetch_on_miss: bool) -> Result<Hyd
 
     // const sid = result.ok && result.card?.id
     let sid = match (ok_flag, result.get("card").and_then(|c| c.get("id"))) {
-        (true, Some(v)) if truthy(Some(v)) => Some(js_to_string(Some(v))),
+        (true, Some(v)) if truthy(Some(v)) => Some(js_to_string(v)),
         _ => None,
     };
     if let Some(sid) = sid {
@@ -533,7 +534,7 @@ fn hydrate(conn: &Connection, result: &Value, fetch_on_miss: bool) -> Result<Hyd
                         _ => c.get("scryfallId").cloned().unwrap_or(Value::Null),
                     }
                 })
-                .map(|v| js_to_string(Some(&v)))
+                .map(|v| js_to_string(&v))
                 .collect();
             let need = hydrate_cards_forward(conn, &ids)?;
             match need {
@@ -977,7 +978,7 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
         if x.is_null() || !scry_id_ok(&idv) {
             return res_json(StatusCode::BAD_REQUEST, &serde_json::json!({"ok":false,"error":"Invalid card id"}));
         }
-        ids.push(js_to_string(Some(&idv)));
+        ids.push(js_to_string(&idv));
     }
     let headers = parts.headers.clone();
     let mut results: Vec<Value> = Vec::with_capacity(ids.len());
@@ -1043,7 +1044,7 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
         Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
     };
     let ids: Vec<String> = match body.get("ids") {
-        Some(Value::Array(a)) => a.iter().map(|v| js_to_string(Some(v))).collect(),
+        Some(Value::Array(a)) => a.iter().map(|v| js_to_string(v)).collect(),
         _ => vec![],
     };
     let headers = parts.headers.clone();
@@ -1206,7 +1207,7 @@ pub async fn handle_telemetry(State(st): State<AppState>, req: Request) -> Respo
         .take(200)
         .collect::<String>();
     let session = match body.get("session") {
-        Some(v) if truthy(Some(v)) => js_to_string(Some(v)).chars().take(20).collect(),
+        Some(v) if truthy(Some(v)) => js_to_string(v).chars().take(20).collect(),
         _ => String::new(),
     };
     let mut lines = String::new();

@@ -46,28 +46,46 @@ pub fn js_truthy(v: Option<&Value>) -> bool {
 }
 
 /// JS `String(x)` over JSON values. Numbers use JS Number→String formatting
-/// (integral f64 prints without a decimal point); arrays/objects approximate
-/// `Array.prototype.join` / `"[object Object]"` (Moxfield payloads never carry
-/// these where String() runs, except trivially).
+/// (`js_number_to_string`); arrays follow `Array.prototype.toString` =
+/// `join(",")` where null renders empty and nested arrays recurse; objects
+/// are `"[object Object]"`.
 pub fn js_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                return i.to_string();
+            // JS JSON.parse (and the Node sqlite driver) yield IEEE-754
+            // doubles, so exact-int u64/i64 serde variants beyond 2^53 must
+            // print as the *rounded double*, not the exact integer — always
+            // format through f64 (String(18446744073709551615) ===
+            // "18446744073709552000" in V8).
+            match n.as_f64() {
+                Some(f) => js_number_to_string(f),
+                None => n.to_string(),
             }
-            if let Some(u) = n.as_u64() {
-                return u.to_string();
-            }
-            if let Some(f) = n.as_f64() {
-                return js_number_to_string(f);
-            }
-            n.to_string()
         }
-        Value::Array(a) => a.iter().map(js_to_string).collect::<Vec<_>>().join(","),
+        Value::Array(a) => a.iter().map(js_array_join_elem).collect::<Vec<_>>().join(","),
         Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// `Array.prototype.join(",")` element rendering: null (and undefined, which
+/// cannot appear in JSON) render as the empty string; nested arrays recurse;
+/// everything else goes through String().
+fn js_array_join_elem(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Array(inner) => inner.iter().map(js_array_join_elem).collect::<Vec<_>>().join(","),
+        other => js_to_string(other),
+    }
+}
+
+/// JS `String(x)` where an absent property (undefined) prints as "undefined".
+pub fn js_to_string_opt(v: Option<&Value>) -> String {
+    match v {
+        None => "undefined".to_string(),
+        Some(x) => js_to_string(x),
     }
 }
 
@@ -116,16 +134,60 @@ fn js_string_to_number(s: &str) -> Option<f64> {
     t.parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
-/// JS Number→String for non-integral f64 (integral values never reach here).
+/// JS Number→String per ECMA-262 `Number::toString` (shortest round-trip
+/// decimal digits s with exponent n: fixed notation for -6 < n <= 21,
+/// exponential `d(.ddd)e±XX` otherwise; -0 prints "0"; NaN/Infinity spelled
+/// JS-style). The shortest digits come from serde_json's ryu serializer —
+/// its digit selection matches V8's `String()` on ties where Rust's own
+/// `{:e}` rounds differently (e.g. the double -873199428122901.25 prints
+/// "…01.2" in V8, "…01.3" from `{:e}`; fuzz-verified against node).
 pub fn js_number_to_string(f: f64) -> String {
-    if f == f.trunc() && f.abs() < 1e21 {
-        // Integral, but not representable as i64/u64 (caller fell through).
-        return format!("{:.0}", f);
+    if f.is_nan() {
+        return "NaN".to_string();
     }
-    // Rust's Display for f64 matches JS for the common JSON cases (shortest
-    // round-trip form; 'e' notation at |x| >= 1e21 or < 1e-6 like JS).
-    let s = f.to_string();
-    s
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return "0".to_string(); // covers -0 (String(-0) === "0")
+    }
+    let neg = f < 0.0;
+    let a = f.abs();
+    let sj = serde_json::Number::from_f64(a)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| a.to_string());
+    let (mant, exp) = match sj.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => (sj.as_str(), 0),
+    };
+    let frac_len = mant.split_once('.').map(|(_, fr)| fr.len() as i32).unwrap_or(0);
+    let digits_raw: String = mant.chars().filter(|c| *c != '.').collect();
+    let digits = digits_raw.trim_end_matches('0'); // ryu's shortest form keeps one "0" for integral values
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let k = digits.len() as i32;
+    let n = exp + digits_raw.len() as i32 - frac_len; // ECMAScript's decimal-point position
+    let body = if n > 0 && n <= 21 {
+        if n >= k {
+            format!("{}{}", digits, "0".repeat((n - k) as usize))
+        } else {
+            format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+        }
+    } else if n <= 0 && n > -6 {
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else {
+        let e = n - 1;
+        let m = if k > 1 {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        } else {
+            digits.to_string()
+        };
+        format!("{}e{}{}", m, if e < 0 { "-" } else { "+" }, e.abs())
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
 }
 
 /// JS `parseInt(v, 10)`: strings parse the leading signed integer run
@@ -402,4 +464,98 @@ pub fn synthesize_moxfield_card(scrybox_id: &str, card: &Value) -> Map<String, V
     m.insert("price_currency".into(), Value::String("USD".into()));
     m.insert("price_source".into(), Value::String("moxfield".into()));
     m
+}
+
+// ---------------------------------------------------------------------------
+// Value-kind matrix for JS `String(x)` over JSON values.
+//
+// Ground truth captured from Node (the reference backend runs V8):
+//   node -e 'for (const [n,v] of VALS) console.log(JSON.stringify(n)+"\t"+String(v))'
+// Values are written as JSON *text* through serde_json::from_str where the
+// f64 round-trip matters (18446744073709551615, 5.0), matching how request
+// bodies actually arrive.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod js_string_matrix_tests {
+    use super::{js_to_string, js_to_string_opt};
+    use serde_json::{json, Value};
+
+    fn v(text: &str) -> Value {
+        serde_json::from_str(text).expect("matrix literal must parse")
+    }
+
+    #[test]
+    fn string_kinds() {
+        assert_eq!(js_to_string(&json!("abc")), "abc");
+        assert_eq!(js_to_string(&json!("")), "");
+        assert_eq!(js_to_string(&json!(" ")), " ");
+    }
+
+    #[test]
+    fn bool_and_null_kinds() {
+        assert_eq!(js_to_string(&json!(true)), "true");
+        assert_eq!(js_to_string(&json!(false)), "false");
+        assert_eq!(js_to_string(&json!(null)), "null");
+    }
+
+    #[test]
+    fn number_kinds_match_v8() {
+        // (JSON literal, String(literal) as printed by node)
+        let cases = [
+            ("0", "0"),
+            ("-0", "0"),
+            ("5", "5"),
+            ("-5", "-5"),
+            ("9007199254740991", "9007199254740991"),
+            ("10000000000000000000", "10000000000000000000"),
+            ("18446744073709551615", "18446744073709552000"),
+            ("100000000000000000000", "100000000000000000000"),
+            ("1e21", "1e+21"),
+            ("1000000000000000000000", "1e+21"),
+            ("1.5e21", "1.5e+21"),
+            ("1.23e22", "1.23e+22"),
+            ("1e300", "1e+300"),
+            ("1.5", "1.5"),
+            ("-1.5", "-1.5"),
+            ("0.1", "0.1"),
+            ("0.30000000000000004", "0.30000000000000004"),
+            ("1e-6", "0.000001"),
+            ("0.000001", "0.000001"),
+            ("1e-7", "1e-7"),
+            ("5e-324", "5e-324"),
+            ("1e-5", "0.00001"),
+            ("5.0", "5"),
+            ("10.0", "10"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(js_to_string(&v(src)), want, "String({src}) via js_to_string");
+        }
+    }
+
+    #[test]
+    fn array_kinds_match_v8_join() {
+        // Array.prototype.toString === join(","): null/undefined render
+        // EMPTY (not "null"), nested arrays recurse, objects stringify.
+        assert_eq!(js_to_string(&json!([])), "");
+        assert_eq!(js_to_string(&json!([1, 2, 3])), "1,2,3");
+        assert_eq!(js_to_string(&json!([null])), "");
+        assert_eq!(js_to_string(&json!([null, 1])), ",1");
+        assert_eq!(js_to_string(&json!([null, "a", null])), ",a,");
+        assert_eq!(js_to_string(&json!([1, [null, 2], 3])), "1,,2,3");
+        assert_eq!(js_to_string(&json!([{}])), "[object Object]");
+        assert_eq!(js_to_string(&json!([1, [2, [null, [true]]]])), "1,2,,true");
+    }
+
+    #[test]
+    fn object_kinds() {
+        assert_eq!(js_to_string(&json!({ "a": 1 })), "[object Object]");
+        assert_eq!(js_to_string(&json!({})), "[object Object]");
+    }
+
+    #[test]
+    fn undefined_via_option_opt() {
+        assert_eq!(js_to_string_opt(None), "undefined");
+        assert_eq!(js_to_string_opt(Some(&json!(null))), "null");
+        assert_eq!(js_to_string_opt(Some(&json!("x"))), "x");
+    }
 }
