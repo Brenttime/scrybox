@@ -163,6 +163,11 @@ struct Fix {
 }
 
 async fn fixture(routes: &[&str]) -> Fix {
+    fixture_mode(routes, false).await
+}
+
+/// `node_free` = SCRYBOX_NODE_UPSTREAM empty (production: no Node at all).
+async fn fixture_mode(routes: &[&str], node_free: bool) -> Fix {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), "precons.db");
     let node = spawn_fake_node().await;
@@ -171,7 +176,7 @@ async fn fixture(routes: &[&str]) -> Fix {
     let (scry_addr, scry) = mock_scryfall::spawn_mock().await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        node_upstream: format!("http://{node}"),
+        node_upstream: if node_free { String::new() } else { format!("http://{node}") },
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db.clone()),
@@ -456,7 +461,11 @@ async fn stale_fallback_and_502() {
 // ---------------------------------------------------------------------------
 
 async fn ok_import_fix() -> Fix {
-    let f = fixture(&["precons"]).await;
+    ok_import_fix_mode(false).await
+}
+
+async fn ok_import_fix_mode(node_free: bool) -> Fix {
+    let f = fixture_mode(&["precons"], node_free).await;
     // Uniq rows to resolve: (10e|1 qty 4+2), (m19|9 qty 'x'→1),
     // (m19|1 qty 1 commander). sideboard excluded by SECTIONS.
     *f.mtg.deck.lock().unwrap() = json!({"data":{
@@ -780,4 +789,45 @@ async fn import_batching_over_75() {
     assert_eq!(s, 201);
     assert_eq!(json_body(&b)["cards"], 80);
     assert_eq!(f.scry.hits_for("POST /cards/collection").len(), 2);
+}
+
+
+// ---------------------------------------------------------------------------
+// Node-free (SCRYBOX_NODE_UPSTREAM empty): the former forward legs answer
+// natively with Node's own bodies — never the proxy's 404/502.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn standalone_import_partial_miss_is_native_partial_deck() {
+    let f = ok_import_fix_mode(true).await;
+    *f.scry.collection_batches.lock().unwrap() = vec![json!({
+        "data": [mock_scryfall::raw_card("aaa", "Card A", "10e", "1", Some(1.0))],
+        "not_found": [{"set":"m19","collector_number":"9"}, {"set":"m19","collector_number":"1"}]
+    })];
+    let (s, _h, b) = request(
+        &f.router, "POST", "/api/precons/import", &ADMIN_JSON,
+        Some(r#"{"fileName":"tcd_Deck","name":"Partial"}"#),
+    )
+    .await;
+    assert_eq!(s, 201, "{}", String::from_utf8_lossy(&b));
+    let v = json_body(&b);
+    assert_eq!(v["message"], "Precon imported: 1 card types in the deck");
+    assert_eq!(v["cards"], 1);
+    assert_eq!(v["notFound"], 2);
+}
+
+#[tokio::test]
+async fn standalone_import_scryfall_client_error_is_route_catch() {
+    let f = ok_import_fix_mode(true).await;
+    f.scry.statuses.lock().unwrap().insert("POST /cards/collection".into(), vec![503]);
+    let (s, _h, b) = request(
+        &f.router, "POST", "/api/precons/import", &ADMIN_JSON,
+        Some(r#"{"fileName":"tcd_Deck"}"#),
+    )
+    .await;
+    assert_eq!(s, 500);
+    assert_eq!(
+        String::from_utf8_lossy(&b),
+        r#"{"error":"Precon import failed: Request failed with status code 503","notFound":0}"#
+    );
 }

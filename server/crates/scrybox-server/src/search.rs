@@ -1490,7 +1490,29 @@ fn raw_pages() -> &'static Mutex<HashMap<String, (i64, RawPage)>> {
 /// post-retry 429, non-404/422 status). Node routes it through the big
 /// catch; Rust answers the scope=internet cache fallback itself and proxies
 /// everything else (Node owns that answer).
-struct LiveErr;
+struct LiveErr(
+    /// true = the post-retry failure was a 429 (Node: RATE_LIMIT_EXCEEDED).
+    bool,
+);
+
+/// Node-free sentinel errors for the live-merge failure arms Node answers
+/// itself (`throw new Error('RATE_LIMIT_EXCEEDED' | 'UPSTREAM_UNAVAILABLE')`
+/// with nothing cached). Carried through the single-flight slot as an Err so
+/// every waiter sees the same verdict; the handler maps them to the route
+/// catch's 429/503 bodies. Hybrid mode never produces them (it proxies).
+const LIVE_RATE_LIMIT: &str = "\u{0}node0:RATE_LIMIT_EXCEEDED";
+const LIVE_UNAVAILABLE: &str = "\u{0}node0:UPSTREAM_UNAVAILABLE";
+
+/// The route catch's answer for a live-merge sentinel (None = not one).
+fn live_sentinel_response(e: &str) -> Option<Response> {
+    if e == LIVE_RATE_LIMIT {
+        Some(json_error(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"))
+    } else if e == LIVE_UNAVAILABLE {
+        Some(json_error(StatusCode::SERVICE_UNAVAILABLE, "Card API is having trouble. Try again in a moment."))
+    } else {
+        None
+    }
+}
 
 /// `langSearch(q, lang)`: English adds nothing (the old query string stays
 /// byte-identical); anything else appends ` lang:code` and requires
@@ -1507,7 +1529,8 @@ enum PageFetch {
     Page(RawPage),
     /// tryQuery's 404/422 catch: the window is empty, meta.total untouched.
     Mismatch,
-    Failed,
+    /// true = 429 after scryGetRetried's retries.
+    Failed(bool),
 }
 
 /// `scryPage` — one /cards/search page through the shared Scry client.
@@ -1569,7 +1592,7 @@ async fn scry_page_live(
             PageFetch::Page(value)
         }
         Err(e) if e.status == Some(404) || e.status == Some(422) => PageFetch::Mismatch,
-        Err(_) => PageFetch::Failed,
+        Err(e) => PageFetch::Failed(e.is_status(429)),
     }
 }
 
@@ -1593,7 +1616,7 @@ async fn fetch_window(
         let p = match scry_page_live(st, &scoped, lang_key, multilingual, page, order).await {
             PageFetch::Page(p) => p,
             PageFetch::Mismatch => return Ok((Vec::new(), None)),
-            PageFetch::Failed => return Err(LiveErr),
+            PageFetch::Failed(rl) => return Err(LiveErr(rl)),
         };
         if p.total.is_some() {
             total = p.total;
@@ -1664,12 +1687,45 @@ pub fn standalone_raw_q_plan(user_id: i64, raw_query: Option<&str>) -> Option<Ra
 
 /// Upstream query string for the raw leg (see RawQ).
 pub fn raw_q_upstream(q: &str, scry_code: &str) -> String {
-    let upstream = crate::collq::walk_base(q).unwrap_or_else(|| q.to_string());
+    // Outside walk_base's exact toScryfall subset the query rides verbatim
+    // except for the Scrybox `is:<type>` extension, which toScryfall
+    // rewrites to `t:` (Scryfall does not know it).
+    let upstream = crate::collq::walk_base(q).unwrap_or_else(|| crate::collq::rewrite_is_types(q));
     if scry_code == "en" { upstream } else { format!("({upstream})") }
 }
 
 async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> Response {
     let lang_name = to_name(rq.lang.as_deref());
+    // Upstream mode: a query the parser rejects is INVALID_QUERY without a
+    // request (only the tokenizer-provable rejects are modelled).
+    if !st.local_scrayfall && crate::collq::definitely_invalid(&rq.q) {
+        return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
+    }
+    // analyze(q).mode === 'local' (inside the ported leaf subset): the
+    // card_cache answer — first in upstream mode for database scope when
+    // the language has cached rows, and the fallback when the engine fails.
+    let local_leaves = crate::collq::raw_local_leaves(&rq.q);
+    if let Some(leaves) = &local_leaves {
+        if !st.local_scrayfall && !rq.internet {
+            let pool2 = Arc::clone(pool);
+            let ln = lang_name.clone();
+            let has_lang = tokio::task::spawn_blocking(move || -> bool {
+                pool2
+                    .get()
+                    .ok()
+                    .and_then(|c| {
+                        c.query_row("SELECT COUNT(*) AS n FROM card_cache WHERE language = ?", [ln], |r| r.get::<_, i64>(0)).ok()
+                    })
+                    .unwrap_or(0)
+                    > 0
+            })
+            .await
+            .unwrap_or(false);
+            if has_lang {
+                return raw_answer_locally(st, pool, &rq, leaves, &lang_name).await;
+            }
+        }
+    }
     let (_code, scry_code) = lang_codes(rq.lang.as_deref());
     let upstream = raw_q_upstream(&rq.q, &scry_code);
     let (scoped, multilingual) = lang_search(&upstream, &scry_code);
@@ -1709,6 +1765,12 @@ async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> 
             }
             Err(e) if e.status == Some(400) => {
                 return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
+            }
+            Err(e) if local_leaves.is_some() => {
+                // Upstream down: a data-backed query is answered from the
+                // cache (checked before the 429 arm, exactly like Node).
+                tracing::error!("Scryfall raw query failed: {}", e.message);
+                return raw_answer_locally(st, pool, &rq, local_leaves.as_ref().unwrap(), &lang_name).await;
             }
             Err(e) if e.status == Some(429) => {
                 return json_error(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
@@ -1763,6 +1825,430 @@ async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> 
     h.insert("x-source", HeaderValue::from_static(source));
     h.insert("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"));
     res
+}
+
+/// runSearch's raw-q `answerLocally` + the route tail: compileRawQuery
+/// rows (parseCardRow), COUNT → meta.total, meta.source 'cache', the
+/// floating stale refresh, then attachOwnedQty / mergeSearchPrices.
+async fn raw_answer_locally(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    rq: &RawQ,
+    leaves: &[crate::collq::Leaf],
+    lang_name: &str,
+) -> Response {
+    let offset = (rq.page - 1).saturating_mul(rq.limit);
+    let (sql, params, count_sql, count_params) = crate::collq::compile_raw_query(leaves, lang_name, rq.limit, offset);
+    let pool2 = Arc::clone(pool);
+    let user_id = rq.user_id;
+    let built = tokio::task::spawn_blocking(move || -> Result<(Vec<Value>, Vec<Value>, Option<u64>), String> {
+        let conn = pool2.get().map_err(|e| e.to_string())?;
+        let rows = crate::decks_reads::rows_map(&conn, &sql, &params).map_err(|e| e.to_string())?;
+        let n: Option<i64> = conn
+            .query_row(&count_sql, rusqlite::params_from_iter(count_params.iter()), |r| r.get::<_, Option<i64>>(0))
+            .map_err(|e| e.to_string())?;
+        let now = now_ms() as i64;
+        let stale: Vec<Value> = rows
+            .iter()
+            .filter(|r| {
+                r.get("last_updated")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::card_cache::parse_sqlite_utc)
+                    .map(|at| now - at.timestamp_millis() > 3 * 24 * 60 * 60 * 1000)
+                    .unwrap_or(false)
+            })
+            .map(|r| Value::Object(r.clone()))
+            .collect();
+        let mut cards: Vec<Value> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            cards.push(Value::Object(crate::decks_reads::parse_card_row(r).map_err(|_| "bad card row".to_string())?));
+        }
+        attach_owned_qty(&conn, &mut cards[..], user_id)?;
+        Ok((cards, stale, n.map(|n| n.max(0) as u64)))
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let (mut cards, stale, total) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("raw q local answer failed: {e}");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    };
+    if st.stale_refresh && !stale.is_empty() {
+        let st_bg = st.clone();
+        tokio::spawn(async move { bulk_refresh_stale(&st_bg, &stale).await });
+    }
+    if rq.internet {
+        merge_search_prices(st, pool, &mut cards).await;
+    }
+    let mut res = axum::response::IntoResponse::into_response((StatusCode::OK, axum::Json(Value::Array(cards))));
+    let h = res.headers_mut();
+    if let Some(t) = total {
+        h.insert("x-total-count", HeaderValue::from_str(&t.to_string()).unwrap());
+    }
+    h.insert("x-source", HeaderValue::from_static("cache"));
+    h.insert("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"));
+    res
+}
+
+/// Marker extension: a Node-free internal re-dispatch of `/api/search`
+/// (standalone_search) — the limiter already counted the outer request and
+/// the canonical query never re-enters standalone_search.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InternalSearch;
+
+/// Node's merged `query` for searchCards: `req.query` parsed by qs (a
+/// repeated key becomes an ARRAY of strings) with `req.body`'s own keys
+/// spread over it on POST.
+fn merged_query(raw_query: Option<&str>, body: Option<&Map<String, Value>>) -> Map<String, Value> {
+    let mut m: Map<String, Value> = Map::new();
+    if let Some(q) = raw_query {
+        for (k, v) in form_urlencoded::parse(q.as_bytes()).into_owned() {
+            match m.get_mut(&k) {
+                Some(Value::Array(a)) => a.push(Value::String(v)),
+                Some(prev) => {
+                    let first = prev.take();
+                    *prev = Value::Array(vec![first, Value::String(v)]);
+                }
+                None => {
+                    m.insert(k, Value::String(v));
+                }
+            }
+        }
+    }
+    if let Some(b) = body {
+        for (k, v) in b {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    m
+}
+
+/// Node-free twin of the searchCards legs hybrid mode leaves to Node:
+/// POST bodies the field gate cannot model, `prints=1` (scanner
+/// allPrints), `image` (cvScan.scoreCards ranking), repeated query keys.
+/// The merged query is reduced to the canonical single-valued GET query
+/// Node's code effectively reads, which the native GET planner then
+/// answers through an internal re-dispatch; prints and image wrap it.
+#[allow(clippy::too_many_arguments)]
+async fn standalone_search(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    user_id: i64,
+    is_post: bool,
+    raw_query: Option<&str>,
+    body: Option<&Map<String, Value>>,
+    headers: &HeaderMap,
+    cc: ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    let m = merged_query(raw_query, body);
+    let get = |k: &str| m.get(k);
+    let str_of = |k: &str| match get(k) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let q = str_of("q").unwrap_or_default();
+    let scope = str_of("scope");
+    let coll_q = scope.as_deref() == Some("collection") && !q.trim().is_empty();
+    // runSearch's `(x || '').trim()` / parseSetList `.split` on a truthy
+    // non-string throws inside the route try → generic 500.
+    let truthy_non_string = |k: &str| match get(k) {
+        None | Some(Value::String(_)) => false,
+        Some(v) => truthy(v),
+    };
+    if !coll_q {
+        let mut crashers = vec!["name", "number"];
+        if q.trim().is_empty() {
+            crashers.push("set");
+        }
+        if crashers.iter().any(|k| truthy_non_string(k)) {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    }
+    let image = str_of("image").filter(|s| !s.is_empty());
+    let cropped = get("cropped").map(truthy).unwrap_or(false);
+    let prints_is_1 = str_of("prints").as_deref() == Some("1");
+    let lang: Option<String> = get("lang").filter(|v| truthy(v)).map(crate::precons::js_string);
+
+    // Canonical single-valued query (qs-array keys reduce exactly as Node
+    // reads them: name/number/set crashed above, q/scope/count/snapshot
+    // must be strings, page/limit/lang are String()-coerced).
+    let canonical = {
+        let mut ser = form_urlencoded::Serializer::new(String::new());
+        for k in ["name", "number", "set", "q", "scope", "count", "snapshot"] {
+            if let Some(v) = str_of(k) {
+                ser.append_pair(k, &v);
+            }
+        }
+        if let Some(l) = &lang {
+            ser.append_pair("lang", l);
+        }
+        for k in ["page", "limit"] {
+            match get(k) {
+                None | Some(Value::Null) => {}
+                Some(v) => {
+                    ser.append_pair(k, &crate::precons::js_string(v));
+                }
+            }
+        }
+    ser.finish()
+    };
+
+    let lang_name = to_name(lang.as_deref());
+    let page = get("page").map(crate::precons::js_string).and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let page = if page == 0 { 1 } else { page }.max(1);
+    let limit = get("limit").map(crate::precons::js_string).and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let limit = if limit == 0 { 60 } else { limit }.clamp(1, if coll_q { 2000 } else { 250 });
+    let inm = if is_post { None } else { headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string) };
+    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(str::to_string);
+
+    // allPrints leg (`allPrints && cleanName && scope !== 'collection'`,
+    // only reached when no raw q took the request first).
+    let clean_name = str_of("name").unwrap_or_default().trim().to_string();
+    if prints_is_1 && q.trim().is_empty() && !clean_name.is_empty() && scope.as_deref() != Some("collection") {
+        let set_list: Vec<String> = str_of("set")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let pq = if set_list.is_empty() {
+            format!("!\"{clean_name}\" unique:prints -is:digital")
+        } else {
+            let scry_set = if set_list.len() == 1 {
+                format!("set:{}", set_list[0])
+            } else {
+                format!("({})", set_list.iter().map(|s| format!("set:{s}")).collect::<Vec<_>>().join(" or "))
+            };
+            format!("!\"{clean_name}\" {scry_set} unique:prints -is:digital")
+        };
+        let code = lang_codes(lang.as_deref()).1;
+        let offset = (page - 1).saturating_mul(limit);
+        if let Ok((raw, total)) =
+            fetch_window(st, &pq, lang.as_deref().unwrap_or(""), &code, offset, limit, None).await
+        {
+            if !raw.is_empty() {
+                let maps: Vec<Map<String, Value>> = raw.iter().map(|r| sidecar::normalize_card(r, &lang_name)).collect();
+                let internet = scope.as_deref() == Some("internet");
+                let source = if st.local_scrayfall { "sidecar" } else { "scryfall" };
+                let res = finish_live_cards(st, pool, maps, true, total, Some(source), user_id, internet, image.as_deref(), cropped, &lang_name).await;
+                return express_json(res, inm.as_deref(), ae.as_deref());
+            }
+        }
+        // No exact-name match / error — fall through to the normal search.
+    }
+
+    // Re-dispatch the canonical GET through the native planner.
+    let mut rb = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(if canonical.is_empty() { "/api/search".to_string() } else { format!("/api/search?{canonical}") });
+    for (k, v) in headers.iter() {
+        if k == header::CONTENT_LENGTH || k == header::CONTENT_TYPE || k == header::TRANSFER_ENCODING {
+            continue;
+        }
+        if (is_post || image.is_some()) && k == header::IF_NONE_MATCH {
+            continue;
+        }
+        if image.is_some() && k == header::ACCEPT_ENCODING {
+            continue;
+        }
+        rb = rb.header(k, v);
+    }
+    let mut req = rb.body(Body::empty()).unwrap_or_else(|_| Request::new(Body::empty()));
+    req.extensions_mut().insert(InternalSearch);
+    let res = handle_boxed(st.clone(), cc, req).await;
+    match image {
+        Some(img) => rank_response(res, &img, cropped, &lang_name, inm.as_deref(), ae.as_deref()).await,
+        None => res,
+    }
+}
+
+/// Type-erased GET re-dispatch into `handle` (breaks the async recursion
+/// cycle: standalone_search awaits a declared `dyn Future + Send`).
+fn handle_boxed(
+    st: AppState,
+    cc: ConnectInfo<std::net::SocketAddr>,
+    req: Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(handle(Method::GET, State(st), cc, req))
+}
+
+/// A finished card list as Node's route emits it after runSearch: cvScan
+/// ranking (image), attachOwnedQty, mergeSearchPrices on scope=internet,
+/// X-Total-Count / X-Source headers. `cache` = runSearch's cacheCards.
+#[allow(clippy::too_many_arguments)]
+async fn finish_live_cards(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    maps: Vec<Map<String, Value>>,
+    cache: bool,
+    total: Option<u64>,
+    source: Option<&'static str>,
+    user_id: i64,
+    internet: bool,
+    image: Option<&str>,
+    cropped: bool,
+    lang_name: &str,
+) -> Result<(Vec<Value>, Option<u64>, Option<&'static str>), Response> {
+    let pool2 = Arc::clone(pool);
+    let mut cards: Vec<Value> = if cache && !maps.is_empty() {
+        let maps2 = maps.clone();
+        let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = pool2.get().map_err(|e| e.to_string())?;
+            crate::card_cache::cache_normalized_cards(&conn, &maps2).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        if let Err(e) = wrote {
+            tracing::error!("search cacheCards failed: {e}");
+            return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"));
+        }
+        maps.into_iter().map(Value::Object).collect()
+    } else {
+        maps.into_iter().map(Value::Object).collect()
+    };
+    if let Some(img) = image {
+        cards = score_image(cards, img, cropped, lang_name).await;
+    }
+    let pool3 = Arc::clone(pool);
+    let attached = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+        let conn = pool3.get().map_err(|e| e.to_string())?;
+        attach_owned_qty(&conn, &mut cards[..], user_id)?;
+        Ok(cards)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let mut cards = match attached {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("search attachOwnedQty failed: {e}");
+            return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"));
+        }
+    };
+    if internet {
+        merge_search_prices(st, pool, &mut cards).await;
+    }
+    Ok((cards, total, source))
+}
+
+/// res.json for a finished card list: headers set before send, Express's
+/// default weak ETag, conditional 304 on GET, compression() gzip.
+fn express_json(
+    built: Result<(Vec<Value>, Option<u64>, Option<&'static str>), Response>,
+    inm: Option<&str>,
+    ae: Option<&str>,
+) -> Response {
+    let (cards, total, source) = match built {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    let body = serde_json::to_vec(&Value::Array(cards)).unwrap_or_else(|_| b"[]".to_vec());
+    let mut extra: Vec<(&'static str, String)> = Vec::new();
+    if let Some(t) = total {
+        extra.push(("x-total-count", t.to_string()));
+        extra.push(("access-control-expose-headers", "X-Total-Count".into()));
+    }
+    if let Some(src) = source {
+        extra.retain(|(k, _)| *k != "access-control-expose-headers");
+        extra.push(("x-source", src.to_string()));
+        extra.push(("access-control-expose-headers", "X-Total-Count, X-Source".into()));
+    }
+    emit_json(StatusCode::OK, body, extra, inm, ae)
+}
+
+fn emit_json(
+    status: StatusCode,
+    body: Vec<u8>,
+    extra: Vec<(&'static str, String)>,
+    inm: Option<&str>,
+    ae: Option<&str>,
+) -> Response {
+    let tag = body_etag(&body);
+    let mut b = Response::builder().status(status);
+    for (k, v) in &extra {
+        if let Ok(h) = HeaderValue::from_str(v) {
+            b = b.header(*k, h);
+        }
+    }
+    if status == StatusCode::OK && etag_matches(inm, &tag) {
+        return b.status(StatusCode::NOT_MODIFIED).header(header::ETAG, tag).body(Body::empty()).unwrap();
+    }
+    b = b
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"))
+        .header(header::ETAG, tag);
+    if wants_encoding(ae, "gzip", body.len()) {
+        let gz = gzip_bytes(&body);
+        return b
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::VARY, "Accept-Encoding")
+            .body(Body::from(gz))
+            .unwrap();
+    }
+    b.body(Body::from(body)).unwrap()
+}
+
+/// `image.replace(/^data:image\/\w+;base64,/, '')` → Buffer → scoreCards.
+async fn score_image(cards: Vec<Value>, image: &str, cropped: bool, lang_name: &str) -> Vec<Value> {
+    let b64 = strip_data_url(image);
+    if b64.is_empty() {
+        return cards;
+    }
+    let buf = crate::cvscan::node_base64_decode(b64);
+    let lang = lang_name.to_string();
+    let fallback = cards.clone();
+    tokio::task::spawn_blocking(move || crate::cvscan::score_cards(&buf, "mtg", cards, &lang, cropped))
+        .await
+        .unwrap_or(fallback)
+}
+
+fn strip_data_url(image: &str) -> &str {
+    if let Some(rest) = image.strip_prefix("data:image/") {
+        let word = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+        if word > 0 {
+            if let Some(tail) = rest[word..].strip_prefix(";base64,") {
+                return tail;
+            }
+        }
+    }
+    image
+}
+
+/// Image ranking over an already-built native search answer: re-order the
+/// 200 JSON array (owned_qty stays last — Node attaches it after ranking)
+/// and re-emit with a fresh ETag / gzip / conditional answer.
+async fn rank_response(
+    res: Response,
+    image: &str,
+    cropped: bool,
+    lang_name: &str,
+    inm: Option<&str>,
+    ae: Option<&str>,
+) -> Response {
+    if res.status() != StatusCode::OK || res.headers().contains_key(header::CONTENT_ENCODING) {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"),
+    };
+    let cards = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Array(a)) if a.len() > 1 => a,
+        _ => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    let ranked = score_image(cards, image, cropped, lang_name).await;
+    let body = serde_json::to_vec(&Value::Array(ranked)).unwrap_or_else(|_| b"[]".to_vec());
+    let mut extra: Vec<(&'static str, String)> = Vec::new();
+    for k in ["x-total-count", "x-source", "x-catalog-complete", "x-catalog-upstream-total", "x-catalog-cache", "x-catalog-snapshot", "access-control-expose-headers"] {
+        if let Some(v) = parts.headers.get(k).and_then(|v| v.to_str().ok()) {
+            extra.push((k, v.to_string()));
+        }
+    }
+    emit_json(StatusCode::OK, body, extra, inm, ae)
 }
 
 /// The merge block's `tryQuery`: a window, normalized, with the catch
@@ -2274,9 +2760,19 @@ pub async fn handle(
     // hit exactly once per authenticated request so it advances in lockstep
     // with the Node limiter's bucket (which counts every request, including
     // the ones Rust re-serves through the proxy).
+    // A Node-free internal re-dispatch (standalone_search) already counted
+    // this request against the limiter on its way in.
+    let internal = parts.extensions.get::<InternalSearch>().is_some();
     let rl_key = ip_limit::client_ip_key(Some(cc.0.ip()), &headers, &st.trust_proxy);
-    let rl = crate::cvscan::search_limiter().hit(&rl_key, crate::cvscan::now_ms());
+    let rl = if internal {
+        crate::ip_limit::Verdict { blocked: false, remaining: 0, reset_secs: 0 }
+    } else {
+        crate::cvscan::search_limiter().hit(&rl_key, crate::cvscan::now_ms())
+    };
     let with_rl = |res: Response| -> Response {
+        if internal {
+            return res;
+        }
         let mut res = res;
         let h = res.headers_mut();
         let _ = h.try_insert("ratelimit-policy", HeaderValue::from_static("300;w=900"));
@@ -2338,6 +2834,15 @@ pub async fn handle(
                 if let Some(rq) = standalone_raw_q_plan(user.id, raw_query.as_deref()) {
                     return with_rl(serve_raw_q_standalone(&st, &pool, rq).await);
                 }
+            }
+            if st.cfg.node_upstream.is_empty() && !internal {
+                // Node-free: canonicalize Node's merged `query` (POST body
+                // over query string, qs arrays for repeated keys) and answer
+                // the prints / image / POST-q legs natively.
+                return with_rl(
+                    standalone_search(&st, &pool, user.id, is_post, raw_query.as_deref(), body_map.as_ref(), &headers, cc)
+                        .await,
+                );
             }
             return to_node(&st, parts, bytes).await;
         }
@@ -2538,8 +3043,15 @@ pub async fn handle(
                                 let mut meta: Option<u64> = None;
                                 let outcome = match live_merge(&init_st, &init_p, &mut meta).await {
                                     Ok(o) => o,
-                                    Err(LiveErr) => {
+                                    Err(LiveErr(rate_limited)) => {
+                                        // Node-free: the route catch's own
+                                        // verdict when nothing cached answers.
+                                        let sentinel = if rate_limited { LIVE_RATE_LIMIT } else { LIVE_UNAVAILABLE };
+                                        let node_free = init_st.cfg.node_upstream.is_empty();
                                         if !init_p.internet {
+                                            if node_free {
+                                                return Err(sentinel.to_string());
+                                            }
                                             tracing::debug!(
                                                 name = %init_p.name,
                                                 "live merge upstream error → proxy"
@@ -2556,6 +3068,9 @@ pub async fn handle(
                                             format!("local rows task panicked: {e}")
                                         })??;
                                         if rows.is_empty() {
+                                            if node_free {
+                                                return Err(sentinel.to_string());
+                                            }
                                             tracing::debug!(
                                                 name = %init_p.name,
                                                 "live merge failed, no cache rows → proxy"
@@ -2675,6 +3190,9 @@ pub async fn handle(
             match res {
                 Ok(Ok(Some(e))) => e.clone(),
                 Ok(Ok(None)) => return to_node(&st, parts.clone(), bytes.clone()).await,
+                Ok(Err(ref e)) | Err(ref e) if live_sentinel_response(e).is_some() => {
+                    return with_rl(live_sentinel_response(e).unwrap());
+                }
                 Ok(Err(ref e)) | Err(ref e) => {
                     tracing::error!(error = %e, "search build failed");
                     return with_rl(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"));

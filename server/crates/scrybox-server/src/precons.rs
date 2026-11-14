@@ -619,7 +619,8 @@ pub(crate) async fn bulk_fetch_by_identifier_opts(
             .scry
             .post_retried("/cards/collection", Value::Object(body), opts, 4)
             .await
-            .map_err(|e| e.to_string())?;
+            // axios-shaped `err.message` (route catches interpolate it).
+            .map_err(|e| e.axios_message())?;
         // `(resp.data && resp.data.not_found) || []`
         out.not_found += resp
             .as_ref()
@@ -889,12 +890,22 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     let bulk = match bulk_fetch_by_identifier(&st, &uniq).await {
         Ok(b) => b,
         Err(e) => {
+            if st.cfg.node_upstream.is_empty() {
+                // Node-free: the route catch's own answer — the axios error
+                // has no `.status`, so 500 with `err.notFound || 0`.
+                tracing::warn!("precons import: scryfall bulk fetch failed ({e})");
+                return import_failed(StatusCode::INTERNAL_SERVER_ERROR, &e, Value::from(0));
+            }
             tracing::warn!("precons import: scryfall bulk fetch failed ({e}); forwarding to Node");
             return forward_import(st, &headers, &body_req).await;
         }
     };
     let matched: HashMap<usize, ()> = bulk.pairs.iter().map(|(i, _)| (*i, ())).collect();
-    if uniq.iter().enumerate().any(|(i, _)| !matched.contains_key(&i)) {
+    // Node-free: an unmatched printing is simply absent from `pairs` and
+    // counted in Scryfall's not_found — the native fold below is Node's
+    // importPreconCardsIntoDeck verbatim (partial deck, notFound>0, or the
+    // 422 when nothing resolved), so only hybrid mode replays.
+    if !st.cfg.node_upstream.is_empty() && uniq.iter().enumerate().any(|(i, _)| !matched.contains_key(&i)) {
         tracing::debug!("precons import: unresolvable printing, forwarding to Node");
         return forward_import(st, &headers, &body_req).await;
     }
