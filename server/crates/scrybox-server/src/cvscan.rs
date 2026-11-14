@@ -1576,7 +1576,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use std::net::SocketAddr;
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::bearer_token;
 use crate::cards_tags::read_body;
 use crate::ip_limit::{self, FixedWindowLimiter};
 use crate::AppState;
@@ -1692,12 +1692,15 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         return crate::proxy(State(st), req).await;
     }
     // authenticateToken (global /api gate, runs before bigJson + the limiter).
+    // M5 (REVIEW) same-class (iter-55): auth via get_async (idle-pop /
+    // blocking-pool hop, never a worker park) — marketplace iter-83/84 shape,
+    // cardscan_park scan_match pin (red-before-fix measured).
     let pool = match st.db.as_ref() {
         Some(p) => p.clone(),
         None => return crate::proxy(State(st), req).await,
     };
     let token = bearer_token(req.headers()).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => {
             // Auth failed with a body still queued: drain-and-discard with
@@ -1880,42 +1883,71 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
     if standalone {
         prefetch_missing(&st.scry, &pool, &cands, &lang_name).await;
     }
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(_) => {
+    // M5 (REVIEW) same-class (iter-55): the pool checkout + hydrate loop run
+    // on the blocking pool (ONE hop), never inline on the runtime worker —
+    // db.rs get() parks on the live-cap Condvar and a parked worker starves
+    // the runtime (iter-82 shape; cardscan ScanLeg iter-54 / marketplace
+    // iter-83/84 twin). Pool/Forward map to the exact same folds the inline
+    // code produced; a join panic mirrors the Forward arm (DB fault → 500).
+    enum ScanMatchLeg {
+        Done(Vec<Value>),
+        Pool,
+        Forward,
+    }
+    let pool_h = pool.clone();
+    let cands_h = cands.clone();
+    let lang_h = lang_name.clone();
+    let leg = tokio::task::spawn_blocking(move || -> ScanMatchLeg {
+        let conn = match pool_h.get() {
+            Ok(c) => c,
+            Err(_) => return ScanMatchLeg::Pool,
+        };
+        let mut hydrated = Vec::with_capacity(cands_h.len());
+        for cand in &cands_h {
+            let cand_map = match cand {
+                Value::Object(m) => m.clone(),
+                other => {
+                    hydrated.push(other.clone());
+                    continue;
+                }
+            };
+            match hydrate_candidate(&conn, &cand_map, &lang_h, standalone) {
+                Ok(Hydrate::Done(m)) => hydrated.push(Value::Object(m)),
+                Ok(Hydrate::Unchanged(m)) => hydrated.push(Value::Object(m)),
+                // would-fetch or DB oddity: whole-request replay to Node.
+                Ok(Hydrate::Forward) | Err(_) => {
+                    tracing::warn!(card = ?cand_map.get("cardId"), "scan-match hydrate Forward-to-Node");
+                    return ScanMatchLeg::Forward;
+                }
+            }
+        }
+        ScanMatchLeg::Done(hydrated)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        tracing::warn!("scan-match hydrate panicked: {join}");
+        ScanMatchLeg::Forward
+    });
+    let hydrated = match leg {
+        ScanMatchLeg::Done(h) => h,
+        ScanMatchLeg::Pool => {
             return limit_headers(cardscan::res_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &serde_json::json!({ "error": "Scan match failed" }),
             ));
         }
-    };
-    let mut hydrated = Vec::with_capacity(cands.len());
-    for cand in &cands {
-        let cand_map = match cand {
-            Value::Object(m) => m.clone(),
-            other => {
-                hydrated.push(other.clone());
-                continue;
+        ScanMatchLeg::Forward => {
+            // Standalone: Forward is impossible (fetch_exhausted); a DB
+            // fault is a throw inside Node's try → its 500.
+            if standalone {
+                return limit_headers(cardscan::res_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({ "error": "Scan match failed" }),
+                ));
             }
-        };
-        match hydrate_candidate(&conn, &cand_map, &lang_name, standalone) {
-            Ok(Hydrate::Done(m)) => hydrated.push(Value::Object(m)),
-            Ok(Hydrate::Unchanged(m)) => hydrated.push(Value::Object(m)),
-            // would-fetch or DB oddity: whole-request replay to Node.
-            Ok(Hydrate::Forward) | Err(_) => {
-                tracing::warn!(card = ?cand_map.get("cardId"), "scan-match hydrate Forward-to-Node");
-                // Standalone: Forward is impossible (fetch_exhausted); a DB
-                // fault is a throw inside Node's try → its 500.
-                if standalone {
-                    return limit_headers(cardscan::res_json(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &serde_json::json!({ "error": "Scan match failed" }),
-                    ));
-                }
-                return crate::proxy(State(st), replay(parts, bytes, headers)).await;
-            }
+            return crate::proxy(State(st), replay(parts, bytes, headers)).await;
         }
-    }
+    };
     result.insert("candidates".into(), Value::Array(hydrated));
     limit_headers(cardscan::res_json(StatusCode::OK, &Value::Object(result)))
 }

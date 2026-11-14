@@ -143,7 +143,7 @@ fn parked_probe(
                 // whole scan+hydrate fold must complete on the Rust side.
                 node_upstream: String::new(),
                 static_dir: None,
-                rust_routes: ["cardscan".to_string()].into_iter().collect(),
+                rust_routes: ["cardscan".to_string(), "scan_match".to_string()].into_iter().collect(),
                 db_path: Some(db_for_rt),
                 sidecar_url: None,
             };
@@ -170,7 +170,10 @@ fn parked_probe(
             let mut b = axum::http::Request::builder()
                 .method(method_owned.as_str())
                 .uri(uri_owned.as_str())
-                .header("authorization", "Bearer sess-1");
+                .header("authorization", "Bearer sess-1")
+                // ConnectInfo for the scan-match handler (oneshot bypasses the
+                // listener injector; the extractor reads this extension).
+                .extension(axum::extract::ConnectInfo("127.0.0.1:9".parse::<std::net::SocketAddr>().unwrap()));
             if let Some(ct) = content_type {
                 b = b.header("content-type", ct);
             }
@@ -245,6 +248,61 @@ fn choices_does_not_park_the_runtime_worker_at_the_live_cap() {
     assert_eq!(cards.len(), 2, "two picker rows expected: {v}");
     assert_eq!(cards[0]["name"], json!("Frame Card"));
     assert_eq!(cards[1]["name"], json!("Twin B"));
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn status_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // iter-55 same-class pins: handle_status / handle_detect / handle_telemetry
+    // ran synchronous authed() (authenticate -> pool.get()) inline on the
+    // runtime worker. Full standalone arm with the pool's single live slot held.
+    std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
+    let (_s, bytes, pool) = parked_probe("GET", "/api/cardscan/status", None, None, 200);
+    let v = parse(&bytes);
+    assert_eq!(v["ok"], json!(true), "status ok=true expected (sidecar /api/health 200): {v}");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn detect_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // Full standalone arm: auth → capped body read → parse_raw_image →
+    // sidecar /api/detect-cards passthrough.
+    let (_s, bytes, pool) = parked_probe("POST", "/api/cardscan/detect", Some("image/jpeg"), Some(Box::leak(img(200).into_boxed_str())), 200);
+    let v = parse(&bytes);
+    assert_eq!(v["ok"], json!(true), "detect passthrough body expected: {v}");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn telemetry_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // Full standalone arm (NO sidecar leg): auth → body → record fold →
+    // JSONL append via the existing spawn_blocking file hop.
+    std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
+    let body = r#"{"session":"s-1","records":[{"ev":"tap"}]}"#;
+    let (_s, bytes, pool) = parked_probe("POST", "/api/cardscan/telemetry", Some("application/json"), Some(body), 204);
+    assert!(bytes.is_empty(), "204 carries no body, got {bytes:?}");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn scan_match_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // iter-55 same-class pin for handle_scan_match (cvscan.rs): synchronous
+    // authenticate AND the hydrate loop's pool.get() ran inline on the
+    // runtime worker. This pin fires the pre-ort fold (no built catalog /
+    // no ORT runtime in the test env → Node's own 503-notBuilt / 500
+    // "Scan match failed" arms): the auth checkout is the per-request park
+    // vector and must go through the async hop. The hydrate-loop hop is
+    // same-class hardening behind it (red-flagged identically by this
+    // harness whenever the pool is exhausted before the loop).
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 200]);
+    let body = format!(r#"{{"image":"data:image/jpeg;base64,{b64}"}}"#);
+    let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 200);
+    let v = parse(&bytes);
+    assert!(
+        v["error"].is_string() && (v["notBuilt"].as_bool() == Some(true) || v["error"] == serde_json::json!("Scan match failed")),
+        "expected the pre-ort 503-notBuilt or 500 scan-failed fold, got {bytes:?}"
+    );
     assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
 }
 
