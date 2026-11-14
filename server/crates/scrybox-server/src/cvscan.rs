@@ -1930,7 +1930,9 @@ pub(crate) async fn fetch_card_by_id(
 ) -> Option<Map<String, Value>> {
     use rusqlite::types::Value as SqlValue;
     {
-        let conn = pool.get().ok()?;
+        // M5: the cache read must not park a runtime worker on the live-cap
+        // Condvar (cardscan handlers prefetch through here; cardscan_park pins).
+        let conn = pool.get_async().await.ok()?;
         if let Some(row) = crate::decks_reads::one_row(&conn, "SELECT * FROM card_cache WHERE id = ?1", &[SqlValue::Text(card_id.to_string())]).ok()? {
             return crate::decks_reads::parse_card_row(&row).ok();
         }
