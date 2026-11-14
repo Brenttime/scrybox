@@ -165,6 +165,36 @@ impl ScryError {
     fn transport(message: impl Into<String>) -> Self {
         Self { status: None, message: message.into(), retry_after_secs: None }
     }
+
+    /// The `err.message` an axios client error carries in Node — what a
+    /// route catch interpolates into `... failed: ${err.message}`. Used by
+    /// the Node-free legs that used to replay the request to Node so its
+    /// own message rode verbatim:
+    ///   * HTTP status            → `Request failed with status code N`
+    ///   * 6000 ms client timeout → `timeout of 6000ms exceeded`
+    ///   * DNS failure            → `getaddrinfo ENOTFOUND <host>`
+    ///   * any other connect fail → `connect ECONNREFUSED <host>:<port>`
+    pub fn axios_message(&self) -> String {
+        if let Some(s) = self.status {
+            return format!("Request failed with status code {s}");
+        }
+        let m = self.message.as_str();
+        if m.ends_with(": timeout") {
+            return format!("timeout of {}ms exceeded", REQUEST_TIMEOUT.as_millis());
+        }
+        let Some((url, err)) = m.split_once(": ") else { return m.to_string() };
+        let Ok(uri) = url.parse::<hyper::Uri>() else { return m.to_string() };
+        let host = uri.host().unwrap_or("").to_string();
+        let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+        let low = err.to_ascii_lowercase();
+        if low.contains("dns") || low.contains("lookup") || low.contains("resolve") {
+            return format!("getaddrinfo ENOTFOUND {host}");
+        }
+        if low.contains("reset") {
+            return "read ECONNRESET".to_string();
+        }
+        format!("connect ECONNREFUSED {host}:{port}")
+    }
 }
 
 impl std::fmt::Display for ScryError {
