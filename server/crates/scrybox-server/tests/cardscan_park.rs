@@ -312,12 +312,11 @@ fn scan_match_does_not_park_the_runtime_worker_at_the_live_cap() {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 200]);
     let body = format!(r#"{{"image":"data:image/jpeg;base64,{b64}"}}"#);
-    // Hermetic test env: no catalog is ever registered → is_built is
-    // deterministically false → Node's own 503-notBuilt arm (collection.js
-    // :304 res.status(503)); the iter-55 note's 'green' expected 200, which
-    // is not a status this arm can answer. Pre-fix the pin dies at
-    // recv_timeout ('never completed'), so the status expectation does not
-    // touch red-before-green.
+    // The fold answers 503 notBuilt (is_built gate fires before the ORT leg in
+    // the test env — no catalog built; collection.js:304 res.status(503) and
+    // cvscan mirrors byte-exact). Park-RED is the timeout panic in
+    // parked_probe, independent of this status, so the pin stays valid
+    // (pre-fix the pin dies at recv_timeout, 'never completed').
     let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 503);
     let v = parse(&bytes);
     assert!(

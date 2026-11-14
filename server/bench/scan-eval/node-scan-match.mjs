@@ -1,11 +1,25 @@
 // Ground-truth probe: Node :3312 scan-match over the corpus.
 // node node-scan-match.mjs [--rust URL]  (default Node only)
+//
+// Corpus (lane-B iter-57): the DEFAULT is the lane eval corpus
+// <repo-root>/data/scan-eval-corpus — the SAME dir node_truth_parity_on_eval_corpus
+// consumes (CORPUS_DIR override in the unit test). The stale ./corpus copy in this
+// dir holds same-NAMED but DIFFERENT images (regenerated Nov 12 via mkcorpus/
+// mkvariants); reading it by default silently captured truth over the wrong images
+// (measured: different top candidates/scores per file). Regenerate BOTH dirs or
+// pass CORPUS_DIR explicitly.
+//
+// Truth write (lane-B iter-57): node-truth.json (unit-test ground truth, via
+// include_str!) is only rewritten when WRITE_TRUTH=1 AND this is a Node :3312
+// capture. Everything else — --rust runs, exploratory Node runs — writes
+// node-truth.last.json, so a comparison run can never clobber the ground truth.
 import fs from 'node:fs';
 import path from 'node:path';
 const TOK = process.env.AB_TOKEN;
 if (!TOK) { console.error('AB_TOKEN required'); process.exit(1); }
-const BASE = process.argv[3] === '--rust' ? process.argv[2].replace('--rust', '') : 'http://127.0.0.1:3312';
-const dir = process.env.CORPUS_DIR || new URL('./corpus', import.meta.url).pathname;
+const IS_RUST = process.argv[3] === '--rust';
+const BASE = IS_RUST ? process.argv[2].replace('--rust', '') : 'http://127.0.0.1:3312';
+const dir = process.env.CORPUS_DIR || new URL('../../../../data/scan-eval-corpus', import.meta.url).pathname;
 const files = fs.readdirSync(dir).filter(f => f.startsWith('scan')).sort();
 const out = {};
 for (const f of files) {
@@ -24,4 +38,9 @@ for (const f of files) {
     c0 ? `top=${c0.cardId} score=${c0.score}` : JSON.stringify(j)?.slice(0, 120));
   if (j?.crop) out[f].cropLen = j.crop.length;
 }
-fs.writeFileSync(new URL('./node-truth.json', import.meta.url).pathname, JSON.stringify(out, null, 1));
+const truthPath = new URL('./node-truth.json', import.meta.url).pathname;
+const lastPath = new URL('./node-truth.last.json', import.meta.url).pathname;
+const writeTruth = process.env.WRITE_TRUTH === '1' && !IS_RUST;
+const dest = writeTruth ? truthPath : lastPath;
+fs.writeFileSync(dest, JSON.stringify(out, null, 1));
+console.error(`wrote ${dest}${writeTruth ? '' : ' (node-truth.json untouched — WRITE_TRUTH=1 + Node capture required to rewrite ground truth)'}`);
