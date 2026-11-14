@@ -26,9 +26,16 @@ use crate::poison::LockExt;
 ///
 /// `cache_kb` is the PER-CONNECTION page-cache budget in KiB (negative
 /// PRAGMA cache_size semantics). The pool applies a GLOBAL budget
-/// (`SCRYBOX_DB_CACHE_BUDGET_MB`, default 64 MB — Node's single-connection
-/// size) divided across `max` connections, so 16 pooled readers no longer
-/// each get their own 64 MB cache. `mmap_kb` (default 4 MB, was 256 MB then
+/// (`SCRYBOX_DB_CACHE_BUDGET_MB`, default 16 MB — the a2full measured
+/// config; 64 MB was Node's single-connection value, kept as an explicit
+/// override) divided across `live_max`
+/// connections, not `max`: a burst past the idle target opens connections
+/// up to `live_max` (default 2*max), and when the budget was split by
+/// `max` the worst case was live_max × (budget/max) = 2× the "global"
+/// budget (review/MEMORY.md #7: POOL_MAX=4 + budget 16 MB was part of the
+/// 500→360 MB drop; the 2× burst leak is what made the cap nominal).
+/// Splitting by `live_max` keeps the whole pool inside the budget at any
+/// checkout level (subject only to the 2 MB/conn floor). `mmap_kb` (default 4 MB, was 256 MB then
 /// 32 MB) is the per-connection mmap window; the DB copy is 256 MB and
 /// the hot working set is far smaller, so a small window caps how much
 /// file-backed page cache can be faulted in per reader. 0 disables mmap
@@ -53,13 +60,24 @@ pub struct PoolConfig {
 
 impl PoolConfig {
     /// Env-tunable defaults: SCRYBOX_DB_POOL_MAX, SCRYBOX_DB_CACHE_BUDGET_MB
-    /// (global, split across the pool), SCRYBOX_DB_MMAP_MB (per conn),
+    /// (global, split across live_max connections), SCRYBOX_DB_MMAP_MB (per conn),
     /// SCRYBOX_DB_LIVE_MAX (live checkout cap, default 2*max).
     pub fn from_env(default_max: usize) -> Self {
         let env_i64 = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0);
         let max = env_i64("SCRYBOX_DB_POOL_MAX").unwrap_or(default_max as i64).max(1) as usize;
-        let budget_mb = env_i64("SCRYBOX_DB_CACHE_BUDGET_MB").unwrap_or(64);
-        let cache_kb = (budget_mb * 1024 / max as i64).max(2048); // never below 2 MB/conn
+        let live_max = env_i64("SCRYBOX_DB_LIVE_MAX")
+            .unwrap_or(max as i64 * 2)
+            .max(max as i64)
+            .max(1) as usize;
+        // MEMORY.md #7: default budget 16 MB (a2full measured: POOL_MAX=4 +
+        // budget 16 was part of the 500→360 drop) split across live_max, so
+        // even a full burst (live_max live connections, each carrying its
+        // own page cache) cannot exceed the global budget — splitting by
+        // `max` let the 2×max burst reach 2× the budget. The 2 MB/conn
+        // floor can exceed the budget on wide pools; SQLite would clamp
+        // sub-page caches anyway, and wide pools are an operator choice.
+        let budget_mb = env_i64("SCRYBOX_DB_CACHE_BUDGET_MB").unwrap_or(16);
+        let cache_kb = (budget_mb * 1024 / live_max as i64).max(2048); // never below 2 MB/conn
         // SCRYBOX_DB_MMAP_MB accepts 0 (mmap OFF). The shared env_i64 above
         // filters `> 0`, which silently turned `0` into the default — a
         // deliberate "disable mmap" setting was a no-op (review/MEMORY.md #3).
@@ -73,10 +91,6 @@ impl PoolConfig {
             .filter(|v| *v >= 0)
             .unwrap_or(4);
         let mmap_kb = mmap_mb * 1024;
-        let live_max = env_i64("SCRYBOX_DB_LIVE_MAX")
-            .unwrap_or(max as i64 * 2)
-            .max(max as i64)
-            .max(1) as usize;
         Self { max, cache_kb, mmap_kb, live_max }
     }
 }
@@ -498,7 +512,11 @@ mod tests {
         std::env::set_var("SCRYBOX_DB_MMAP_MB", "16");
         let c = PoolConfig::from_env(4);
         assert_eq!(c.max, 8);
-        assert_eq!(c.cache_kb, 64 * 1024 / 8);
+        // MEMORY.md #7: the budget splits across live_max (2*max by default),
+        // so a full burst (live_max live connections each with its own page
+        // cache) stays inside the global budget — not 2× it as when the
+        // split used `max`.
+        assert_eq!(c.cache_kb, 64 * 1024 / 16);
         assert_eq!(c.mmap_kb, 16 * 1024);
         // Live cap default: 2x the idle target.
         assert_eq!(c.live_max, 16);
@@ -516,11 +534,19 @@ mod tests {
         for k in ["SCRYBOX_DB_POOL_MAX", "SCRYBOX_DB_CACHE_BUDGET_MB", "SCRYBOX_DB_MMAP_MB", "SCRYBOX_DB_LIVE_MAX"] {
             std::env::remove_var(k);
         }
-        // Defaults: budget 64 MB, mmap 4 MB (Gate-D memory fix), caller's max.
+        // Defaults: budget 16 MB (MEMORY.md #7, split across live_max),
+        // mmap 4 MB (Gate-D memory fix), caller's max.
         let c = PoolConfig::from_env(6);
         assert_eq!(c.max, 6);
-        assert_eq!(c.cache_kb, 64 * 1024 / 6);
+        assert_eq!(c.live_max, 12);
+        // 16 MB / 12 conns = 1365 KB -> the 2 MB/conn floor wins.
+        assert_eq!(c.cache_kb, 2048);
         assert_eq!(c.mmap_kb, 4 * 1024);
+        // Narrow pool shows the live_max split without the floor: max=1,
+        // live=2 -> 8 MB/conn on the 16 MB default budget.
+        let c = PoolConfig::from_env(1);
+        assert_eq!(c.live_max, 2);
+        assert_eq!(c.cache_kb, 16 * 1024 / 2);
         // MEMORY.md #3: SCRYBOX_DB_MMAP_MB=0 must mean "mmap OFF". The old
         // shared env_i64 filtered `> 0`, so 0 silently became the default
         // (a deliberate disable was a no-op).
@@ -548,13 +574,39 @@ mod tests {
         std::env::set_var("SCRYBOX_DB_CACHE_BUDGET_MB", "0");
         let c = PoolConfig::from_env(5);
         assert_eq!(c.max, 5);
-        assert_eq!(c.cache_kb, 64 * 1024 / 5);
+        // 0 rejected -> default budget 16 MB / live_max 10 = 1638 KB -> floor.
+        assert_eq!(c.cache_kb, 2048);
         std::env::remove_var("SCRYBOX_DB_MMAP_MB");
         std::env::remove_var("SCRYBOX_DB_POOL_MAX");
         std::env::remove_var("SCRYBOX_DB_CACHE_BUDGET_MB");
     }
 
     // ---- H3/M3: LIVE connection cap (REVIEW-concurrency H3, REVIEW-writes M3) ----
+
+    #[test]
+    fn from_env_page_cache_burst_stays_inside_global_budget() {
+        // MEMORY.md #7: live_max=2*max burst must not double the "global"
+        // page-cache budget. The invariant: live_max * cache_kb == budget
+        // (while above the 2 MB/conn floor). Red-before-fix: with the split
+        // by `max`, live_max*cache_kb = 2*budget -> first assert fails
+        // (8*2048 KiB = 16 MiB != 32... pre-fix cache_kb was budget/max=
+        // 4096 KiB, product 32 MiB).
+        std::env::set_var("SCRYBOX_DB_POOL_MAX", "4");
+        std::env::set_var("SCRYBOX_DB_CACHE_BUDGET_MB", "16");
+        let c = PoolConfig::from_env(4);
+        assert_eq!(c.live_max, 8);
+        assert_eq!(c.cache_kb * c.live_max as i64, 16 * 1024, "full burst must equal the global budget");
+        std::env::set_var("SCRYBOX_DB_CACHE_BUDGET_MB", "64");
+        let c = PoolConfig::from_env(4);
+        assert_eq!(c.cache_kb * c.live_max as i64, 64 * 1024);
+        // Explicit live cap re-divides the budget to match.
+        std::env::set_var("SCRYBOX_DB_LIVE_MAX", "4");
+        let c = PoolConfig::from_env(4);
+        assert_eq!(c.cache_kb * c.live_max as i64, 64 * 1024);
+        std::env::remove_var("SCRYBOX_DB_POOL_MAX");
+        std::env::remove_var("SCRYBOX_DB_CACHE_BUDGET_MB");
+        std::env::remove_var("SCRYBOX_DB_LIVE_MAX");
+    }
 
     fn capped_pool(tag: &str, max: usize, live_max: usize) -> (PathBuf, DbPool) {
         let p = temp_db(tag);
