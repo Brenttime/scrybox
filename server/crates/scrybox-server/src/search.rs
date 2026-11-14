@@ -1235,8 +1235,12 @@ struct Inner {
 /// alone (>64 → clear) never bounded BYTES: an entry is raw+gz body plus
 /// stale identifier rows, and the realistic bench (64 varied queries)
 /// ratcheted the process VmHWM +694 MB through this one cache
-/// (lane-B iter-22 per-leg attribution). Env-tunable like the DB pools.
-const SEARCH_STORE_MAX_BYTES_DEFAULT: u64 = 128 << 20; // 128 MiB
+/// (lane-B iter-22 per-leg attribution). Default 128 MiB at iter-22;
+/// memory queue item 7 (MEMORY.md #10) lowers it to 32 MiB — 32 MiB holds
+/// the realistic 64-query varied working set gz-dominant shapes with
+/// room, while capping the worst case at a quarter of the old budget.
+/// Env-tunable like the DB pools.
+const SEARCH_STORE_MAX_BYTES_DEFAULT: u64 = 32 << 20; // 32 MiB
 /// Heap estimate per stale identifier row (small objects; errs generous).
 const STALE_ROW_BYTES: u64 = 1024;
 
@@ -2969,6 +2973,14 @@ mod cache_budget_tests {
         let e = c.inner.guard();
         assert_eq!(e.entries.len(), 1);
         assert_eq!(e.total_bytes, 1); // the single "x" body, counters reset on clear
+    }
+
+    #[test]
+    fn default_budget_is_32_mib() {
+        // Memory queue item 7 (MEMORY.md #10): pin the lowered budget —
+        // `env_overrides_default_budget` only compares against the constant,
+        // so it alone cannot catch a re-raise.
+        assert_eq!(SEARCH_STORE_MAX_BYTES_DEFAULT, 32 << 20);
     }
 
     #[test]
