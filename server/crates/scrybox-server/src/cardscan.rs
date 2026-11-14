@@ -511,8 +511,9 @@ fn hydrate(conn: &Connection, result: &Value, fetch_on_miss: bool) -> Result<Hyd
             .get("footer_ocr")
             .and_then(|f| f.get("choices"))
             .cloned()
-            .filter(|c| c.is_array())
-            .map(|c| c.as_array().unwrap().clone())
+            // errors-maint L1: as_array().cloned() instead of is_array +
+            // as_array().unwrap() (same set, no panic edge).
+            .and_then(|c| c.as_array().cloned())
     } else {
         None
     };

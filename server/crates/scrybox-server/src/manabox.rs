@@ -361,7 +361,9 @@ pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
             });
             continue;
         }
-        let qty = qty.unwrap();
+        // errors-maint L1: bind through the same guard instead of unwrapping
+        // a checked Option (identical control flow, no panic edge).
+        let Some(qty) = qty.filter(|q| *q > 0) else { continue };
         let expect = Expectation {
             set: cell("Set code").unwrap_or_default().to_lowercase(),
             number: cell("Collector number").unwrap_or_default(),
@@ -415,7 +417,9 @@ pub fn parse_manabox_export(text: &str) -> Result<Parsed, String> {
             });
             continue;
         }
-        let (p, c, l) = (p.unwrap(), c.unwrap(), l.unwrap());
+        // errors-maint L1: destructure the already-guarded Options instead
+        // of unwrapping (identical control flow, no panic edge).
+        let (Some(p), Some(c), Some(l)) = (p, c, l) else { continue };
         let key = format!("{card_id}|{p}|{c}|{l}");
         let d = to_sql_date(cell("Added").as_ref());
         let price = js_parse_float(cell("Purchase price").as_ref());

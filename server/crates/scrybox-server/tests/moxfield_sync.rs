@@ -180,6 +180,8 @@ fn mfx_client(addr: SocketAddr) -> Arc<MfxApi> {
         base_url: format!("http://{addr}"),
         // Plain curl: the impersonate probe must never hijack the mock leg.
         curl_bin: "curl".into(),
+        // Node's execFile wall (TIMEOUT_S + 5); the mock never gets near it.
+        exec_timeout: std::time::Duration::from_secs(35),
     })
 }
 
@@ -1398,7 +1400,12 @@ async fn curl_output_over_max_buffer_kills_child_early() {
     std::fs::write(&bin, "#!/bin/sh\nhead -c 11000000 /dev/zero\nexec sleep 60\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let api = MfxApi { base_url: "http://127.0.0.1:1".into(), curl_bin: bin.to_string_lossy().into() };
+    let api = MfxApi {
+        base_url: "http://127.0.0.1:1".into(),
+        curl_bin: bin.to_string_lossy().into(),
+        // The maxBuffer kill must fire long before the execFile wall.
+        exec_timeout: std::time::Duration::from_secs(35),
+    };
     let t0 = std::time::Instant::now();
     let err = api.get("/v2/x", &[]).await.unwrap_err();
     assert!(t0.elapsed() < std::time::Duration::from_secs(15), "took {:?}", t0.elapsed());
