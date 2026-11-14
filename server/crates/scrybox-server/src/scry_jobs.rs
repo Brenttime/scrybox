@@ -402,7 +402,7 @@ fn urlencode(s: &str) -> String {
 /// transaction sequence), so they live on a dedicated thread with a
 /// current-thread runtime + LocalSet — the future is !Send by design and
 /// never crosses threads.
-pub fn start_job_timers(db_path: std::path::PathBuf) {
+pub fn start_job_timers(db_path: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo) {
     std::thread::Builder::new()
         .name("scry-jobs".into())
         .spawn(move || {
@@ -411,13 +411,36 @@ pub fn start_job_timers(db_path: std::path::PathBuf) {
                 .build()
                 .expect("jobs runtime");
             let local = tokio::task::LocalSet::new();
+            // REVIEW concurrency-jobs L4: boot_catchup and hourly_loop share
+            // one running flag — a sweep longer than an hour (floor fills on
+            // a slow network exceed 225 s easily) can no longer overlap its
+            // successor tick.
+            let sweeping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             local.spawn_local(boot_sets_sync(db_path.clone()));
-            local.spawn_local(weekly_loop(db_path.clone()));
-            local.spawn_local(hourly_loop(db_path.clone()));
-            local.spawn_local(boot_catchup(db_path));
+            local.spawn_local(weekly_loop(db_path.clone(), memo));
+            local.spawn_local(hourly_loop(db_path.clone(), std::sync::Arc::clone(&sweeping)));
+            local.spawn_local(boot_catchup(db_path, sweeping));
             rt.block_on(local);
         })
         .expect("spawn scry-jobs thread");
+}
+
+/// Sweep-overlap guard (REVIEW concurrency-jobs L4). `swap` gives exactly
+/// one winner; the Drop reset makes an early return or a panic inside the
+/// sweep safe (the jobs thread never aborts mid-sweep, but Drop is free).
+struct SweepGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for SweepGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn try_begin_sweep(sweeping: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<SweepGuard> {
+    if sweeping.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        None
+    } else {
+        Some(SweepGuard(std::sync::Arc::clone(sweeping)))
+    }
 }
 
 fn open_conn(db: &std::path::Path) -> Result<Connection, String> {
@@ -441,11 +464,13 @@ async fn boot_sets_sync(db: std::path::PathBuf) {
     }
 }
 
-async fn weekly_loop(db: std::path::PathBuf) {
+async fn weekly_loop(db: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo) {
     // Weekly sets refresh (picks up newly released sets) + the
     // autoUpdateCatalogs twin (Lane B unit 6c: one behind-catalog build kick
     // per tick; the Node weekly timer is switched off for this leg with
-    // CATALOG_AUTO_UPDATE=0 on the test container).
+    // CATALOG_AUTO_UPDATE=0 on the test container). The Scryfall-sets memo
+    // is AppState's, not a fresh per-tick Mutex (REVIEW concurrency-jobs L4:
+    // a new memo dropped the cache and cost an extra upstream fetch).
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(7 * 24 * 3600)).await;
         let scry = Scry::new(ScryEnv::from_env());
@@ -460,12 +485,18 @@ async fn weekly_loop(db: std::path::PathBuf) {
         crate::catalog_build::auto_update_tick(
             &db,
             std::sync::Arc::new(Scry::new(ScryEnv::from_env())),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::clone(&memo),
         );
     }
 }
 
-async fn sweep_once(db: &std::path::Path, force: bool) {
+async fn sweep_once(db: &std::path::Path, force: bool, sweeping: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    // L4 overlap guard: a tick that finds the previous sweep still running
+    // is skipped (logged), never queued.
+    let Some(_guard) = try_begin_sweep(sweeping) else {
+        tracing::info!("Price sweep tick skipped: previous sweep still running");
+        return;
+    };
     let scry = Scry::new(ScryEnv::from_env());
     match open_conn(db) {
         Ok(conn) => {
@@ -477,20 +508,49 @@ async fn sweep_once(db: &std::path::Path, force: bool) {
     }
 }
 
-async fn hourly_loop(db: std::path::PathBuf) {
+async fn hourly_loop(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     // Hourly price sweep tick, NOT forced: shouldSweepPrices decides from the
     // admin's price_refresh_days (the daily timer this replaced made that
     // setting dead code — server.js comment, ported verbatim).
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        sweep_once(&db, false).await;
+        sweep_once(&db, false, &sweeping).await;
     }
 }
 
-async fn boot_catchup(db: std::path::PathBuf) {
+async fn boot_catchup(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     // Boot catch-up 30 s in (NOT forced, so a sweep inside the interval
     // costs one indexed read). Node runs oracleTags.runMaintenance first —
     // that job belongs to the catalog unit and still runs on Node.
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-    sweep_once(&db, false).await;
+    sweep_once(&db, false, &sweeping).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_begin_sweep;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn sweep_guard_serializes_ticks() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = try_begin_sweep(&flag).expect("idle sweep acquires");
+        assert!(try_begin_sweep(&flag).is_none(), "overlap tick is refused while running");
+        assert!(try_begin_sweep(&flag).is_none(), "refusal is stable until release");
+        drop(first);
+        assert!(try_begin_sweep(&flag).is_some(), "release re-opens the gate");
+    }
+
+    #[test]
+    fn sweep_guard_resets_even_on_forget() {
+        // A leaked guard (panic-unwind path on the jobs thread) would wedge
+        // the flag; Drop must fire on unwind too — assert via catch_unwind.
+        let flag = Arc::new(AtomicBool::new(false));
+        let _ = std::panic::catch_unwind(|| {
+            let _g = try_begin_sweep(&flag).unwrap();
+            panic!("sweep blew up mid-flight");
+        });
+        assert!(try_begin_sweep(&flag).is_some(), "unwind released the gate");
+    }
 }

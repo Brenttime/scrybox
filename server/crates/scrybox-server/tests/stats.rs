@@ -787,3 +787,135 @@ async fn concurrent_misses_coalesce_into_one_computation() {
     }
     assert_eq!(cache.computes(), 1, "burst of 8 cold requests must compute the body exactly once");
 }
+
+// --- REVIEW-writes L1 / concurrency-jobs L2: native writes bump the gen ----
+//
+// Node's `app.use('/api', statsCache.invalidateOnWrite)` (server.js:445)
+// bumps req.user's generation after authenticateToken on EVERY non-GET.
+// Proxied writes reproduced that via stats::on_proxied_write, but natively
+// served writes never bumped: a client that wrote through Rust and read
+// /api/stats back could get the stale cached body (read-your-writes race).
+
+#[tokio::test]
+async fn native_write_bumps_gen_so_stats_read_your_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded_stats_db(dir.path(), "nativewrite.db");
+    {
+        // Writer becomes admin so the settings PUT reaches the handler body;
+        // app_settings mirrors the real schema (tests/settings.rs twin).
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "UPDATE users SET role = 'admin' WHERE id = 1;
+             CREATE TABLE app_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                public_base_url TEXT DEFAULT '',
+                price_refresh_days INTEGER DEFAULT 1,
+                scan_exclude_tokens INTEGER DEFAULT 0,
+                scan_exclude_art_cards INTEGER DEFAULT 0,
+                scan_exclude_jumpstart INTEGER DEFAULT 0,
+                scan_exclude_promos INTEGER DEFAULT 0,
+                setup_complete INTEGER DEFAULT 0,
+                moxfield_decklist_interval_min INTEGER DEFAULT 60,
+                moxfield_content_interval_min INTEGER DEFAULT 1
+             );
+             INSERT INTO app_settings (id) VALUES (1);",
+        )
+        .unwrap();
+    }
+    let upstream = spawn_fake_node().await;
+    let r = router_for(
+        db_path,
+        &["stats", "settings", "decks_writes", "decks_reads"],
+        &format!("http://{upstream}"),
+    );
+
+    let xsc = |h: &HeaderMap| h["x-stats-cache"].to_str().unwrap().to_string();
+
+    // After an invalidation the handler serves the SWR stale body ('miss')
+    // and rebuilds the key in the background; poll until the store settles
+    // to a hit. A read that wrongly bumps can never settle — that is the
+    // "GET must not bump" assertion in wait_hit's panic.
+    async fn wait_hit(r: &Router, headers: &[(&'static str, &'static str)]) {
+        for _ in 0..400 {
+            let (_, h, _) = request(r, "GET", "/api/stats", headers).await;
+            if h["x-stats-cache"].to_str().unwrap() == "hit" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("stats cache never settled to a hit — reads must not bump the gen");
+    }
+
+    // Warm the cache: miss then hit.
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &auth()).await.1), "miss");
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &auth()).await.1), "hit");
+
+    // Native deck create — a real collection-adjacent write. (The schema's
+    // deck triggers bump deck_list_revision too, so this leg is not the
+    // discriminator; the settings PUT below is.)
+    let (s, _, _) = request_body(
+        &r,
+        "POST",
+        "/api/decks",
+        &auth_json(),
+        Some(r#"{"name":"bump probe"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "deck create must succeed for the probe");
+    assert_eq!(
+        xsc(&request(&r, "GET", "/api/stats", &auth()).await.1),
+        "miss",
+        "REVIEW-writes L1: native non-GET must invalidate the writer's stats cache"
+    );
+
+    // A plain GET must NOT bump: the refill then replays warm.
+    wait_hit(&r, &auth()).await;
+
+    // settings PUT touches NONE of the three dataRevision counters — the gen
+    // bump is the only Node-side invalidation path for this write.
+    let (s, _, _) = request_body(
+        &r,
+        "PUT",
+        "/api/settings",
+        &auth_json(),
+        Some(r#"{"price_refresh_days":7}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        xsc(&request(&r, "GET", "/api/stats", &auth()).await.1),
+        "miss",
+        "settings PUT (no revision change) must still bump via invalidateOnWrite"
+    );
+    wait_hit(&r, &auth()).await;
+
+    // Node bumps BEFORE requireAdmin: user 2 (member) gets 403 but is still
+    // a write to invalidateOnWrite — their warm cache must drop.
+    let u2: Vec<(&'static str, &'static str)> =
+        vec![("authorization", "Bearer tok-stats-empty")];
+    let u2j: Vec<(&'static str, &'static str)> =
+        vec![("authorization", "Bearer tok-stats-empty"), ("content-type", "application/json")];
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &u2).await.1), "miss");
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &u2).await.1), "hit");
+    let (s403, _, _) = request_body(&r, "PUT", "/api/settings", &u2j, Some("{}")).await;
+    assert_eq!(s403, StatusCode::FORBIDDEN);
+    assert_eq!(
+        xsc(&request(&r, "GET", "/api/stats", &u2).await.1),
+        "miss",
+        "role-gated 403 still bumped in Node (bump runs before requireAdmin)"
+    );
+
+    // Unauthenticated write: no req.user in Node, so nobody bumps —
+    // user 1's freshly warm slot survives untouched.
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &auth()).await.1), "hit");
+    let (s401, _, _) = request_body(
+        &r,
+        "PUT",
+        "/api/settings",
+        &[("content-type", "application/json")],
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(s401, StatusCode::UNAUTHORIZED);
+    assert_eq!(xsc(&request(&r, "GET", "/api/stats", &auth()).await.1), "hit");
+}

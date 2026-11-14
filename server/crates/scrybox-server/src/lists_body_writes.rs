@@ -126,6 +126,9 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     match add_one(&pool, &id, user.id, &body) {
         AddOne::Response(res) => res,
         AddOne::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
@@ -309,6 +312,9 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     // `Array.isArray(req.body?.cards) ? cards : []` then the 1-250 gate —
     // both outside the try.
     let Some(entries) = bulk_entries(&body) else {
@@ -419,6 +425,9 @@ pub async fn handle_bulk_remove(Path(id): Path<String>, State(st): State<AppStat
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     let Some(entries) = bulk_entries(&body) else {
         return json_error(StatusCode::BAD_REQUEST, "cards must be 1-250 entries");
     };
@@ -507,6 +516,9 @@ pub async fn handle_remove_from_collection(Path(id): Path<String>, State(st): St
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     // `!!(req.body && req.body.dry_run)` — any truthy value; non-object bodies false.
     let dry_run = body.get("dry_run").is_some_and(|v| !js_falsy(Some(v)));
     // Node wraps the whole flow in withAllocationLock; the transaction only
@@ -665,6 +677,9 @@ pub async fn handle_cheapest_printings(Path(id): Path<String>, State(st): State<
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     match cheapest_printings(&pool, &id, user.id) {
         Ok(res) => res,
         Err(e) => internal_fail("Failed to move cards to cheapest printings", "lists cheapest-printings", &e),
@@ -779,6 +794,9 @@ pub async fn handle_printing(
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     // `req.body?.card_id ? String(req.body.card_id) : ''` — falsy gate first,
     // then JS String() coercion (numbers -> "5", objects -> "[object Object]").
     let card_v = body.get("card_id");
@@ -879,6 +897,9 @@ pub async fn handle_remove_card(Path((id, card_id)): Path<(String, String)>, Sta
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     match remove_card(&pool, &id, &card_id, user.id) {
         Ok(res) => res,
         Err(e) => internal_fail("Failed to remove card from list", "lists remove-card", &e),

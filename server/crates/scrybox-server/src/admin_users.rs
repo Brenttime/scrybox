@@ -16,7 +16,7 @@
 //!   requireAdmin twin (`settings::admin_gate`); then handler. (Node's
 //!   statsCache.invalidateOnWrite sits on the bare '/api' mounts, BELOW
 //!   server.js's '/api/admin' mount — it never sees admin-surface writes;
-//!   the Rust on_proxied_write call is hygiene-only, see authorize().)
+//!   the Rust on_native_write call is hygiene-only, see authorize().)
 //!
 //! Deliberate deviations (same rulings as the settings/lists ports):
 //! - non-string username/password in POST and PUT reach a TypeError in
@@ -145,15 +145,15 @@ pub(crate) async fn authorize(
     st: &AppState,
     pool: &DbPool,
     headers: &HeaderMap,
-    method: &Method,
+    _method: &Method,
     is_get: bool,
-    path: &str,
+    _path: &str,
 ) -> Result<auth::AuthUser, Response> {
-    let headers = headers.clone();
-    let method = method.clone();
-    let user = authenticate(pool, &headers, is_get)?;
+    let user = authenticate(pool, headers, is_get)?;
     if !is_get {
-        crate::stats::on_proxied_write(st, &method, path, &headers);
+        // invalidateOnWrite twin: synchronous (a client reading /api/stats
+        // right after its admin write lands must see fresh numbers).
+        crate::stats::on_native_write(st, user.id);
     }
     if let Some(res) = admin_gate(&user) {
         return Err(res);

@@ -453,6 +453,23 @@ pub fn on_proxied_write(st: &AppState, method: &Method, path: &str, headers: &He
     });
 }
 
+/// statsCache.invalidateOnWrite twin for NATIVE write handlers (REVIEW
+/// writes L1 / concurrency-jobs L2). Node bumps the authenticated user's
+/// stats generation in the `/api` middleware — after authenticateToken,
+/// BEFORE the handler body — on every non-GET. Native handlers that own
+/// their auth call this right after their authenticate Ok-arm, which is the
+/// same moment: a client that reads /api/stats back after its write response
+/// lands always sees fresh numbers, closing the read-your-writes race the
+/// fire-and-forget proxied bump above cannot guarantee.
+pub fn on_native_write(st: &AppState, user_id: i64) {
+    // Same ownership guard as on_proxied_write: while the stats routes are
+    // Node's, this cache is never read and the bump is pointless work.
+    if !(st.owns("stats") || st.owns("stats_subs")) {
+        return;
+    }
+    st.stats_cache.bump(user_id);
+}
+
 // ---------------------------------------------------------------------------
 // JS numeric semantics (byte-parity traps; vectors in tests/stats.rs)
 // ---------------------------------------------------------------------------

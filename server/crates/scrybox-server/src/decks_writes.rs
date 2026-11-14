@@ -285,6 +285,9 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
         Ok(u) => u,
         Err(res) => return crate::collection_writes::node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
 
     if method == Method::PUT {
         put_deck(&pool, &id, user.id, &body)
@@ -320,6 +323,9 @@ pub async fn handle_card(
         Ok(u) => u,
         Err(res) => return crate::collection_writes::node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
 
     delete_deck_card(&pool, &id, &card_id, user.id)
 }
@@ -363,6 +369,9 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     create_deck(&pool, user.id, &body)
 }
 
@@ -528,6 +537,9 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     match add_card(&pool, &id, user.id, &body) {
         AddCard::Response(res) => res,
         AddCard::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
@@ -730,6 +742,9 @@ pub async fn handle_register(Path(id): Path<String>, State(st): State<AppState>,
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     register_deck(&pool, &id, user.id)
 }
 
@@ -905,6 +920,9 @@ pub async fn handle_checkout(Path(id): Path<String>, State(st): State<AppState>,
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     checkout_deck(&pool, &id, user.id).await
 }
 
@@ -1152,6 +1170,9 @@ pub async fn handle_return(Path(id): Path<String>, State(st): State<AppState>, r
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     return_deck(&pool, &id, user.id)
 }
 

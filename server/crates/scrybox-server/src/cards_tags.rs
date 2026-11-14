@@ -592,9 +592,13 @@ pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Respo
         BodyOutcome::Parsed(v) => v,
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    if let Err(res) = authenticate(&pool, token.as_deref(), false) {
-        return node_exact(res).await;
-    }
+    let user = match authenticate(&pool, token.as_deref(), false) {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     let ids = body_strings(&body, "ids");
     let slugs = body_strings(&body, "slugs");
     if ids.is_empty() || slugs.is_empty() || ids.len() > 1000 || slugs.len() > 100 {
@@ -784,9 +788,13 @@ pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Respo
         BodyOutcome::Parsed(v) => v,
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    if let Err(res) = authenticate(&pool, token.as_deref(), false) {
-        return node_exact(res).await;
-    }
+    let user = match authenticate(&pool, token.as_deref(), false) {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
+    // after auth, before the handler body (REVIEW-writes L1).
+    crate::stats::on_native_write(&st, user.id);
     let ids = body_strings(&body, "ids");
     if ids.is_empty() || ids.len() > 1000 {
         return json_error(StatusCode::BAD_REQUEST, "ids (1-1000) are required");

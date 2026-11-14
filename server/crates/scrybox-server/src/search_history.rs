@@ -369,6 +369,11 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         Err(res) => return res,
     };
     let user_id = user.id;
+    // statsCache.invalidateOnWrite twin: any authenticated non-GET/HEAD
+    // bumps the user's stats gen (Node's middleware condition).
+    if method != Method::GET && method != Method::HEAD {
+        crate::stats::on_native_write(&st, user_id);
+    }
 
     let result: Result<Value, (&'static str, String)> = match method {
         Method::GET => load(&pool, user_id)
