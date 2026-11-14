@@ -224,8 +224,11 @@ fn oracle_after_fetch(
 }
 
 pub async fn handle_oracle(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("cards_tags") {
+    if !st.owns("cards_tags") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != axum::http::Method::GET {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -468,8 +471,11 @@ fn oracle_tags_query(
 }
 
 pub async fn handle_oracle_tags(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("cards_tags") {
+    if !st.owns("cards_tags") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != axum::http::Method::GET {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -562,8 +568,11 @@ fn role_tags(conn: &rusqlite::Connection, ids: &[String], slugs: &[String]) -> R
 }
 
 pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::POST || !st.owns("cards_tags") {
+    if !st.owns("cards_tags") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != axum::http::Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -762,8 +771,11 @@ fn tag_stats(conn: &rusqlite::Connection, ids: &[String]) -> Result<Value, Strin
 }
 
 pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::POST || !st.owns("cards_tags") {
+    if !st.owns("cards_tags") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != axum::http::Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;

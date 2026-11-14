@@ -802,8 +802,11 @@ async fn replay_post(
 
 /// GET /api/export — routes/importExport.js GET /export.
 pub async fn route_export(State(st): State<AppState>, req: Request) -> Response {
-    if !st.owns("export") || req.method() != Method::GET {
+    if !st.owns("export") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::GET {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
@@ -836,11 +839,17 @@ pub async fn route_export(State(st): State<AppState>, req: Request) -> Response 
         // object format would crash the same way.
         match &fmt_val {
             QsVal::Array(_) | QsVal::Obj => {
+                if st.cfg.node_upstream.is_empty() {
+                    return node_crash_divergence("GET /api/export format array/object");
+                }
                 return replay_get(st, &headers, "/api/export", query).await
             }
             _ => {}
         }
     } else if matches!(eco_val, QsVal::Array(_) | QsVal::Obj) {
+        if st.cfg.node_upstream.is_empty() {
+            return node_crash_divergence("GET /api/export ecosystem array/object");
+        }
         return replay_get(st, &headers, "/api/export", query).await;
     }
     let target_format = if eco_selected {
@@ -872,7 +881,9 @@ pub async fn route_export(State(st): State<AppState>, req: Request) -> Response 
     {
         Ok(Ok(rows)) => rows,
         // Node's catch answers {error:'Export failed', message:<sqlite
-        // text>}; the text is driver-specific → Node itself answers.
+        // text>}; hybrid lets Node author it, standalone synthesizes it.
+        Ok(Err(e)) if st.cfg.node_upstream.is_empty() => return export_failed(&node_sqlite_message(&e)),
+        Err(_) if st.cfg.node_upstream.is_empty() => return crate::collection_writes::internal_error(),
         _ => return replay_get(st, &headers, "/api/export", query).await,
     };
     send_export(&headers, &rows, is_json, &target_format, "scrybox_collection")
@@ -885,8 +896,11 @@ pub async fn route_export(State(st): State<AppState>, req: Request) -> Response 
 /// POST /api/export — routes/importExport.js POST /export. normalJson is
 //  mounted above the auth gate, so body outcomes answer BEFORE auth.
 pub async fn route_export_post(State(st): State<AppState>, req: Request) -> Response {
-    if !st.owns("export") || req.method() != Method::POST {
+    if !st.owns("export") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
@@ -954,6 +968,8 @@ pub async fn route_export_post(State(st): State<AppState>, req: Request) -> Resp
     .await
     {
         Ok(Ok(rows)) => rows,
+        Ok(Err(e)) if st.cfg.node_upstream.is_empty() => return export_failed(&node_sqlite_message(&e)),
+        Err(_) if st.cfg.node_upstream.is_empty() => return crate::collection_writes::internal_error(),
         _ => return replay_post(st, &headers, "/api/export", &body_req).await,
     };
     send_export(&headers, &rows, is_json, &target_format, "scrybox_view")
@@ -1024,8 +1040,11 @@ fn strip_outer_quotes(s: &str) -> String {
 /// POST /api/import — routes/importExport.js POST /import. bigJson mounts
 /// AFTER the auth gate (server.js), so auth answers before body parsing.
 pub async fn route_import(State(st): State<AppState>, req: Request) -> Response {
-    if !st.owns("export") || req.method() != Method::POST {
+    if !st.owns("export") {
         return crate::proxy(State(st), req).await;
+    }
+    if req.method() != Method::POST {
+        return crate::collection_writes::unowned(st, req, false).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
@@ -1063,7 +1082,13 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     let raw_items: Vec<Value> = if is_json_mode {
         let parsed = match &data {
             Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
-                // V8's JSON.parse failure text is unreproducible → Node.
+                // V8's JSON.parse failure text: hybrid lets Node author
+                // it; standalone synthesizes the V8 (Node 22) message.
+                Err(_) if st.cfg.node_upstream.is_empty() => {
+                    let msg = v8_json_parse_error(s)
+                        .unwrap_or_else(|| "Unexpected end of JSON input".into());
+                    return import_failed(&msg);
+                }
                 Err(_) => return replay_post(st, &headers, "/api/import", &body_req).await,
                 Ok(v) => v,
             },
@@ -1169,7 +1194,10 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
         // node-sqlite3 rejects object/array/boolean binds at the probe too
         // (reject → outer catch → 500 driver text); nothing has been
         // written yet — Node answers those.
-        if matches!(supplied, Value::Object(_) | Value::Array(_) | Value::Bool(_)) {
+        // node-sqlite3 6.x actually binds them ('[object Object]' text,
+        // bools 0/1 — see node_bind); standalone runs that natively.
+        let standalone = st.cfg.node_upstream.is_empty();
+        if !standalone && matches!(supplied, Value::Object(_) | Value::Array(_) | Value::Bool(_)) {
             return replay_post(st, &headers, "/api/import", &body_req).await;
         }
         let lookup_present = truthy(&supplied);
@@ -1180,16 +1208,17 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
             let sid = supplied.clone();
             let got = tokio::task::spawn_blocking(move || -> Result<Option<Map<String, Value>>, rusqlite::Error> {
                 let conn = db.get()?;
-                rows_map(&conn, "SELECT id FROM card_cache WHERE id = ?", &[json_to_sql_value(&sid)])
+                let bind = if standalone { node_bind(&sid) } else { json_to_sql_value(&sid) };
+                rows_map(&conn, "SELECT id FROM card_cache WHERE id = ?", &[bind])
                     .map(|mut r| r.pop())
             })
-            .await
-            .map_err(|_| ())
-            .and_then(|r| r.map_err(|_| ()));
+            .await;
             match got {
-                Ok(row) => cached = row,
+                Ok(Ok(row)) => cached = row,
                 // node-sqlite3 rejects → outer catch → 500 with driver text.
-                Err(()) => return replay_post(st, &headers, "/api/import", &body_req).await,
+                Ok(Err(e)) if standalone => return import_failed(&node_sqlite_message(&e)),
+                Err(_) if standalone => return crate::collection_writes::internal_error(),
+                _ => return replay_post(st, &headers, "/api/import", &body_req).await,
             }
         }
         if let Some(c) = &cached {
@@ -1224,7 +1253,9 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
 
         let bulk = match bulk_fetch_by_identifier(&st, std::slice::from_ref(&lookup)).await {
             Ok(b) => b,
-            // axios/scry client failure text is client-specific → Node.
+            // axios/scry client failure text: Node authors it in hybrid;
+            // standalone synthesizes axios' message.
+            Err(e) if standalone => return import_failed(&axios_message(&e)),
             Err(_) => return replay_post(st, &headers, "/api/import", &body_req).await,
         };
         let matched = bulk.pairs.first().map(|(_, c)| c.clone());
@@ -1273,7 +1304,13 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     // ("Invalid data type") and the whole request 500s with driver text →
     // Node answers those; non-finite numbers ride the same forward (Node
     // binds Infinity/NaN as REAL, the driver text for rejects differs).
+    let standalone = st.cfg.node_upstream.is_empty();
     for (item, card_id) in &prepared {
+        if standalone {
+            // Standalone binds exactly like node-sqlite3 (node_bind); a
+            // JSON body can never carry a non-finite number.
+            break;
+        }
         let binds = [
             card_id.clone(),
             orf(item, &["quantity"], Value::from(1)),
@@ -1301,9 +1338,11 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     let db = pool.clone();
     let uid = user.id;
     let cards: Vec<Map<String, Value>> = authoritative.into_iter().map(|(_, c)| c).collect();
+    let bindf: fn(&Value) -> SqlValue = if standalone { node_bind } else { json_to_sql_value };
     let rows: Vec<Vec<SqlValue>> = prepared
         .iter()
         .map(|(item, card_id)| {
+            let json_to_sql_value = bindf;
             vec![
                 json_to_sql_value(card_id),
                 json_to_sql_value(&orf(item, &["quantity"], Value::from(1))),
@@ -1323,7 +1362,14 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     .await;
     if !matches!(tx_ok, Ok(Ok(()))) {
         // Node's withTransaction rolls back and the catch 500s with the
-        // sqlite3 error text — nothing persisted, let Node answer for real.
+        // sqlite3 error text — nothing persisted. Hybrid: Node answers for
+        // real; standalone synthesizes node-sqlite3's message.
+        if standalone {
+            return match tx_ok {
+                Ok(Err(msg)) => import_failed(&msg),
+                _ => crate::collection_writes::internal_error(),
+            };
+        }
         return replay_post(st, &headers, "/api/import", &body_req).await;
     }
 
@@ -1357,9 +1403,9 @@ fn import_transaction(
     cards: &[Map<String, Value>],
     rows: &[Vec<SqlValue>],
     after_begin: Option<&dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>>,
-) -> Result<(), ()> {
-    let conn = db.get().map_err(|_| ())?;
-    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION").map_err(|_| ())?;
+) -> Result<(), String> {
+    let conn = db.get().map_err(|e| format!("SQLITE_ERROR: {e}"))?;
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION").map_err(|e| node_sqlite_message(&e))?;
     let result = (|| -> rusqlite::Result<()> {
         if let Some(f) = after_begin {
             f(&conn)?;
@@ -1376,14 +1422,14 @@ fn import_transaction(
     match result {
         Ok(()) => match conn.execute_batch("COMMIT") {
             Ok(()) => Ok(()),
-            Err(_) => {
+            Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
-                Err(())
+                Err(node_sqlite_message(&e))
             }
         },
-        Err(_) => {
+        Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
-            Err(())
+            Err(node_sqlite_message(&e))
         }
     }
 }
@@ -1403,6 +1449,322 @@ fn rejected_row(index: usize, reason: &str) -> Value {
     Value::Object(m)
 }
 
+// ---------------------------------------------------------------------------
+// Standalone (no Node upstream) error-text twins
+// ---------------------------------------------------------------------------
+
+/// node-sqlite3's `err.message`: `${codeName}: ${sqlite3_errmsg}` with the
+/// PRIMARY result-code name (extended codes are not enabled by node-sqlite3).
+pub(crate) fn node_sqlite_message(e: &rusqlite::Error) -> String {
+    const NAMES: [&str; 27] = [
+        "SQLITE_OK", "SQLITE_ERROR", "SQLITE_INTERNAL", "SQLITE_PERM", "SQLITE_ABORT",
+        "SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_NOMEM", "SQLITE_READONLY", "SQLITE_INTERRUPT",
+        "SQLITE_IOERR", "SQLITE_CORRUPT", "SQLITE_NOTFOUND", "SQLITE_FULL", "SQLITE_CANTOPEN",
+        "SQLITE_PROTOCOL", "SQLITE_EMPTY", "SQLITE_SCHEMA", "SQLITE_TOOBIG", "SQLITE_CONSTRAINT",
+        "SQLITE_MISMATCH", "SQLITE_MISUSE", "SQLITE_NOLFS", "SQLITE_AUTH", "SQLITE_FORMAT",
+        "SQLITE_RANGE", "SQLITE_NOTADB",
+    ];
+    match e {
+        rusqlite::Error::SqliteFailure(f, msg) => {
+            let primary = (f.extended_code & 0xff) as usize;
+            let name = NAMES.get(primary).copied().unwrap_or("SQLITE_ERROR");
+            let text = match msg {
+                Some(m) => m.clone(),
+                None => unsafe {
+                    std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_errstr(f.extended_code))
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            };
+            format!("{name}: {text}")
+        }
+        other => format!("SQLITE_ERROR: {other}"),
+    }
+}
+
+/// node-sqlite3 6.x parameter binding for a JSON-derived JS value: objects
+/// and arrays bind as `String(v)` = '[object Object]' text (verified on
+/// sqlite3 6.0.1), booleans as 0/1, int32 numbers as INTEGER, any other
+/// number as REAL.
+pub(crate) fn node_bind(v: &Value) -> SqlValue {
+    match v {
+        Value::Null => SqlValue::Null,
+        Value::Bool(b) => SqlValue::Integer(*b as i64),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) if i >= i32::MIN as i64 && i <= i32::MAX as i64 => SqlValue::Integer(i),
+            _ => SqlValue::Real(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Value::String(s) => SqlValue::Text(s.clone()),
+        Value::Object(_) | Value::Array(_) => SqlValue::Text("[object Object]".into()),
+    }
+}
+
+/// axios `error.message` for a failed Scryfall call (client timeout 6000).
+pub(crate) fn axios_message(err: &str) -> String {
+    // ScryError Display: "<status>: <detail>" for HTTP-status failures.
+    if let Some((code, _)) = err.split_once(": ") {
+        if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("Request failed with status code {code}");
+        }
+    }
+    let l = err.to_ascii_lowercase();
+    if l.contains("timed out") || l.contains("timeout") {
+        return "timeout of 6000ms exceeded".into();
+    }
+    err.to_string()
+}
+
+/// V8 (Node 22) `JSON.parse` SyntaxError message for `src`, or None when it
+/// parses. Mirrors V8's JsonParser error sites (positions/columns are UTF-16
+/// code units; `\r\n`, `\n` and lone `\r` each end a line).
+pub(crate) fn v8_json_parse_error(src: &str) -> Option<String> {
+    let u: Vec<u16> = src.encode_utf16().collect();
+    let mut p = JsonP { u: &u, i: 0 };
+    let r = (|| -> Result<(), JErr> {
+        p.value()?;
+        p.ws();
+        if p.i < u.len() {
+            return Err(JErr::At("Unexpected non-whitespace character after JSON", p.i));
+        }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => None,
+        Err(JErr::Eos) => Some("Unexpected end of JSON input".into()),
+        Err(JErr::At(msg, pos)) => {
+            let (mut line, mut col_start, mut k) = (1usize, 0usize, 0usize);
+            while k < pos.min(u.len()) {
+                if u[k] == 0x0a || (u[k] == 0x0d && u.get(k + 1) != Some(&0x0a)) {
+                    line += 1;
+                    col_start = k + 1;
+                }
+                k += 1;
+            }
+            Some(format!("{msg} at position {pos} (line {line} column {})", pos - col_start + 1))
+        }
+        Err(JErr::Token(pos)) if matches!(u.get(pos), Some(c) if *c == 0x2d || (0x30..=0x39).contains(c) || *c == 0x22) => {
+            // V8 classifies the offending char's token: NUMBER / STRING.
+            let what = if u[pos] == 0x22 { "string" } else { "number" };
+            let (mut line, mut col_start) = (1usize, 0usize);
+            for k in 0..pos {
+                if u[k] == 0x0a || (u[k] == 0x0d && u.get(k + 1) != Some(&0x0a)) {
+                    line += 1;
+                    col_start = k + 1;
+                }
+            }
+            Some(format!("Unexpected {what} in JSON at position {pos} (line {line} column {})", pos - col_start + 1))
+        }
+        Err(JErr::Token(pos)) => {
+            let s = |a: usize, b: usize| String::from_utf16_lossy(&u[a..b.min(u.len())]);
+            let tok = s(pos, pos + 1);
+            let ctx = if u.len() <= 20 {
+                format!("\"{}\"", s(0, u.len()))
+            } else if pos < 10 {
+                format!("\"{}\"...", s(0, pos + 10))
+            } else if pos >= u.len() - 10 {
+                format!("...\"{}\"", s(pos - 10, u.len()))
+            } else {
+                format!("...\"{}\"...", s(pos - 10, pos + 10))
+            };
+            Some(format!("Unexpected token '{tok}', {ctx} is not valid JSON"))
+        }
+    }
+}
+
+enum JErr {
+    Eos,
+    At(&'static str, usize),
+    Token(usize),
+}
+
+struct JsonP<'a> {
+    u: &'a [u16],
+    i: usize,
+}
+
+impl JsonP<'_> {
+    fn ws(&mut self) {
+        while let Some(&c) = self.u.get(self.i) {
+            if c == 0x20 || c == 0x09 || c == 0x0a || c == 0x0d {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    fn peek(&self) -> Option<u16> {
+        self.u.get(self.i).copied()
+    }
+    fn digits(&mut self) -> usize {
+        let s = self.i;
+        while matches!(self.peek(), Some(c) if (0x30..=0x39).contains(&c)) {
+            self.i += 1;
+        }
+        self.i - s
+    }
+    fn value(&mut self) -> Result<(), JErr> {
+        self.ws();
+        let Some(c) = self.peek() else { return Err(JErr::Eos) };
+        match c {
+            0x22 => self.string(),
+            0x7b => {
+                self.i += 1;
+                self.ws();
+                if self.peek() == Some(0x7d) {
+                    self.i += 1;
+                    return Ok(());
+                }
+                let mut first = true;
+                loop {
+                    if self.peek() != Some(0x22) {
+                        return Err(JErr::At(
+                            if first { "Expected property name or '}' in JSON" } else { "Expected double-quoted property name in JSON" },
+                            self.i,
+                        ));
+                    }
+                    first = false;
+                    self.string()?;
+                    self.ws();
+                    if self.peek() != Some(0x3a) {
+                        return Err(JErr::At("Expected ':' after property name in JSON", self.i));
+                    }
+                    self.i += 1;
+                    self.value()?;
+                    self.ws();
+                    match self.peek() {
+                        Some(0x2c) => {
+                            self.i += 1;
+                            self.ws();
+                        }
+                        Some(0x7d) => {
+                            self.i += 1;
+                            return Ok(());
+                        }
+                        _ => return Err(JErr::At("Expected ',' or '}' after property value in JSON", self.i)),
+                    }
+                }
+            }
+            0x5b => {
+                self.i += 1;
+                self.ws();
+                if self.peek() == Some(0x5d) {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.value()?;
+                    self.ws();
+                    match self.peek() {
+                        Some(0x2c) => self.i += 1,
+                        Some(0x5d) => {
+                            self.i += 1;
+                            return Ok(());
+                        }
+                        _ => return Err(JErr::At("Expected ',' or ']' after array element in JSON", self.i)),
+                    }
+                }
+            }
+            0x2d | 0x30..=0x39 => {
+                if c == 0x2d {
+                    self.i += 1;
+                    if !matches!(self.peek(), Some(d) if (0x30..=0x39).contains(&d)) {
+                        return Err(JErr::At("No number after minus sign in JSON", self.i));
+                    }
+                }
+                if self.peek() == Some(0x30) {
+                    self.i += 1;
+                    if matches!(self.peek(), Some(d) if (0x30..=0x39).contains(&d)) {
+                        return Err(JErr::At("Unexpected number in JSON", self.i));
+                    }
+                } else {
+                    self.digits();
+                }
+                if self.peek() == Some(0x2e) {
+                    self.i += 1;
+                    if self.digits() == 0 {
+                        return Err(JErr::At("Unterminated fractional number in JSON", self.i));
+                    }
+                }
+                if matches!(self.peek(), Some(0x65) | Some(0x45)) {
+                    self.i += 1;
+                    if matches!(self.peek(), Some(0x2b) | Some(0x2d)) {
+                        self.i += 1;
+                    }
+                    if self.digits() == 0 {
+                        return Err(JErr::At("Exponent part is missing a number in JSON", self.i));
+                    }
+                }
+                Ok(())
+            }
+            0x74 | 0x66 | 0x6e => {
+                let lit: &[u8] = match c {
+                    0x74 => b"true",
+                    0x66 => b"false",
+                    _ => b"null",
+                };
+                for &b in lit {
+                    match self.peek() {
+                        None => return Err(JErr::Eos),
+                        Some(x) if x == b as u16 => self.i += 1,
+                        Some(_) => return Err(JErr::Token(self.i)),
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(JErr::Token(self.i)),
+        }
+    }
+    fn string(&mut self) -> Result<(), JErr> {
+        self.i += 1;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(JErr::At("Unterminated string in JSON", self.i));
+            };
+            match c {
+                0x22 => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                0x5c => {
+                    self.i += 1;
+                    let Some(e) = self.peek() else { return Err(JErr::Eos) };
+                    match e {
+                        0x22 | 0x5c | 0x2f | 0x62 | 0x66 | 0x6e | 0x72 | 0x74 => self.i += 1,
+                        0x75 => {
+                            self.i += 1;
+                            for _ in 0..4 {
+                                match self.peek() {
+                                    Some(h) if (h as u8 as u16 == h) && (h as u8).is_ascii_hexdigit() => self.i += 1,
+                                    _ => return Err(JErr::At("Bad Unicode escape in JSON", self.i)),
+                                }
+                            }
+                        }
+                        _ => return Err(JErr::At("Bad escaped character in JSON", self.i)),
+                    }
+                }
+                c if c < 0x20 => return Err(JErr::At("Bad control character in string literal in JSON", self.i)),
+                _ => self.i += 1,
+            }
+        }
+    }
+}
+
+/// Node's handler throws OUTSIDE its try (async → unhandled rejection →
+/// launch.js exits the process; the client sees a dropped connection). No
+/// Node bytes exist to copy; standalone answers the generic error-handler
+/// body instead of a dead-upstream 502 (documented divergence).
+fn node_crash_divergence(what: &str) -> Response {
+    tracing::warn!("{what}: Node would crash here (unhandled rejection); answering 500");
+    crate::collection_writes::internal_error()
+}
+
+fn export_failed(message: &str) -> Response {
+    let mut m = Map::new();
+    m.insert("error".into(), Value::String("Export failed".into()));
+    m.insert("message".into(), Value::String(message.to_string()));
+    crate::precons::json_response(StatusCode::INTERNAL_SERVER_ERROR, &m)
+}
+
 fn import_failed(message: &str) -> Response {
     let mut m = Map::new();
     m.insert("error".into(), Value::String("Import failed".into()));
@@ -1413,6 +1775,37 @@ fn import_failed(message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Standalone JSON.parse text twin, checked against real Node 22 output
+    /// (tests/fixtures/v8_json_parse_errors.json: curated + 400 fuzz rows).
+    #[test]
+    fn v8_json_parse_error_matches_node22() {
+        let rows: Vec<(String, Option<String>)> =
+            serde_json::from_str(include_str!("../tests/fixtures/v8_json_parse_errors.json")).unwrap();
+        let mut bad = Vec::new();
+        for (src, want) in &rows {
+            let got = v8_json_parse_error(src);
+            if &got != want {
+                bad.push(format!("{src:?}\n   node: {want:?}\n   rust: {got:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{} of {} mismatch:\n{}", bad.len(), rows.len(), bad.join("\n"));
+    }
+
+    #[test]
+    fn node_sqlite_message_and_bind_twins() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        let e = c.execute("SELECT * FROM nope", []).unwrap_err();
+        assert_eq!(node_sqlite_message(&e), "SQLITE_ERROR: no such table: nope");
+        c.execute_batch("CREATE TABLE t(a NOT NULL)").unwrap();
+        let e = c.execute("INSERT INTO t VALUES (NULL)", []).unwrap_err();
+        assert_eq!(node_sqlite_message(&e), "SQLITE_CONSTRAINT: NOT NULL constraint failed: t.a");
+        assert_eq!(node_bind(&serde_json::json!({"a":1})), SqlValue::Text("[object Object]".into()));
+        assert_eq!(node_bind(&serde_json::json!([1, 2])), SqlValue::Text("[object Object]".into()));
+        assert_eq!(node_bind(&serde_json::json!(true)), SqlValue::Integer(1));
+        assert_eq!(node_bind(&serde_json::json!(5_000_000_000i64)), SqlValue::Real(5e9));
+        assert_eq!(axios_message("500: http://x/cards/collection -> 500"), "Request failed with status code 500");
+    }
 
     fn m(pairs: &[(&str, Value)]) -> Map<String, Value> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
