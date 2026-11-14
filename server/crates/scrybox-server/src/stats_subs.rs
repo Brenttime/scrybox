@@ -18,7 +18,10 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use axum::{
@@ -273,9 +276,119 @@ struct HistCard {
     prices: Vec<f64>,
 }
 
-fn hist_store() -> &'static Mutex<HashMap<i64, (String, Arc<Vec<HistCard>>)>> {
-    static STORE: OnceLock<Mutex<HashMap<i64, (String, Arc<Vec<HistCard>>)>>> = OnceLock::new();
+/// Flat SoA view of a user's decoded history cards (review/memory-evidence
+/// MEMORY.md #6). The per-card shape (Vec<Addition> + 3 heap Vecs per card)
+/// kept ~4 allocations per card alive for the life of the store; this packs
+/// every field into one Vec<f64> with per-card end offsets, so a user's
+/// whole history is 7 allocations regardless of card count. history_totals
+/// walks these slices in exactly the iteration order the old per-card Vecs
+/// had — float accumulation order (and therefore the response bytes, Gate
+/// A) is unchanged.
+struct HistCards {
+    /// Per-card exclusive end offsets into the add_* arrays (len = ncards).
+    add_end: Vec<u32>,
+    /// Per-card exclusive end offsets into the hist_* arrays (len = ncards).
+    hist_end: Vec<u32>,
+    add_time: Vec<f64>,
+    add_qty: Vec<f64>,
+    add_val: Vec<f64>,
+    hist_time: Vec<f64>,
+    hist_price: Vec<f64>,
+}
+
+impl HistCards {
+    fn from_cards(cards: &[HistCard]) -> HistCards {
+        let n_add: usize = cards.iter().map(|c| c.additions.len()).sum();
+        let n_hist: usize = cards.iter().map(|c| c.times.len()).sum();
+        let mut out = HistCards {
+            add_end: Vec::with_capacity(cards.len()),
+            hist_end: Vec::with_capacity(cards.len()),
+            add_time: Vec::with_capacity(n_add),
+            add_qty: Vec::with_capacity(n_add),
+            add_val: Vec::with_capacity(n_add),
+            hist_time: Vec::with_capacity(n_hist),
+            hist_price: Vec::with_capacity(n_hist),
+        };
+        for c in cards {
+            for a in &c.additions {
+                out.add_time.push(a.time);
+                out.add_qty.push(a.quantity);
+                out.add_val.push(a.current_value);
+            }
+            out.add_end.push(out.add_time.len() as u32);
+            out.hist_time.extend(c.times.iter().copied());
+            out.hist_price.extend(c.prices.iter().copied());
+            out.hist_end.push(out.hist_time.len() as u32);
+        }
+        out
+    }
+
+    fn ncards(&self) -> usize {
+        self.add_end.len()
+    }
+
+    /// (start, end) slice bounds of card `i`'s additions in the add_* arrays.
+    fn add_range(&self, i: usize) -> (usize, usize) {
+        let start = if i == 0 { 0 } else { self.add_end[i - 1] as usize };
+        (start, self.add_end[i] as usize)
+    }
+
+    fn hist_range(&self, i: usize) -> (usize, usize) {
+        let start = if i == 0 { 0 } else { self.hist_end[i - 1] as usize };
+        (start, self.hist_end[i] as usize)
+    }
+}
+
+/// Memory queue item 4 (MEMORY.md #6, ranked 6, Lane A): the store is now an
+/// LRU bounded to the last HIST_USERS_KEPT users touched instead of retaining
+/// one card-set per user forever. 2 = the owner's ruling ("current user/LRU
+/// 2"); pinned by hist_store_lru_tests (BRIEF: owner-set bounds need guards).
+const HIST_USERS_KEPT: usize = 2;
+
+struct HistEntry {
+    revision: Option<String>,
+    cards: Arc<HistCards>,
+    /// Monotonic touch tick — the LRU recency key (the store holds at most
+    /// HIST_USERS_KEPT entries, so the linear victim scan is free).
+    last_use: u64,
+}
+
+fn hist_tick() -> u64 {
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    TICK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn hist_store() -> &'static Mutex<HashMap<i64, HistEntry>> {
+    static STORE: OnceLock<Mutex<HashMap<i64, HistEntry>>> = OnceLock::new();
     STORE.get_or_init(Default::default)
+}
+
+/// Revision-matched hit (Node's `if (cached && cached.revision ===
+/// dataRevision)`): no revision yet ⇒ miss, exactly the old `Some(rev)`
+/// requirement; refreshes the entry's LRU recency on hit.
+fn hist_get(user_id: i64, revision: Option<&String>) -> Option<Arc<HistCards>> {
+    let rev = revision?;
+    let mut store = hist_store().guard();
+    let e = store.get_mut(&user_id)?;
+    if e.revision.as_deref() != Some(rev.as_str()) {
+        return None;
+    }
+    e.last_use = hist_tick();
+    Some(Arc::clone(&e.cards))
+}
+
+fn hist_put(user_id: i64, revision: Option<String>, cards: Arc<HistCards>) {
+    let mut store = hist_store().guard();
+    store.insert(user_id, HistEntry { revision, cards, last_use: hist_tick() });
+    while store.len() > HIST_USERS_KEPT {
+        let victim = store.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k);
+        match victim {
+            Some(k) => {
+                store.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 fn load_history_cards(pool: &DbPool, user_id: i64) -> Result<Vec<HistCard>, String> {
@@ -349,22 +462,20 @@ fn history_cards(
     pool: &DbPool,
     user_id: i64,
     allow_cache: bool,
-) -> Result<Arc<Vec<HistCard>>, String> {
+) -> Result<Arc<HistCards>, String> {
     let rev = StatsCache::revision(pool);
     if allow_cache {
-        if let (Some(rev), Some(hit)) = (rev.as_ref(), hist_store().guard().get(&user_id)) {
-            if &hit.0 == rev {
-                return Ok(Arc::clone(&hit.1));
-            }
+        if let Some(hit) = hist_get(user_id, rev.as_ref()) {
+            return Ok(hit);
         }
     }
-    let cards = Arc::new(load_history_cards(pool, user_id)?);
+    let cards = Arc::new(HistCards::from_cards(&load_history_cards(pool, user_id)?));
     // Node only stores when nothing moved while loading (a racing write must
     // not pin pre-write rows under the post-write revision).
     if allow_cache {
         if let (Some(rev), Some(after)) = (rev.as_ref(), StatsCache::revision(pool)) {
             if after == *rev {
-                hist_store().guard().insert(user_id, (rev.clone(), Arc::clone(&cards)));
+                hist_put(user_id, Some(rev.clone()), Arc::clone(&cards));
             }
         }
     }
@@ -377,33 +488,38 @@ fn history_cards(
 
 /// stats.js /stats/history sweep — pure over the decoded cards so the
 /// float-ordering is unit-testable against node-generated vectors.
-fn history_totals(cards: &[HistCard], now_ms: i64, style: Style) -> Vec<f64> {
+fn history_totals(cards: &HistCards, now_ms: i64, style: Style) -> Vec<f64> {
     let (count, step) = plan(style);
     let targets: Vec<f64> =
         (0..count).map(|i| (now_ms - (count as i64 - 1 - i as i64) * step) as f64).collect();
     let mut totals = vec![0f64; count];
-    for card in cards {
+    for ci in 0..cards.ncards() {
+        // SoA walk with per-card offsets — the index arithmetic is exactly
+        // the old card.additions[..]/card.times[..]/card.prices[..] order
+        // (same comparisons, same accumulation), so float order is identical.
+        let (a_start, a_end) = cards.add_range(ci);
+        let (h_start, h_end) = cards.hist_range(ci);
         let mut addition_index = 0usize;
         let mut owned_quantity = 0f64;
         let mut owned_current_value = 0f64;
         let mut history_index: i64 = -1;
         for (index, target) in targets.iter().enumerate() {
-            while addition_index < card.additions.len() && card.additions[addition_index].time <= *target {
-                owned_quantity += card.additions[addition_index].quantity;
-                owned_current_value += card.additions[addition_index].current_value;
+            while addition_index < a_end - a_start && cards.add_time[a_start + addition_index] <= *target {
+                owned_quantity += cards.add_qty[a_start + addition_index];
+                owned_current_value += cards.add_val[a_start + addition_index];
                 addition_index += 1;
             }
-            if card.times.is_empty() {
+            if h_end == h_start {
                 totals[index] += owned_current_value;
                 continue;
             }
-            while ((history_index + 1) as usize) < card.times.len() && card.times[(history_index + 1) as usize] <= *target {
+            while ((history_index + 1) as usize) < h_end - h_start && cards.hist_time[h_start + (history_index + 1) as usize] <= *target {
                 history_index += 1;
             }
             let price = if history_index >= 0 {
-                card.prices[history_index as usize]
+                cards.hist_price[h_start + history_index as usize]
             } else {
-                card.prices[0]
+                cards.hist_price[h_start]
             };
             totals[index] += owned_quantity * price;
         }
@@ -892,7 +1008,7 @@ mod stats_subs_tests {
                 &[(now as f64 - 28.5 * d, 0.25), (now as f64 - 0.5 * d, 1.75)],
             ),
         ];
-        let totals = history_totals(&cards, now, Style::MonthDay);
+        let totals = history_totals(&HistCards::from_cards(&cards), now, Style::MonthDay);
         // node-generated expected (script in iter-25 PROGRESS log).
         let expected: Vec<f64> = serde_json::from_str(
             r#"[10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10.5,10.5,13.5,13.5,13.5,13.5,13.5,13.5,13.5,13.5,14.5,16,19]"#,
@@ -911,7 +1027,7 @@ mod stats_subs_tests {
             &[(now as f64 - 40.0 * DAY_MS as f64, 2.0, 8.0)],
             &[(now as f64 - 1.0 * DAY_MS as f64, 3.0)],
         )];
-        let totals = history_totals(&cards, now, Style::MonthDay);
+        let totals = history_totals(&HistCards::from_cards(&cards), now, Style::MonthDay);
         // qty 2 added long ago; every target except possibly the last uses
         // prices[0]=3 → 6 per point. Target[29]=now > history time, still 3.
         assert!(totals.iter().all(|t| *t == 6.0), "{totals:?}");
@@ -1055,6 +1171,71 @@ mod stats_subs_tests {
         assert!(card.times[0] < card.times[1]);
         // Non-array element → Err (Node's destructuring TypeError → 500).
         assert!(decode_hist_card(Some("[[1,\"x\"],5]"), Some("[]")).is_err());
+    }
+
+    #[test]
+    fn hist_store_bounds_users_to_lru_two() {
+        // Memory queue item 4 (MEMORY.md #6): store is an LRU, not "forever".
+        // HIST_USERS_KEPT is the owner-set bound (BRIEF ruling 2026-11-13:
+        // "current user/LRU 2") — guard it per the BRIEF constants rule.
+        assert_eq!(HIST_USERS_KEPT, 2);
+        let cards = |n: f64| Arc::new(HistCards::from_cards(&[hcard(&[(n, 1.0, 1.0)], &[])]));
+        // Large negative ids: cannot collide with real user ids in-proc.
+        let u = |k: i64| -(k + 1_000_000);
+        hist_store().guard().retain(|k, _| *k != u(1) && *k != u(2) && *k != u(3));
+        hist_put(u(1), Some("r1".into()), cards(1.0));
+        hist_put(u(2), Some("r2".into()), cards(2.0));
+        // Touch u(1) ⇒ u(2) is the LRU victim when u(3) arrives.
+        assert!(hist_get(u(1), Some(&"r1".to_string())).is_some(), "revision match must hit");
+        hist_put(u(3), Some("r3".into()), cards(3.0));
+        {
+            let store = hist_store().guard();
+            assert_eq!(store.len(), HIST_USERS_KEPT, "store must not exceed the LRU bound");
+            assert!(store.contains_key(&u(1)) && store.contains_key(&u(3)));
+            assert!(!store.contains_key(&u(2)), "least-recently-touched user must be evicted");
+        }
+        // Node's cached.revision === dataRevision: mismatch ⇒ miss, and no
+        // revision yet ⇒ miss (old `Some(rev)` requirement).
+        assert!(hist_get(u(3), Some(&"other".to_string())).is_none());
+        assert!(hist_get(u(3), None).is_none());
+        // A failed hit must not refresh recency: u(4) is oldest, u(5) is a
+        // fresh miss, u(6) is newest; a miss-lookup of u(4) that wrongly
+        // touched it would evict u(5) instead of u(4).
+        hist_store().guard().retain(|k, _| *k != u(4) && *k != u(5) && *k != u(6));
+        hist_put(u(4), Some("r4".into()), cards(5.0));
+        hist_put(u(5), Some("r5".into()), cards(6.0));
+        assert!(hist_get(u(4), Some(&"stale".to_string())).is_none());
+        hist_put(u(6), Some("r6".into()), cards(7.0));
+        {
+            let store = hist_store().guard();
+            assert_eq!(store.len(), HIST_USERS_KEPT);
+            assert!(store.contains_key(&u(5)) && store.contains_key(&u(6)));
+            assert!(!store.contains_key(&u(4)), "failed-hit lookup must not refresh recency");
+        }
+        hist_store().guard().retain(|k, _| *k != u(1) && *k != u(2) && *k != u(3) && *k != u(4) && *k != u(5) && *k != u(6));
+    }
+
+    #[test]
+    fn hist_cards_soa_offsets_are_exact() {
+        // Per-card offsets into the flat arrays, including empty-card
+        // boundaries (a card with no additions/history keeps its slot — the
+        // loader may push those rows and the sweep must still see ncards).
+        let soa = HistCards::from_cards(&[
+            hcard(&[(1.0, 1.0, 1.0), (2.0, 1.0, 1.0)], &[(1.0, 5.0)]),
+            hcard(&[], &[]),
+            hcard(&[(3.0, 2.0, 2.0)], &[(2.0, 6.0), (3.0, 7.0)]),
+        ]);
+        assert_eq!(soa.ncards(), 3);
+        assert_eq!(soa.add_range(0), (0, 2));
+        assert_eq!(soa.add_range(1), (2, 2));
+        assert_eq!(soa.add_range(2), (2, 3));
+        assert_eq!(soa.hist_range(0), (0, 1));
+        assert_eq!(soa.hist_range(1), (1, 1));
+        assert_eq!(soa.hist_range(2), (1, 3));
+        assert_eq!(soa.add_time, vec![1.0, 2.0, 3.0]);
+        assert_eq!(soa.add_qty, vec![1.0, 1.0, 2.0]);
+        assert_eq!(soa.add_val, vec![1.0, 1.0, 2.0]);
+        assert_eq!(soa.hist_price, vec![5.0, 6.0, 7.0]);
     }
 
     #[test]
