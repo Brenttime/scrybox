@@ -635,7 +635,7 @@ async fn names_page(st: &crate::AppState, base: &str, q: &str, page: i64, multil
 /// langSearch's non-English scoping (` lang:xx` keyword + the
 /// include_multilingual parameter — the engine ignores a bare `lang` URL
 /// param, which is why the keyword form is load-bearing).
-pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &str, lang_code: &str, walk_limit: i64) -> Result<NamesWalk, NamesWalkErr> {
+pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &str, lang_code: &str, walk_limit: i64, by_printing: bool) -> Result<NamesWalk, NamesWalkErr> {
     let non_en = lang_code != "en";
     let scoped = if non_en { format!("{walk_q} lang:{lang_code}") } else { walk_q.to_string() };
     let mut page = 1i64;
@@ -660,6 +660,20 @@ pub async fn walk_collection_names(st: &crate::AppState, base: &str, walk_q: &st
         }
         out_len += p.data.len() as i64;
         for raw in &p.data {
+            if by_printing {
+                // runWalk: `if (raw.id) names.add(`mtg-${raw.id}`)`.
+                if let Some(id) = raw.get("id").filter(|v| crate::collection::truthy(v)) {
+                    let id = match id {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let k = format!("mtg-{id}");
+                    if seen.insert(k.clone()) {
+                        names.push(k);
+                    }
+                }
+                continue;
+            }
             // String(raw.name || ''): falsy (absent, null, false, 0, '') →
             // ''; a number stringifies, anything else object/bool text.
             let full = match raw.get("name") {

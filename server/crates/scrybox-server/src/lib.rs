@@ -39,6 +39,7 @@ pub mod card_art;
 pub mod cards_tags;
 pub mod catalog_read;
 pub mod collq;
+pub mod scryq;
 pub mod cvscan;
 pub mod ip_limit;
 pub mod oidc;

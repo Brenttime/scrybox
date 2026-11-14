@@ -129,7 +129,7 @@ async fn standalone_raw_q_internet_search_is_native() {
     assert_eq!(hd["x-total-count"], "2");
     assert_eq!(hd["x-source"], "scryfall");
     // Verbatim (parser-rejected subset) upstream query, English unscoped.
-    assert_eq!(h.hits.lock().unwrap()[0], "!\"Lightning Bolt\" unique:prints");
+    assert_eq!(h.hits.lock().unwrap()[0], "!\"lightning bolt\" unique:prints", "toScryfall(ast): Node lowercases name leaves");
     // cacheCards wrote the printings.
     let n: i64 = Connection::open(&h.db)
         .unwrap()
