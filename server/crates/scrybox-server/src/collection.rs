@@ -839,6 +839,17 @@ fn store_max_bytes() -> u64 {
         .unwrap_or(STORE_MAX_BYTES_DEFAULT)
 }
 
+/// Review M4 (memory design): bodies at least this large are cached in ONE
+/// encoding — the gzip copy — instead of raw + lazy gz. The full-collection
+/// shape is ~27 MB raw / ~3 MB gz, so the double copy cost ~30 MB per cached
+/// shape while every realistic client (and the bench) asks for gzip.
+/// Identity-encoded requests re-inflate on demand (deterministic: the bytes
+/// are identical; the Express-default ETag is computed over raw at build).
+/// Below the threshold entries keep raw + lazy gz: a lazy compress costs
+/// ~1 ms for small shapes, and pre-compressing every cheap paged shape would
+/// charge the (bench-critical) first-hit latency for no real memory win.
+const SINGLE_ENC_MIN_BYTES: u64 = 4 << 20; // 4 MiB
+
 /// Freed bytes (pruned/evicted) in one `put` before the refresher tick is
 /// asked to return heap to the OS (`malloc_trim`). Small churn is left for
 /// the allocator to reuse; the refresher swaps this flag off the request
@@ -912,14 +923,23 @@ fn slot_key(key: &str, rp: RevPair) -> String {
 pub struct CacheEntry {
     rev: i64,
     deck_rev: i64,
-    raw: Bytes,
+    /// Raw JSON body. Large shapes (>= `CollectionCache::single_enc_min`)
+    /// store ONLY the gzip copy (review M4) and keep this `None` — identity
+    /// clients re-inflate on demand via [`CacheEntry::raw_body`].
+    raw: Option<Bytes>,
+    /// Uncompressed body length, retained even when `raw` is dropped: the
+    /// 1 KB compression threshold and the identity-encode path need it.
+    raw_len: usize,
     total: Option<u64>,
-    /// Express-default body ETag, computed once with the body.
+    /// Express-default body ETag, computed once with the body (over RAW —
+    /// stable regardless of which encoding is stored).
     etag: String,
-    /// gzip is filled lazily on the first gzip-demanding hit. Node pays for
-    /// compression inside each response that asks for it; precomputing at
-    /// build time charged ~300 ms per rebuild even on clients (and the bench)
-    /// that never send Accept-Encoding.
+    /// gzip is filled lazily on the first gzip-demanding hit for small
+    /// shapes; large shapes have it pre-filled at `put` (single-encoding,
+    /// review M4). Node pays for compression inside each response that asks
+    /// for it; precomputing small shapes at build time charged ~300 ms per
+    /// rebuild even on clients (and the bench) that never send
+    /// Accept-Encoding.
     gz: OnceCell<Bytes>,
     /// Monotonic LRU clock value: stamped at `put`, refreshed on every cache
     /// hit in `get`. Eviction under `STORE_MAX_BYTES` drops the smallest.
@@ -927,10 +947,63 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
-    /// Heap held by this entry (raw + gz if it was ever built).
+    /// Heap held by this entry: whichever encoding(s) are actually stored
+    /// (small shapes: raw + lazily-built gz; large shapes: gz only, M4).
     fn bytes(&self) -> u64 {
-        self.raw.len() as u64 + self.gz.get().map_or(0, |g| g.len() as u64)
+        self.raw.as_ref().map_or(0, |r| r.len() as u64)
+            + self.gz.get().map_or(0, |g| g.len() as u64)
     }
+
+    /// Body for an identity-encoded client: the stored raw copy, or — for
+    /// gz-only (M4) entries — a fresh inflate of the stored gzip. Inflating
+    /// is deterministic, so the bytes are identical and the Express-default
+    /// ETag (computed over raw at build) stays valid.
+    async fn raw_body(&self) -> Result<Bytes, String> {
+        if let Some(r) = &self.raw {
+            return Ok(r.clone());
+        }
+        let gz = self
+            .gz
+            .get()
+            .cloned()
+            .ok_or_else(|| "gz-only entry has no gz (put invariant broken)".to_string())?;
+        tokio::task::spawn_blocking(move || {
+            gunzip_bytes(&gz).map(Bytes::from).map_err(|e| format!("gunzip: {e}"))
+        })
+        .await
+        .map_err(|e| format!("gunzip task panicked: {e}"))?
+    }
+
+    /// Body for a gzip-encoded client: the stored gzip copy when present,
+    /// else the lazy parallel compress of raw (coalesced through the
+    /// OnceCell, as before).
+    async fn gz_body(&self) -> Result<Bytes, String> {
+        let raw = self.raw.clone();
+        self.gz
+            .get_or_try_init(move || async move {
+                let raw = raw.ok_or_else(|| {
+                    std::io::Error::other("gz-only entry must have gz pre-filled at put")
+                })?;
+                tokio::task::spawn_blocking(move || {
+                    Ok::<_, std::io::Error>(Bytes::from(gzip_members(&raw, 6)))
+                })
+                .await
+                .map_err(|e| std::io::Error::other(format!("gzip task panicked: {e}")))?
+            })
+            .await
+            .cloned()
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Inflate a (possibly multi-member) gzip body back to the exact raw bytes.
+/// Multi-member matters: [`gzip_members`] concatenates independently
+/// compressed members, and a plain `GzDecoder` would stop after the first.
+pub(crate) fn gunzip_bytes(gz: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::bufread::MultiGzDecoder::new(gz).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// Single-flight slot, same shape as the stats cache (stats.rs): every
@@ -961,12 +1034,27 @@ pub struct CollectionCache {
     /// Cross-key cap on concurrent full builds (a full shape is ~26 MB raw;
     /// unbounded builds under stampede drove RSS to ~4 GB in iter 4's
     /// realistic run).
+    ///
+    /// Review M4 review-note asked for ONE full build at a time. 2 is kept
+    /// deliberately: at 1, a write-mix bench tick with two hot shapes missing
+    /// serialises two ~26 MB builds (~600 ms each) behind one another and
+    /// pushes p95 collection latency out; the chunk pool
+    /// (CHUNK_POOL_MAX_BUFFERS = 8 = 2 builds x 4 workers) and the live
+    /// connection cap were both sized around permits=2, and the M4 gz-only
+    /// storage already removed the dominant transient (the raw+gz double
+    /// copy). Reducing to 1 would be a bench-visible policy change — logged
+    /// as an owner decision alongside the Gate D cache budgets, not smuggled
+    /// in as an "M4 fix".
     builds: Arc<Semaphore>,
     /// Monotonic LRU clock stamped into `CacheEntry::seen` (a clock, not a
     /// wall clock: tests get deterministic eviction order).
     clock: AtomicU64,
     /// Byte budget for `Inner::entries` bodies; settable in tests.
     max_bytes: AtomicU64,
+    /// Bodies at least this large are stored gz-only (review M4: one
+    /// encoding per body); settable in tests. Below it, entries keep raw and
+    /// build gz lazily on first gzip demand (serve-latency trade).
+    single_enc_min: AtomicU64,
     /// Freed-bytes threshold that arms `trim_dirty`; settable in tests.
     trim_dirty_bytes: AtomicU64,
     /// True once a `put` freed at least `trim_dirty_bytes` and the heap has
@@ -986,6 +1074,7 @@ impl Default for CollectionCache {
             builds: Arc::new(Semaphore::new(2)),
             clock: AtomicU64::new(0),
             max_bytes: AtomicU64::new(store_max_bytes()),
+            single_enc_min: AtomicU64::new(SINGLE_ENC_MIN_BYTES),
             trim_dirty_bytes: AtomicU64::new(TRIM_DIRTY_BYTES),
             trim_dirty: AtomicBool::new(false),
             max_rev: AtomicI64::new(i64::MIN),
@@ -1062,14 +1151,38 @@ impl CollectionCache {
     fn put(&self, key: String, rev: impl Into<RevPair>, raw: Vec<u8>, total: Option<u64>, cost: Duration) -> Arc<CacheEntry> {
         let rp = rev.into();
         let etag = body_etag(&raw);
+        let raw_len = raw.len();
         let seen = self.clock.fetch_add(1, Ordering::Relaxed);
+        // Review M4 (one encoding per body): large shapes are stored gz-only.
+        // Compressing here (the build thread, never a runtime worker) costs
+        // one ~150 ms parallel member-gzip per FULL build — a build happens
+        // once per revision-generation per shape, while the raw+gz double
+        // copy (~1.2x body size extra RSS per cached shape) was paid on every
+        // generation the budget kept alive. Guard: gz must win >= 50% (JSON
+        // always does; incompressible bodies keep raw + the lazy gz path so
+        // an adversarial body can never grow the store).
+        let (raw_keep, gz) = if raw_len as u64 >= self.single_enc_min.load(Ordering::Relaxed) {
+            let gz = Bytes::from(gzip_members(&raw, 6));
+            if gz.len().saturating_mul(2) < raw_len {
+                (None, Some(gz))
+            } else {
+                (Some(Bytes::from(raw)), None)
+            }
+        } else {
+            (Some(Bytes::from(raw)), None)
+        };
+        let gz_cell = OnceCell::new();
+        if let Some(g) = gz {
+            let _ = gz_cell.set(g);
+        }
         let entry = Arc::new(CacheEntry {
             rev: rp.coll,
             deck_rev: rp.deck,
-            raw: Bytes::from(raw),
+            raw: raw_keep,
+            raw_len,
             total,
             etag,
-            gz: OnceCell::new(),
+            gz: gz_cell,
             seen: AtomicU64::new(seen),
         });
         self.max_rev.fetch_max(rp.coll, Ordering::Relaxed);
@@ -1538,37 +1651,35 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         }
     }
 
-    let use_gzip = wants_encoding(ae.as_deref(), "gzip", entry.raw.len());
+    let use_gzip = wants_encoding(ae.as_deref(), "gzip", entry.raw_len);
     let (body, encoding) = if use_gzip {
-        // Compressed on first demand, then shared by every later hit; members
-        // compress in parallel (see gzip_members).
-        let gz = entry
-            .gz
-            .get_or_try_init(|| {
-                let raw = entry.raw.clone();
-                async move {
-                    tokio::task::spawn_blocking(move || Ok::<_, std::io::Error>(Bytes::from(gzip_members(
-                        &raw, 6,
-                    ))))
-                    .await
-                    .map_err(|e| {
-                        std::io::Error::other(format!("gzip task panicked: {e}"))
-                    })?
-                }
-            })
-            .await;
-        if gz.is_ok() {
-            st.collection_cache.account_encoded();
-        }
-        match gz {
-            Ok(gz) => (gz.clone(), Some("gzip")),
+        // Compressed on first demand (small shapes), then shared by every
+        // later hit; large shapes already hold the stored gz copy (M4).
+        // Members compress in parallel (see gzip_members).
+        match entry.gz_body().await {
+            Ok(gz) => {
+                st.collection_cache.account_encoded();
+                (gz, Some("gzip"))
+            }
             Err(e) => {
                 tracing::error!(error = %e, "collection gzip failed; serving raw");
-                (entry.raw.clone(), None)
+                match entry.raw_body().await {
+                    Ok(raw) => (raw, None),
+                    Err(e) => {
+                        tracing::error!(error = %e, "collection raw fallback failed");
+                        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch collection");
+                    }
+                }
             }
         }
     } else {
-        (entry.raw.clone(), None)
+        match entry.raw_body().await {
+            Ok(raw) => (raw, None),
+            Err(e) => {
+                tracing::error!(error = %e, "collection identity inflate failed");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to fetch collection");
+            }
+        }
     };
 
     let mut b = Response::builder().status(StatusCode::OK).header(
@@ -1914,7 +2025,11 @@ mod store_budget {
         assert!(cache.get(&params(0).cache_key(), 1).is_some());
         cache.put(params(300).cache_key(), 1, body, None, Duration::from_millis(50));
         let inner = cache.inner.lock().unwrap();
-        let stored: usize = inner.entries.values().map(|e| e.raw.len()).sum();
+        let stored: usize = inner
+            .entries
+            .values()
+            .map(|e| e.raw.as_ref().map_or(0, |b| b.len()))
+            .sum();
         assert!(stored <= 3000, "stored bytes must fit the budget: {stored}");
         assert!(inner.entries.contains_key(&params(0).cache_key()), "recently served survives");
         assert!(inner.entries.contains_key(&params(300).cache_key()), "the new entry survives");
@@ -2050,5 +2165,124 @@ mod store_budget {
         // Same revision still coalesces onto one cell.
         let same = cache.slot(&slot_key(&key, rp1));
         assert!(Arc::ptr_eq(&old_build, &same), "same-revision misses must coalesce");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review M4 (memory design): one encoding stored per large body.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod single_encoding {
+    use super::*;
+
+    fn params(offset: i64) -> CollectionParams {
+        CollectionParams {
+            user_id: 1,
+            is_trade: None,
+            card_id: None,
+            paginated: true,
+            limit: 100,
+            offset,
+            alloc: false,
+            count_zero: false,
+            qs: String::new(),
+        }
+    }
+
+    /// Highly compressible JSON-shaped filler so gzip wins big.
+    fn compressible(len: usize) -> Vec<u8> {
+        let unit = br#"{"card_id":"00000000-0000-0000-0000-000000000000","qty":1,"notes":""},"#;
+        let mut v = Vec::with_capacity(len);
+        while v.len() < len {
+            v.extend_from_slice(unit);
+        }
+        v.truncate(len);
+        v
+    }
+
+    #[test]
+    fn large_bodies_store_gz_only() {
+        let cache = CollectionCache::new();
+        cache.single_enc_min.store(1 << 20, Ordering::Relaxed);
+        let body = compressible(5 << 20); // 5 MiB -> multi-member gzip path
+        let entry =
+            cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        assert!(entry.raw.is_none(), "M4: the raw copy must not be retained once gz exists");
+        let gz = entry.gz.get().expect("M4: gz must be stored at put time for large shapes");
+        assert!(
+            (gz.len() as u64) < (body.len() / 4) as u64,
+            "gzip should dominate JSON: gz={} raw={}",
+            gz.len(),
+            body.len()
+        );
+        assert_eq!(entry.bytes(), gz.len() as u64, "stored bytes count the ONE encoding");
+        assert_eq!(entry.raw_len, body.len(), "raw_len survives the dropped copy");
+        assert_eq!(entry.etag, body_etag(&body), "ETag is computed over RAW regardless");
+        // Multi-member round-trip: gunzip must reassemble every member.
+        assert_eq!(gunzip_bytes(gz).unwrap(), body, "identity re-inflate is byte-exact");
+    }
+
+    #[test]
+    fn incompressible_large_bodies_keep_raw() {
+        let cache = CollectionCache::new();
+        cache.single_enc_min.store(1024, Ordering::Relaxed);
+        // Pseudo-random bytes defeat gzip: gz must NOT be stored (no store growth).
+        // (A multiplicative counter is NOT random: odd multipliers just permute
+        // 0..255 with period 256 — compressible.)
+        let mut s: u64 = 0x2545F4914F6CDD1D;
+        let body: Vec<u8> = (0..4096)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect();
+        let entry =
+            cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        assert!(entry.raw.is_some(), "a losing gzip copy must not replace raw");
+        assert!(entry.gz.get().is_none(), "no gz stored when compression does not win >= 2x");
+        assert_eq!(entry.bytes(), body.len() as u64);
+    }
+
+    #[test]
+    fn small_bodies_keep_raw_and_lazy_gz() {
+        let cache = CollectionCache::new();
+        let body = compressible(1000);
+        let entry =
+            cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        assert!(entry.raw.is_some(), "below the threshold the serve-latency trade stands");
+        assert!(entry.gz.get().is_none(), "gz stays lazy for small shapes");
+    }
+
+    #[tokio::test]
+    async fn both_encodings_serve_byte_identical_bodies() {
+        let cache = CollectionCache::new();
+        cache.single_enc_min.store(1 << 20, Ordering::Relaxed);
+        let body = compressible(5 << 20);
+        let entry =
+            cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        // gzip client: the stored copy, no re-compression (pointer-stable).
+        let gz1 = entry.gz_body().await.unwrap();
+        let gz2 = entry.gz_body().await.unwrap();
+        assert!(gz1.as_ptr() == gz2.as_ptr() && gz1.len() == gz2.len(), "one shared stored gz copy per entry");
+        let decoded = gunzip_bytes(&gz1).unwrap();
+        assert_eq!(decoded, body, "gzip client body decodes to the exact raw");
+        // identity client: re-inflated on demand, byte-identical to Node's raw.
+        let raw = entry.raw_body().await.unwrap();
+        assert_eq!(&raw[..], &body[..], "identity body must be byte-identical");
+        assert_eq!(entry.bytes(), gz1.len() as u64, "re-inflation must not store a second copy");
+    }
+
+    #[tokio::test]
+    async fn small_entry_gz_fills_lazily_and_stays_shared() {
+        let cache = CollectionCache::new();
+        let body = compressible(2000);
+        let entry =
+            cache.put(params(0).cache_key(), 1, body.clone(), None, Duration::from_millis(50));
+        let (a, b) = tokio::join!(entry.gz_body(), entry.gz_body());
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(a.as_ptr() == b.as_ptr() && a.len() == b.len(), "concurrent first gzip hits coalesce on the OnceCell");
+        assert_eq!(gunzip_bytes(&a).unwrap(), body);
     }
 }
