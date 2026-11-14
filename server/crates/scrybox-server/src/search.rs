@@ -1609,6 +1609,162 @@ async fn fetch_window(
     Ok((out, total))
 }
 
+/// MVP standalone (no Node upstream): runSearch's raw-`q` leg for the
+/// database/internet scopes (`if (cleanRaw)` block, scryfallApi.js) — the
+/// Add Cards search box. In hybrid mode this leg proxies to Node (its
+/// parser, shared/scryfallQuery.js, is not ported); with Node gone the
+/// proxy answered 502 for every Add Cards search. Served here:
+///   * upstream query: collq::walk_base's exact toScryfall twin when the
+///     query is in its accepted subset, else the trimmed query VERBATIM —
+///     Node's own sidecar-mode behaviour for queries its parser rejects
+///     (Scryfall is the grammar authority). Known divergence: the Scrybox
+///     `is:<type>` extension is not rewritten to `t:`;
+///   * `(q)` language scoping + langSearch, fetchWindow over 175-card pages;
+///   * 404/422 → [], 400 → INVALID_QUERY, 429 → rate limit, else 503
+///     (Node's answerLocally fallback for data-backed queries is not ported);
+///   * cacheCards, attachOwnedQty, mergeSearchPrices on scope=internet,
+///     X-Total-Count / X-Source headers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawQ {
+    pub user_id: i64,
+    pub q: String,
+    pub internet: bool,
+    pub lang: Option<String>,
+    pub page: i64,
+    pub limit: i64,
+}
+
+pub fn standalone_raw_q_plan(user_id: i64, raw_query: Option<&str>) -> Option<RawQ> {
+    let pairs: Vec<(String, String)> = raw_query
+        .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    for k in ["name", "number", "set", "q", "scope", "lang", "prints", "image", "page", "limit"] {
+        if pairs.iter().filter(|(kk, _)| kk == k).count() > 1 {
+            return None;
+        }
+    }
+    let first = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    let q = first("q")?.trim().to_string();
+    if q.is_empty() {
+        return None;
+    }
+    let scope = first("scope").unwrap_or_else(|| "database".to_string());
+    if scope == "collection"
+        || first("prints").as_deref() == Some("1")
+        || first("image").is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
+    let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let page = if page == 0 { 1 } else { page }.max(1);
+    let limit = first("limit").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let limit = if limit == 0 { 60 } else { limit }.clamp(1, 250);
+    Some(RawQ { user_id, q, internet: scope == "internet", lang: first("lang"), page, limit })
+}
+
+/// Upstream query string for the raw leg (see RawQ).
+pub fn raw_q_upstream(q: &str, scry_code: &str) -> String {
+    let upstream = crate::collq::walk_base(q).unwrap_or_else(|| q.to_string());
+    if scry_code == "en" { upstream } else { format!("({upstream})") }
+}
+
+async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> Response {
+    let lang_name = to_name(rq.lang.as_deref());
+    let (_code, scry_code) = lang_codes(rq.lang.as_deref());
+    let upstream = raw_q_upstream(&rq.q, &scry_code);
+    let (scoped, multilingual) = lang_search(&upstream, &scry_code);
+    let offset = (rq.page - 1).saturating_mul(rq.limit);
+    let mut page = offset.div_euclid(SCRY_PAGE_SIZE) + 1;
+    let mut skip = offset.rem_euclid(SCRY_PAGE_SIZE) as usize;
+    let mut raw: Vec<Value> = Vec::new();
+    let mut total: Option<u64> = None;
+    let mut empty = false;
+    while (raw.len() as i64) < rq.limit {
+        let url = format!(
+            "/cards/search?q={}&page={}{}",
+            sidecar::encode_uri_component(&scoped),
+            page,
+            if multilingual { "&include_multilingual=true" } else { "" }
+        );
+        match st.scry.get_retried(&url, &crate::scryfall::ScryOpts::default(), 4).await {
+            Ok(Some(v)) => {
+                if let Some(t) = v.get("total_cards").and_then(Value::as_u64) {
+                    total = Some(t);
+                }
+                let data = v.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                raw.extend(data.into_iter().skip(skip));
+                skip = 0;
+                if !v.get("has_more").map(truthy).unwrap_or(false) {
+                    break;
+                }
+                page += 1;
+            }
+            Ok(None) => {
+                empty = true;
+                break;
+            }
+            Err(e) if e.status == Some(404) || e.status == Some(422) => {
+                empty = true;
+                break;
+            }
+            Err(e) if e.status == Some(400) => {
+                return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
+            }
+            Err(e) if e.status == Some(429) => {
+                return json_error(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+            }
+            Err(e) => {
+                tracing::error!("Scryfall raw query failed: {}", e.message);
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Card API is having trouble. Try again in a moment.",
+                );
+            }
+        }
+    }
+    if empty {
+        raw.clear();
+        total = None;
+    }
+    raw.truncate(rq.limit as usize);
+    let maps: Vec<Map<String, Value>> = raw.iter().map(|r| sidecar::normalize_card(r, &lang_name)).collect();
+    let pool2 = Arc::clone(pool);
+    let user_id = rq.user_id;
+    let cards = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+        let conn = pool2.get().map_err(|e| e.to_string())?;
+        if !maps.is_empty() {
+            if let Err(e) = crate::card_cache::cache_normalized_cards(&conn, &maps) {
+                return Err(e.to_string());
+            }
+        }
+        let mut cards: Vec<Value> = maps.into_iter().map(Value::Object).collect();
+        attach_owned_qty(&conn, &mut cards[..], user_id)?;
+        Ok(cards)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let mut cards = match cards {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("raw q search failed: {e}");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    };
+    if rq.internet {
+        merge_search_prices(st, pool, &mut cards).await;
+    }
+    let source = if st.local_scrayfall { "sidecar" } else { "scryfall" };
+    let mut res = axum::response::IntoResponse::into_response((StatusCode::OK, axum::Json(Value::Array(cards))));
+    let h = res.headers_mut();
+    if let Some(t) = total {
+        h.insert("x-total-count", HeaderValue::from_str(&t.to_string()).unwrap());
+    }
+    h.insert("x-source", HeaderValue::from_static(source));
+    h.insert("access-control-expose-headers", HeaderValue::from_static("X-Total-Count, X-Source"));
+    res
+}
+
 /// The merge block's `tryQuery`: a window, normalized, with the catch
 /// rules. `meta` is meta.total — only the broad query's non-null total
 /// reaches it (the specific set+cn probe would report its own tiny count),
@@ -2177,7 +2333,14 @@ pub async fn handle(
         Plan::InvalidQuery => {
             return with_rl(json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY"));
         }
-        Plan::Proxy => return to_node(&st, parts, bytes).await,
+        Plan::Proxy => {
+            if st.cfg.node_upstream.is_empty() && !is_post {
+                if let Some(rq) = standalone_raw_q_plan(user.id, raw_query.as_deref()) {
+                    return with_rl(serve_raw_q_standalone(&st, &pool, rq).await);
+                }
+            }
+            return to_node(&st, parts, bytes).await;
+        }
     };
 
     // Express's res.json sets the body ETag on POST too, but conditional
