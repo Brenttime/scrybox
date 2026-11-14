@@ -372,9 +372,13 @@ async fn run() {
     }
     // Iter-58 cold-start attribution (single-shot cold stats 573 ms vs storm
     // probe 1360 ms — the gap is queueing behind the start-of-process storm):
-    // pre-build /stats bodies at boot like the collection prewarm does for
-    // pages. Kept in main (NOT app()) so Router-building tests keep their
-    // cold-cache contracts. SCRYBOX_STATS_PREWARM=0 restores pure lazy.
+    // pre-build /stats bodies like the collection prewarm does for pages.
+    // Memory queue item 6 (MEMORY.md #9): the warm now parks on the
+    // first-real-request gate by DEFAULT (SCRYBOX_STATS_PREWARM unset ->
+    // BootWarmMode::Traffic), so an idle process boots without it; =boot /
+    // =1 restores the iter-58 eager boot shape, =0 the pure-lazy one.
+    // Kept in main (NOT app()) so Router-building tests keep their
+    // cold-cache contracts.
     if state.owns("stats") {
         scrybox_server::stats::spawn_boot_warm(&state);
     }

@@ -254,6 +254,13 @@ pub struct AppState {
     pub rules_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     pub kw_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
     pub rules_build: Arc<tokio::sync::Mutex<()>>,
+    /// Memory queue item 6 (MEMORY.md #9): set once by the native-route
+    /// traffic layer when the FIRST real (non-health) request arrives.
+    /// Shares state across AppState clones (Arc), so the layer's write is
+    /// visible to boot-time tasks awaiting the gate.
+    pub(crate) traffic_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes everyone awaiting `traffic_seen` flipping to true.
+    pub(crate) traffic_notify: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -295,12 +302,49 @@ impl AppState {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .or_else(|| precons_index_path.parent().map(|d| d.join("edhrec-cache")));
-        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), stale_refresh: !std::env::var("SCRYBOX_DISABLE_STALE_REFRESH").map(|v| v == "true" || v == "1").unwrap_or(false), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), local_scrayfall: std::env::var("LOCAL_SCRYFALL_ENABLED").map(|v| v == "true").unwrap_or(false), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), deck_http: std::sync::Arc::new(crate::decks_combos::RealDecksProviders), edhrec_mem: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), edhrec_cache_dir, precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())) }
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), stale_refresh: !std::env::var("SCRYBOX_DISABLE_STALE_REFRESH").map(|v| v == "true" || v == "1").unwrap_or(false), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), local_scrayfall: std::env::var("LOCAL_SCRYFALL_ENABLED").map(|v| v == "true").unwrap_or(false), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), deck_http: std::sync::Arc::new(crate::decks_combos::RealDecksProviders), edhrec_mem: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), edhrec_cache_dir, precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())), traffic_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)), traffic_notify: Arc::new(tokio::sync::Notify::new()) }
     }
 
     /// Kill-switch decision for a route name (`collection`, `stats`, ...).
     pub fn owns(&self, route: &str) -> bool {
         self.db.is_some() && (self.cfg.rust_routes.contains("*") || self.cfg.rust_routes.contains(route))
+    }
+
+    /// Memory queue item 6 (MEMORY.md #9): record that the process has seen
+    /// its FIRST real request (the traffic layer calls this for every
+    /// non-`/api/health` request). One-shot: after the flip the bool stays
+    /// true and everyone parked on `traffic_notify::notified()` wakes.
+    pub(crate) fn note_traffic(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.traffic_seen.swap(true, Ordering::SeqCst) {
+            self.traffic_notify.notify_waiters();
+            // ...plus a stored permit: `notify_waiters` only wakes ALREADY
+            // registered waiters, so a waiter that registers between the
+            // swap and a racing loop-check (see wait_traffic) would never
+            // see the edge. The permit makes the NEXT notified() return
+            // immediately; the loop re-reads the bool, so no spurious pass.
+            self.traffic_notify.notify_one();
+        }
+    }
+
+    /// Test/ops hook mirroring what the traffic layer does per real request
+    /// (used by tests/stats_boot_warm_gate.rs to open the gate directly).
+    pub fn open_traffic_gate_for_test(&self) {
+        self.note_traffic();
+    }
+}
+
+/// Resolve once `note_traffic` has fired (immediately if it already has).
+/// Takes the two gate Arcs (not `&AppState`) so spawned `'static` tasks and
+/// tests can share the exact same code path.
+pub(crate) async fn wait_traffic(seen: &Arc<std::sync::atomic::AtomicBool>, notify: &Arc<tokio::sync::Notify>) {
+    use std::sync::atomic::Ordering;
+    // The bool is the source of truth; the Notify is the wake-up edge
+    // (notify_waiters for parked waiters + one stored permit in
+    // note_traffic for the register-after-notify window, so no lost
+    // wakeup and no spurious early pass: every wake re-reads the bool).
+    while !seen.load(Ordering::SeqCst) {
+        notify.notified().await;
     }
 }
 
@@ -992,6 +1036,23 @@ pub fn app(state: AppState) -> Router {
     } else {
         router
     };
+    // Memory queue item 6 (MEMORY.md #9, Gate D): first-traffic trigger.
+    // The boot-time eager warmers (stats boot warm today; the pattern is
+    // reusable) park on `wait_traffic()` until the FIRST real request
+    // arrives, so an idle process never pays their HWM. /api/health is
+    // excluded on purpose: uptime probes (docker/orchestrator) poll it
+    // forever, and a health-only process is by definition still idle.
+    // Mounted with the routes above the fallback (like secheaders), so
+    // proxied/static traffic never touches it.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        |State(st): State<AppState>, req: Request, next: axum::middleware::Next| async move {
+            if req.uri().path() != "/api/health" {
+                st.note_traffic();
+            }
+            next.run(req).await
+        },
+    ));
     // REVIEW-errors H2 (fix queue): tower-http CatchPanicLayer answering
     // Node's generic error handler (server.js:642 `res.status(500).json(
     // {error:'Internal server error'})`) byte-for-byte on a handler panic

@@ -218,6 +218,12 @@ impl StatsCache {
         self.computes.load(Ordering::Relaxed)
     }
 
+    /// Bodies currently in the store (boot-warm gate test + observability):
+    /// the observable proof that a warm ran (or, at boot, has not).
+    pub fn store_len(&self) -> usize {
+        self.inner.guard().store.len()
+    }
+
     /// One compute slot (Gate D iter-25). Held INSIDE the OnceCell init,
     /// around the blocking build — waiters on the same key never take one.
     pub async fn build_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
@@ -1001,20 +1007,55 @@ pub fn spawn_refresher(state: &AppState) {
 /// exact-for-current-rev (a write that lands mid-warm bumps gen/rev and the
 /// request simply recomputes), builds go through the request-path
 /// single-flight slot (a request already building the key is joined, never
-/// double-computed), and `SCRYBOX_STATS_PREWARM=0` restores the lazy shape.
+/// double-computed), and `SCRYBOX_STATS_PREWARM=0` restores the pure-lazy
+/// shape (see `BootWarmMode` for the third, traffic-gated default).
 const BOOT_WARM_MAX_USERS: usize = 4;
 
-/// Kill-switch for the boot warm (mirrors cvscan's warm_requested shape):
-/// on by default; SCRYBOX_STATS_PREWARM=0/false restores the lazy shape.
+/// When the boot warm runs (memory queue item 6, MEMORY.md #9). The gate
+/// exists because the warm is the ONLY eager boot-path work left after
+/// cvscan went opt-in (iter-23) and the pool page-cache right-sizing
+/// (iter-78): up to 4 serial stats-body builds + a scratch pool open at
+/// boot, which pins the pre-traffic VmHWM above Gate D's <66 MB idle floor.
+#[derive(PartialEq, Eq, Debug)]
+pub enum BootWarmMode {
+    /// Iter-58 shape: warm at boot, before any traffic.
+    Eager,
+    /// New default: park on `AppState::wait_traffic()` — the first REAL
+    /// (non-health) request starts the warm; an idle (health-probed-only)
+    /// process never pays the HWM. First-hit cost: the first client is
+    /// served by the normal request path (single-flight shared with the
+    /// warm), later requests hit the warmed store — bounded by
+    /// BOOT_WARM_MAX_USERS serial builds either way.
+    Traffic,
+    /// Pure lazy (the old `0`/`false` kill switch).
+    Off,
+}
+
+/// Kill-switch + gate, mirrors cvscan's warm_requested shape:
+/// `SCRYBOX_STATS_PREWARM` = `0|false|off|none` -> Off;
+/// `boot|eager|1|true` -> Eager (iter-58 restore);
+/// unset/anything-else -> Traffic (deferred until first real request).
+pub fn boot_warm_mode() -> BootWarmMode {
+    match std::env::var("SCRYBOX_STATS_PREWARM")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "0" | "false" | "off" | "none" => BootWarmMode::Off,
+        "boot" | "eager" | "1" | "true" => BootWarmMode::Eager,
+        _ => BootWarmMode::Traffic,
+    }
+}
+
+/// Back-compat shape used before the gate (on == not Off).
 pub fn boot_warm_requested() -> bool {
-    std::env::var("SCRYBOX_STATS_PREWARM")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
+    boot_warm_mode() != BootWarmMode::Off
 }
 
 pub fn spawn_boot_warm(state: &AppState) {
     let Some(pool) = state.db.clone() else { return };
-    if !boot_warm_requested() {
+    let mode = boot_warm_mode();
+    if mode == BootWarmMode::Off {
         return;
     }
     // Iter-64 boot-RSS attribution (Gate D): running the warm through the
@@ -1025,12 +1066,21 @@ pub fn spawn_boot_warm(state: &AppState) {
     // (request-path parity untouched), but the reads go the read() path and
     // the pages leave RSS when the twin drops. The serving pool's windows
     // stay clean until real traffic faults them on demand.
-    let Ok(scratch) = pool.scratch() else {
-        return; // best-effort warm: a scratch-open failure leaves pure lazy
-    };
-    let pool = Arc::new(scratch);
     let cache = Arc::clone(&state.stats_cache);
+    let traffic = (mode == BootWarmMode::Traffic).then(|| {
+        (Arc::clone(&state.traffic_seen), Arc::clone(&state.traffic_notify))
+    });
     tokio::spawn(async move {
+        if let Some((seen, notify)) = &traffic {
+            // Park until the first real request. The scratch pool is opened
+            // AFTER this: an idle process never touches the DB at all on the
+            // warm path.
+            crate::wait_traffic(seen, notify).await;
+        }
+        let Ok(scratch) = pool.scratch() else {
+            return; // best-effort warm: a scratch-open failure leaves pure lazy
+        };
+        let pool = Arc::new(scratch);
         let pool2 = Arc::clone(&pool);
         let users = match tokio::task::spawn_blocking(move || {
             let conn = pool2.get().ok()?;
@@ -1573,20 +1623,69 @@ mod boot_warm_gate {
     use super::*;
 
     #[test]
-    fn boot_warm_is_on_by_default_with_kill_switch() {
-        // Iter-58 shape: the boot warm is ON unless the operator opts out —
-        // the mirror of cvscan's opt-in guard (boot warm for stats is cheap
-        // DB work the collection prewarm already does for pages; the ONNX
-        // assets are the expensive ones that stay opt-in).
+    fn boot_warm_mode_contract() {
+        // Memory queue item 6 (MEMORY.md #9): three states. Unset is the
+        // NEW default (Traffic — deferred to first real request); `1/true/
+        // boot/eager` restore the iter-58 eager boot; `0/false` (+off/none)
+        // stay the pure-lazy kill switch. Unknown values fall to Traffic:
+        // the safe direction (no eager boot work) for a typo'd setting.
         std::env::remove_var("SCRYBOX_STATS_PREWARM");
-        assert!(boot_warm_requested(), "default must pre-warm");
-        std::env::set_var("SCRYBOX_STATS_PREWARM", "1");
-        assert!(boot_warm_requested());
-        std::env::set_var("SCRYBOX_STATS_PREWARM", "0");
-        assert!(!boot_warm_requested(), "0 must restore pure lazy");
-        std::env::set_var("SCRYBOX_STATS_PREWARM", "false");
-        assert!(!boot_warm_requested());
+        assert_eq!(boot_warm_mode(), BootWarmMode::Traffic, "default must defer to first traffic");
+        assert!(boot_warm_requested(), "deferred is still 'on'");
+        for v in ["boot", "eager", "1", "true", "TRUE", " Boot "] {
+            std::env::set_var("SCRYBOX_STATS_PREWARM", v);
+            assert_eq!(boot_warm_mode(), BootWarmMode::Eager, "{v} must restore the iter-58 boot shape");
+        }
+        for v in ["0", "false", "FALSE", "off", "none", " 0 "] {
+            std::env::set_var("SCRYBOX_STATS_PREWARM", v);
+            assert_eq!(boot_warm_mode(), BootWarmMode::Off, "{v} must restore pure lazy");
+            assert!(!boot_warm_requested());
+        }
+        for v in ["", "garbage", "traffic", "auto", "lazy"] {
+            std::env::set_var("SCRYBOX_STATS_PREWARM", v);
+            assert_eq!(boot_warm_mode(), BootWarmMode::Traffic, "{v} must fall to the deferred default");
+        }
         std::env::remove_var("SCRYBOX_STATS_PREWARM");
+    }
+
+    /// The traffic gate itself (AppState::note_traffic / wait_traffic):
+    /// one-shot, late-waiter-safe, and health-exclusion is the layer's
+    /// contract (tested end-to-end in tests/stats_boot_warm_gate.rs).
+    #[tokio::test]
+    async fn traffic_gate_is_one_shot_and_wakes_waiters() {
+        let cfg = crate::Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            node_upstream: String::new(),
+            static_dir: None,
+            rust_routes: Default::default(),
+            db_path: None,
+            sidecar_url: None,
+        };
+        let st = AppState::new(cfg.clone());
+
+        // Late-arriving waiter: gate already fired -> returns immediately.
+        st.note_traffic();
+        tokio::time::timeout(Duration::from_millis(50), crate::wait_traffic(&st.traffic_seen, &st.traffic_notify))
+            .await
+            .expect("wait_traffic must resolve after note_traffic");
+
+        // Fresh state: waiter parks until notified mid-flight.
+        let st2 = AppState::new(cfg);
+        let (seen2, notify2) = (st2.traffic_seen.clone(), st2.traffic_notify.clone());
+        let w = tokio::spawn(async move { crate::wait_traffic(&seen2, &notify2).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // (Red-before-fix hook: with the swap/notify neutered this hangs
+        // until the timeout below fires.)
+        st2.note_traffic();
+        tokio::time::timeout(Duration::from_millis(200), w)
+            .await
+            .expect("waiter must wake on note_traffic")
+            .unwrap();
+        // Second note_traffic is a no-op (no panic, still true).
+        st2.note_traffic();
+        tokio::time::timeout(Duration::from_millis(50), crate::wait_traffic(&st2.traffic_seen, &st2.traffic_notify))
+            .await
+            .expect("idempotent note_traffic keeps the gate open");
     }
 }
 
