@@ -630,9 +630,9 @@ async fn route(
     let headers = req.headers().clone();
 
     // authenticateToken (Bearer session; API keys GET-only) — same 401/403
-    // bodies as the /stats port.
+    // bodies as the /stats port. REVIEW M5: async checkout (worker-safe).
     let token = crate::auth::bearer_token(&headers).map(str::to_string);
-    let user = match crate::auth::authenticate(&pool, token.as_deref(), true) {
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -646,8 +646,10 @@ async fn route(
     let outcome: Result<(bool, Arc<StatsEntry>), String> = if resp_cache {
         // Phase 1: resolve the shared-store key (gen, rev) and probe —
         // statsCache.js reads dataRevision per request, even for hits.
+        // REVIEW M5: async checkout so the per-request rev read never
+        // parks the runtime worker.
         let key = {
-            let conn = match pool.get() {
+            let conn = match pool.get_async().await {
                 Ok(c) => c,
                 Err(e) => return server_error(500, kind.err_msg(), true, Some(&format!("read pool: {e}"))),
             };

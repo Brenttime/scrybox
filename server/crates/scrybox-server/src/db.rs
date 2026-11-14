@@ -7,7 +7,13 @@
 //! `backend/src/db.js` so readers get the same page-cache/mmap behaviour
 //! Node configured.
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use rusqlite::Connection;
 
@@ -74,6 +80,9 @@ pub struct DbPool {
     max: usize,
     live_max: usize,
     cfg: PoolConfig,
+    /// M5: number of `get_async()` calls that found no idle connection and
+    /// had to hop to the blocking pool (observability + the cap tests).
+    blocking_fallbacks: AtomicUsize,
 }
 
 struct PoolState {
@@ -103,6 +112,7 @@ impl DbPool {
             max,
             live_max,
             cfg,
+            blocking_fallbacks: AtomicUsize::new(0),
         })
     }
 
@@ -140,11 +150,18 @@ impl DbPool {
     /// fallback (REVIEW M5); today's inline call sites already block in
     /// `connect()`, so the wait adds no new class of blocking.
     pub fn get(&self) -> rusqlite::Result<PooledConn<'_>> {
+        Ok(PooledConn { pool: self, conn: Some(self.get_conn()?) })
+    }
+
+    /// Core of `get()`: the idle-pop / permit-reserve / Condvar-wait loop
+    /// returning the raw connection. Shared by the borrowed (`PooledConn`)
+    /// and owned (`OwnedConn`, async) checkout paths.
+    fn get_conn(&self) -> rusqlite::Result<Connection> {
         let mut st = self.state.lock().unwrap();
         loop {
             if let Some(c) = st.idle.pop() {
                 st.live += 1;
-                return Ok(PooledConn { pool: self, conn: Some(c) });
+                return Ok(c);
             }
             if st.live < self.live_max {
                 // Reserve the permit before releasing the mutex so the
@@ -155,7 +172,7 @@ impl DbPool {
                 let opened = Self::connect(&self.path, self.cfg);
                 st = self.state.lock().unwrap();
                 match opened {
-                    Ok(c) => return Ok(PooledConn { pool: self, conn: Some(c) }),
+                    Ok(c) => return Ok(c),
                     Err(e) => {
                         st.live -= 1;
                         self.live_cv.notify_all();
@@ -165,6 +182,18 @@ impl DbPool {
             }
             st = self.live_cv.wait(st).unwrap();
         }
+    }
+
+    /// Idle-only pop for the async fast path (REVIEW M5): never opens a
+    /// connection, never waits on the cap — the two operations that can
+    /// pin a runtime worker for up to `busy_timeout`.
+    fn take_idle(&self) -> Option<Connection> {
+        let mut st = self.state.lock().unwrap();
+        let c = st.idle.pop();
+        if c.is_some() {
+            st.live += 1;
+        }
+        c
     }
 
     /// Non-blocking `get()`: returns `Ok(None)` when a checkout would have
@@ -192,6 +221,40 @@ impl DbPool {
         } else {
             Ok(None)
         }
+    }
+
+    /// Owned twin of [`get`](Self::get) for callers that must move the
+    /// checkout across threads (or into `spawn_blocking`): the borrowed
+    /// [`PooledConn`] cannot outlive the pool reference.
+    pub fn get_owned(self: &Arc<Self>) -> rusqlite::Result<OwnedConn> {
+        Ok(OwnedConn { pool: self.clone(), conn: Some(self.get_conn()?) })
+    }
+
+    /// Async-safe checkout for code running ON a tokio runtime worker
+    /// (REVIEW M5): hot handlers, the auth gate, revision probes. The fast
+    /// path pops an IDLE connection only — never an inline `connect()` and
+    /// never a Condvar park, the two operations that can pin a worker for
+    /// up to `busy_timeout` under a checkpoint stall. On a miss the full
+    /// `get()` (open / wait-for-permit) runs on the blocking pool.
+    pub async fn get_async(self: &Arc<Self>) -> rusqlite::Result<OwnedConn> {
+        if let Some(c) = self.take_idle() {
+            return Ok(OwnedConn { pool: self.clone(), conn: Some(c) });
+        }
+        self.blocking_fallbacks.fetch_add(1, Ordering::Relaxed);
+        let pool = self.clone();
+        let conn = tokio::task::spawn_blocking(move || pool.get_conn())
+            .await
+            .map_err(|e| rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERNAL),
+                Some(format!("db pool blocking hop: {e}")),
+            ))??;
+        Ok(OwnedConn { pool: self.clone(), conn: Some(conn) })
+    }
+
+    /// White-box: how many `get_async()` calls found no idle connection and
+    /// had to hop to the blocking pool (M5 observability + cap tests).
+    pub fn blocking_fallbacks(&self) -> usize {
+        self.blocking_fallbacks.load(Ordering::Relaxed)
     }
 
     /// White-box: connections currently checked out / currently open
@@ -285,6 +348,30 @@ impl std::ops::Deref for PooledConn<'_> {
 }
 
 impl Drop for PooledConn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.put(conn);
+        }
+    }
+}
+
+/// Owned twin of [`PooledConn`] for async callers: holds the pool by `Arc`
+/// so the checkout can be produced inside `spawn_blocking` (`'static`) and
+/// moved back into the awaiting task. Derefs to `Connection`, returns the
+/// connection to the pool on drop — same accounting as `PooledConn`.
+pub struct OwnedConn {
+    pool: Arc<DbPool>,
+    conn: Option<Connection>,
+}
+
+impl std::ops::Deref for OwnedConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("conn present until drop")
+    }
+}
+
+impl Drop for OwnedConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             self.pool.put(conn);
@@ -516,5 +603,84 @@ mod tests {
         assert_eq!(pool.open_count(), 4);
         let _c = pool.get().unwrap();
         assert_eq!(pool.open_count(), 4, "hit-path checkout must reuse an idle conn");
+    }
+
+    // ---- M5: async checkout on runtime workers (REVIEW-concurrency M5) ----
+
+    #[test]
+    fn get_async_serves_idle_inline_and_hops_when_none_idle() {
+        // Hit path = idle pop on the worker (no blocking hop, no open).
+        // Miss path (no idle conn) = full get() on the blocking pool —
+        // the open+PRAGMA cost is never paid on the worker thread.
+        let (_p, pool) = capped_pool("async-idle", 2, 4);
+        let pool = std::sync::Arc::new(pool);
+        pool.warm(1);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        let p1 = std::sync::Arc::clone(&pool);
+        let a = rt.block_on(async move { p1.get_async().await.unwrap() });
+        assert_eq!(pool.blocking_fallbacks(), 0, "idle checkout must not hop to the blocking pool");
+        assert_eq!(pool.live_count(), 1);
+
+        // `a` still held: idle is empty, so this checkout must HOP.
+        let p2 = std::sync::Arc::clone(&pool);
+        let b = rt.block_on(async move { p2.get_async().await.unwrap() });
+        assert_eq!(pool.blocking_fallbacks(), 1, "no-idle checkout must hop to the blocking pool");
+        assert_eq!(pool.open_count(), 2, "the fresh connection was opened off-worker");
+
+        drop((a, b));
+        // Returned connections are idle: async checkouts go inline again.
+        let p3 = std::sync::Arc::clone(&pool);
+        let c = rt.block_on(async move { p3.get_async().await.unwrap() });
+        assert_eq!(pool.blocking_fallbacks(), 1, "idle checkout after a return must not hop");
+        drop(c);
+        assert_eq!(pool.live_count(), 0);
+    }
+
+    #[test]
+    fn get_async_never_parks_a_runtime_worker() {
+        // M5 red-before-fix: neuter get_async() to the pre-M5 shape (pay
+        // the checkout inline on the worker — get_conn() instead of the
+        // spawn_blocking hop) and the single worker parks on the Condvar
+        // behind the live cap, the timer task starves, `pinged` stays
+        // false at the 300 ms assert. With the hop in place the worker
+        // stays free throughout. The held connection is released by a
+        // helper thread at 1.2 s so a red run FAILS (the parked worker
+        // wakes, rt drop joins) instead of deadlocking the test binary.
+        let (_p, pool) = capped_pool("async-cap", 1, 1);
+        let pool = std::sync::Arc::new(pool);
+        let held = pool.get_owned().unwrap(); // live = live_max = 1, idle empty
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(held).unwrap();
+        std::thread::spawn(move || {
+            let h = rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            drop(h);
+        });
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let p1 = std::sync::Arc::clone(&pool);
+        let waiter = rt.spawn(async move { p1.get_async().await });
+        let pinged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&pinged);
+        rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            pinged.load(std::sync::atomic::Ordering::SeqCst),
+            "M5: the runtime worker was parked by an inline checkout at the live cap"
+        );
+        let got = rt.block_on(waiter).unwrap().unwrap();
+        assert_eq!(pool.blocking_fallbacks(), 1, "the capped checkout must have used the hop");
+        drop(got);
+        assert_eq!(pool.live_count(), 0);
+        assert!(pool.open_count() <= 1, "async path opened more than live_max connections");
     }
 }

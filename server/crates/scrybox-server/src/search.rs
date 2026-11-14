@@ -1896,7 +1896,7 @@ async fn merge_search_prices(st: &AppState, pool: &Arc<DbPool>, cards: &mut [Val
         }
     }
     let rows: Vec<Map<String, Value>> = {
-        let Ok(conn) = pool.get() else { return };
+        let Ok(conn) = pool.get_async().await else { return };
         let placeholders = vec!["?"; ids.len()].join(",");
         let sql = format!(
             "SELECT id, {} FROM card_cache WHERE id IN ({placeholders}) AND price_source IS NOT NULL",
@@ -2086,7 +2086,7 @@ pub async fn handle(
     // reads (authenticate's is_get), so a POST with an api key gets Node's
     // 403 before any body parse — same as Node's gate.
     let token = auth::bearer_token(&headers).map(|s| s.to_string());
-    let user = match auth::authenticate(&pool, token.as_deref(), !is_post) {
+    let user = match auth::authenticate_async(&pool, token.as_deref(), !is_post).await {
         Ok(u) => u,
         Err(res) => return res,
     };
