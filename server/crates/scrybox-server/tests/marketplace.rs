@@ -597,6 +597,11 @@ mod mock_scryfall;
 use mock_scryfall::raw_card;
 
 async fn build_scry(stub: Arc<StubHttp>) -> (Fix, Arc<mock_scryfall::MockState>) {
+    build_scry_mode(stub, false).await
+}
+
+/// `node_free` = SCRYBOX_NODE_UPSTREAM empty (production).
+async fn build_scry_mode(stub: Arc<StubHttp>, node_free: bool) -> (Fix, Arc<mock_scryfall::MockState>) {
     stub_base_once();
     let dir = std::env::temp_dir().join(format!(
         "scrybox-mp2-it-{}",
@@ -606,7 +611,7 @@ async fn build_scry(stub: Arc<StubHttp>) -> (Fix, Arc<mock_scryfall::MockState>)
     std::fs::write(dir.join("bindarr.db"), []).unwrap();
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        node_upstream: "http://127.0.0.1:1".to_string(),
+        node_upstream: if node_free { String::new() } else { "http://127.0.0.1:1".to_string() },
         static_dir: None,
         rust_routes: ["marketplace".to_string()].into_iter().collect(),
         db_path: Some(dir.join("bindarr.db")),
@@ -1069,4 +1074,36 @@ async fn parse_and_price_folds_units() {
         .unwrap_err();
     assert_eq!(e.status, Some(422));
     assert_eq!(e.observed_keys.unwrap(), vec![Value::String("orders".into())]);
+}
+
+/// Node-free: a localized printing absent from card_cache used to be a
+/// whole-request replay to Node (502 with no Node). Now addCardToCollection's
+/// own getPrintingInLang leg runs natively; the mock has no German printing
+/// (404), so — exactly like Node — the picked English rows are filed with
+/// language German.
+#[tokio::test]
+async fn standalone_add_localized_miss_hydrates_natively() {
+    let stub = StubHttp::new(vec![(200, card_detail())]);
+    let (f, scry) = build_scry_mode(stub, true).await;
+    *scry.collection_batches.lock().unwrap() = card_batches();
+    let (st, b) = post(
+        &f,
+        "/api/marketplace/add",
+        MEMBER_TOK,
+        &mp_post_body(UUID_A, Some("\"language\":\"German\"")),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    let v: Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["failed"], json!([]), "{b}");
+    let conn = f.pool.get().unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT card_id, language FROM collection ORDER BY card_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    assert_eq!(rows, vec![("mtg-aaa".into(), "German".into()), ("mtg-ccc".into(), "German".into())]);
+    assert!(!scry.hits_for("GET /cards/10e/1/de").is_empty(), "printing-in-language lookup ran");
 }
