@@ -1169,8 +1169,14 @@ fn parked_probe_scoped(
         .unwrap();
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
-    let release = Arc::new(Notify::new());
-    let release_for_rt = release.clone();
+    // oneshot (not Notify): notify_waiters() stores no permit, so a held
+    // task that registered after the parent's 300 ms timer lost the release
+    // under parallel load — the slot never freed and the handler sat on the
+    // live cap until the 10 s recv timeout (which mis-labelled the lost
+    // wakeup as a parking regression; same class as cardscan_park, iter-15).
+    // Red-before-green semantics intact: pre-fix the worker itself parks on
+    // the cap and the release task can never run regardless of delivery.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let pool_for_rt = pool.clone();
     let db_for_rt = db_path.clone();
     let method_owned = method.to_string();
@@ -1208,11 +1214,10 @@ fn parked_probe_scoped(
             let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
             {
                 let pool2 = pool_for_rt.clone();
-                let rel = release_for_rt.clone();
                 tokio::spawn(async move {
                     let held = pool2.get().unwrap();
                     let _ = held_tx.send(());
-                    rel.notified().await;
+                    let _ = release_rx.await;
                     drop(held);
                 });
             }
@@ -1237,7 +1242,7 @@ fn parked_probe_scoped(
     // Pre-fix this never helps: the worker parked on the Condvar cannot run
     // the releasing task either, so recv_timeout below expires.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    release.notify_waiters();
+    let _ = release_tx.send(());
 
     let (status, bytes) = rx
         .recv_timeout(std::time::Duration::from_secs(10))

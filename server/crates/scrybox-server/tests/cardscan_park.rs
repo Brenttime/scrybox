@@ -97,9 +97,16 @@ fn parked_probe(
     expected: u16,
 ) -> (u16, Vec<u8>, Arc<scrybox_server::db::DbPool>) {
     use std::sync::mpsc;
-    use tokio::sync::Notify;
 
-    std::env::set_var("CARDSCAN_URL", mock_sidecar());
+    // Set CARDSCAN_URL exactly ONCE per process, before ANY test reaches its
+    // request phase: concurrent std::env::set_var from parallel tests racing
+    // base_url()'s env snapshot (cardscan.rs module-load OnceLock) produced
+    // torn reads — the sidecar leg then died inside the runtime thread, the
+    // oneshot disconnected, and scan/frame flaked as 'never completed'
+    // (passing only under --test-threads=1). call_once blocks late arrivals
+    // until the single writer is done.
+    static URL_SET: std::sync::Once = std::sync::Once::new();
+    URL_SET.call_once(|| std::env::set_var("CARDSCAN_URL", mock_sidecar()));
     let dir = std::env::temp_dir().join(format!("scrybox-cspark-{}", scrybox_server::auth_support::uuid_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = seed(&dir);
@@ -113,8 +120,15 @@ fn parked_probe(
     );
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
-    let release = Arc::new(Notify::new());
-    let release_for_rt = release.clone();
+    // oneshot (not Notify): notify_waiters() stores no permit, so a held
+    // task that registered after the parent's 300 ms timer lost the release
+    // under parallel load — the slot never freed and the handler sat on the
+    // live cap until the 10 s recv timeout (which mis-labelled the lost
+    // wakeup as a parking regression). oneshot::send stores the value, so a
+    // late registration still wakes. Red-before-green semantics are intact:
+    // pre-fix, the worker itself parks on the cap and the release task can
+    // never run regardless of how release is delivered.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let pool_for_rt = pool.clone();
     let db_for_rt = db_path.clone();
     let method_owned = method.to_string();
@@ -144,11 +158,10 @@ fn parked_probe(
             let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
             {
                 let pool2 = pool_for_rt.clone();
-                let rel = release_for_rt.clone();
                 tokio::spawn(async move {
                     let held = pool2.get().unwrap();
                     let _ = held_tx.send(());
-                    rel.notified().await;
+                    let _ = release_rx.await;
                     drop(held);
                 });
             }
@@ -173,7 +186,7 @@ fn parked_probe(
     // Pre-fix this never helps: the worker parked on the Condvar cannot run
     // the releasing task either, so recv_timeout below expires.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    release.notify_waiters();
+    let _ = release_tx.send(());
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
         panic!(

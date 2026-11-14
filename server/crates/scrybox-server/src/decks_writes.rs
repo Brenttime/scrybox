@@ -22,7 +22,7 @@ use axum::extract::Request;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection::{sqlite_value, truthy};
 use crate::collection_writes::{
     alloc_lock, get_row_map, internal_error, is_basic_land, js_falsy, js_parse_int_v, js_to_string,
@@ -78,7 +78,7 @@ fn get_col(conn: &Connection, sql: &str, params: &[SqlValue], idx: usize) -> Res
 // PUT /api/decks/:id — routes/decks.js:522.
 // ---------------------------------------------------------------------------
 
-fn put_deck(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Response {
+async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Response {
     // `const { name, description } = req.body` then `if (!name)`. parse_body
     // has already reduced non-object JSON to {} (arrays) or 500 (primitives),
     // matching Node's strict-mode + error-handler answers (live-verified).
@@ -91,7 +91,7 @@ fn put_deck(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Response {
     let Some(name_v) = name else {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     };
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update deck"),
     };
@@ -121,10 +121,10 @@ fn put_deck(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Response {
 // cache invalidates without any HTTP-side hook.
 // ---------------------------------------------------------------------------
 
-async fn delete_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
+async fn delete_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
     const FAILED: &str = "Failed to delete deck";
     let _guard = alloc_lock().lock().await;
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED),
     };
@@ -190,9 +190,9 @@ async fn delete_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
 // sqlCardKey) but only while the deck is checked-in.
 // ---------------------------------------------------------------------------
 
-fn delete_deck_card(pool: &DbPool, id: &str, card_id: &str, user_id: i64) -> Response {
+async fn delete_deck_card(pool: &std::sync::Arc<DbPool>, id: &str, card_id: &str, user_id: i64) -> Response {
     const FAILED: &str = "Failed to remove card from deck";
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED),
     };
@@ -286,7 +286,7 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
     };
 
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return crate::collection_writes::node_exact(res).await,
     };
@@ -295,7 +295,7 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
     crate::stats::on_native_write(&st, user.id);
 
     if method == Method::PUT {
-        put_deck(&pool, &id, user.id, &body)
+        put_deck(&pool, &id, user.id, &body).await
     } else {
         delete_deck(&pool, &id, user.id).await
     }
@@ -324,7 +324,7 @@ pub async fn handle_card(
     let _ = body; // the route ignores the parsed body; parsing only mirrors error order.
 
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return crate::collection_writes::node_exact(res).await,
     };
@@ -332,7 +332,7 @@ pub async fn handle_card(
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
 
-    delete_deck_card(&pool, &id, &card_id, user.id)
+    delete_deck_card(&pool, &id, &card_id, user.id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -371,17 +371,17 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    create_deck(&pool, user.id, &body)
+    create_deck(&pool, user.id, &body).await
 }
 
-fn create_deck(pool: &DbPool, user_id: i64, body: &Value) -> Response {
+async fn create_deck(pool: &std::sync::Arc<DbPool>, user_id: i64, body: &Value) -> Response {
     const FAILED: &str = "Failed to create deck";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks create: {e:?}");
@@ -396,7 +396,7 @@ fn create_deck(pool: &DbPool, user_id: i64, body: &Value) -> Response {
     let Some(name_v) = name else {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     };
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -544,14 +544,14 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match add_card(&pool, &id, user.id, &body, false) {
+    match add_card(&pool, &id, user.id, &body, false).await {
         AddCard::Response(res) => res,
         AddCard::Forward if !crate::lists_body_writes::standalone(&st) => {
             crate::proxy(State(st), rebuild(parts, &bytes)).await
@@ -562,7 +562,7 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
             if !crate::lists_body_writes::standalone_fetch(&st, &cid).await {
                 return crate::lists_body_writes::not_on_provider(&cid);
             }
-            match add_card(&pool, &id, user.id, &body, true) {
+            match add_card(&pool, &id, user.id, &body, true).await {
                 AddCard::Response(res) => res,
                 AddCard::Forward => crate::lists_body_writes::not_on_provider(&cid),
             }
@@ -570,7 +570,7 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
     }
 }
 
-fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddCard {
+async fn add_card(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddCard {
     const FAILED: &str = "Failed to add card to deck";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks add-card: {e:?}");
@@ -585,7 +585,7 @@ fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) 
     let Some(card_id) = card_id_v else {
         return AddCard::Response(json_error(StatusCode::BAD_REQUEST, "card_id is required"));
     };
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return AddCard::Response(fail(&e)),
     };
@@ -767,23 +767,23 @@ pub async fn handle_register(Path(id): Path<String>, State(st): State<AppState>,
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    register_deck(&pool, &id, user.id)
+    register_deck(&pool, &id, user.id).await
 }
 
-fn register_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
+async fn register_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
     const FAILED: &str = "Failed to register deck in collection";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks register: {e:?}");
         json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED)
     };
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -945,7 +945,7 @@ pub async fn handle_checkout(Path(id): Path<String>, State(st): State<AppState>,
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -1039,7 +1039,7 @@ fn checkout_sql() -> String {
     )
 }
 
-async fn checkout_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
+async fn checkout_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
     const FAILED: &str = "Failed to checkout deck";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks checkout: {e:?}");
@@ -1053,7 +1053,7 @@ async fn checkout_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
     // cap queued writers could starve the lock holder (deadlock).
     let checked_out = {
         let _guard = alloc_lock().lock().await;
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(e) => return fail(&e),
         };
@@ -1080,7 +1080,7 @@ async fn checkout_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
     }
     // Diagnostics + mutation run outside the lock, like Node's — this
     // checkout is taken only on the slow path, after every alloc_lock wait.
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -1195,23 +1195,23 @@ pub async fn handle_return(Path(id): Path<String>, State(st): State<AppState>, r
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    return_deck(&pool, &id, user.id)
+    return_deck(&pool, &id, user.id).await
 }
 
-fn return_deck(pool: &DbPool, id: &str, user_id: i64) -> Response {
+async fn return_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
     const FAILED: &str = "Failed to return deck";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks return: {e:?}");
         json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED)
     };
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };

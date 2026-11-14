@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use serde_json::{json, Map, Value};
 
-use crate::auth::{authenticate, bearer_token, AuthUser};
+use crate::auth::{bearer_token, AuthUser};
 use crate::auth_support::*;
 use crate::db::DbPool;
 use crate::ip_limit::client_ip_key;
@@ -146,10 +146,10 @@ pub fn session_expiry_str(now_ms: u64) -> String {
 use crate::util::now_ms_u64 as now_ms;
 
 /// `generateSession`: 32 random bytes hex, 7-day expiry, INSERT.
-fn generate_session(pool: &DbPool, user_id: i64) -> Result<String, rusqlite::Error> {
+async fn generate_session(pool: &std::sync::Arc<DbPool>, user_id: i64) -> Result<String, rusqlite::Error> {
     let token = random_hex(32);
     let expires = session_expiry_str(now_ms());
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     conn.execute(
         "INSERT INTO sessions (token, user_id, expires_at) VALUES (?1, ?2, ?3)",
         rusqlite::params![token, user_id, expires],
@@ -157,8 +157,8 @@ fn generate_session(pool: &DbPool, user_id: i64) -> Result<String, rusqlite::Err
     Ok(token)
 }
 
-fn user_count(pool: &DbPool) -> Result<i64, rusqlite::Error> {
-    let conn = pool.get()?;
+async fn user_count(pool: &std::sync::Arc<DbPool>) -> Result<i64, rusqlite::Error> {
+    let conn = pool.get_async().await?;
     let mut stmt = conn.prepare_cached("SELECT COUNT(*) count FROM users")?;
     let mut rows = stmt.query([])?;
     match rows.next()? {
@@ -298,14 +298,14 @@ pub async fn handle(
     }
 
     let res = match key {
-        ("GET", "/api/auth/config") => handle_config(&pool),
-        ("GET", "/api/auth/me") => handle_me(&pool, &headers),
+        ("GET", "/api/auth/config") => handle_config(&pool).await,
+        ("GET", "/api/auth/me") => handle_me(&pool, &headers).await,
         ("POST", "/api/auth/register") => handle_register(&pool, &body_val).await,
         ("POST", "/api/auth/bootstrap") => handle_bootstrap(&pool, &body_val).await,
         ("POST", "/api/auth/login") => handle_login(&pool, &body_val).await,
-        ("POST", "/api/auth/logout") => handle_logout(&pool, &headers),
-        ("POST", "/api/auth/api-key") => handle_api_key_post(&pool, &headers),
-        ("DELETE", "/api/auth/api-key") => handle_api_key_delete(&pool, &headers),
+        ("POST", "/api/auth/logout") => handle_logout(&pool, &headers).await,
+        ("POST", "/api/auth/api-key") => handle_api_key_post(&pool, &headers).await,
+        ("DELETE", "/api/auth/api-key") => handle_api_key_delete(&pool, &headers).await,
         ("PUT", "/api/auth/settings") => handle_settings(&pool, &headers, &body_val).await,
         ("GET", "/api/auth/oidc/login") => handle_oidc_login(&headers).await,
         ("GET", "/api/auth/oidc/callback") => {
@@ -346,9 +346,9 @@ fn apply_conditional_get(method: &Method, headers: &HeaderMap, res: Response) ->
 // Handlers (byte-exact to routes/auth.js — error strings included)
 // ---------------------------------------------------------------------------
 
-fn handle_config(pool: &DbPool) -> Response {
+async fn handle_config(pool: &std::sync::Arc<DbPool>) -> Response {
     // Node catches the count error and keeps setupRequired=false.
-    let setup_required = user_count(pool).map(|c| c == 0).unwrap_or_else(|e| {
+    let setup_required = user_count(pool).await.map(|c| c == 0).unwrap_or_else(|e| {
         tracing::error!(error = %e, "auth config: user count failed");
         false
     });
@@ -366,9 +366,9 @@ fn handle_config(pool: &DbPool) -> Response {
 /// `res.json({ user: req.user })` — the middleware's req.user object,
 /// exact key order: id, username, role, share_token, share_enabled,
 /// api_key (|| ''), oidc_sub (|| null), via_api_key.
-fn handle_me(pool: &DbPool, headers: &HeaderMap) -> Response {
+async fn handle_me(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap) -> Response {
     let token = bearer_token(headers).map(|s| s.to_string());
-    match authenticate(pool, token.as_deref(), true) {
+    match crate::auth::authenticate_async(pool, token.as_deref(), true).await {
         Ok(u) => json_response(
             StatusCode::OK,
             &json!({
@@ -388,7 +388,7 @@ fn handle_me(pool: &DbPool, headers: &HeaderMap) -> Response {
     }
 }
 
-async fn handle_register(pool: &DbPool, body: &Value) -> Response {
+async fn handle_register(pool: &std::sync::Arc<DbPool>, body: &Value) -> Response {
     if !registration_enabled() {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -408,11 +408,11 @@ async fn handle_register(pool: &DbPool, body: &Value) -> Response {
     if p.encode_utf16().count() < 8 {
         return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
     }
-    let existing = (|| -> Result<bool, rusqlite::Error> {
-        let conn = pool.get()?;
+    let existing = (async {
+        let conn = pool.get_async().await?;
         let mut stmt = conn.prepare_cached("SELECT id FROM users WHERE username = ?1")?;
-        Ok(stmt.query_row([&clean], |_| Ok(())).is_ok())
-    })();
+        Ok::<_, rusqlite::Error>(stmt.query_row([&clean], |_| Ok(())).is_ok())
+    }).await;
     match existing {
         Ok(true) => {
             return json_error(StatusCode::BAD_REQUEST, "Username is already taken")
@@ -435,14 +435,14 @@ async fn handle_register(pool: &DbPool, body: &Value) -> Response {
         }
     };
     let share_token = random_hex(16);
-    let insert = (|| -> Result<i64, rusqlite::Error> {
-        let conn = pool.get()?;
+    let insert = (async {
+        let conn = pool.get_async().await?;
         conn.execute(
             "INSERT INTO users (username, password_hash, role, share_token, share_enabled) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![clean, hash, "member", share_token, 0],
         )?;
-        Ok(conn.last_insert_rowid())
-    })();
+        Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
+    }).await;
     let id = match insert {
         Ok(id) => id,
         Err(e) => {
@@ -450,7 +450,7 @@ async fn handle_register(pool: &DbPool, body: &Value) -> Response {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to register");
         }
     };
-    let token = match generate_session(pool, id) {
+    let token = match generate_session(pool, id).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "auth register: session failed");
@@ -472,7 +472,7 @@ async fn handle_register(pool: &DbPool, body: &Value) -> Response {
     )
 }
 
-async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
+async fn handle_bootstrap(pool: &std::sync::Arc<DbPool>, body: &Value) -> Response {
     // Open by necessity until the first account exists (auth.js:167-176).
     let password = body_str(body, "password").filter(|s| !s.is_empty());
     let Some(p) = password else {
@@ -481,7 +481,7 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
     if p.encode_utf16().count() < 8 {
         return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
     }
-    match user_count(pool) {
+    match user_count(pool).await {
         Ok(0) => {}
         Ok(_) => {
             return json_error(
@@ -512,14 +512,14 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
         }
     };
     let share_token = random_hex(16);
-    let insert = (|| -> Result<i64, rusqlite::Error> {
-        let conn = pool.get()?;
+    let insert = (async {
+        let conn = pool.get_async().await?;
         conn.execute(
             "INSERT INTO users (username, password_hash, role, share_token, share_enabled) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["admin", hash, "admin", share_token, 0],
         )?;
-        Ok(conn.last_insert_rowid())
-    })();
+        Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
+    }).await;
     let id = match insert {
         Ok(id) => id,
         Err(e) => {
@@ -531,7 +531,7 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
         }
     };
     // Orphan rows skipped by initDb, which found no account to hand them to.
-    if let Err(e) = pool.get().and_then(|c| {
+    if let Err(e) = pool.get_async().await.and_then(|c| {
         c.execute(
             "UPDATE collection SET user_id = ?1 WHERE user_id IS NULL",
             rusqlite::params![id],
@@ -544,7 +544,7 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
             "Failed to create the owner account",
         );
     }
-    let token = match generate_session(pool, id) {
+    let token = match generate_session(pool, id).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "auth bootstrap: session failed");
@@ -570,7 +570,7 @@ async fn handle_bootstrap(pool: &DbPool, body: &Value) -> Response {
     )
 }
 
-async fn handle_login(pool: &DbPool, body: &Value) -> Response {
+async fn handle_login(pool: &std::sync::Arc<DbPool>, body: &Value) -> Response {
     let username = body_str(body, "username");
     let password = body_str(body, "password");
     let (Some(u), Some(p)) = (username.filter(|s| !s.is_empty()), password.filter(|s| !s.is_empty()))
@@ -578,8 +578,11 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
         return json_error(StatusCode::BAD_REQUEST, "Username and password are required");
     };
     let clean = u.trim().to_lowercase();
-    let row = (|| -> Result<Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
-        let conn = pool.get()?;
+    let row: Result<
+        Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>,
+        rusqlite::Error,
+    > = (async {
+        let conn = pool.get_async().await?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, username, role, password_hash, share_token, share_enabled, api_key FROM users WHERE username = ?1",
         )?;
@@ -598,7 +601,7 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
             )),
             None => None,
         })
-    })();
+    }).await;
     let fail_401 = || json_error(StatusCode::UNAUTHORIZED, "Invalid username or password");
     let err_500 = |ctx: &str, e: &dyn std::fmt::Display| {
         tracing::error!(error = %e, ctx = %ctx, "auth login");
@@ -626,7 +629,7 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
         return fail_401();
     }
     let _ = id;
-    let token = match generate_session(pool, id) {
+    let token = match generate_session(pool, id).await {
         Ok(t) => t,
         Err(e) => return err_500("session", &e),
     };
@@ -648,14 +651,14 @@ async fn handle_login(pool: &DbPool, body: &Value) -> Response {
 
 /// POST /logout runs authenticateToken FIRST (401 without a token) and
 /// deletes the session token from the Authorization header (not the body).
-fn handle_logout(pool: &DbPool, headers: &HeaderMap) -> Response {
+async fn handle_logout(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap) -> Response {
     let token = bearer_token(headers).map(|s| s.to_string());
     // authenticateToken: any method reaches the handler with is_get=false
     // for logout (POST) — API-key bearer gets the read-only 403 first.
-    if let Err(res) = authenticate(pool, token.as_deref(), false) {
+    if let Err(res) = crate::auth::authenticate_async(pool, token.as_deref(), false).await {
         return res;
     }
-    let r = pool.get().and_then(|c| {
+    let r = pool.get_async().await.and_then(|c| {
         c.execute("DELETE FROM sessions WHERE token = ?1", rusqlite::params![token])?;
         Ok(())
     });
@@ -668,14 +671,14 @@ fn handle_logout(pool: &DbPool, headers: &HeaderMap) -> Response {
     }
 }
 
-fn handle_api_key_post(pool: &DbPool, headers: &HeaderMap) -> Response {
+async fn handle_api_key_post(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap) -> Response {
     let token = bearer_token(headers).map(|s| s.to_string());
-    let user = match authenticate(pool, token.as_deref(), false) {
+    let user = match crate::auth::authenticate_async(pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
     let key = format!("bnd_{}", random_hex(24));
-    let r = pool.get().and_then(|c| {
+    let r = pool.get_async().await.and_then(|c| {
         c.execute(
             "UPDATE users SET api_key = ?1 WHERE id = ?2",
             rusqlite::params![key, user.id],
@@ -691,13 +694,13 @@ fn handle_api_key_post(pool: &DbPool, headers: &HeaderMap) -> Response {
     }
 }
 
-fn handle_api_key_delete(pool: &DbPool, headers: &HeaderMap) -> Response {
+async fn handle_api_key_delete(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap) -> Response {
     let token = bearer_token(headers).map(|s| s.to_string());
-    let user = match authenticate(pool, token.as_deref(), false) {
+    let user = match crate::auth::authenticate_async(pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
-    let r = pool.get().and_then(|c| {
+    let r = pool.get_async().await.and_then(|c| {
         c.execute("UPDATE users SET api_key = NULL WHERE id = ?1", rusqlite::params![user.id])?;
         Ok(())
     });
@@ -710,9 +713,9 @@ fn handle_api_key_delete(pool: &DbPool, headers: &HeaderMap) -> Response {
     }
 }
 
-async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Response {
+async fn handle_settings(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap, body: &Value) -> Response {
     let token = bearer_token(headers).map(|s| s.to_string());
-    let user = match authenticate(pool, token.as_deref(), false) {
+    let user = match crate::auth::authenticate_async(pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -736,12 +739,12 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
                 "Password must be at least 8 characters",
             );
         }
-        let cur = (|| -> Result<Option<String>, rusqlite::Error> {
-            let conn = pool.get()?;
+        let cur = (async {
+            let conn = pool.get_async().await?;
             let mut stmt = conn.prepare_cached("SELECT password_hash FROM users WHERE id = ?1")?;
             let mut rows = stmt.query([user.id])?;
-            Ok(rows.next()?.map(|r| r.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default()))
-        })();
+            Ok::<_, rusqlite::Error>(rows.next()?.map(|r| r.get::<_, Option<String>>(0).ok().flatten().unwrap_or_default()))
+        }).await;
         let cur = match cur {
             Ok(Some(c)) => c,
             Ok(None) => return err_500("no-user", &"user row vanished"),
@@ -775,7 +778,7 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
             Ok(h) => h,
             Err(e) => return err_500("hash", &e),
         };
-        if let Err(e) = pool.get().and_then(|c| {
+        if let Err(e) = pool.get_async().await.and_then(|c| {
             c.execute(
                 "UPDATE users SET password_hash = ?1 WHERE id = ?2",
                 rusqlite::params![hash, user.id],
@@ -788,7 +791,7 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
 
     if body.get("share_enabled").is_some() {
         let on = if js_truthy(body.get("share_enabled")) { 1 } else { 0 };
-        if let Err(e) = pool.get().and_then(|c| {
+        if let Err(e) = pool.get_async().await.and_then(|c| {
             c.execute(
                 "UPDATE users SET share_enabled = ?1 WHERE id = ?2",
                 rusqlite::params![on, user.id],
@@ -801,7 +804,7 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
 
     if js_truthy(body.get("regenerate_share_token")) {
         let newtok = random_hex(16);
-        if let Err(e) = pool.get().and_then(|c| {
+        if let Err(e) = pool.get_async().await.and_then(|c| {
             c.execute(
                 "UPDATE users SET share_token = ?1 WHERE id = ?2",
                 rusqlite::params![newtok, user.id],
@@ -812,8 +815,8 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
         }
     }
 
-    let updated = (|| -> Result<Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> {
-        let conn = pool.get()?;
+    let updated: Result<Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)>, rusqlite::Error> = (async {
+        let conn = pool.get_async().await?;
         let mut stmt = conn.prepare_cached(
             "SELECT username, role, share_token, share_enabled, api_key FROM users WHERE id = ?1",
         )?;
@@ -828,7 +831,7 @@ async fn handle_settings(pool: &DbPool, headers: &HeaderMap, body: &Value) -> Re
             )),
             None => None,
         })
-    })();
+    }).await;
     match updated {
         Ok(Some((username, role, share_token, share_enabled, api_key))) => json_response(
             StatusCode::OK,
@@ -886,7 +889,7 @@ fn query_str(qs: &[(String, String)], key: &str) -> Option<String> {
 }
 
 async fn handle_oidc_callback(
-    pool: &DbPool,
+    pool: &std::sync::Arc<DbPool>,
     headers: &HeaderMap,
     raw_query: Option<&str>,
 ) -> Response {
@@ -948,23 +951,23 @@ async fn handle_oidc_callback(
         let (sub, username) = (ok.sub.clone(), ok.username.clone());
 
         // 1. Match by existing oidc_sub.
-        let by_sub = (|| -> Result<Option<(i64, Option<String>)>, rusqlite::Error> {
-            let conn = pool.get()?;
+        let by_sub = (async {
+            let conn = pool.get_async().await?;
             let mut stmt = conn.prepare_cached("SELECT id, oidc_sub FROM users WHERE oidc_sub = ?1")?;
             let mut rows = stmt.query([&sub])?;
-            Ok(rows.next()?.map(|r| (r.get(0).unwrap(), r.get(1).ok().flatten())))
-        })()
+            Ok::<_, rusqlite::Error>(rows.next()?.map(|r| (r.get::<_, i64>(0).unwrap(), r.get::<_, Option<String>>(1).ok().flatten())))
+        }).await
         .map_err(|e| e.to_string())?;
         let mut user_id = by_sub.map(|(id, _)| id);
 
         // 2. Username link (operator-trusted IdP usernames only).
         if user_id.is_none() {
-            let existing = (|| -> Result<Option<(i64, Option<String>)>, rusqlite::Error> {
-                let conn = pool.get()?;
+            let existing = (async {
+                let conn = pool.get_async().await?;
                 let mut stmt = conn.prepare_cached("SELECT id, oidc_sub FROM users WHERE username = ?1")?;
                 let mut rows = stmt.query([&username])?;
-                Ok(rows.next()?.map(|r| (r.get(0).unwrap(), r.get(1).ok().flatten())))
-            })()
+                Ok::<_, rusqlite::Error>(rows.next()?.map(|r| (r.get::<_, i64>(0).unwrap(), r.get::<_, Option<String>>(1).ok().flatten())))
+            }).await
             .map_err(|e| e.to_string())?;
             if let Some((id, bound)) = existing.clone() {
                 if !oidc::is_username_link_enabled() {
@@ -973,7 +976,7 @@ async fn handle_oidc_callback(
                 if bound.is_some() && bound.as_deref() != Some(sub.as_str()) {
                     return Err("That username is already linked to a different single sign-on identity. Ask an administrator.".into());
                 }
-                pool.get()
+                pool.get_async().await
                     .and_then(|c| {
                         c.execute(
                             "UPDATE users SET oidc_sub = ?1 WHERE id = ?2",
@@ -988,7 +991,7 @@ async fn handle_oidc_callback(
 
         // 3. Provision (first-run owner bootstrap or auto-provision).
         if user_id.is_none() {
-            let count = user_count(pool).map_err(|e| e.to_string())?;
+            let count = user_count(pool).await.map_err(|e| e.to_string())?;
             let locked_hash = format!("oidc_locked:{}", random_hex(16));
             let share_token = random_hex(16);
             let (uname, role) = if count == 0 {
@@ -997,11 +1000,11 @@ async fn handle_oidc_callback(
                 let mut final_username = username.clone();
                 let mut suffix = 1u32;
                 loop {
-                    let taken = (|| -> Result<bool, rusqlite::Error> {
-                        let conn = pool.get()?;
+                    let taken = (async {
+                        let conn = pool.get_async().await?;
                         let mut stmt = conn.prepare_cached("SELECT id FROM users WHERE username = ?1")?;
-                        Ok(stmt.query_row([&final_username], |_| Ok(())).is_ok())
-                    })()
+                        Ok::<_, rusqlite::Error>(stmt.query_row([&final_username], |_| Ok(())).is_ok())
+                    }).await
                     .map_err(|e| e.to_string())?;
                     if !taken {
                         break;
@@ -1013,17 +1016,17 @@ async fn handle_oidc_callback(
             } else {
                 return Err("No matching Scrybox account found. Auto-provisioning is disabled; ask an administrator to create your account.".into());
             };
-            let id = (|| -> Result<i64, rusqlite::Error> {
-                let conn = pool.get()?;
+            let id = (async {
+                let conn = pool.get_async().await?;
                 conn.execute(
                     "INSERT INTO users (username, password_hash, role, share_token, share_enabled, oidc_sub) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     rusqlite::params![uname, locked_hash, role, share_token, 0, sub],
                 )?;
-                Ok(conn.last_insert_rowid())
-            })()
+                Ok::<_, rusqlite::Error>(conn.last_insert_rowid())
+            }).await
             .map_err(|e| e.to_string())?;
             if count == 0 {
-                pool.get()
+                pool.get_async().await
                     .and_then(|c| {
                         c.execute(
                             "UPDATE collection SET user_id = ?1 WHERE user_id IS NULL",
@@ -1044,7 +1047,7 @@ async fn handle_oidc_callback(
             tracing::error!("OIDC callback processing failed: {msg}");
             frontend_redirect([("oidc_error", msg)])
         }
-        Ok(uid) => match generate_session(pool, uid) {
+        Ok(uid) => match generate_session(pool, uid).await {
             Ok(token) => frontend_redirect([("oidc_token", token)]),
             Err(e) => {
                 tracing::error!("OIDC callback session failed: {e}");
