@@ -158,7 +158,15 @@ pub fn list_ids(st: &AppState) -> Vec<String> {
 /// `GET /api/card-art/index` — `{ ids: [...] }`. Node's listIds never
 /// throws (both readdir legs are caught), so there is no error branch.
 pub async fn handle_index(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("catalog_art") {
+    // express routes HEAD through router.get (Node-zero: no Node to do it).
+    let head_ok = req.method() == axum::http::Method::HEAD && st.cfg.node_upstream.is_empty();
+    if (req.method() != axum::http::Method::GET && !head_ok) || !st.owns("catalog_art") {
+        // Node-zero: `/index` is only special for GET; every other method
+        // walks the router like any `/:cardId` (POST upload, DELETE remove,
+        // anything else auth-gate → finalhandler 404).
+        if st.cfg.node_upstream.is_empty() && st.owns("catalog_art") {
+            return route_card(State(st), req).await;
+        }
         return crate::proxy(State(st), req).await;
     }
     let v = Value::Object({
@@ -182,7 +190,8 @@ pub async fn handle_index(State(st): State<AppState>, req: Request) -> Response 
 /// Divergence: Range requests are not answered with 206 (browsers only
 /// range images on explicit seeks; nothing in this SPA does).
 pub async fn handle_png(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("catalog_art") {
+    let head_ok = req.method() == axum::http::Method::HEAD && st.cfg.node_upstream.is_empty();
+    if (req.method() != axum::http::Method::GET && !head_ok) || !st.owns("catalog_art") {
         return crate::proxy(State(st), req).await;
     }
     let path = req.uri().path().to_string();
@@ -191,7 +200,9 @@ pub async fn handle_png(State(st): State<AppState>, req: Request) -> Response {
         .and_then(|p| p.strip_suffix(".png"))
     {
         Some(id) if !id.is_empty() => id.to_string(),
-        _ => return crate::proxy(State(st.clone()), req).await,
+        // Not `/:cardId.png`: the router's authenticateToken then no GET
+        // route → finalhandler 404.
+        _ => return auth_then_404(&st, req).await,
     };
     // Express URIError on a malformed % escape surfaces through the global
     // error handler (same convention as cards_tags).
@@ -303,10 +314,37 @@ pub async fn route_card(State(st): State<AppState>, req: Request) -> Response {
     }
     match *req.method() {
         axum::http::Method::GET => handle_png(State(st), req).await,
+        axum::http::Method::HEAD if st.cfg.node_upstream.is_empty() => handle_png(State(st), req).await,
         axum::http::Method::POST => handle_post(State(st), req).await,
         axum::http::Method::DELETE => handle_delete(State(st), req).await,
-        _ => crate::proxy(State(st), req).await,
+        _ => auth_then_404(&st, req).await,
     }
+}
+
+/// Node-zero: a request that falls past every cardArt route. Node runs the
+/// global normalJson (1 MiB strict), then the router's `router.use(
+/// authenticateToken)`, then finds no route → finalhandler's 404. Hybrid
+/// mode keeps the replay to Node.
+async fn auth_then_404(st: &AppState, req: Request) -> Response {
+    let pool = match st.db.clone() {
+        Some(p) if st.cfg.node_upstream.is_empty() => p,
+        _ => return crate::proxy(State(st.clone()), req).await,
+    };
+    let (parts, bytes, oversize) = crate::collection_writes::read_parts(req, crate::collection_writes::BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    use crate::collection_writes::{internal_error, parse_body, too_large, BodyOutcome};
+    match parse_body(&parts.headers, &bytes) {
+        BodyOutcome::TooLarge => return too_large(),
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::Parsed(_) => {}
+    }
+    let is_get = parts.method == axum::http::Method::GET;
+    if let Err(res) = crate::settings::authenticate(&pool, &parts.headers, is_get) {
+        return crate::collection_writes::node_exact(res).await;
+    }
+    crate::static_assets::express_default_404(&parts.method, parts.uri.path())
 }
 
 /// `cardArt.save` — metadata, EXIF rotate (sharp's argument-less

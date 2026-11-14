@@ -65,6 +65,11 @@ const API_KEY_SQL: &str = concat!(
 /// cap, both of which block the calling thread. Callers on async-runtime
 /// workers on the hot request path should prefer [`authenticate_async`];
 /// this sync form stays for code already on a blocking thread.
+tokio::task_local! {
+    /// Set by the standalone HEAD->GET routing layer for the request's task.
+    pub static HEAD_AS_GET: bool;
+}
+
 pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<AuthUser, Response> {
     let Some(token) = token else {
         return Err(json_error(StatusCode::UNAUTHORIZED, "Access denied. No token provided."));
@@ -105,6 +110,9 @@ pub async fn authenticate_async(
 /// The shared lookup body: Node's exact two queries, in order, on an
 /// already-held connection.
 fn authenticate_on(conn: &rusqlite::Connection, token: &str, is_get: bool) -> Result<AuthUser, Response> {
+    // A HEAD re-dispatched as GET (standalone routing layer) is still
+    // `req.method === 'HEAD'` to Node's API-key GET-only rule.
+    let is_get = is_get && !HEAD_AS_GET.try_with(|v| *v).unwrap_or(false);
     // Node's exact two queries, in order. All seven columns come back
     // (middleware/auth.js selects them for req.user); the tuple maps
     // (user_id, username, role, share_token, share_enabled, api_key, oidc_sub).

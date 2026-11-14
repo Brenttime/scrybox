@@ -930,6 +930,15 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
                 parts.headers.remove(axum::http::header::CONTENT_LENGTH);
                 axum::body::Bytes::new()
             }
+            // Node-zero: a chunked stream past the cap is body-parser's
+            // 413 for JSON; non-JSON skips the parser (empty body).
+            Err(_) if st.cfg.node_upstream.is_empty() && crate::collection_writes::is_json_ct(&parts.headers) => {
+                return crate::collection_writes::too_large();
+            }
+            Err(_) if st.cfg.node_upstream.is_empty() => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                axum::body::Bytes::new()
+            }
             Err(_) => {
                 parts.headers.remove(axum::http::header::CONTENT_LENGTH);
                 return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
@@ -939,6 +948,10 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
             Ok(v) => {
                 req = Request::from_parts(parts, Body::from(bytes.to_vec()));
                 v
+            }
+            // Node-zero: normalJson SyntaxError → global handler 500.
+            Err(()) if st.cfg.node_upstream.is_empty() => {
+                return crate::collection_writes::internal_error();
             }
             Err(()) => {
                 let fwd = Request::from_parts(parts, Body::from(bytes.to_vec()));
@@ -968,6 +981,15 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
                 parts.headers.remove(axum::http::header::CONTENT_LENGTH);
                 axum::body::Bytes::new()
             }
+            // Node-zero: a chunked stream past the cap is body-parser's
+            // 413 for JSON; non-JSON skips the parser (empty body).
+            Err(_) if st.cfg.node_upstream.is_empty() && crate::collection_writes::is_json_ct(&parts.headers) => {
+                return crate::collection_writes::too_large();
+            }
+            Err(_) if st.cfg.node_upstream.is_empty() => {
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                axum::body::Bytes::new()
+            }
             Err(_) => {
                 parts.headers.remove(axum::http::header::CONTENT_LENGTH);
                 return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
@@ -977,6 +999,10 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
             Ok(v) => {
                 req = Request::from_parts(parts, Body::from(bytes.to_vec()));
                 v
+            }
+            // Node-zero: normalJson SyntaxError → global handler 500.
+            Err(()) if st.cfg.node_upstream.is_empty() => {
+                return crate::collection_writes::internal_error();
             }
             Err(()) => {
                 let fwd = Request::from_parts(parts, Body::from(bytes.to_vec()));
@@ -1012,7 +1038,14 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
 
     let langs = crate::catalog_read::load_languages(&st);
 
-    match (req.method().clone(), path.as_str()) {
+    // express serves HEAD through router.get (Node-zero only; hybrid keeps
+    // HEAD on Node).
+    let method = if req.method() == axum::http::Method::HEAD && st.cfg.node_upstream.is_empty() {
+        axum::http::Method::GET
+    } else {
+        req.method().clone()
+    };
+    match (method, path.as_str()) {
         (axum::http::Method::GET, "/api/admin/catalogs") => {
             let conn = match open_conn(&st) {
                 Ok(c) => c,
@@ -1041,6 +1074,11 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
         }
         (axum::http::Method::POST, "/api/admin/catalogs/build") => {
             let Some(langs) = langs else {
+                // Node-zero: no languages table (SCRYBOX_SHARED_DIR unset —
+                // Node's require() would have failed); nothing to forward to.
+                if st.cfg.node_upstream.is_empty() {
+                    return crate::collection_writes::internal_error();
+                }
                 let (parts, _) = req.into_parts();
                 return crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await;
             };
@@ -1078,6 +1116,11 @@ pub async fn handle_catalogs(State(st): State<AppState>, mut req: Request) -> Re
         }
         _ => {
             // Any other method/path on this prefix: Node's router owns the 404.
+            // Node-zero: auth + requireAdmin ran above; no admin route
+            // matches → finalhandler 404.
+            if st.cfg.node_upstream.is_empty() {
+                return crate::static_assets::express_default_404(req.method(), req.uri().path());
+            }
             let (parts, _) = req.into_parts();
             crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await
         }

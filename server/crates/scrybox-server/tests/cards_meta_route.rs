@@ -106,13 +106,18 @@ struct Fix {
 }
 
 async fn fixture(routes: &[&str]) -> Fix {
+    fixture_mode(routes, false).await
+}
+
+/// `node_free` = SCRYBOX_NODE_UPSTREAM empty (production: no Node at all).
+async fn fixture_mode(routes: &[&str], node_free: bool) -> Fix {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), "cards_meta.db");
     let node = spawn_fake_node().await;
     let (scry_addr, scry) = mock_scryfall::spawn_mock().await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        node_upstream: format!("http://{node}"),
+        node_upstream: if node_free { String::new() } else { format!("http://{node}") },
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db),
@@ -520,3 +525,30 @@ async fn cotd_error_shapes() {
     assert_eq!(json_body(&b), json!({"error": "Commander of the day unavailable"}));
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Node-free: highlight's replay legs answer natively.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn standalone_highlight_replay_legs_are_native() {
+    let f = fixture_mode(&["cards_meta"], true).await;
+    // Operator syntax goes to the engine (no Node parser to defer to).
+    *f.scry.search.lock().unwrap() = json!({"data": [{"name": "Island"}], "has_more": false, "total_cards": 1});
+    let (s, _, b) = request(&f.router, "POST", "/api/cards/highlight", &MEMBER_JSON, Some("{\"q\":\"is:land\",\"names\":[\"Island\",\"Bolt\"]}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json_body(&b), json!({"names": ["Island"]}));
+    assert_eq!(f.scry.hits_for("GET /cards/search").len(), 1);
+    // Tokenizer-provable syntax errors: analyze()'s QuerySyntaxError text.
+    let (s, _, b) = request(&f.router, "POST", "/api/cards/highlight", &MEMBER_JSON, Some("{\"q\":\"(is:land\",\"names\":[\"a\"]}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({"error": "Unbalanced parenthesis"}));
+    let (s, _, b) = request(&f.router, "POST", "/api/cards/highlight", &MEMBER_JSON, Some("{\"q\":\"o:\\\"draw\",\"names\":[\"a\"]}")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&b), json!({"error": "Unterminated quoted phrase \u{2014} close it with \""}));
+    // Malformed JSON → the global error handler's 500.
+    let (s, _, b) = request(&f.router, "POST", "/api/cards/highlight", &MEMBER_JSON, Some("{oops")).await;
+    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json_body(&b), json!({"error": "Internal server error"}));
+}

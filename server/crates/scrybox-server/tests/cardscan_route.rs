@@ -700,3 +700,102 @@ async fn nested_bodies_are_compact_stringify() {
     assert!(text.starts_with("{\"ok\":true,\"cards\":[{\"id\":\"mtg-"), "got {text}");
     assert!(!text.contains("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// MVP standalone (no Node upstream): the card_cache-miss arms used to
+// Forward to Node → 502 "Upstream unavailable" once Node is gone. They now
+// run getCardById's fetch lane (scryGet + cacheCards) natively.
+// ---------------------------------------------------------------------------
+
+async fn mock_scryfall() -> String {
+    let r = Router::new().route(
+        "/cards/{id}",
+        axum::routing::get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+            let (name, num) = match id.as_str() {
+                "eeeeeeee-5555-5555-5555-555555555555" => ("Fetched E", "15"),
+                "dddddddd-4444-4444-4444-444444444444" => ("Scene Card", "11"),
+                _ => return (StatusCode::NOT_FOUND, axum::Json(json!({"object":"error","status":404}))).into_response(),
+            };
+            axum::Json(json!({
+                "object":"card","id":id,"name":name,"lang":"en","set":"xct","set_name":"X Set",
+                "collector_number":num,"rarity":"common","type_line":"Creature — Goblin","cmc":2.0,
+                "color_identity":["R"],"image_uris":{"normal":"http://x/i.jpg"},"prices":{"usd":"1.00"}
+            }))
+            .into_response()
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, r).await.unwrap() });
+    format!("http://{addr}")
+}
+
+async fn harness_standalone() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_db(dir.path());
+    std::env::set_var("CARDSCAN_URL", mock_sidecar());
+    let scry_base = mock_scryfall().await;
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: String::new(),
+        static_dir: None,
+        rust_routes: ["cardscan".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        db_path: Some(db.clone()),
+        sidecar_url: None,
+    };
+    let mut st = AppState::new(cfg);
+    st.scry = std::sync::Arc::new(scrybox_server::scryfall::Scry::new(scrybox_server::scryfall::ScryEnv {
+        local: false,
+        local_url: scry_base.clone(),
+        base_url: scry_base,
+        gap_scale: 0.0,
+    }));
+    Harness { router: app(st), db, _dir: dir }
+}
+
+#[tokio::test]
+async fn standalone_cards_miss_fetches_and_caches() {
+    let h = harness_standalone().await;
+    let body = r#"{"results":[{"scryfallId":"eeeeeeee-5555-5555-5555-555555555555","number":1}]}"#;
+    let (st, _, b) = call(&h.router, "POST", "/api/cardscan/cards", &JSON_CT, Some(body)).await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let v = json_body(&b);
+    assert_eq!(v["results"][0]["ok"], true, "{v}");
+    assert_eq!(v["results"][0]["card"]["name"], "Fetched E");
+    let n: i64 = Connection::open(&h.db).unwrap()
+        .query_row("SELECT COUNT(*) FROM card_cache WHERE id='mtg-eeeeeeee-5555-5555-5555-555555555555'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1, "cacheCards write");
+    // Scryfall 404: Node's null arm (ok:false + 'not in the card database yet').
+    let body = r#"{"results":[{"scryfallId":"ffffffff-6666-6666-6666-666666666666"}]}"#;
+    let (st, _, b) = call(&h.router, "POST", "/api/cardscan/cards", &JSON_CT, Some(body)).await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let v = json_body(&b);
+    assert_eq!(v["results"][0]["ok"], false);
+    assert_eq!(v["results"][0]["error"], "printing not in the card database yet");
+}
+
+#[tokio::test]
+async fn standalone_choices_miss_fetches_or_400s() {
+    let h = harness_standalone().await;
+    let body = format!(r#"{{"ids":["eeeeeeee-5555-5555-5555-555555555555","{UUID_B}"]}}"#);
+    let (st, _, b) = call(&h.router, "POST", "/api/cardscan/choices", &JSON_CT, Some(&body)).await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(json_body(&b)["cards"][0]["name"], "Fetched E");
+    let body = r#"{"ids":["eeeeeeee-5555-5555-5555-555555555555","ffffffff-6666-6666-6666-666666666666"]}"#;
+    let (st, _, b) = call(&h.router, "POST", "/api/cardscan/choices", &JSON_CT, Some(body)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(json_body(&b), json!({"ok":false,"error":"Expected 2-8 card ids that exist"}));
+}
+
+#[tokio::test]
+async fn standalone_scan_miss_fetches_instead_of_502() {
+    let h = harness_standalone().await;
+    {
+        let conn = Connection::open(&h.db).unwrap();
+        conn.execute_batch("DELETE FROM card_cache WHERE id='mtg-dddddddd-4444-4444-4444-444444444444';").unwrap();
+    }
+    let (st, _, b) = call(&h.router, "POST", "/api/cardscan", &JSON_CT, Some(r#"{"cards":[{"image":"STANDALONE-SENT"}]}"#)).await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let v = json_body(&b);
+    assert!(v.to_string().contains("Scene Card"), "{v}");
+}

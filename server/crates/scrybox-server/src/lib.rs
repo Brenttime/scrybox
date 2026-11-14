@@ -39,9 +39,11 @@ pub mod card_art;
 pub mod cards_tags;
 pub mod catalog_read;
 pub mod collq;
+pub mod scryq;
 pub mod cvscan;
 pub mod ip_limit;
 pub mod oidc;
+pub mod oracle_tags;
 pub mod collection;
 pub mod collection_writes;
 pub mod db;
@@ -410,18 +412,6 @@ pub(crate) async fn drain_request_body(body: &mut Body) {
     }
 }
 
-/// Paths Node mounts ABOVE its single `app.use('/api', authenticateToken)`
-/// gate (server.js): their routers authenticate themselves or are deliberately
-/// public (login, shared collection, card art, health). Everything else under
-/// /api passes through the gate before its route runs.
-fn pre_gate_api_path(p: &str) -> bool {
-    p.starts_with("/api/health")
-        || p.starts_with("/api/auth")
-        || p.starts_with("/api/shared")
-        || p.starts_with("/api/admin")
-        || p.starts_with("/api/card-art")
-}
-
 /// Reverse-proxy one request to Node, streaming both bodies.
 pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
     // Lane B unit 7b (e2e-on-Rust): in standalone (Node-free) mode this is
@@ -436,17 +426,10 @@ pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
     // (readiness manifest). Internal proxy legs from handlers that already
     // authenticated just pay one more µs-cached SELECT.
     if st.cfg.node_upstream.is_empty() {
-        let p = req.uri().path();
-        if p.starts_with("/api/") && !pre_gate_api_path(p) {
-            if let Some(pool) = st.db.as_ref() {
-                let token = auth::bearer_token(req.headers()).map(|s| s.to_string());
-                let is_get = req.method() == axum::http::Method::GET;
-                if let Err(res) = auth::authenticate_async(pool, token.as_deref(), is_get).await {
-                    drain_request_body(req.body_mut()).await;
-                    return res;
-                }
-            }
-        }
+        // Node-free: the ONE central no-route path (body parser -> admin /
+        // global auth gate -> large parsers -> finalhandler 404), shared
+        // with every native handler's unowned arm.
+        return collection_writes::standalone_unmatched(&st, req).await;
     }
     // statsCache.invalidateOnWrite twin: an authenticated non-GET /api write
     // bumps that user's stats generation so their cached /stats body is
@@ -511,19 +494,176 @@ pub fn node_panic_500(err: Box<dyn std::any::Any + Send>) -> Response {
     )
 }
 
+/// Original request method, recorded by the standalone HEAD layer before it
+/// re-dispatches HEAD as GET (finalhandler's `Cannot HEAD /x` needs it).
+#[derive(Clone, Debug)]
+pub struct OrigMethod(pub axum::http::Method);
+
+thread_local! {
+    /// Route patterns registered while `app()` builds (see `RRoute`).
+    static ROUTE_PATS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `.route` twin that records the pattern, so the standalone routing layer
+/// can resolve Express's case-insensitive / non-strict matches against
+/// exactly the routes this process registered.
+trait RRoute<S> {
+    fn rroute(self, path: &str, m: axum::routing::MethodRouter<S>) -> Self;
+}
+impl<S: Clone + Send + Sync + 'static> RRoute<S> for Router<S> {
+    fn rroute(self, path: &str, m: axum::routing::MethodRouter<S>) -> Self {
+        ROUTE_PATS.with(|v| v.borrow_mut().push(path.to_string()));
+        self.route(path, m)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Seg<'a> {
+    // Ord: matchit priority, static > param > catch-all.
+    Catch,
+    Param,
+    Lit(&'a str),
+}
+
+fn pat_segs(p: &str) -> Vec<Seg<'_>> {
+    p.split('/')
+        .skip(1)
+        .map(|s| {
+            if s.starts_with("{*") {
+                Seg::Catch
+            } else if s.starts_with('{') {
+                Seg::Param
+            } else {
+                Seg::Lit(s)
+            }
+        })
+        .collect()
+}
+
+/// Match `segs` against `pat`; `ci` = case-insensitive literals. Returns
+/// the per-segment priority key (higher = more specific) on a match.
+fn seg_match(pat: &[Seg<'_>], segs: &[&str], ci: bool) -> Option<Vec<u8>> {
+    let mut key = Vec::new();
+    for (i, ps) in pat.iter().enumerate() {
+        match ps {
+            Seg::Catch => {
+                let rest = &segs[i.min(segs.len())..];
+                if rest.is_empty() || rest.join("/").is_empty() {
+                    return None;
+                }
+                key.push(0);
+                return Some(key);
+            }
+            _ if i >= segs.len() => return None,
+            Seg::Param => {
+                if segs[i].is_empty() {
+                    return None;
+                }
+                key.push(1);
+            }
+            Seg::Lit(l) => {
+                let ok = if ci { l.eq_ignore_ascii_case(segs[i]) } else { *l == segs[i] };
+                if !ok {
+                    return None;
+                }
+                key.push(2);
+            }
+        }
+    }
+    (pat.len() == segs.len()).then_some(key)
+}
+
+/// Express default routing (no `case sensitive routing` / `strict routing`
+/// set in server.js): `/API/Stats` and `/api/stats/` reach the `/api/stats`
+/// route. Returns the registered spelling of `path` when it differs and
+/// only a case/trailing-slash relaxation makes it match; `None` when the
+/// path already matches as typed (or matches nothing). Params and
+/// catch-all tails keep their original bytes. Scoped to `/api` — static
+/// and SPA lookups are filesystem-cased on Node too.
+pub(crate) fn express_canonical_path(path: &str, pats: &[String]) -> Option<String> {
+    let first = path.split('/').nth(1)?;
+    if !first.eq_ignore_ascii_case("api") {
+        return None;
+    }
+    let exact: Vec<&str> = path.split('/').skip(1).collect();
+    let parsed: Vec<Vec<Seg<'_>>> = pats.iter().filter(|p| p.starts_with("/api")).map(|p| pat_segs(p)).collect();
+    if parsed.iter().any(|p| seg_match(p, &exact, false).is_some()) {
+        return None;
+    }
+    let trimmed = if path.len() > 1 && path.ends_with('/') { &path[..path.len() - 1] } else { path };
+    let segs: Vec<&str> = trimmed.split('/').skip(1).collect();
+    let best = parsed
+        .iter()
+        .filter_map(|p| seg_match(p, &segs, true).map(|k| (k, p)))
+        .max_by(|a, b| a.0.cmp(&b.0))?
+        .1;
+    let mut out = String::new();
+    for (i, s) in segs.iter().enumerate() {
+        out.push('/');
+        match best.get(i) {
+            Some(Seg::Lit(l)) => out.push_str(l),
+            _ => out.push_str(s),
+        }
+    }
+    (out != path).then_some(out)
+}
+
+/// Standalone-only outer layer giving the Rust router Express's routing
+/// semantics for EVERY route: (1) HEAD runs the GET handler and answers its
+/// headers with no body (Express routes HEAD to GET handlers when no HEAD
+/// route exists); (2) case-insensitive, trailing-slash-optional path
+/// matching (`express_canonical_path`). The original method rides in
+/// `OrigMethod` and the original URI in axum's `OriginalUri`, so
+/// finalhandler 404s and the API-key GET-only rule still see what the
+/// client sent.
+async fn express_routing(
+    State(pats): State<Arc<Vec<String>>>,
+    mut req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(canon) = express_canonical_path(req.uri().path(), &pats) {
+        let pq = match req.uri().query() {
+            Some(q) => format!("{canon}?{q}"),
+            None => canon,
+        };
+        if let Ok(pq) = pq.parse::<axum::http::uri::PathAndQuery>() {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(u) = Uri::from_parts(parts) {
+                *req.uri_mut() = u;
+            }
+        }
+    }
+    let orig = req.method().clone();
+    req.extensions_mut().insert(OrigMethod(orig.clone()));
+    if orig != axum::http::Method::HEAD {
+        return next.run(req).await;
+    }
+    *req.method_mut() = axum::http::Method::GET;
+    let res = auth::HEAD_AS_GET.scope(true, next.run(req)).await;
+    let (mut parts, body) = res.into_parts();
+    if !parts.headers.contains_key(header::CONTENT_LENGTH) {
+        if let Some(n) = axum::body::HttpBody::size_hint(&body).exact() {
+            parts.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+        }
+    }
+    Response::from_parts(parts, Body::empty())
+}
+
 /// Build the router. Ported routes are mounted explicitly; everything else
 /// falls back to Node (optionally after a static-file lookup).
 pub fn app(state: AppState) -> Router {
     // Health cache prober (iter 17): keeps the last healthy Node response
     // warm so the handler answers from memory while fresh. SCRYBOX_HEALTH_CACHE=0
     // disables both the prober and the cache lookup (iter-16 live proxy).
+    ROUTE_PATS.with(|v| v.borrow_mut().clear());
     health::spawn_prober(&state);
     // Heap hygiene (memory queue item 2, MEMORY.md #4): in-code glibc
     // tuning (mmap threshold, arena cap) plus malloc_trim on an idle timer,
     // independent of route-group ownership so the kill switches can't
     // disable it. Idempotent with the collection/search paths.
     collection::spawn_idle_trim_timer(&state);
-    let router = Router::new().route("/api/health", get(health::handle));
+    let router = Router::new().rroute("/api/health", get(health::handle));
     // Ported API routes behind the per-route kill switch. Non-GET methods on
     // an owned path still proxy to Node (the handler dispatches internally).
     let router = if state.owns("collection") {
@@ -536,7 +676,7 @@ pub fn app(state: AppState) -> Router {
         if std::env::var("SCRYBOX_COLLECTION_PREWARM").map(|v| v != "0").unwrap_or(true) {
             collection::spawn_refresher(&state);
         }
-        router.route("/api/collection", any(collection::handle))
+        router.rroute("/api/collection", any(collection::handle))
     } else {
         router
     };
@@ -545,7 +685,7 @@ pub fn app(state: AppState) -> Router {
         // churned bodies (rev-prune/eviction arm the flag; this timer pays
         // it back, never a serving thread).
         search::spawn_trim_timer(&state);
-        router.route("/api/search", any(search::handle))
+        router.rroute("/api/search", any(search::handle))
     } else {
         router
     };
@@ -555,9 +695,9 @@ pub fn app(state: AppState) -> Router {
     // would hydrate it from Scryfall), are proxied to Node untouched.
     let router = if state.owns("collection_writes") {
         router
-            .route("/api/collection/cardlist", any(collection_writes::handle_cardlist))
-            .route("/api/collection/bulk", any(collection_writes::handle_bulk))
-            .route("/api/collection/{id}", any(collection_writes::handle_entry))
+            .rroute("/api/collection/cardlist", any(collection_writes::handle_cardlist))
+            .rroute("/api/collection/bulk", any(collection_writes::handle_bulk))
+            .rroute("/api/collection/{id}", any(collection_writes::handle_entry))
     } else {
         router
     };
@@ -580,8 +720,8 @@ pub fn app(state: AppState) -> Router {
             post(collection_writes::handle_add).fallback(crate::proxy)
         };
         router
-            .route("/api/collection", adds)
-            .route("/api/collection/bulk-add", any(collection_writes::handle_bulk_add))
+            .rroute("/api/collection", adds)
+            .rroute("/api/collection/bulk-add", any(collection_writes::handle_bulk_add))
     } else {
         router
     };
@@ -591,7 +731,7 @@ pub fn app(state: AppState) -> Router {
         // the router (same runtime); tests that build a Router get it too,
         // which is the point — the bounded-staleness tests exercise it.
         stats::spawn_refresher(&state);
-        router.route("/api/stats", any(stats::handle))
+        router.rroute("/api/stats", any(stats::handle))
     } else {
         router
     };
@@ -604,9 +744,9 @@ pub fn app(state: AppState) -> Router {
         // as the /stats mount, and mounting these never changes what
         // /api/stats itself resolves to — the groups stay independent.
         router
-            .route("/api/stats/history", any(stats_subs::handle_history))
-            .route("/api/stats/networth", any(stats_subs::handle_networth))
-            .route("/api/stats/top-mover", any(stats_subs::handle_top_mover))
+            .rroute("/api/stats/history", any(stats_subs::handle_history))
+            .rroute("/api/stats/networth", any(stats_subs::handle_networth))
+            .rroute("/api/stats/top-mover", any(stats_subs::handle_top_mover))
     } else {
         router
     };
@@ -615,14 +755,14 @@ pub fn app(state: AppState) -> Router {
     // Express keeps authoring the 404 pages.
     let router = if state.owns("auth") {
         router
-            .route("/api/auth", any(auth_routes::handle))
-            .route("/api/auth/{*rest}", any(auth_routes::handle))
+            .rroute("/api/auth", any(auth_routes::handle))
+            .rroute("/api/auth/{*rest}", any(auth_routes::handle))
     } else {
         router
     };
     // Sets route group (Lane B unit 1): native GET /api/sets (flat + tree).
     let router = if state.owns("sets") {
-        router.route("/api/sets", any(sets::handle))
+        router.rroute("/api/sets", any(sets::handle))
     } else {
         router
     };
@@ -631,10 +771,10 @@ pub fn app(state: AppState) -> Router {
     // authors everything else under /api/cards (e.g. /cards/highlight).
     let router = if state.owns("cards_tags") {
         router
-            .route("/api/cards/{id}/oracle", any(cards_tags::handle_oracle))
-            .route("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
-            .route("/api/cards/role-tags", any(cards_tags::handle_role_tags))
-            .route("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
+            .rroute("/api/cards/{id}/oracle", any(cards_tags::handle_oracle))
+            .rroute("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
+            .rroute("/api/cards/role-tags", any(cards_tags::handle_role_tags))
+            .rroute("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
     } else {
         router
     };
@@ -646,12 +786,12 @@ pub fn app(state: AppState) -> Router {
     // gate — Rust answers it without any session too). Methods/paths the
     // port does not own proxy to Node untouched.
     let router = if state.owns("search_history") {
-        router.route("/api/search-history", any(search_history::handle))
+        router.rroute("/api/search-history", any(search_history::handle))
     } else {
         router
     };
     let router = if state.owns("shared") {
-        router.route("/api/shared/{token}", any(shared::handle))
+        router.rroute("/api/shared/{token}", any(shared::handle))
     } else {
         router
     };
@@ -661,13 +801,13 @@ pub fn app(state: AppState) -> Router {
     // build-control routes stay unregistered so the catch-all proxies them.
     let router = if state.owns("catalog_art") {
         router
-            .route("/api/card-art/index", any(card_art::handle_index))
+            .rroute("/api/card-art/index", any(card_art::handle_index))
             // matchit has no `{param}.png` suffix segments — Node's route is
             // `/:cardId.png`; route_card dispatches GET/POST/DELETE on the
             // decoded id and proxies anything outside the group's shapes.
-            .route("/api/card-art/{cardId}", any(card_art::route_card))
-            .route("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
-            .route("/api/scan-sets", any(catalog_read::handle_scan_sets))
+            .rroute("/api/card-art/{cardId}", any(card_art::route_card))
+            .rroute("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
+            .rroute("/api/scan-sets", any(catalog_read::handle_scan_sets))
     } else {
         router
     };
@@ -676,12 +816,12 @@ pub fn app(state: AppState) -> Router {
     // paths while the group is off, so Node keeps its own engine there.
     let router = if state.owns("catalog_build") {
         router
-            .route("/api/admin/catalogs", any(catalog_build::handle_catalogs))
-            .route("/api/admin/catalogs/progress", any(catalog_build::handle_catalogs))
-            .route("/api/admin/catalogs/build", any(catalog_build::handle_catalogs))
-            .route("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
-            .route("/api/admin/models", any(model_assets::handle_models))
-            .route("/api/admin/models/download", any(model_assets::handle_models))
+            .rroute("/api/admin/catalogs", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/progress", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/build", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/models", any(model_assets::handle_models))
+            .rroute("/api/admin/models/download", any(model_assets::handle_models))
     } else {
         router
     };
@@ -692,7 +832,7 @@ pub fn app(state: AppState) -> Router {
     // ps_seed_oversize_no_token — global normalJson 413 above auth — so the
     // Lane-A twin is authoritative; see PROGRESS.)
     let router = if state.owns("seed_cards") {
-        router.route("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
+        router.rroute("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
     } else {
         router
     };
@@ -704,7 +844,7 @@ pub fn app(state: AppState) -> Router {
     // else (or groups that are off) falls through to the catch-all proxy —
     // never 405 here.
     let router = if state.owns("decks_reads") {
-        router.route("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+        router.rroute("/api/decks/{id}/locations", any(decks_reads::handle_locations))
     } else {
         router
     };
@@ -713,32 +853,32 @@ pub fn app(state: AppState) -> Router {
     // proxies both untouched.
     let router = if state.owns("decks_combos") {
         router
-            .route("/api/decks/{id}/combos", any(decks_combos::handle_combos))
-            .route("/api/decks/{id}/synergy", any(decks_combos::handle_synergy))
+            .rroute("/api/decks/{id}/combos", any(decks_combos::handle_combos))
+            .rroute("/api/decks/{id}/synergy", any(decks_combos::handle_synergy))
     } else {
         router
     };
     let router = if state.owns("decks_reads") && state.owns("decks_writes") {
-        router.route("/api/decks", any(decks_writes::route_collection))
+        router.rroute("/api/decks", any(decks_writes::route_collection))
     } else if state.owns("decks_reads") {
-        router.route("/api/decks", any(decks_reads::handle_list))
+        router.rroute("/api/decks", any(decks_reads::handle_list))
     } else if state.owns("decks_writes") {
-        router.route("/api/decks", any(decks_writes::handle_create))
+        router.rroute("/api/decks", any(decks_writes::handle_create))
     } else {
         router
     };
     let router = if state.owns("decks_reads") || state.owns("decks_writes") {
-        router.route("/api/decks/{id}", any(decks_reads::route_entry))
+        router.rroute("/api/decks/{id}", any(decks_reads::route_entry))
     } else {
         router
     };
     let router = if state.owns("decks_writes") {
         router
-            .route("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
-            .route("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
-            .route("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
-            .route("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
-            .route("/api/decks/{id}/return", any(decks_writes::handle_return))
+            .rroute("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .rroute("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
+            .rroute("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
+            .rroute("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
+            .rroute("/api/decks/{id}/return", any(decks_writes::handle_return))
     } else {
         router
     };
@@ -747,8 +887,8 @@ pub fn app(state: AppState) -> Router {
     // catch-all proxy — never 405.
     let router = if state.owns("settings") {
         router
-            .route("/api/settings", any(settings::route_settings))
-            .route("/api/settings/version", any(settings::route_version))
+            .rroute("/api/settings", any(settings::route_settings))
+            .rroute("/api/settings/version", any(settings::route_version))
     } else {
         router
     };
@@ -757,8 +897,8 @@ pub fn app(state: AppState) -> Router {
     // group+method and forward anything else — never 405/404 locally.
     let router = if state.owns("precons") {
         router
-            .route("/api/precons", any(precons::route_precons))
-            .route("/api/precons/import", any(precons::route_import))
+            .rroute("/api/precons", any(precons::route_precons))
+            .rroute("/api/precons/import", any(precons::route_import))
     } else {
         router
     };
@@ -767,8 +907,8 @@ pub fn app(state: AppState) -> Router {
     // else — never 405/404 locally.
     let router = if state.owns("rules") {
         router
-            .route("/api/rules", any(rules::route_rules))
-            .route("/api/rules/keywords", any(rules::route_keywords))
+            .rroute("/api/rules", any(rules::route_rules))
+            .rroute("/api/rules/keywords", any(rules::route_keywords))
     } else {
         router
     };
@@ -776,7 +916,7 @@ pub fn app(state: AppState) -> Router {
     // `limited`. The handler self-checks the method; anything else rides the
     // proxy so Node's final-handler 404 (router.post does not match) is kept.
     let router = if state.owns("limited") {
-        router.route("/api/limited/analyze", any(limited::handle))
+        router.rroute("/api/limited/analyze", any(limited::handle))
     } else {
         router
     };
@@ -786,9 +926,9 @@ pub fn app(state: AppState) -> Router {
     // else — never 405/404 locally.
     let router = if state.owns("secret_lair") {
         router
-            .route("/api/secret-lair", any(secret_lair::route_search))
-            .route("/api/secret-lair/preview", any(secret_lair::route_preview))
-            .route("/api/secret-lair/add", any(secret_lair::route_add))
+            .rroute("/api/secret-lair", any(secret_lair::route_search))
+            .rroute("/api/secret-lair/preview", any(secret_lair::route_preview))
+            .rroute("/api/secret-lair/add", any(secret_lair::route_add))
     } else {
         router
     };
@@ -797,8 +937,8 @@ pub fn app(state: AppState) -> Router {
     // Handlers self-check owns+method and proxy everything else.
     let router = if state.owns("export") {
         router
-            .route("/api/export", any(export::route_export).post(export::route_export_post))
-            .route("/api/import", any(export::route_import))
+            .rroute("/api/export", any(export::route_export).post(export::route_export_post))
+            .rroute("/api/import", any(export::route_import))
     } else {
         router
     };
@@ -809,11 +949,11 @@ pub fn app(state: AppState) -> Router {
     // Handlers self-check owns+method and proxy everything else.
     let router = if state.owns("cards_meta") {
         router
-            .route("/api/cards/highlight", any(cards_meta::handle_highlight))
-            .route("/api/cards/{id}/decks", any(cards_meta::handle_card_decks))
-            .route("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
-            .route("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
-            .route("/api/suggest", any(cards_meta::handle_suggest))
+            .rroute("/api/cards/highlight", any(cards_meta::handle_highlight))
+            .rroute("/api/cards/{id}/decks", any(cards_meta::handle_card_decks))
+            .rroute("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
+            .rroute("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
+            .rroute("/api/suggest", any(cards_meta::handle_suggest))
     } else {
         router
     };
@@ -824,8 +964,8 @@ pub fn app(state: AppState) -> Router {
     // never a local 404/405.
     let router = if state.owns("admin_users") {
         router
-            .route("/api/admin/users", any(admin_users::route_users))
-            .route("/api/admin/users/{id}", any(admin_users::route_user))
+            .rroute("/api/admin/users", any(admin_users::route_users))
+            .rroute("/api/admin/users/{id}", any(admin_users::route_user))
     } else {
         router
     };
@@ -836,10 +976,10 @@ pub fn app(state: AppState) -> Router {
     // methods ride the catch-all proxy, never a local 404/405.
     let router = if state.owns("marketplace") {
         router
-            .route("/api/marketplace/accounts", any(marketplace::route_accounts))
-            .route("/api/marketplace/recent/{source}", any(marketplace::route_recent))
-            .route("/api/marketplace/preview", any(marketplace::route_preview))
-            .route("/api/marketplace/add", any(marketplace::route_add))
+            .rroute("/api/marketplace/accounts", any(marketplace::route_accounts))
+            .rroute("/api/marketplace/recent/{source}", any(marketplace::route_recent))
+            .rroute("/api/marketplace/preview", any(marketplace::route_preview))
+            .rroute("/api/marketplace/add", any(marketplace::route_add))
     } else {
         router
     };
@@ -850,25 +990,25 @@ pub fn app(state: AppState) -> Router {
     // other method, so shapes are never 405'd here.
     let router = if state.owns("lists_reads") {
         let router = router
-            .route("/api/lists/card-matches", any(lists_reads::handle_card_matches))
-            .route("/api/lists/{id}", any(lists_reads::route_entry))
-            .route("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist));
+            .rroute("/api/lists/card-matches", any(lists_reads::handle_card_matches))
+            .rroute("/api/lists/{id}", any(lists_reads::route_entry))
+            .rroute("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist));
         if state.owns("lists_writes") {
             // iter-32: /api/lists POST + /order are native under lists_writes;
             // the collection dispatcher keeps GET with lists_reads.
             router
-                .route("/api/lists", any(lists_writes::route_collection))
-                .route("/api/lists/order", any(lists_writes::handle_order))
+                .rroute("/api/lists", any(lists_writes::route_collection))
+                .rroute("/api/lists/order", any(lists_writes::handle_order))
         } else {
-            router.route("/api/lists", any(lists_reads::handle_collection))
+            router.rroute("/api/lists", any(lists_reads::handle_collection))
         }
     } else if state.owns("lists_writes") {
         router
-            .route("/api/lists", any(lists_writes::route_collection))
-            .route("/api/lists/order", any(lists_writes::handle_order))
+            .rroute("/api/lists", any(lists_writes::route_collection))
+            .rroute("/api/lists/order", any(lists_writes::handle_order))
             // The /:id dispatcher answers PUT/DELETE natively here; its GET
             // leg self-checks lists_reads and proxies when that group is off.
-            .route("/api/lists/{id}", any(lists_reads::route_entry))
+            .rroute("/api/lists/{id}", any(lists_reads::route_entry))
     } else {
         router
     };
@@ -878,13 +1018,13 @@ pub fn app(state: AppState) -> Router {
     // group and the method, forwarding anything else to Node (never 405).
     let router = if state.owns("lists_writes") {
         router
-            .route("/api/lists/{id}/cards", any(lists_body_writes::handle_add_card))
-            .route("/api/lists/{id}/cards/bulk", any(lists_body_writes::handle_bulk_add))
-            .route("/api/lists/{id}/cards/bulk-remove", any(lists_body_writes::handle_bulk_remove))
-            .route("/api/lists/{id}/remove-from-collection", any(lists_body_writes::handle_remove_from_collection))
-            .route("/api/lists/{id}/cheapest-printings", any(lists_body_writes::handle_cheapest_printings))
-            .route("/api/lists/{id}/cards/{card_id}/printing", any(lists_body_writes::handle_printing))
-            .route("/api/lists/{id}/cards/{card_id}", any(lists_body_writes::handle_remove_card))
+            .rroute("/api/lists/{id}/cards", any(lists_body_writes::handle_add_card))
+            .rroute("/api/lists/{id}/cards/bulk", any(lists_body_writes::handle_bulk_add))
+            .rroute("/api/lists/{id}/cards/bulk-remove", any(lists_body_writes::handle_bulk_remove))
+            .rroute("/api/lists/{id}/remove-from-collection", any(lists_body_writes::handle_remove_from_collection))
+            .rroute("/api/lists/{id}/cheapest-printings", any(lists_body_writes::handle_cheapest_printings))
+            .rroute("/api/lists/{id}/cards/{card_id}/printing", any(lists_body_writes::handle_printing))
+            .rroute("/api/lists/{id}/cards/{card_id}", any(lists_body_writes::handle_remove_card))
     } else {
         router
     };
@@ -909,13 +1049,13 @@ pub fn app(state: AppState) -> Router {
             moxfield::spawn_scheduler(&state);
         }
         router
-            .route("/api/moxfield", any(moxfield::handle_status))
-            .route("/api/moxfield/authors", any(moxfield::handle_add_author))
-            .route("/api/moxfield/authors/{id}", any(moxfield::handle_delete_author))
-            .route("/api/moxfield/authors/{id}/sync-decklist", any(moxfield::handle_sync_decklist))
-            .route("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
-            .route("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
-            .route("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
+            .rroute("/api/moxfield", any(moxfield::handle_status))
+            .rroute("/api/moxfield/authors", any(moxfield::handle_add_author))
+            .rroute("/api/moxfield/authors/{id}", any(moxfield::handle_delete_author))
+            .rroute("/api/moxfield/authors/{id}/sync-decklist", any(moxfield::handle_sync_decklist))
+            .rroute("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
+            .rroute("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
+            .rroute("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
     } else {
         router
     };
@@ -935,12 +1075,12 @@ pub fn app(state: AppState) -> Router {
             backup::spawn_auto_backup(&state);
         }
         router
-            .route("/api/manabox-sync/preview", any(manabox::handle_preview))
-            .route("/api/manabox-sync/apply", any(manabox::handle_apply))
-            .route("/api/manabox-sync/runs", any(manabox::handle_runs))
-            .route("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
-            .route("/api/admin/backups", any(backup::handle_backups_collection))
-            .route("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
+            .rroute("/api/manabox-sync/preview", any(manabox::handle_preview))
+            .rroute("/api/manabox-sync/apply", any(manabox::handle_apply))
+            .rroute("/api/manabox-sync/runs", any(manabox::handle_runs))
+            .rroute("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
+            .rroute("/api/admin/backups", any(backup::handle_backups_collection))
+            .rroute("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
     } else {
         router
     };
@@ -950,13 +1090,13 @@ pub fn app(state: AppState) -> Router {
     // gate: the routes only exist when LOCAL_WEB_PORTAL_ENABLED === 'true'.
     let router = if state.owns("static_assets") {
         router
-            .route("/scan-assets", any(static_assets::handle_scan_assets))
+            .rroute("/scan-assets", any(static_assets::handle_scan_assets))
             // Explicit trailing-slash exacts: matchit's catch-all does NOT
             // match an empty tail, and under static_spa the SPA wildcard
             // would otherwise swallow these (live :3312-vs-:3320 diff).
-            .route("/scan-assets/", any(static_assets::handle_scan_assets))
-            .route("/scan-assets/{*rest}", any(static_assets::handle_scan_assets))
-            .route("/models/cornelius.onnx", any(static_assets::handle_model))
+            .rroute("/scan-assets/", any(static_assets::handle_scan_assets))
+            .rroute("/scan-assets/{*rest}", any(static_assets::handle_scan_assets))
+            .rroute("/models/cornelius.onnx", any(static_assets::handle_model))
     } else {
         router
     };
@@ -964,9 +1104,9 @@ pub fn app(state: AppState) -> Router {
         && std::env::var("LOCAL_WEB_PORTAL_ENABLED").as_deref() == Ok("true")
     {
         router
-            .route("/scryfall-portal", any(static_assets::handle_portal))
-            .route("/scryfall-portal/", any(static_assets::handle_portal))
-            .route("/scryfall-portal/{*rest}", any(static_assets::handle_portal))
+            .rroute("/scryfall-portal", any(static_assets::handle_portal))
+            .rroute("/scryfall-portal/", any(static_assets::handle_portal))
+            .rroute("/scryfall-portal/{*rest}", any(static_assets::handle_portal))
     } else {
         router
     };
@@ -979,8 +1119,8 @@ pub fn app(state: AppState) -> Router {
     // (Node serves the SPA, exactly like a dist-less Node install).
     let router = if state.owns("static_spa") && state.cfg.static_dir.is_some() {
         router
-            .route("/", any(spa::handle))
-            .route("/{*rest}", any(spa::handle))
+            .rroute("/", any(spa::handle))
+            .rroute("/{*rest}", any(spa::handle))
     } else {
         router
     };
@@ -992,14 +1132,14 @@ pub fn app(state: AppState) -> Router {
     // time — a direct .layer here would also buffer other lanes' bodies).
     let router = if state.owns("cardscan") {
         let cs = axum::Router::new()
-            .route("/api/cardscan/status", any(cardscan::handle_status))
-            .route("/api/cardscan/detect", any(cardscan::handle_detect))
-            .route("/api/cardscan/frame", any(cardscan::handle_frame))
-            .route("/api/cardscan/choices", any(cardscan::handle_choices))
-            .route("/api/cardscan/cards", any(cardscan::handle_cards))
-            .route("/api/cardscan/telemetry", any(cardscan::handle_telemetry))
-            .route("/api/cardscan", any(cardscan::handle_scan))
-            .route("/api/cardscan/scan", any(cardscan::handle_scan))
+            .rroute("/api/cardscan/status", any(cardscan::handle_status))
+            .rroute("/api/cardscan/detect", any(cardscan::handle_detect))
+            .rroute("/api/cardscan/frame", any(cardscan::handle_frame))
+            .rroute("/api/cardscan/choices", any(cardscan::handle_choices))
+            .rroute("/api/cardscan/cards", any(cardscan::handle_cards))
+            .rroute("/api/cardscan/telemetry", any(cardscan::handle_telemetry))
+            .rroute("/api/cardscan", any(cardscan::handle_scan))
+            .rroute("/api/cardscan/scan", any(cardscan::handle_scan))
             .layer(axum::middleware::from_fn(cardscan::compress));
         router.merge(cs)
     } else {
@@ -1010,7 +1150,7 @@ pub fn app(state: AppState) -> Router {
     // cardscan group (Node's global compression() gzips this JSON too).
     let router = if state.owns("scan_match") {
         let sm = axum::Router::new()
-            .route("/api/scan-match", any(cvscan::handle_scan_match))
+            .rroute("/api/scan-match", any(cvscan::handle_scan_match))
             .layer(axum::middleware::from_fn(cardscan::compress));
         router.merge(sm)
     } else {
@@ -1034,7 +1174,7 @@ pub fn app(state: AppState) -> Router {
         async fn boom() -> StatusCode {
             panic!("SCRYBOX_TEST_PANIC_ROUTE: intentional handler panic (REVIEW-errors H2 test)")
         }
-        router.route("/api/__test_panic", any(boom))
+        router.rroute("/api/__test_panic", any(boom))
     } else {
         router
     };
@@ -1076,11 +1216,26 @@ pub fn app(state: AppState) -> Router {
             // Static hits are served by Rust; misses (API, SPA deep links,
             // /scan-assets, portal) go to Node unchanged.
             let fallback = axum::routing::any(proxy).with_state(state.clone());
-            router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            if state.cfg.node_upstream.is_empty() {
+                // Node-free: no Node stamps helmet/COEP/cors on the
+                // fallback's replies (unknown /api 401/404, static misses),
+                // so the secheaders twin must cover the fallback too.
+                let fallback = fallback.layer(axum::middleware::from_fn(crate::secheaders::guard));
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            } else {
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            }
         }
+        None if state.cfg.node_upstream.is_empty() => router.fallback_service(
+            axum::routing::any(proxy)
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn(crate::secheaders::guard)),
+        ),
         None => router.fallback(proxy),
     };
-    router
+    let pats = Arc::new(ROUTE_PATS.with(|v| std::mem::take(&mut *v.borrow_mut())));
+    let standalone = state.cfg.node_upstream.is_empty();
+    let router = router
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // REVIEW-auth H1 backstop: DefaultBodyLimit at the largest route
         // parser ceiling (manabox-sync 40mb, server.js:464). Raw to_bytes
@@ -1092,5 +1247,14 @@ pub fn app(state: AppState) -> Router {
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             40 * 1024 * 1024,
         ))
-        .with_state(state)
+        .with_state(state);
+    if !standalone {
+        // Hybrid: Node still authors every relaxed match / HEAD through the
+        // proxy, exactly as before.
+        return router;
+    }
+    // URI rewrite must happen BEFORE routing, so the layer wraps the whole
+    // inner Router as a service under an empty outer Router.
+    let svc = tower::Layer::layer(&axum::middleware::from_fn_with_state(pats, express_routing), router);
+    Router::new().fallback_service(svc)
 }

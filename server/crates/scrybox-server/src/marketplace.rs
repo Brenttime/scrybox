@@ -1657,7 +1657,7 @@ async fn preview_fold(
     user_id: i64,
     lines: &OrderLines,
     include_extras: bool,
-) -> Result<Map<String, Value>, ()> {
+) -> Result<Map<String, Value>, String> {
     if lines.lines.is_empty() {
         // Node's early answer — deliberately MISSING totalCopies,
         // extrasIncluded and price_cents (the object literal stops at
@@ -1671,7 +1671,7 @@ async fn preview_fold(
         m.insert("sealedCount".into(), json!(0));
         return Ok(m);
     }
-    let uniq = build_uniq(lines, false).map_err(|_| ())?;
+    let uniq = build_uniq(lines, false)?;
     let rows = bulk_rows(&uniq);
     let bulk = if rows.is_empty() {
         crate::precons::BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 }
@@ -1680,19 +1680,19 @@ async fn preview_fold(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("marketplace preview: scryfall bulk fetch failed ({e}); forwarding to Node");
-                return Err(());
+                return Err(e);
             }
         }
     };
     let pool = pool.clone();
     let lines = lines.clone();
-    let hop = tokio::task::spawn_blocking(move || -> Result<Map<String, Value>, ()> {
+    let hop = tokio::task::spawn_blocking(move || -> Result<Map<String, Value>, String> {
         let mut m = Map::new();
         let conn = match pool.get() {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
                 tracing::error!("marketplace preview: cannot open connection");
-                return Err(());
+                return Err(e.to_string());
             }
         };
     if !bulk.cards.is_empty() {
@@ -1700,7 +1700,7 @@ async fn preview_fold(
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
         if let Err(e) = cache_normalized_cards(&conn, &fresh) {
             tracing::error!("marketplace preview: cacheCards failed: {e}; forwarding to Node");
-            return Err(());
+            return Err(e.to_string());
         }
     }
     let mut seen: HashSet<String> = HashSet::new();
@@ -1791,7 +1791,7 @@ async fn preview_fold(
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!("marketplace preview: owned-count query failed: {e}; forwarding to Node");
-                    return Err(());
+                    return Err(e.to_string());
                 }
             };
             let mut owned: Vec<(String, f64)> = Vec::new();
@@ -1840,6 +1840,7 @@ async fn preview_fold(
     });
     hop.await.map_err(|e| {
         tracing::error!(error = %e, "marketplace preview: blocking hop panicked");
+        "Could not resolve the order lines".to_string()
     })?
 }
 
@@ -1875,11 +1876,26 @@ struct AddResult {
 }
 
 enum AddErr {
+    /// Node-free pre-pass found cards whose hydration leg (getCardById /
+    /// getPrintingInLang) needs the network, which cannot run on the
+    /// blocking hop. Nothing was written. The async leg resolves each
+    /// payload via `plan_add_standalone`, then reruns the real hop.
+    HydrateFirst(Vec<(usize, Map<String, Value>)>),
     /// Whole-request replay (scryfall leg, cache DB failure, plan Forward).
-    Replay,
+    /// `Some(message)` = a throw Node's route catch would answer as
+    /// `500 {error: message}` (the Node-free leg answers it natively);
+    /// `None` = a plan_add hydration leg only Node can run.
+    Replay(Option<String>),
     /// addOrderToCollection threw — route answers status||500 with this
     /// message (the numeric-scryfall_id TypeError today).
     Boom(String),
+}
+
+/// Node-free pre-pass result for one hydration-needing payload, resolved by
+/// the worker leg (`plan_add_standalone`) and carried into the real hop.
+enum ResolvedAdd {
+    Ready(AddPlan),
+    Reject(String),
 }
 
 /// addOrderToCollection twin. Groups are filed through the shared
@@ -1922,24 +1938,39 @@ async fn add_fold(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("marketplace add: scryfall bulk fetch failed ({e}); forwarding to Node");
-                return Err(AddErr::Replay);
+                return Err(AddErr::Replay(Some(e)));
             }
         }
     };
     // M5 (REVIEW): the checkout and every query after it run on the blocking
     // pool (iter-70/82/83 shape) — pool.get() parks on the live-cap Condvar,
     // which must never happen on a runtime worker. Nothing after the scryfall
-    // await above awaits; the guards stay on the blocking thread.
-    let pool = pool.clone();
-    let lines = lines.clone();
-    let body = body.clone();
-    let hop = tokio::task::spawn_blocking(move || -> Result<AddResult, AddErr> {
+    // await above awaits; the guards stay on the blocking thread. The hop is
+    // a factory: node-free instances run it once in plan-only mode first,
+    // because the hydration leg (plan_add_standalone) needs the network and
+    // cannot run on a blocking thread.
+    use crate::collection_writes::plan_add_standalone;
+    let node_free = st.cfg.node_upstream.is_empty();
+    let pool_c = pool.clone();
+    let lines_c = lines.clone();
+    let body_c = body.clone();
+    let bulk_c = bulk.clone();
+    let uniq_c = uniq.clone();
+    let cond_c = cond.clone();
+    let run_hop = move |plan_only: bool, resolved: Vec<(usize, ResolvedAdd)>| {
+        let pool = pool_c.clone();
+        let lines = lines_c.clone();
+        let body = body_c.clone();
+        let bulk = bulk_c.clone();
+        let uniq = uniq_c.clone();
+        let cond = cond_c.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<AddResult>, AddErr> {
     // rusqlite guards are not Send: open only after the last await point.
     let conn = match pool.get() {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             tracing::error!("marketplace add: cannot open connection");
-            return Err(AddErr::Replay);
+            return Err(AddErr::Replay(Some(e.to_string())));
         }
     };
     if !bulk.cards.is_empty() {
@@ -1947,7 +1978,7 @@ async fn add_fold(
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
         if let Err(e) = cache_normalized_cards(&conn, &fresh) {
             tracing::error!("marketplace add: cacheCards failed: {e}; forwarding to Node");
-            return Err(AddErr::Replay);
+            return Err(AddErr::Replay(Some(e.to_string())));
         }
     }
     let mode = match body.get("printing_mode") {
@@ -2019,6 +2050,7 @@ async fn add_fold(
     // Two bulkAddToCollection calls, Normal group first, index restarting per
     // call — exactly the Secret Lair two-pass shape (all reads before any
     // write so a mid-add Forward can replay clean).
+    let mut hydrate: Vec<(usize, Map<String, Value>)> = Vec::new();
     for group in ["Normal", "Holofoil"] {
         let members: Vec<(usize, &AddPlanEntry)> =
             plan.iter().enumerate().filter(|(_, p)| p.printing == group).collect();
@@ -2056,9 +2088,36 @@ async fn add_fold(
             match plan_add(&conn, &merged) {
                 Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
                 Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if node_free => {
+                    // Node-free: the hydration leg hits the network (scryfall
+                    // getCardById / localized printing), which a blocking
+                    // thread cannot await. The plan-only pre-pass collects
+                    // the payloads — nothing has been written — the worker
+                    // resolves them with `plan_add_standalone`, and the real
+                    // pass re-plans with the cache rows now present. A card
+                    // still unresolvable in the real pass answers Node's
+                    // per-card message (or the worker's not-found message).
+                    if plan_only {
+                        hydrate.push((index, merged.clone()));
+                    } else {
+                        match resolved.iter().find(|(i, _)| *i == index) {
+                            Some((_, ResolvedAdd::Ready(pp))) => {
+                                planned.push((index, (*p).clone(), Planned::Ready(pp.clone())))
+                            }
+                            Some((_, ResolvedAdd::Reject(msg))) => {
+                                planned.push((index, (*p).clone(), Planned::Reject(msg.clone())))
+                            }
+                            None => planned.push((
+                                index,
+                                (*p).clone(),
+                                Planned::Reject("Failed to add card".into()),
+                            )),
+                        }
+                    }
+                }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
-                    return Err(AddErr::Replay);
+                    return Err(AddErr::Replay(None));
                 }
                 // Non-AddCardError: Node console.errors and reports the
                 // generic per-card message.
@@ -2067,6 +2126,12 @@ async fn add_fold(
                     planned.push((index, (*p).clone(), Planned::Reject("Failed to add card".into())));
                 }
             }
+        }
+        if plan_only {
+            // Pre-pass: planning is read-only; the write loop never runs, so
+            // a hydration-needing card can replay clean after the worker
+            // hydrates it.
+            continue;
         }
         for (index, p, pl) in planned {
             let mut fail = |error: String, failed: &mut Vec<Value>| {
@@ -2107,19 +2172,78 @@ async fn add_fold(
             }
         }
     }
+    if plan_only {
+        if !hydrate.is_empty() {
+            return Err(AddErr::HydrateFirst(hydrate));
+        }
+        return Ok(None);
+    }
     let extras_held = lines.extras as f64;
-    Ok(AddResult {
+    Ok(Some(AddResult {
         added,
         failed,
         resolved: plan.len(),
         total_listed: uniq.len() as f64 + extras_held,
         unresolved: bulk.not_found,
-    })
-    });
-    hop.await.map_err(|e| {
-        tracing::error!(error = %e, "marketplace add: blocking hop panicked");
-        AddErr::Replay
-    })?
+    }))
+        })
+    };
+    // Node-free pre-pass: plan everything on the blocking pool (read-only).
+    // If any card needs the network hydration leg, resolve those payloads on
+    // the worker via `plan_add_standalone` (the established node-free
+    // pattern — secret_lair, collection_writes) and rerun the real pass with
+    // the cache rows present. Nothing is written before hydration, matching
+    // Node's all-reads-before-any-write ordering.
+    let mut resolved: Vec<(usize, ResolvedAdd)> = Vec::new();
+    if node_free {
+        match run_hop(true, Vec::new()).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => {
+                return Err(AddErr::Replay(Some("plan pre-pass wrote".into())))
+            }
+            Ok(Err(AddErr::HydrateFirst(list))) => {
+                let Some(ap) = st.db.as_ref() else {
+                    return Err(AddErr::Replay(Some("db unavailable".into())));
+                };
+                use crate::collection_writes::StandalonePlan;
+                for (index, merged) in &list {
+                    match plan_add_standalone(st, ap, merged).await {
+                        Ok(StandalonePlan::Plan(pl @ AddPlan::Ready { .. })) => {
+                            resolved.push((*index, ResolvedAdd::Ready(pl)));
+                        }
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => {
+                            resolved.push((*index, ResolvedAdd::Reject(msg)));
+                        }
+                        Ok(StandalonePlan::NotFound(cid)) => {
+                            resolved.push((*index, ResolvedAdd::Reject(format!("Card ID {cid} not found."))));
+                        }
+                        // Forward again after the hydration leg (fetch
+                        // failed): Node's generic per-card failure message.
+                        Ok(_) => {
+                            resolved.push((*index, ResolvedAdd::Reject("Failed to add card".into())));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, "marketplace add: hydration leg failed");
+                            resolved.push((*index, ResolvedAdd::Reject("Failed to add card".into())));
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                tracing::error!(error = %e, "marketplace add: plan pre-pass panicked");
+                return Err(AddErr::Replay(Some("Could not add the order lines".into())));
+            }
+        }
+    }
+    let hop = run_hop(false, resolved);
+    let inner = hop
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "marketplace add: blocking hop panicked");
+            AddErr::Replay(Some("Could not add the order lines".into()))
+        })?;
+    inner?.ok_or_else(|| AddErr::Replay(Some("Could not add the order lines".into())))
 }
 
 // ---------------------------------------------------------------------------
@@ -2283,7 +2407,13 @@ async fn handle_preview(st: AppState, req: Request) -> Response {
     let mut out = parsed.to_json();
     let preview = match preview_fold(&st, &pool, user.id, &parsed.lines, include_extras).await {
         Ok(m) => m,
-        Err(()) => {
+        Err(msg) if st.cfg.node_upstream.is_empty() => {
+            // Node-free: the route catch — `err.message || 'Could not
+            // resolve the order lines'` (axios errors carry no .status).
+            let msg = if msg.is_empty() { "Could not resolve the order lines".to_string() } else { msg };
+            return mp_error_json(msg);
+        }
+        Err(_) => {
             return replay_post(st, &headers, "/api/marketplace/preview", &body).await;
         }
     };
@@ -2318,8 +2448,17 @@ async fn handle_add(st: AppState, req: Request) -> Response {
     let body_obj = body.as_object().cloned().unwrap_or_default();
     let result = match add_fold(&st, &pool, user.id, &parsed.lines, &body_obj).await {
         Ok(r) => r,
-        Err(AddErr::Replay) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
+        Err(AddErr::Replay(Some(msg))) if st.cfg.node_upstream.is_empty() => {
+            let msg = if msg.is_empty() { "Adding to collection failed".to_string() } else { msg };
+            return mp_error_json(msg);
+        }
+        Err(AddErr::Replay(_)) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
         Err(AddErr::Boom(msg)) => return mp_error_json(msg),
+        // Internal to the node-free pre-pass; never escapes add_fold. Treat
+        // an escape like a hydration replay.
+        Err(AddErr::HydrateFirst(_)) => {
+            return replay_post(st, &headers, "/api/marketplace/add", &body).await
+        }
     };
     let mut out = Map::new();
     let mut order = Map::new();
