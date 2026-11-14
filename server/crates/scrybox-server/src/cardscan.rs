@@ -864,15 +864,34 @@ pub async fn handle_detect(State(st): State<AppState>, req: Request) -> Response
     }
 }
 
+/// M5 (REVIEW) hop outcome for the frame/scan hydrate loops (one
+/// spawn_blocking leg each): the pool checkout, the loop and its three
+/// failure classes. Pool/Throw map to upstream_error(Failed) exactly as
+/// the inline code did; Forward re-plays the original request to Node.
+enum ScanLeg {
+    Done(Vec<Value>),
+    Pool,
+    Forward,
+    Throw,
+}
+
 /// POST /api/cardscan/frame — raw image → /api/scan-frame + hydration.
 pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    let uid = match authed(&st, req.headers(), false) {
-        Ok(u) => u,
+    // M5 (REVIEW): auth via get_async (idle-pop / blocking-pool hop, never
+    // a worker park) — iter-83/84 marketplace shape, cardscan_park pins.
+    let Some(pool) = st.db.clone() else {
+        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
+    };
+    let token = bearer_token(req.headers()).map(|s| s.to_string());
+    let uid = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u.id,
         Err(res) => return node_exact(res).await,
     };
+    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
+    crate::stats::on_native_write(&st, uid);
     let headers = req.headers().clone();
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
@@ -927,37 +946,44 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
                 Ok(a) => a,
                 Err(()) => return upstream_error(&Up::Failed),
             };
-            let mut results: Vec<Value> = Vec::new();
-            let mut forward = false;
             let fetch_on_miss = !standalone(&st);
             if !fetch_on_miss {
                 let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
                 prefetch_ids(&st, &ids).await;
             }
-            {
-                let conn = match st.db.as_ref().unwrap().get() {
+            // M5 (REVIEW): the checkout + hydrate loop is ONE blocking-pool
+            // leg — db.rs get() parks on the live-cap Condvar, which must
+            // never happen on a worker (cardscan_park frame pin).
+            let pool_leg = pool.clone();
+            let results_leg = results_in.clone();
+            let leg = tokio::task::spawn_blocking(move || -> ScanLeg {
+                let conn = match pool_leg.get() {
                     Ok(c) => c,
-                    Err(_) => return upstream_error(&Up::Failed),
+                    Err(_) => return ScanLeg::Pool,
                 };
-                for x in &results_in {
+                let mut results: Vec<Value> = Vec::new();
+                for x in &results_leg {
                     match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(mut m)) => {
                             m.insert("cached".into(), Value::Bool(truthy(x.get("cached"))));
                             results.push(Value::Object(m));
                         }
-                        Ok(Hydrate::Forward) | Err(_) => {
-                            forward = true;
-                            break;
-                        }
-                        Ok(Hydrate::Throw) => return upstream_error(&Up::Failed),
+                        Ok(Hydrate::Forward) | Err(_) => return ScanLeg::Forward,
+                        Ok(Hydrate::Throw) => return ScanLeg::Throw,
                     }
                 }
-            }
-            if forward {
-                // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
-                // false); only a SQLite fault lands here.
-                return forward_or_500(&st, replay(parts, bytes, headers)).await;
-            }
+                ScanLeg::Done(results)
+            })
+            .await;
+            let results: Vec<Value> = match leg {
+                Ok(ScanLeg::Done(r)) => r,
+                Ok(ScanLeg::Pool) | Ok(ScanLeg::Throw) | Err(_) => return upstream_error(&Up::Failed),
+                Ok(ScanLeg::Forward) => {
+                    // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
+                    // false); only a SQLite fault lands here.
+                    return forward_or_500(&st, replay(parts, bytes, headers)).await;
+                }
+            };
             let cands = match js_or_array(&data_v, "candidates") {
                 Ok(a) => a,
                 Err(()) => return upstream_error(&Up::Failed),
@@ -1014,9 +1040,17 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    if let Err(res) = authed(&st, req.headers(), false) {
-        return node_exact(res).await;
-    }
+    // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
+    let Some(pool) = st.db.clone() else {
+        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
+    };
+    let token = bearer_token(req.headers()).map(|s| s.to_string());
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
+    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
     if oversize {
@@ -1048,16 +1082,17 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
         ids.push(js_to_string(&idv));
     }
     let headers = parts.headers.clone();
-    let mut results: Vec<Value> = Vec::with_capacity(ids.len());
     let fetch_on_miss = !standalone(&st);
     if !fetch_on_miss {
         prefetch_ids(&st, &ids).await;
     }
-    {
-        let conn = match st.db.as_ref().unwrap().get() {
-            Ok(c) => c,
-            Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
-        };
+    // M5 (REVIEW): checkout + hydrate loop in ONE blocking-pool leg
+    // (cardscan_park cards pin).
+    let pool_leg = pool.clone();
+    let items_leg = items.clone();
+    let leg = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, ()> {
+        let conn = pool_leg.get().map_err(|_| ())?;
+        let mut results: Vec<Value> = Vec::with_capacity(items_leg.len());
         // Node maps each item through the SAME hydrate() with a synthetic
         // result: {ok:true, scene_number:x.number, title:x.title,
         // card:{id:x.scryfallId}, footer_ocr:{resolved_by:x.via}} — and
@@ -1066,7 +1101,7 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
         // whose outcome is observable (resolved card vs the 'not in the
         // card database yet' row). fetch_on_miss = true: any miss hands the
         // whole request to Node, which runs that fetch itself.
-        for item in &items {
+        for item in &items_leg {
             // scene_number must be ABSENT (not null) when the client omitted
             // number — hydrate's JSON.stringify then drops out.number, like
             // Node's `number: result.scene_number` with an undefined source.
@@ -1080,13 +1115,17 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
             synth.insert("footer_ocr".into(), serde_json::json!({ "resolved_by": item.get("via").cloned().unwrap_or(Value::Null) }));
             match hydrate(&conn, &Value::Object(synth), fetch_on_miss) {
                 Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
-                Ok(Hydrate::Forward) | Ok(Hydrate::Throw) | Err(_) => {
-                    drop(conn);
-                    return forward_or_500(&st, replay(parts, bytes, headers)).await;
-                }
+                Ok(Hydrate::Forward) | Ok(Hydrate::Throw) | Err(_) => return Err(()),
             }
         }
-    }
+        Ok(results)
+    })
+    .await
+    .map_err(|_| ());
+    let results: Vec<Value> = match leg {
+        Ok(Ok(r)) => r,
+        _ => return forward_or_500(&st, replay(parts, bytes, headers)).await,
+    };
     let mut body = Map::new();
     body.insert("ok".into(), Value::Bool(true));
     body.insert("results".into(), Value::Array(results));
@@ -1098,9 +1137,17 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    if let Err(res) = authed(&st, req.headers(), false) {
-        return node_exact(res).await;
-    }
+    // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
+    let Some(pool) = st.db.clone() else {
+        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
+    };
+    let token = bearer_token(req.headers()).map(|s| s.to_string());
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
+    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
     if oversize {
@@ -1123,31 +1170,34 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
     if is_standalone && ids.len() >= 2 && ids.len() <= 8 && ids.iter().all(|id| scry_id_ok(&Value::String(id.clone()))) {
         prefetch_ids(&st, &ids).await;
     }
-    let outcome = {
-        let conn = match st.db.as_ref().unwrap().get() {
-            Ok(c) => c,
-            Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
-        };
-        hydrate_choices(&conn, &ids)
-    };
+    // M5 (REVIEW): checkout + hydrate_choices in ONE blocking-pool leg
+    // (cardscan_park choices pin).
+    let pool_leg = pool.clone();
+    let ids_leg = ids.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<Choices, ()> {
+        let conn = pool_leg.get().map_err(|_| ())?;
+        hydrate_choices(&conn, &ids_leg).map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ());
     match outcome {
-        Ok(Choices::Cards(cards)) => {
+        Ok(Ok(Choices::Cards(cards))) => {
             let mut m = Map::new();
             m.insert("ok".into(), Value::Bool(true));
             m.insert("cards".into(), Value::Array(cards));
             res_json(StatusCode::OK, &Value::Object(m))
         }
-        Ok(Choices::Null) => res_json(
+        Ok(Ok(Choices::Null)) => res_json(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
         ),
         // Standalone: the fetch already ran — a still-missing id is
         // hydrateChoices' `cards.every(Boolean) ? cards : null` → 400.
-        Ok(Choices::NeedsFetch) if is_standalone => res_json(
+        Ok(Ok(Choices::NeedsFetch)) if is_standalone => res_json(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
         ),
-        Ok(Choices::NeedsFetch) | Err(_) => forward_or_500(&st, replay(parts, bytes, headers)).await,
+        Ok(Ok(Choices::NeedsFetch)) | Ok(Err(())) | Err(_) => forward_or_500(&st, replay(parts, bytes, headers)).await,
     }
 }
 
@@ -1156,9 +1206,17 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    if let Err(res) = authed(&st, req.headers(), false) {
-        return node_exact(res).await;
-    }
+    // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
+    let Some(pool) = st.db.clone() else {
+        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
+    };
+    let token = bearer_token(req.headers()).map(|s| s.to_string());
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
+    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
     if oversize {
@@ -1196,34 +1254,40 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
                 Ok(a) => a,
                 Err(()) => return upstream_error(&Up::Failed),
             };
-            let mut results: Vec<Value> = Vec::new();
-            let mut forward = false;
             let fetch_on_miss = !standalone(&st);
             if !fetch_on_miss {
                 let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
                 prefetch_ids(&st, &ids).await;
             }
-            {
-                let conn = match st.db.as_ref().unwrap().get() {
+            // M5 (REVIEW): checkout + hydrate loop in ONE blocking-pool leg
+            // (cardscan_park scan pin).
+            let pool_leg = pool.clone();
+            let results_leg = results_in.clone();
+            let leg = tokio::task::spawn_blocking(move || -> ScanLeg {
+                let conn = match pool_leg.get() {
                     Ok(c) => c,
-                    Err(_) => return upstream_error(&Up::Failed),
+                    Err(_) => return ScanLeg::Pool,
                 };
-                for x in &results_in {
+                let mut results: Vec<Value> = Vec::new();
+                for x in &results_leg {
                     match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
-                        Ok(Hydrate::Forward) | Err(_) => {
-                            forward = true;
-                            break;
-                        }
-                        Ok(Hydrate::Throw) => return upstream_error(&Up::Failed),
+                        Ok(Hydrate::Forward) | Err(_) => return ScanLeg::Forward,
+                        Ok(Hydrate::Throw) => return ScanLeg::Throw,
                     }
                 }
-            }
-            if forward {
-                // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
-                // false); only a SQLite fault lands here.
-                return forward_or_500(&st, replay(parts, bytes, headers)).await;
-            }
+                ScanLeg::Done(results)
+            })
+            .await;
+            let results: Vec<Value> = match leg {
+                Ok(ScanLeg::Done(r)) => r,
+                Ok(ScanLeg::Pool) | Ok(ScanLeg::Throw) | Err(_) => return upstream_error(&Up::Failed),
+                Ok(ScanLeg::Forward) => {
+                    // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
+                    // false); only a SQLite fault lands here.
+                    return forward_or_500(&st, replay(parts, bytes, headers)).await;
+                }
+            };
             let mut body = Map::new();
             body.insert("ok".into(), Value::Bool(true));
             body.insert("results".into(), Value::Array(results));
