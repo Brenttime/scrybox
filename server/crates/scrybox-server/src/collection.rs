@@ -79,8 +79,15 @@ pub fn body_etag(raw: &[u8]) -> String {
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     h.update(raw);
-    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, h.finalize());
-    format!("W/\"{:x}-{}\"", raw.len(), &digest[..27.min(digest.len())])
+    etag_from_digest(raw.len(), h.finalize())
+}
+
+/// `body_etag` shared tail: base64(sha1 digest) → `W/"{len:x}-{27 chars}"`.
+/// The streaming build (memory queue item 3) hashes incrementally and must
+/// format the tag through this exact code path.
+fn etag_from_digest(len: usize, digest: impl AsRef<[u8]>) -> String {
+    let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+    format!("W/\"{:x}-{}\"", len, &digest[..27.min(digest.len())])
 }
 
 /// Node: `inm.split(',').some(t => t.trim() === tag || t.trim() === '*')`.
@@ -458,10 +465,29 @@ pub fn build_values(
 /// byte-identical to `serde_json::to_vec` over the whole `Vec<Value>`
 /// (`to_writer` shares the element formatter; comma joining is the same code
 /// path), pinned by a test against the sequential oracle.
+///
+/// Kept for the byte-identity oracle, the incompressible-body fallback and
+/// the perf probes; the route itself uses `build_body_stream` (memory queue
+/// item 3) which never materializes the whole raw body.
 pub fn build_body_parallel(
     pool: &Arc<DbPool>,
     p: &CollectionParams,
 ) -> Result<(Vec<u8>, Option<u64>), String> {
+    let (raw_rows, alloc, total) = query_build_inputs(pool, p)?;
+    let groups = serialize_groups(&raw_rows, alloc.as_ref())?;
+    // RowStore released before stitching (queue item 3, second half): the
+    // shaped group buffers are all that's needed from here on.
+    drop(raw_rows);
+    drop(alloc);
+    shape_and_concat_parallel(groups, total)
+}
+
+/// Query stage shared by `build_body_parallel` and `build_body_stream`:
+/// count + (overlapped) allocation + raw column collection on ONE connection.
+fn query_build_inputs(
+    pool: &Arc<DbPool>,
+    p: &CollectionParams,
+) -> Result<(RowStore, Option<HashMap<i64, f64>>, Option<u64>), String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
     let (filter_sql, params) = filter_clause(p);
     let total = count_total(&conn, p, &filter_sql, &params)?;
@@ -485,7 +511,15 @@ pub fn build_body_parallel(
     } else {
         (collect_raw_rows(&conn, p, &filter_sql, &params)?, None)
     };
+    Ok((raw_rows, alloc, total))
+}
 
+/// Shape + serialize stage shared by both builders: worker threads each
+/// serialize one contiguous row range into a single pooled chunk buffer.
+fn serialize_groups(
+    raw_rows: &RowStore,
+    alloc: Option<&HashMap<i64, f64>>,
+) -> Result<Vec<Vec<u8>>, String> {
     let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 4);
     let n = raw_rows.len();
     // Each group buffer holds `row,row,...` for one contiguous row range.
@@ -495,7 +529,7 @@ pub fn build_body_parallel(
             if r > 0 {
                 buf.push(b',');
             }
-            let v = match shape_row(raw_rows.row(r), alloc.as_ref()) {
+            let v = match shape_row(raw_rows.row(r), alloc) {
                 Ok(v) => v,
                 Err(e) => {
                     give_chunk(buf);
@@ -510,8 +544,7 @@ pub fn build_body_parallel(
         vec![buf]
     } else {
         let step = n.div_ceil(nthreads);
-        let alloc_ref = alloc.as_ref();
-        let store = &raw_rows;
+        let store = raw_rows;
         let results = std::thread::scope(|s| {
             let handles: Vec<_> = (0..nthreads)
                 .map(|t| {
@@ -526,7 +559,7 @@ pub fn build_body_parallel(
                             if r > lo {
                                 buf.push(b',');
                             }
-                            let v = match shape_row(store.row(r), alloc_ref) {
+                            let v = match shape_row(store.row(r), alloc) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     give_chunk(buf);
@@ -561,12 +594,15 @@ pub fn build_body_parallel(
         }
         groups
     };
+    Ok(groups)
+}
 
-    // Stitch the array: serde_json writes elements back-to-back separated by
-    // ',' inside the brackets, so concatenating the group buffers (with ','
-    // between non-empty groups) reproduces the whole-array serialization byte
-    // for byte. The group buffers then return to the arena instead of being
-    // freed to glibc — that churn is the collection_full p99 tail.
+/// Concatenate the group buffers into the whole-array serialization and
+/// return every buffer to the arena. serde_json writes elements back-to-back
+/// separated by ',' inside the brackets, so concatenating the group buffers
+/// (with ',' between non-empty groups) reproduces the whole-array
+/// serialization byte for byte.
+fn shape_and_concat_parallel(groups: Vec<Vec<u8>>, total: Option<u64>) -> Result<(Vec<u8>, Option<u64>), String> {
     let mut body = Vec::with_capacity(groups.iter().map(|g| g.len() + 1).sum::<usize>() + 2);
     body.push(b'[');
     let mut first = true;
@@ -585,6 +621,136 @@ pub fn build_body_parallel(
         give_chunk(g);
     }
     Ok((body, total))
+}
+
+/// Outcome of the streaming build (BRIEF memory queue item 3, owner ruling
+/// 2026-11-14): the full-collection body is never materialized.
+pub enum StreamedBody {
+    /// Body stayed under the single-encoding threshold: store raw + lazy gz
+    /// exactly like the classic `put` path.
+    Small { raw: Vec<u8>, total: Option<u64> },
+    /// Body reached the threshold: the multi-member gzip and the Express
+    /// body ETag were produced straight from the group stream (no raw body,
+    /// no materialized members, no concat).
+    Encoded { gz: Vec<u8>, etag: String, raw_len: usize, members: usize, total: Option<u64> },
+}
+
+/// Streaming full-body build: query + parallel serialize (identical buffers
+/// to `build_body_parallel`, so identical bytes), then the group buffers are
+/// consumed one at a time — each slice goes to the incremental SHA1 (the
+/// Express-default ETag, same code path as `body_etag`) and to a rolling
+/// 4 MiB-member gzip encoder (same flate2 write encoder and level 6 as
+/// `gzip_at`, so single-member output is byte-identical to a one-shot
+/// compression), and the buffer returns to the arena immediately. Peak
+/// transient is one full set of group buffers + the retained gz output; the
+/// old path also materialized the raw concat and the member copies.
+pub fn build_body_stream(
+    pool: &Arc<DbPool>,
+    p: &CollectionParams,
+    single_enc_min: u64,
+) -> Result<StreamedBody, String> {
+    let (raw_rows, alloc, total) = query_build_inputs(pool, p)?;
+    // Cheap estimate of the serialized size (rows × ~1.1 KB) picks the
+    // stream path; a shape that ends up under the threshold after all just
+    // yields its buffered raw bytes — behaviour is threshold-exact either
+    // way, this only avoids compressing bodies `put` would not pre-encode.
+    let est = (raw_rows.len() as u64).saturating_mul(CHUNK_ROW_EST_BYTES as u64);
+    let groups = serialize_groups(&raw_rows, alloc.as_ref())?;
+    // Drop the raw column store before consuming the groups (queue item 3
+    // "drop RowStore before stitching"): every worker Arc is joined here, so
+    // this frees the whole Value store while the stitcher still has work.
+    drop(raw_rows);
+    drop(alloc);
+    if est < single_enc_min {
+        let (body, total) = shape_and_concat_parallel(groups, total)?;
+        return Ok(StreamedBody::Small { raw: body, total });
+    }
+    Ok(stream_feed(groups, single_enc_min, total))
+}
+
+/// Stitch groups straight into (etag, gzip) — see `build_body_stream`.
+fn stream_feed(groups: Vec<Vec<u8>>, threshold: u64, total: Option<u64>) -> StreamedBody {
+    use flate2::{write::GzEncoder, Compression};
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    // Same member size as `gzip_members`; each member is an independent
+    // flate2 gzip stream, so the concatenation gunzips to the raw body and
+    // one-member output is byte-identical to a one-shot `gzip_at`.
+    const MEMBER: usize = 4 << 20;
+
+    let mut hasher = Sha1::new();
+    let mut raw_len: usize = 0;
+    // Buffered raw bytes while the body could still land under `threshold`
+    // (the classic raw + lazy-gz storage shape); dropped once exceeded.
+    let mut small: Option<Vec<u8>> = Some(Vec::new());
+    let mut gz = Vec::new();
+    let mut enc: Option<GzEncoder<Vec<u8>>> = Some(GzEncoder::new(Vec::new(), Compression::new(6)));
+    let mut member_bytes = 0usize;
+    let mut members = 0usize;
+
+    // Feed one slice of the logical raw body to hash + compress + small.
+    macro_rules! feed {
+        ($slice:expr) => {{
+            let slice: &[u8] = $slice;
+            hasher.update(slice);
+            let new_len = raw_len + slice.len();
+            if let Some(s) = small.as_mut() {
+                if new_len < threshold as usize {
+                    s.extend_from_slice(slice);
+                } else {
+                    small = None;
+                }
+            }
+            let mut off = 0usize;
+            while off < slice.len() {
+                if enc.is_none() {
+                    enc = Some(GzEncoder::new(Vec::new(), Compression::new(6)));
+                    member_bytes = 0;
+                }
+                let e = enc.as_mut().expect("encoder started above");
+                let take = (MEMBER - member_bytes).min(slice.len() - off);
+                e.write_all(&slice[off..off + take]).expect("vec write");
+                member_bytes += take;
+                off += take;
+                if member_bytes == MEMBER {
+                    let done = enc.take().expect("encoder started above");
+                    gz.extend(done.finish().expect("gzip"));
+                    members += 1;
+                }
+            }
+            raw_len = new_len;
+        }};
+    }
+
+    feed!(b"[");
+    let mut first = true;
+    for g in &groups {
+        if g.is_empty() {
+            continue;
+        }
+        if !first {
+            feed!(b",");
+        }
+        feed!(g.as_slice());
+        first = false;
+    }
+    feed!(b"]");
+    for g in groups {
+        give_chunk(g);
+    }
+    if let Some(e) = enc {
+        // Final partial member; none is emitted after an exact MEMBER
+        // boundary (matches `raw.chunks(MEMBER)` — no trailing empty chunk).
+        gz.extend(e.finish().expect("gzip"));
+        members += 1;
+    }
+
+    if raw_len < threshold as usize {
+        StreamedBody::Small { raw: small.expect("raw_len < threshold ⇒ buffer never dropped"), total }
+    } else {
+        let etag = etag_from_digest(raw_len, hasher.finalize());
+        StreamedBody::Encoded { gz, etag, raw_len, members, total }
+    }
 }
 
 /// COUNT(*) companion for paginated shapes (same SQL as Node's count query).
@@ -643,8 +809,12 @@ impl RowStore {
 /// at iter 17) and feeds the RSS ratchet (iter 15/16) far less: only the
 /// final stitched body the cache keeps is a fresh allocation.
 const CHUNK_KEEP_MAX_CAP: usize = 32 << 20;
-const CHUNK_POOL_MAX_BUFFERS: usize = 8; // ≤ 2 concurrent builds × 4 workers
-const CHUNK_POOL_MAX_BYTES: u64 = 128 << 20;
+// Memory queue item 3 (BRIEF, owner ruling 2026-11-14): the arena holds at
+// most ONE full-build set (4 workers × a full-collection body spread across
+// them, ≈28 MB) — with one build in flight there is no second build to feed,
+// and hoarding two sets was pure retained ratchet.
+const CHUNK_POOL_MAX_BUFFERS: usize = 4;
+const CHUNK_POOL_MAX_BYTES: u64 = 32 << 20;
 /// Per-row serialization-size estimate used to pre-size buffers (full
 /// collection runs ≈1 KB/row).
 const CHUNK_ROW_EST_BYTES: usize = 1152;
@@ -1012,16 +1182,14 @@ pub struct CollectionCache {
     /// unbounded builds under stampede drove RSS to ~4 GB in iter 4's
     /// realistic run).
     ///
-    /// Review M4 review-note asked for ONE full build at a time. 2 is kept
-    /// deliberately: at 1, a write-mix bench tick with two hot shapes missing
-    /// serialises two ~26 MB builds (~600 ms each) behind one another and
-    /// pushes p95 collection latency out; the chunk pool
-    /// (CHUNK_POOL_MAX_BUFFERS = 8 = 2 builds x 4 workers) and the live
-    /// connection cap were both sized around permits=2, and the M4 gz-only
-    /// storage already removed the dominant transient (the raw+gz double
-    /// copy). Reducing to 1 would be a bench-visible policy change — logged
-    /// as an owner decision alongside the Gate D cache budgets, not smuggled
-    /// in as an "M4 fix".
+    /// ONE full build at a time — memory queue item 3 (BRIEF, owner ruling
+    /// 2026-11-14). The old permits=2 was a speed decision made while a
+    /// build materialized raw + concat + members; with `build_body_stream`
+    /// the dominant transients are gone (no whole-body concat, no member
+    /// copies, RowStore dropped before stitching), the chunk pool is sized
+    /// for exactly one build, and the second concurrent build only queued
+    /// an identical ~600 ms build — halving the build-stampede transient is
+    /// the point of the queue item.
     builds: Arc<Semaphore>,
     /// Monotonic LRU clock stamped into `CacheEntry::seen` (a clock, not a
     /// wall clock: tests get deterministic eviction order).
@@ -1048,7 +1216,7 @@ impl Default for CollectionCache {
         Self {
             inner: Mutex::new(Inner::default()),
             computes: AtomicU64::new(0),
-            builds: Arc::new(Semaphore::new(2)),
+            builds: Arc::new(Semaphore::new(1)),
             clock: AtomicU64::new(0),
             max_bytes: AtomicU64::new(store_max_bytes()),
             single_enc_min: AtomicU64::new(SINGLE_ENC_MIN_BYTES),
@@ -1182,7 +1350,79 @@ impl CollectionCache {
             gz: gz_cell,
             seen: AtomicU64::new(seen),
         });
-        self.max_rev.fetch_max(rp.coll, Ordering::Relaxed);
+        self.store_entry(key, entry.clone(), cost);
+        entry
+    }
+
+    /// Store a pre-encoded large shape produced by `build_body_stream`
+    /// (memory queue item 3): the gz and the body ETag came straight off the
+    /// group stream, so the raw body never existed. Storage shape is exactly
+    /// what `put` produces for a compressible large body (gz-only, raw None).
+    fn put_encoded(
+        &self,
+        key: String,
+        rev: impl Into<RevPair>,
+        gz: Vec<u8>,
+        etag: String,
+        raw_len: usize,
+        total: Option<u64>,
+        cost: Duration,
+    ) -> Arc<CacheEntry> {
+        let rp = rev.into();
+        let mut gz_cell = OnceCell::new();
+        let _ = gz_cell.set(Bytes::from(gz));
+        let entry = Arc::new(CacheEntry {
+            rev: rp.coll,
+            deck_rev: rp.deck,
+            raw: None,
+            raw_len,
+            total,
+            etag,
+            gz: gz_cell,
+            seen: AtomicU64::new(self.clock.fetch_add(1, Ordering::Relaxed)),
+        });
+        self.store_entry(key, entry.clone(), cost);
+        entry
+    }
+
+    /// Build + store one shape (the route/refresher hot path, memory queue
+    /// item 3): stream the body, keep gz-only for large compressible shapes
+    /// (the stream never materialized raw), raw + lazy gz for small ones.
+    /// Incompressible large bodies (adversarial only — the same >= 50%
+    /// guard as `put`) fall back to the classic whole-body path so the
+    /// store can keep raw. Callers hold the build permit around this.
+    pub fn build_and_store(
+        &self,
+        pool: &Arc<DbPool>,
+        p: &CollectionParams,
+        key: String,
+        rev: impl Into<RevPair>,
+    ) -> Result<Arc<CacheEntry>, String> {
+        let t0 = Instant::now();
+        let min = self.single_enc_min.load(Ordering::Relaxed);
+        match build_body_stream(pool, p, min)? {
+            StreamedBody::Small { raw, total } => Ok(self.put(key, rev, raw, total, t0.elapsed())),
+            StreamedBody::Encoded { gz, etag, raw_len, total, .. } => {
+                if gz.len().saturating_mul(2) < raw_len {
+                    Ok(self.put_encoded(key, rev, gz, etag, raw_len, total, t0.elapsed()))
+                } else {
+                    let (body, total) = build_body_parallel(pool, p)?;
+                    Ok(self.put(key, rev, body, total, t0.elapsed()))
+                }
+            }
+        }
+    }
+
+    /// Shared bookkeeping tail of `put`/`put_encoded`, under the entries lock:
+    /// - bodies from superseded generations are dropped (`get` filters by
+    ///   exact rev, so they are pure RSS weight);
+    /// - total stored bytes are held under `max_bytes` by evicting the
+    ///   least-recently-served entries first;
+    /// - a big enough drop arms `trim_dirty` so the refresher tick returns
+    ///   the freed heap to the OS off the request path (glibc keeps large
+    ///   freed blocks in its arenas otherwise).
+    fn store_entry(&self, key: String, entry: Arc<CacheEntry>, cost: Duration) {
+        self.max_rev.fetch_max(entry.rev, Ordering::Relaxed);
         let live_rev = self.max_rev.load(Ordering::Relaxed);
         let mut freed: u64 = 0;
         {
@@ -1207,7 +1447,6 @@ impl CollectionCache {
             self.trim_dirty.store(true, Ordering::Relaxed);
         }
         self.computes.fetch_add(1, Ordering::Relaxed);
-        entry
     }
     /// Swap off the "heap was freed" flag (refresher tick → malloc_trim).
     fn take_trim(&self) -> bool {
@@ -1405,8 +1644,9 @@ pub(crate) fn trim_heap() {
 /// recently-requested shape through the SAME single-flight slot and build
 /// semaphore as the request path. Requests landing after an invalidation are
 /// then answered from the cache instead of waiting on a ~400 ms (full shape)
-/// blocking build. Bodies are produced by the identical `build_body_parallel`
-/// path, so this cannot change any response — strict parity is preserved
+/// blocking build. Bodies are produced by the streaming build
+/// (`build_and_store` → `build_body_stream`), so the refresher takes the
+/// same path, and this cannot change any response — strict parity is preserved
 /// (unlike the stats route's bounded-SWR exception, this route needs none).
 ///
 /// Costs are bounded: only shapes requested within REFRESH_ACTIVE, only
@@ -1502,10 +1742,8 @@ pub fn spawn_refresher(state: &AppState) {
                     let init_key = key2.clone();
                     let init = move || async move {
                         let _permit = init_cache.build_permit().await;
-                        let t0 = Instant::now();
                         let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
-                            let (body, total) = build_body_parallel(&init_pool, &p)?;
-                            Ok(init_cache.put(init_key, rp, body, total, t0.elapsed()))
+                            init_cache.build_and_store(&init_pool, &p, init_key, rp)
                         })
                         .await
                         .map_err(|e| format!("collection refresh join: {e}"))?;
@@ -1677,10 +1915,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             let res: Result<&Result<Arc<CacheEntry>, String>, String> = slot
                 .get_or_try_init(move || async move {
                     let _permit = init_cache.build_permit().await;
-                    let t0 = Instant::now();
                     let r = tokio::task::spawn_blocking(move || -> Result<Arc<CacheEntry>, String> {
-                        let (body, total) = build_body_parallel(&init_pool, &init_p)?;
-                        Ok(init_cache.put(init_key, rp, body, total, t0.elapsed()))
+                        init_cache.build_and_store(&init_pool, &init_p, init_key, rp)
                     })
                     .await
                     .map_err(|e| format!("collection build task panicked: {e}"))?;
@@ -2022,6 +2258,168 @@ mod chunk_arena {
             chunk_pool_len(),
             CHUNK_POOL_MAX_BUFFERS
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_build {
+    //! Memory queue item 3 (BRIEF, owner ruling 2026-11-14): the streaming
+    //! stitcher feeds the group buffers straight into the incremental SHA1
+    //! (Express body ETag) and the rolling 4 MiB-member gzip encoder — the
+    //! whole raw body, the member copies and the gz concat never exist.
+
+    use super::*;
+    use std::io::Write;
+
+    fn one_shot_gzip(raw: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        e.write_all(raw).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn groups_of(chunks: &[&[u8]]) -> Vec<Vec<u8>> {
+        chunks.iter().map(|c| c.to_vec()).collect()
+    }
+
+    #[test]
+    fn stitch_produces_oracle_bytes_etag_and_gz() {
+        // Groups hold `row,row,...`; the stitcher adds [ ] and the commas
+        // between non-empty groups (empty groups are skipped entirely).
+        let groups = groups_of(&[br#"{"a":1}"#, b"", br#"{"b":2},{"c":3}"#]);
+        let oracle = br#"[{"a":1},{"b":2},{"c":3}]"#;
+        let s = stream_feed(groups, 1, Some(3));
+        match s {
+            StreamedBody::Encoded { gz, etag, raw_len, members, total } => {
+                assert_eq!(raw_len, oracle.len());
+                assert_eq!(total, Some(3));
+                assert_eq!(members, 1);
+                assert_eq!(gunzip_bytes(&gz).unwrap(), oracle, "streamed gz must inflate to the oracle bytes");
+                assert_eq!(etag, body_etag(oracle), "streamed etag must equal body_etag(oracle)");
+            }
+            StreamedBody::Small { .. } => panic!("threshold 1 must yield the encoded arm"),
+        }
+    }
+
+    #[test]
+    fn threshold_edge_selects_small_vs_encoded_exactly() {
+        // raw = "[ab,cd]" → 7 bytes.
+        let mk = || groups_of(&[b"ab", b"cd"]);
+        match stream_feed(mk(), 7, None) {
+            StreamedBody::Encoded { raw_len, .. } => assert_eq!(raw_len, 7, "raw_len == threshold ⇒ encoded (matches put's >=)"),
+            StreamedBody::Small { .. } => panic!("raw_len == threshold must take the encoded arm"),
+        }
+        match stream_feed(mk(), 8, None) {
+            StreamedBody::Small { raw, total } => {
+                assert_eq!(raw, b"[ab,cd]");
+                assert_eq!(total, None);
+            }
+            StreamedBody::Encoded { .. } => panic!("raw_len < threshold must keep raw"),
+        }
+    }
+
+    #[test]
+    fn single_member_is_byte_identical_to_one_shot_gzip() {
+        // Same flate2 write encoder + level ⇒ identical bytes whether the
+        // member is fed slice-by-slice (stream) or in one write (gzip_at).
+        let chunks: Vec<String> = (0..500).map(|i| format!("{{\"n\":{i},\"s\":\"{:0>40}\"}}", i * 7)).collect();
+        let joined: Vec<&[u8]> = chunks.iter().map(|c| c.as_bytes()).collect();
+        let oracle_str = format!("[{}]", chunks.join(","));
+        let oracle = oracle_str.as_bytes();
+        match stream_feed(groups_of(&joined), 1, None) {
+            StreamedBody::Encoded { gz, .. } => assert_eq!(gz, one_shot_gzip(oracle), "single member must be byte-identical to one-shot gzip_at"),
+            StreamedBody::Small { .. } => panic!(),
+        }
+    }
+
+    #[test]
+    fn members_split_at_4mib_boundaries_with_no_trailing_empty() {
+        const M: usize = 4 << 20;
+        // raw = "[" + a*(M-2) + "]" → exactly 4 MiB ⇒ ONE member (no trailing
+        // empty member after an exact boundary, matching raw.chunks(MEMBER)).
+        match stream_feed(groups_of(&[vec![b'a'; M - 2].as_slice()]), 1, None) {
+            StreamedBody::Encoded { gz, members, raw_len, .. } => {
+                assert_eq!(raw_len, M);
+                assert_eq!(members, 1, "exact member multiple must not emit a trailing empty member");
+                assert_eq!(gunzip_bytes(&gz).unwrap().len(), M);
+            }
+            StreamedBody::Small { .. } => panic!(),
+        }
+        // Two groups straddling the boundary: raw = 2M + 7 bytes ⇒ 3 members.
+        let big = vec![b'a'; M - 1];
+        let bigger = vec![b'b'; M + 5];
+        let mut oracle = Vec::new();
+        oracle.push(b'[');
+        oracle.extend_from_slice(&big);
+        oracle.push(b',');
+        oracle.extend_from_slice(&bigger);
+        oracle.push(b']');
+        match stream_feed(vec![big, bigger], 1, None) {
+            StreamedBody::Encoded { gz, members, raw_len, .. } => {
+                assert_eq!(raw_len, oracle.len());
+                assert_eq!(members, oracle.len().div_ceil(M), "members must split at exact 4 MiB raw boundaries");
+                assert_eq!(gunzip_bytes(&gz).unwrap(), oracle, "multi-member concat must inflate to the exact raw bytes");
+            }
+            StreamedBody::Small { .. } => panic!(),
+        }
+    }
+
+    #[test]
+    fn empty_and_single_group_shapes() {
+        match stream_feed(Vec::new(), 1, None) {
+            StreamedBody::Encoded { gz, etag, raw_len, members, .. } => {
+                assert_eq!(raw_len, 2);
+                assert_eq!(members, 1);
+                assert_eq!(gunzip_bytes(&gz).unwrap(), b"[]");
+                assert_eq!(etag, body_etag(b"[]"));
+            }
+            StreamedBody::Small { .. } => panic!(),
+        }
+        // Empty groups with a generous threshold buffer the raw body (the
+        // classic raw + lazy-gz storage shape).
+        match stream_feed(vec![Vec::new()], 1 << 30, None) {
+            StreamedBody::Small { raw, .. } => assert_eq!(raw, b"[]"),
+            StreamedBody::Encoded { .. } => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_encoded_stores_gz_only_entry_with_identity_inflate() {
+        let cache = CollectionCache::new();
+        let unit = br#"{"card_id":"00000000-0000-0000-0000-000000000000","qty":1},"#;
+        let mut raw = Vec::from(&b"["[..]);
+        while raw.len() < 100_000 {
+            raw.extend_from_slice(unit);
+        }
+        raw.pop(); // drop the trailing comma for valid JSON
+        raw.push(b']');
+        let gz = one_shot_gzip(&raw);
+        let etag = body_etag(&raw);
+        let e = cache.put_encoded("k1".to_string(), 5i64, gz.clone(), etag.clone(), raw.len(), Some(9), Duration::from_millis(10));
+        assert!(e.raw.is_none(), "streamed large entry must not keep raw");
+        assert_eq!(e.raw_len, raw.len());
+        assert_eq!(e.etag, etag);
+        assert_eq!(e.bytes(), gz.len() as u64, "budget counts only the stored encoding");
+        assert_eq!(gunzip_bytes(&gz).unwrap(), raw);
+        // Identity client path inflates deterministically to the raw bytes.
+        assert_eq!(&e.raw_body().await.unwrap()[..], &raw[..]);
+        assert_eq!(cache.computes(), 1, "put_encoded counts as one computed body");
+        // LRU budget accounting sees the gz bytes: budget for exactly one
+        // entry ⇒ the second evicts the first.
+        cache.max_bytes.store(gz.len() as u64 + 64, Ordering::Relaxed);
+        let _e2 = cache.put_encoded("k2".to_string(), 5i64, gz.clone(), etag.clone(), raw.len(), None, Duration::from_millis(10));
+        let inner = cache.inner.guard();
+        assert!(!inner.entries.contains_key("k1"), "gz bytes must count toward eviction");
+        assert!(inner.entries.contains_key("k2"));
+    }
+
+    #[test]
+    fn owner_bounds_guards() {
+        // BRIEF memory queue item 3 (owner ruling 2026-11-14): one full
+        // build at a time; the arena holds at most one full-build set.
+        assert_eq!(CollectionCache::new().builds.available_permits(), 1, "one concurrent full build");
+        assert!(CHUNK_POOL_MAX_BYTES <= 32 << 20, "chunk pool must stay ≤ one full set (32 MiB), got {}", CHUNK_POOL_MAX_BYTES);
+        assert!(CHUNK_POOL_MAX_BUFFERS <= 4, "chunk pool must hold ≤ one 4-worker build set, got {}", CHUNK_POOL_MAX_BUFFERS);
+        assert!(CHUNK_KEEP_MAX_CAP <= 32 << 20);
     }
 }
 

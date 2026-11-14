@@ -630,6 +630,143 @@ fn parallel_build_matches_sequential_oracle_byte_for_byte() {
     }
 }
 
+// ---- Memory queue item 3 (BRIEF, owner ruling 2026-11-14): the streaming
+// full-body build — gz + ETag straight off the group stream, no whole-body
+// materialization. The gz arm must decompress to the sequential oracle byte
+// for byte and its streamed SHA1 must equal body_etag(oracle).
+
+fn gunzip_all(b: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(b).read_to_end(&mut out).unwrap();
+    out
+}
+
+fn one_shot_gzip6(raw: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut e = GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+    e.write_all(raw).unwrap();
+    e.finish().unwrap()
+}
+
+#[test]
+fn stream_build_matches_sequential_oracle_byte_for_byte() {
+    use scrybox_server::collection::{build_body, build_body_stream, body_etag, parse_params, StreamedBody};
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_bulk_db(dir.path(), "stream-identity.db", 4500);
+    let pool = std::sync::Arc::new(scrybox_server::db::DbPool::open(&path, 4).unwrap());
+    let cases = [
+        None,
+        Some(""),
+        Some("is_trade=1"),
+        Some("is_trade=0"),
+        Some("limit=1000&offset=0"),
+        Some("limit=2000&offset=1000"),
+        Some("limit=4499&offset=0"),
+        Some("include_allocation=1"),
+        Some("count=0&limit=10"),
+        Some("card_id=bulk7"),
+        Some("include_allocation=1&count=0&limit=2000&offset=500"),
+    ];
+    for qs in cases {
+        let p = parse_params(1, qs);
+        let seq = build_body(&pool, &p).expect("sequential build");
+        // (threshold, forced arm) — None at the default 4 MiB threshold:
+        // either arm is legitimate depending on the real body size.
+        for (thr, want_encoded) in [(4u64 << 20, None), (0, Some(true)), (u64::MAX, Some(false))] {
+            match build_body_stream(&pool, &p, thr).expect("stream build") {
+                StreamedBody::Small { raw, total } => {
+                    assert_ne!(want_encoded, Some(true), "threshold {thr} for {qs:?} must yield Encoded");
+                    assert_eq!(raw, seq.0, "streamed Small body must equal the oracle bytes for {qs:?}");
+                    assert_eq!(total, seq.1, "x-total-count must match for {qs:?}");
+                }
+                StreamedBody::Encoded { gz, etag, raw_len, members, total } => {
+                    assert_ne!(want_encoded, Some(false), "threshold {thr} for {qs:?} must yield Small");
+                    assert_eq!(total, seq.1, "x-total-count must match for {qs:?}");
+                    assert_eq!(raw_len, seq.0.len(), "stream raw_len must be the oracle length for {qs:?}");
+                    assert_eq!(gunzip_all(&gz), seq.0, "streamed gz must decompress to the oracle bytes for {qs:?}");
+                    assert_eq!(etag, body_etag(&seq.0), "streamed etag must equal body_etag(oracle) for {qs:?}");
+                    assert_eq!(members, seq.0.len().div_ceil(4 << 20).max(1), "members must split at exact 4 MiB raw boundaries for {qs:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stream_single_member_equals_one_shot_gzip_bytes() {
+    // A body under one member must compress to the SAME bytes as the
+    // one-shot level-6 gzip (gzip_at) — slice-by-slice feeding must not
+    // perturb the deflate stream.
+    use scrybox_server::collection::{build_body, build_body_stream, parse_params, StreamedBody};
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db_named(dir.path(), "stream-one-shot.db");
+    let pool = std::sync::Arc::new(scrybox_server::db::DbPool::open(&path, 4).unwrap());
+    let p = parse_params(1, None);
+    let seq = build_body(&pool, &p).unwrap();
+    assert!(seq.0.len() < (4 << 20), "seed must produce a sub-member body");
+    match build_body_stream(&pool, &p, 0).unwrap() {
+        StreamedBody::Encoded { gz, .. } => assert_eq!(gz, one_shot_gzip6(&seq.0), "single member must be byte-identical to one-shot gzip"),
+        StreamedBody::Small { .. } => panic!("threshold 0 must yield Encoded"),
+    }
+}
+
+#[tokio::test]
+async fn build_and_store_serves_incompressible_full_shape_via_classic_fallback() {
+    // Adversarial guard (memory queue item 3): a full shape whose streamed
+    // gz does not win the >=50% test falls back to the classic whole-body
+    // path — the route still answers byte-identical identity AND gzip.
+    // Deterministic pseudo-random base64 names keep gzip at ~0.75 of raw.
+    use scrybox_server::collection::{build_body, parse_params};
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db_named(dir.path(), "incompressible.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        conn.execute_batch("BEGIN").unwrap();
+        for c in 0..600u32 {
+            let name: String = (0..800).map(|_| ALPHA[(rnd() % 64) as usize] as char).collect();
+            conn.execute(
+                "INSERT INTO card_cache (id, name, supertype, types, rarity, set_id, set_name, number, cmc)
+                 VALUES (?1, ?2, 'Card', '[\"Creature\"]', 'Common', 'rnd', 'Rnd', '1', 1)",
+                rusqlite::params![format!("rnd{c}"), name],
+            )
+            .unwrap();
+        }
+        for j in 0..6000i64 {
+            conn.execute(
+                "INSERT INTO collection (id, card_id, quantity, condition, printing, language, added_at, is_trade, user_id, is_proxy)
+                 VALUES (?1, ?2, 1, 'Near Mint', 'Normal', 'English', '2024-01-01 00:00:00', 0, 1, 0)",
+                rusqlite::params![1000 + j, format!("rnd{}", j % 600)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    let oracle = {
+        let pool = std::sync::Arc::new(scrybox_server::db::DbPool::open(&path, 4).unwrap());
+        build_body(&pool, &parse_params(1, None)).unwrap().0
+    };
+    assert!(oracle.len() >= (4 << 20), "seed must push the body past the gz threshold");
+
+    let r = router_for(path, &["collection"], "http://127.0.0.1:1");
+    let (s1, _, raw) = get(&r, "/api/collection", &auth()).await;
+    assert_eq!(s1, StatusCode::OK, "fallback build must serve 200");
+    assert_eq!(raw, oracle, "incompressible full shape must serve the oracle bytes (classic path)");
+    let (s2, h2, gzipped) = get(&r, "/api/collection", &[("authorization", "Bearer tok-session"), ("accept-encoding", "gzip")]).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(h2[header::CONTENT_ENCODING], "gzip");
+    assert_eq!(gunzip_all(&gzipped), oracle, "lazy gz of the fallback entry must inflate to the oracle");
+}
+
 #[tokio::test]
 async fn lazy_gzip_body_decompresses_to_the_raw_body() {
     let dir = tempfile::tempdir().unwrap();
