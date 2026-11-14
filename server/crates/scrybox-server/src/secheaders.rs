@@ -121,58 +121,64 @@ pub fn coep_for_env(ua: &str, scan_isolation: &str, scan_isolation_webkit: &str)
     Some("credentialless")
 }
 
-/// Twin of the PRIVATE_ORIGIN regex (server.js:159):
-/// ^https?:\/\/(localhost|127\..+|.+\.local|.+\.localhost|
-///   (10|172\.(1[6-9]|2\d|3[01])|192\.168)(\..+)?)(:\d+)?$
+/// Twin of the PRIVATE_ORIGIN regex (server.js:179, byte-faithful,
+/// REVIEW-auth H3):
+/// ^https?:\/\/(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+
+///   |172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+
+///   |\[::1\]|[a-z0-9-]+\.local)(:\d+)?$  with the /i flag.
+///
+/// Verified against the JS engine (node -e, 2026-11-13): `127.<anything>`
+/// and bare `10` / `192.168` / `172.16` are NOT matches (the earlier twin
+/// ported a different regex — see git blame), `*.local` is single-label
+/// `[a-z0-9-]+` only, `[::1]` and upper-case hosts ARE matches, and
+/// `http://010.1.2.3` is not.
 pub fn is_private_origin(origin: &str) -> bool {
-    let Some(rest) = origin
+    // /i over the whole pattern: fold once, then match case-sensitively.
+    let o = origin.to_ascii_lowercase();
+    let Some(rest) = o
         .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
+        .or_else(|| o.strip_prefix("https://"))
     else {
         return false;
     };
-    // (:\d+)? suffix — strip one trailing :<digits> at the very end.
+    if rest == "localhost" || rest == "[::1]" {
+        return true;
+    }
+    // Single optional (:\d+)$ — when a colon is present there MUST be ≥1
+    // digit after it (regex (:\d+)? is all-or-nothing, so "localhost:" and
+    // "[::1]:abc" fail; a second colon can only appear inside [::1]).
     let host = match rest.rsplit_once(':') {
-        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && !h.contains(':') => h,
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
         _ => rest,
     };
-    if host == "localhost" {
+    if host == "localhost" || host == "[::1]" {
         return true;
     }
-    // 127\..+ — at least one char after the dot.
-    if host.len() > "127.".len() && host.starts_with("127.") {
-        return true;
-    }
-    // .+\.local / .+\.localhost — non-empty prefix before the suffix.
-    if let Some(prefix) = host.strip_suffix(".local") {
-        if !prefix.is_empty() {
+    let octets = |h: &str, n: usize| -> bool {
+        let parts: Vec<&str> = h.split('.').collect();
+        parts.len() == n && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    // 127\.\d+\.\d+\.\d+ / 10\.\d+\.\d+\.\d+ / 192\.168\.\d+\.\d+
+    if octets(host, 4) {
+        if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") {
             return true;
         }
-    }
-    if let Some(prefix) = host.strip_suffix(".localhost") {
-        if !prefix.is_empty() {
-            return true;
+        // 172\.(1[6-9]|2\d|3[01])\.\d+\.\d+
+        if let Some(tail) = host.strip_prefix("172.") {
+            let second = tail.split('.').next().unwrap_or("");
+            return matches!(
+                second.as_bytes(),
+                [b'1', b'6'..=b'9'] | [b'2', b'0'..=b'9'] | [b'3', b'0' | b'1']
+            );
         }
     }
-    // (10|192\.168)(\..+)? — bare or dotted suffix.
-    if host == "10" || (host.len() > "10.".len() && host.starts_with("10.")) {
-        return true;
-    }
-    if host == "192.168" || (host.len() > "192.168.".len() && host.starts_with("192.168.")) {
-        return true;
-    }
-    // 172\.(1[6-9]|2\d|3[01])(\..+)?
-    if let Some(tail) = host.strip_prefix("172.") {
-        let second = tail.split('.').next().unwrap_or("");
-        let octet_ok = matches!(
-            second.as_bytes(),
-            [b'1', b'6'..=b'9'] | [b'2', b'0'..=b'9'] | [b'3', b'0' | b'1']
-        );
-        if !octet_ok {
-            return false;
-        }
-        // Bare "172.<octet>" (optional group absent) or "<octet>." + >=1 char.
-        return tail == second || tail.len() > second.len() + 1;
+    // [a-z0-9-]+\.local — single label, non-empty, no underscore.
+    if let Some(label) = host.strip_suffix(".local") {
+        return !label.is_empty()
+            && !label.contains('.')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     }
     false
 }
@@ -206,33 +212,43 @@ pub fn url_origin(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// Twin of the cors origin callback (server.js:192-199) combined with the
-/// explicit-origin list built at server.js:163-176. Env is read per call to
+/// Twin of the cors origin callback (server.js:181-199) combined with the
+/// explicit-origin list built at server.js:163-173. Env is read per call to
 /// keep the twin testable; Node fixes the list at boot, which is equivalent
-/// since the container env is immutable.
+/// since the container env is immutable. REVIEW-auth H3: verbatim Node
+/// semantics — explicit entries are compared RAW (no scheme added) and the
+/// reverse-proxy allowance comes from PUBLIC_BASE_URL's URL origin, not
+/// PUBLIC_URL; the iOS WebView's literal `capacitor://localhost` is allowed.
 pub fn origin_allowed(origin: &str) -> bool {
     let explicit: Vec<String> = std::env::var("CORS_ORIGIN")
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            if s.starts_with("http://") || s.starts_with("https://") {
-                s.to_string()
-            } else {
-                format!("https://{s}")
-            }
-        })
+        .map(|s| s.to_string())
         .collect();
-    let capacitor = std::env::var("PUBLIC_URL").unwrap_or_default().trim().to_string();
-    let capacitor_origin = url_origin(&capacitor);
-    origin_allowed_with(origin, &explicit, capacitor_origin.as_deref())
+    let public_base = std::env::var("PUBLIC_BASE_URL").ok().filter(|s| !s.trim().is_empty());
+    origin_allowed_with(origin, &explicit, public_base.as_deref())
 }
 
-pub fn origin_allowed_with(origin: &str, explicit: &[String], capacitor_origin: Option<&str>) -> bool {
-    is_private_origin(origin)
-        || capacitor_origin == Some(origin)
-        || explicit.iter().any(|o| o == origin)
+/// `public_base_url` mirrors server.js's `new URL(process.env.PUBLIC_BASE_URL)
+/// .origin` push: the entry joins the explicit list only when the URL parses
+/// (malformed values are ignored, Node's `catch`).
+pub fn origin_allowed_with(origin: &str, explicit: &[String], public_base_url: Option<&str>) -> bool {
+    if is_private_origin(origin) {
+        return true;
+    }
+    // The iOS app's WebView origin (server.js:187).
+    if origin == "capacitor://localhost" {
+        return true;
+    }
+    if explicit.iter().any(|o| o == origin) {
+        return true;
+    }
+    match public_base_url.and_then(url_origin) {
+        Some(o) => o == origin,
+        None => false,
+    }
 }
 
 fn coep_name() -> HeaderName {
@@ -533,43 +549,86 @@ mod tests {
 
     #[test]
     fn private_origin_ladder() {
+        // Every pin below was cross-checked against the JS engine running
+        // the literal PRIVATE_ORIGIN regex (node -e, 2026-11-13) —
+        // REVIEW-auth H3: the previous ladder encoded a DIFFERENT regex.
         let ok = |o: &str| is_private_origin(o);
         assert!(ok("http://localhost:3000"));
         assert!(ok("https://localhost"));
         assert!(ok("http://127.0.0.1:5173"));
         assert!(ok("http://scrybox.local:3001"));
-        assert!(ok("http://box.localhost"));
         assert!(ok("http://10.1.2.3:80"));
         assert!(ok("http://192.168.4.37:3002"));
         assert!(ok("https://172.16.0.1"));
         assert!(ok("https://172.31.255.255:443"));
-        // Bare (10|172\..|192\.168) hosts match — (\..+)? is optional in the
-        // JS regex, so these weirdos are allowed by Node too.
-        assert!(ok("http://192.168"));
-        assert!(ok("https://172.16"));
-        assert!(ok("http://10"));
+        assert!(ok("http://172.20.0.1"));
+        // /i: upper-case scheme + host are matches for Node.
+        assert!(ok("HTTP://LOCALHOST:8080"));
+        assert!(ok("https://SPARKY.LOCAL"));
+        // [::1] with and without a digit port.
+        assert!(ok("http://[::1]"));
+        assert!(ok("http://[::1]:5173"));
+        // \d+ has no range bound and no leading-zero restriction.
+        assert!(ok("http://127.0.0.01"));
+        assert!(ok("http://127.0.0.1234"));
+        // H3 look-alike hosts Node REJECTS (pre-fix Rust allowed all four).
+        assert!(!ok("http://10.attacker.com"));
+        assert!(!ok("http://127.evil.example"));
+        assert!(!ok("https://a.b.local")); // [a-z0-9-]+ is single-label
+        assert!(!ok("http://a_b.local")); // underscore not in the class
+        // Bare / truncated private prefixes are NOT matches either.
+        assert!(!ok("http://192.168"));
+        assert!(!ok("https://172.16"));
+        assert!(!ok("http://10"));
+        assert!(!ok("http://010.1.2.3")); // alternation needs a literal "10."
+        assert!(!ok("http://172.1.2.3"));
+        assert!(!ok("http://192.167.1.1"));
         assert!(!ok("https://172.15.0.1"));
         assert!(!ok("https://172.32.0.1"));
         assert!(!ok("https://172.160.1.1"));
-        assert!(!ok("https://172.16.")); // (\..+)? needs >=1 char after the dot
+        assert!(!ok("https://172.16.")); // the \d+ arms need digits
         assert!(!ok("https://evil.example.com"));
         assert!(!ok("http://localhost.evil.com"));
         assert!(!ok("ftp://localhost"));
         assert!(!ok("http://localhost:abc"));
+        assert!(!ok("http://localhost:")); // (:\d+)? is all-or-nothing
+        assert!(!ok("http://[::1]:abc"));
         assert!(!ok("localhost:3000"));
-        assert!(!ok("http://.local")); // .+\.local needs a non-empty prefix
-        assert!(!ok("http://.localhost"));
-        assert!(!ok("http://127.")); // 127\..+ needs a char after the dot
+        assert!(!ok("http://.local")); // [a-z0-9-]+ needs >=1 char
+        assert!(!ok("http://.localhost")); // no .localhost arm in Node's regex
+        assert!(!ok("http://box.localhost"));
+        assert!(!ok("http://127.")); // 127\.\d+\.\d+\.\d+ needs 4 octets
         assert!(!ok("http://192.168."));
+        assert!(!ok("http://192.168.4.37:3002:4000")); // only one port group
     }
 
     #[test]
-    fn explicit_and_capacitor_origins() {
+    fn explicit_capacitor_and_public_base_url_origins() {
         let explicit = vec!["https://scry.example.com".to_string(), "https://other.example.com".to_string()];
         assert!(origin_allowed_with("https://scry.example.com", &explicit, None));
         assert!(!origin_allowed_with("https://nope.example.com", &explicit, None));
-        assert!(origin_allowed_with("https://app.example", &explicit, Some("https://app.example")));
-        // Capacitor arm only ever yields scheme://host[:port] — no path.
+        // H3: Node compares the RAW CORS_ORIGIN entries — a bare host is
+        // NOT implicitly https (pre-fix Rust silently rewrote it).
+        let bare = vec!["scry.example.com".to_string()];
+        assert!(!origin_allowed_with("https://scry.example.com", &bare, None));
+        assert!(origin_allowed_with("scry.example.com", &bare, None));
+        // H3: the iOS WebView origin is allowed by Node's literal arm.
+        assert!(origin_allowed_with("capacitor://localhost", &[], None));
+        assert!(!origin_allowed_with("capacitor://evil", &[], None));
+        // PUBLIC_BASE_URL joins the list only via URL().origin (port/path
+        // stripped; malformed values ignored — Node's try/catch).
+        assert!(!origin_allowed_with(
+            "https://proxy.example.com",
+            &[],
+            Some("https://proxy.example.com:8443/base/decks?x=1")
+        ));
+        assert!(origin_allowed_with(
+            "https://proxy.example.com:8443",
+            &[],
+            Some("https://proxy.example.com:8443/base/decks?x=1")
+        ));
+        assert!(!origin_allowed_with("https://proxy.example.com:8443", &[], Some("not a url")));
+        // url_origin only ever yields scheme://host[:port] — no path.
         assert_eq!(url_origin("https://app.example.com:8443/index.html#/decks"), Some("https://app.example.com:8443".into()));
         assert_eq!(url_origin("https://app.example.com:443"), Some("https://app.example.com".into()));
         assert_eq!(url_origin("http://app.example.com:80/x"), Some("http://app.example.com".into()));
