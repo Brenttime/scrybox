@@ -636,6 +636,85 @@ pub fn plan_post(
     })
 }
 
+/// Node-free planner: identical to [`plan`] except that a collection-scope
+/// `q` is classified by the FULL Scryfall-syntax parser port (scryq — the
+/// Scrybox normalization layer in front of local-scryfall), so every q
+/// answers natively instead of falling back to a Node proxy:
+///  * parse error → 400 INVALID_QUERY (upstream mode) / verbatim walk
+///    (sidecar mode, the engine judges);
+///  * mode 'local' + upstream mode → answerLocally over the AST;
+///  * supportsLocalCollectionQuery → Oracle Tags leg (walk on NotReady);
+///  * else the engine walk on `toScryfall(stripDirectives(ast))`, by
+///    printing id when `analyze().printing`.
+pub fn plan_standalone(user_id: i64, raw_query: Option<&str>, local_scrayfall: bool) -> Plan {
+    let pairs: Vec<(String, String)> = raw_query
+        .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    let first = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    let dup = |k: &str| pairs.iter().filter(|(kk, _)| kk == k).count() > 1;
+    let fallback = || plan(user_id, raw_query, local_scrayfall);
+    if ["name", "number", "set", "q", "scope", "lang", "prints", "image", "page", "limit", "count"].iter().any(|k| dup(k)) {
+        return fallback();
+    }
+    let Some(qraw) = first("q").filter(|v| !v.trim().is_empty()) else { return fallback() };
+    if first("scope").as_deref() != Some("collection") {
+        return fallback();
+    }
+    let clean = crate::scryq::js_trim(&qraw).to_string();
+    let parsed = match crate::scryq::analyze(&clean) {
+        Ok(a) => Some(a),
+        Err(_) if !local_scrayfall => return Plan::InvalidQuery,
+        Err(_) => None,
+    };
+    let page = first("page").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let page = if page == 0 { 1 } else { page }.max(1);
+    let limit = first("limit").and_then(|v| js_parse_int(&v)).unwrap_or(0);
+    let limit = if limit == 0 { 60 } else { limit }.clamp(1, 2000);
+    let has_window = pairs.iter().any(|(kk, _)| kk == "page" || kk == "limit");
+    let include_total = first("count").as_deref() != Some("0");
+    let expected_snapshot = if dup("snapshot") { None } else { first("snapshot") };
+    let local_q = |ast: &crate::scryq::Node, tag_leg: bool| collq::LocalQ {
+        user_id,
+        leaves: Vec::new(),
+        tag_leg,
+        has_window,
+        page,
+        limit,
+        include_total,
+        expected_snapshot: expected_snapshot.clone(),
+        ast: Some(ast.clone()),
+        outage_fallback: false,
+    };
+    if let Some(a) = &parsed {
+        if a.local && !local_scrayfall {
+            return Plan::CollectionLocalRows(Arc::new(local_q(&a.ast, false)));
+        }
+    }
+    let walk_base = parsed
+        .as_ref()
+        .and_then(|a| crate::scryq::strip_directives(&a.ast))
+        .map(|n| crate::scryq::to_scryfall(&n))
+        .unwrap_or_else(|| clean.clone());
+    let (lang_code, scry_code) = lang_codes(first("lang").as_deref());
+    let walk = collq::CollectionQ {
+        user_id,
+        walk_base,
+        lang_code,
+        scry_code,
+        has_window,
+        page,
+        limit,
+        include_total,
+        expected_snapshot: expected_snapshot.clone(),
+        by_printing: parsed.as_ref().is_some_and(|a| a.printing),
+        fallback_ast: parsed.as_ref().filter(|a| a.local && local_scrayfall).map(|a| a.ast.clone()),
+    };
+    if let Some(a) = parsed.as_ref().filter(|a| crate::scryq::supports_local_collection_query(a)) {
+        return Plan::CollectionLocalTags { tags: Arc::new(local_q(&a.ast, true)), walk: Arc::new(walk) };
+    }
+    Plan::CollectionQ(Arc::new(walk))
+}
+
 /// Gate + normalization for the collection-scope q leg
 /// (`searchCards`' `scope === 'collection' && q.trim()` branch). Returns
 /// None (→ proxy) whenever anything outside the ported name + operator-
@@ -662,7 +741,7 @@ fn plan_collection_q(
     let limit = if limit == 0 { 60 } else { limit }.clamp(1, 2000);
     let has_window = pairs.iter().any(|(k, _)| k == "page" || k == "limit");
     let include_total = first("count").as_deref() != Some("0");
-    Some(collq::CollectionQ { user_id, walk_base, lang_code, scry_code, has_window, page, limit, include_total, expected_snapshot })
+    Some(collq::CollectionQ { user_id, walk_base, lang_code, scry_code, has_window, page, limit, include_total, expected_snapshot, by_printing: false, fallback_ast: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,13 +1777,17 @@ async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> 
     let lang_name = to_name(rq.lang.as_deref());
     // Upstream mode: a query the parser rejects is INVALID_QUERY without a
     // request (only the tokenizer-provable rejects are modelled).
-    if !st.local_scrayfall && crate::collq::definitely_invalid(&rq.q) {
-        return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY");
-    }
+    // analyze(cleanRaw): a QuerySyntaxError is INVALID_QUERY in upstream
+    // mode; in sidecar mode the query rides verbatim (parsed = null).
+    let parsed = match crate::scryq::analyze(&rq.q) {
+        Ok(a) => Some(a),
+        Err(_) if !st.local_scrayfall => return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY"),
+        Err(_) => None,
+    };
     // analyze(q).mode === 'local' (inside the ported leaf subset): the
     // card_cache answer — first in upstream mode for database scope when
     // the language has cached rows, and the fallback when the engine fails.
-    let local_leaves = crate::collq::raw_local_leaves(&rq.q);
+    let local_leaves: Option<crate::scryq::Node> = parsed.as_ref().filter(|a| a.local).map(|a| a.ast.clone());
     if let Some(leaves) = &local_leaves {
         if !st.local_scrayfall && !rq.internet {
             let pool2 = Arc::clone(pool);
@@ -1727,7 +1810,9 @@ async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> 
         }
     }
     let (_code, scry_code) = lang_codes(rq.lang.as_deref());
-    let upstream = raw_q_upstream(&rq.q, &scry_code);
+    // `parsed ? toScryfall(parsed.ast) : cleanRaw`, parenthesised off-English.
+    let upstream = parsed.as_ref().map(|a| crate::scryq::to_scryfall(&a.ast)).unwrap_or_else(|| rq.q.clone());
+    let upstream = if scry_code == "en" { upstream } else { format!("({upstream})") };
     let (scoped, multilingual) = lang_search(&upstream, &scry_code);
     let offset = (rq.page - 1).saturating_mul(rq.limit);
     let mut page = offset.div_euclid(SCRY_PAGE_SIZE) + 1;
@@ -1834,11 +1919,17 @@ async fn raw_answer_locally(
     st: &AppState,
     pool: &Arc<DbPool>,
     rq: &RawQ,
-    leaves: &[crate::collq::Leaf],
+    ast: &crate::scryq::Node,
     lang_name: &str,
 ) -> Response {
     let offset = (rq.page - 1).saturating_mul(rq.limit);
-    let (sql, params, count_sql, count_params) = crate::collq::compile_raw_query(leaves, lang_name, rq.limit, offset);
+    let (sql, params, count_sql, count_params) = match crate::scryq::compile_raw_query(ast, lang_name, rq.limit, offset) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("raw q compile failed: {e}");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed");
+        }
+    };
     let pool2 = Arc::clone(pool);
     let user_id = rq.user_id;
     let built = tokio::task::spawn_blocking(move || -> Result<(Vec<Value>, Vec<Value>, Option<u64>), String> {
@@ -2804,7 +2895,11 @@ pub async fn handle(
     let p = match if is_post {
         plan_post(user.id, raw_query.as_deref(), body_map.as_ref())
     } else {
-        plan(user.id, raw_query.as_deref(), st.local_scrayfall)
+        if st.cfg.node_upstream.is_empty() {
+            plan_standalone(user.id, raw_query.as_deref(), st.local_scrayfall)
+        } else {
+            plan(user.id, raw_query.as_deref(), st.local_scrayfall)
+        }
     } {
         Plan::Native(p) => p,
         Plan::CollectionQ(cq) => {
@@ -3402,9 +3497,13 @@ async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, i
 /// (single-flight walk inside collq::get_names), owned intersect + shaping
 /// in one pinned read transaction. Node-owned outcomes proxy verbatim.
 async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<collq::CollectionQ>) -> Response {
-    let headers = req.headers();
-    let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let (inm, ae) = {
+        let headers = req.headers();
+        (
+            headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+            headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        )
+    };
 
     let rev_i = pool
         .get()
@@ -3421,6 +3520,9 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
     // must answer itself comes back as Proxy.
     let (entry, resolved_now) = match collq::get_names(st.clone(), &cq).await {
         collq::NamesOutcome::Ready(e, r) => (e, r),
+        collq::NamesOutcome::Proxy if st.cfg.node_upstream.is_empty() => {
+            return standalone_walk_failed(st.clone(), pool, &cq, inm, ae).await;
+        }
         collq::NamesOutcome::Proxy => return crate::proxy(State(st.clone()), req).await,
         collq::NamesOutcome::InvalidQuery => return json_error(StatusCode::BAD_REQUEST, "INVALID_QUERY"),
     };
@@ -3493,12 +3595,78 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
     drop(_slot_guard);
     match res {
         Ok(Ok(Some(e))) => respond_entry(e, inm.as_deref(), ae.as_deref(), Some((status, source))),
+        Ok(Ok(None)) if st.cfg.node_upstream.is_empty() => {
+            tracing::error!("collq build: read transaction unavailable");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
+        }
         Ok(Ok(None)) => crate::proxy(State(st.clone()), req).await,
         Ok(Err(ref e)) | Err(ref e) => {
             tracing::error!(error = %e, "collq build failed");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
         }
     }
+}
+
+/// Node-free twin of resolveCollectionQuery's walk catch for a transport /
+/// timeout failure (or no engine configured): `LOCAL_SCRYFALL && parsed &&
+/// parsed.mode === 'local'` → answerLocally relabelled 'local-fallback';
+/// anything else → UPSTREAM_UNAVAILABLE (503). api.scryfall.com is never
+/// walked as a substitute engine (owner directive: local-scryfall is the
+/// only query authority).
+async fn standalone_walk_failed(
+    st: AppState,
+    pool: Arc<DbPool>,
+    cq: &collq::CollectionQ,
+    inm: Option<String>,
+    ae: Option<String>,
+) -> Response {
+    if let (true, Some(ast)) = (st.local_scrayfall, cq.fallback_ast.clone()) {
+        tracing::error!("sidecar collection walk failed; answering from local SQL");
+        let lq = collq::LocalQ {
+            user_id: cq.user_id,
+            leaves: Vec::new(),
+            tag_leg: false,
+            has_window: cq.has_window,
+            page: cq.page,
+            limit: cq.limit,
+            include_total: cq.include_total,
+            expected_snapshot: cq.expected_snapshot.clone(),
+            ast: Some(ast),
+            outage_fallback: true,
+        };
+        let _ = &st;
+        let outcome = match tokio::task::spawn_blocking(move || collq::build_local(&pool, &lq)).await {
+            Ok(o) => o,
+            Err(e) => collq::LocalOutcome::Failed(format!("local build task panicked: {e}")),
+        };
+        let (cards, total, snapshot) = match outcome {
+            collq::LocalOutcome::Built { cards, total, snapshot } => (cards, total, snapshot),
+            collq::LocalOutcome::Mismatch { .. } => return json_error(StatusCode::CONFLICT, "CATALOG_SNAPSHOT_CHANGED"),
+            collq::LocalOutcome::NotReady | collq::LocalOutcome::Failed(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed")
+            }
+        };
+        let raw = match serde_json::to_vec(&cards) {
+            Ok(v) => bytes::Bytes::from(v),
+            Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"),
+        };
+        let etag = body_etag(&raw);
+        let gz = gzip_bytes(&raw);
+        let entry = Arc::new(SearchEntry {
+            rev: 0,
+            raw,
+            gz,
+            etag,
+            total: None,
+            source: "local-fallback",
+            x_source: true,
+            catalog: Some(CatalogMeta { total, complete: true, upstream_total: None, status: "local-fallback", snapshot }),
+            stale: Arc::new(Vec::new()),
+        });
+        return respond_entry(&entry, inm.as_deref(), ae.as_deref(), Some(("local-fallback", "local-fallback")));
+    }
+    tracing::error!("Scryfall collection query failed: engine unavailable");
+    json_error(StatusCode::SERVICE_UNAVAILABLE, "Card API is having trouble. Try again in a moment.")
 }
 
 /// One of Node's two SQLite answer legs (collq::build_local), served per
@@ -3565,24 +3733,25 @@ async fn serve_local(
     };
     let etag = body_etag(&raw);
     let gz = gzip_bytes(&raw);
+    let label: &'static str = if lq.outage_fallback { "local-fallback" } else { "local" };
     let entry = Arc::new(SearchEntry {
         rev: 0,
         raw,
         gz,
         etag,
         total: None,
-        source: "local",
-        x_source: false,
+        source: label,
+        x_source: lq.outage_fallback,
         catalog: Some(CatalogMeta {
             total,
             complete: true,
             upstream_total: None,
-            status: "local",
+            status: label,
             snapshot,
         }),
         stale: Arc::new(Vec::new()),
     });
-    respond_entry(&entry, inm.as_deref(), ae.as_deref(), Some(("local", "local")))
+    respond_entry(&entry, inm.as_deref(), ae.as_deref(), Some((label, label)))
 }
 
 #[cfg(test)]

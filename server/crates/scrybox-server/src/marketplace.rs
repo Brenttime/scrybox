@@ -2004,6 +2004,21 @@ async fn add_fold(
             match plan_add(&conn, &merged) {
                 Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
                 Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
+                    // Node-free: hydrate natively (getCardById /
+                    // getPrintingInLang) before any write.
+                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
+                    let pl = match match st.db.as_ref() { Some(ap) => plan_add_standalone(st, ap, &merged).await, None => Err(crate::collection_writes::WriteError::Bind) } {
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
+                        Ok(StandalonePlan::Plan(pl)) => Planned::Ready(pl),
+                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
+                        Err(e) => {
+                            tracing::error!(error = ?e, "marketplace add: plan failed");
+                            Planned::Reject("Failed to add card".into())
+                        }
+                    };
+                    planned.push((index, (*p).clone(), pl));
+                }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
                     return Err(AddErr::Replay(None));

@@ -880,6 +880,22 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
                 Ok(AddPlan::Reject(msg)) => {
                     planned.push((index, entry.clone(), Planned::Reject(msg)));
                 }
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
+                    // Node-free: addCardToCollection's own hydration legs
+                    // (getCardById / getPrintingInLang) run natively —
+                    // still before any write, so pass 1 stays read-only.
+                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
+                    let p = match plan_add_standalone(&st, &pool, &merged).await {
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
+                        Ok(StandalonePlan::Plan(p)) => Planned::Ready(p),
+                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
+                        Err(e) => {
+                            tracing::error!(error = ?e, "secret-lair add: plan failed");
+                            Planned::Reject("Failed to add card".into())
+                        }
+                    };
+                    planned.push((index, entry.clone(), p));
+                }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("secret-lair add: hydration-needing card, forwarding to Node");
                     return replay_post(st, &headers, "/api/secret-lair/add", &body_req).await;
