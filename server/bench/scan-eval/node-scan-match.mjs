@@ -3,11 +3,11 @@
 //
 // Corpus (lane-B iter-57): the DEFAULT is the lane eval corpus
 // <repo-root>/data/scan-eval-corpus — the SAME dir node_truth_parity_on_eval_corpus
-// consumes (CORPUS_DIR override in the unit test). The stale ./corpus copy in this
-// dir holds same-NAMED but DIFFERENT images (regenerated Nov 12 via mkcorpus/
-// mkvariants); reading it by default silently captured truth over the wrong images
-// (measured: different top candidates/scores per file). Regenerate BOTH dirs or
-// pass CORPUS_DIR explicitly.
+// consumes (CORPUS_DIR override in the unit test). The stale ./corpus copy that
+// used to live in this dir (same-NAMED but DIFFERENT images — the iter-57
+// ground-truth footgun) is RETIRED: deleted from git in iter-58, and mkcorpus.py/
+// mkvariants.py now regenerate the eval corpus directly, so there is one corpus
+// dir. Pass CORPUS_DIR to point at another capture.
 //
 // Truth write (lane-B iter-57): node-truth.json (unit-test ground truth, via
 // include_str!) is only rewritten when WRITE_TRUTH=1 AND this is a Node :3312

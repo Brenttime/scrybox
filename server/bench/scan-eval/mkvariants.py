@@ -1,7 +1,8 @@
 from PIL import Image, ImageFilter
 import os, random
 here = os.path.dirname(os.path.abspath(__file__))
-corpus = here + '/corpus'
+# lane-B iter-58: write the lane eval corpus directly (see mkcorpus.py); CORPUS_DIR overrides.
+corpus = os.environ.get('CORPUS_DIR') or os.path.normpath(here + '/../../../../data/scan-eval-corpus')
 random.seed(7)
 
 def card(i):

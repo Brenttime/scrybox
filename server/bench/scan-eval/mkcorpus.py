@@ -1,5 +1,10 @@
 import numpy as np, sqlite3, json, urllib.request, os, sys
-out = os.path.dirname(os.path.abspath(__file__)) + '/corpus'
+# lane-B iter-58: generators write the lane eval corpus DIRECTLY — the same dir
+# node_truth_parity_on_eval_corpus and node-scan-match.mjs consume. The old
+# ./corpus copy here is retired (same-NAMED stale images were the iter-57
+# ground-truth footgun). CORPUS_DIR overrides.
+out = os.environ.get('CORPUS_DIR') or os.path.normpath(
+    os.path.dirname(os.path.abspath(__file__)) + '/../../../../data/scan-eval-corpus')
 os.makedirs(out, exist_ok=True)
 d = np.load('/home/brenttime/projects/scrybox-rusttest/data/models/milo-mtg.npz')
 ids = set(str(x).replace('_back', '') for x in d['card_ids'])
