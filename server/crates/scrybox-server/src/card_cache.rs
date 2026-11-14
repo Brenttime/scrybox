@@ -202,6 +202,7 @@ pub fn cache_normalized_cards(conn: &Connection, cards: &[Map<String, Value>]) -
 /// every card as its chunk arrives and drops the JSON tree immediately —
 /// holding `Value` trees for the whole collection was the boot-sweep RSS
 /// spike (Gate D; see tests/sweep_memory.rs).
+#[derive(Clone)]
 pub struct PreparedCard {
     pub id: String,
     pub params: Vec<rusqlite::types::Value>,
