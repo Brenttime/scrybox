@@ -29,7 +29,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection_writes::{
     alloc_lock, get_row_map, internal_error, js_falsy, js_parse_int_v, js_to_string, json_error,
     json_response, json_to_sql_value, logical_inventory_status, node_exact, parse_body, read_parts,
@@ -141,14 +141,14 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match add_one(&pool, &id, user.id, &body, false) {
+    match add_one(&pool, &id, user.id, &body, false).await {
         AddOne::Response(res) => res,
         AddOne::Forward if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
         // Node-free: run getCardById's fetch leg here (scryGet + cacheCards);
@@ -158,7 +158,7 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
             if !standalone_fetch(&st, &cid).await {
                 return not_on_provider(&cid);
             }
-            match add_one(&pool, &id, user.id, &body, true) {
+            match add_one(&pool, &id, user.id, &body, true).await {
                 AddOne::Response(res) => res,
                 AddOne::Forward => not_on_provider(&cid),
             }
@@ -265,7 +265,7 @@ fn inc_fold(
     Ok(())
 }
 
-fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddOne {
+async fn add_one(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddOne {
     const FAILED: &str = "Failed to add card to list";
     let fail = |e: &dyn std::fmt::Debug| internal_fail(FAILED, "lists add-card", e);
     let card_id_v = body.get("card_id");
@@ -282,7 +282,7 @@ fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) -
     // `const { quantity = 1 } = req.body` — destructuring default.
     let quantity = body.get("quantity").cloned().unwrap_or(Value::from(1));
     let qty = qty_or_one(Some(&quantity));
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => return AddOne::Response(fail(&e)),
     };
@@ -345,7 +345,7 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -357,7 +357,7 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
     let Some(entries) = bulk_entries(&body) else {
         return json_error(StatusCode::BAD_REQUEST, "cards must be 1-250 entries");
     };
-    match bulk_add(&pool, &id, user.id, &entries, None) {
+    match bulk_add(&pool, &id, user.id, &entries, None).await {
         Ok(AddOne::Response(res)) => res,
         Ok(AddOne::Forward) if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
         Ok(AddOne::Forward) => {
@@ -381,7 +381,7 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
                     }
                 }
             }
-            match bulk_add(&pool, &id, user.id, &entries, Some(&fetched)) {
+            match bulk_add(&pool, &id, user.id, &entries, Some(&fetched)).await {
                 Ok(AddOne::Response(res)) => res,
                 Ok(AddOne::Forward) => internal_fail("Failed to add cards to list", "lists bulk-add", &"unresolved hydrate"),
                 Err(e) => internal_fail("Failed to add cards to list", "lists bulk-add", &e),
@@ -399,14 +399,14 @@ fn bulk_entries(body: &Value) -> Option<Vec<Value>> {
     Some(arr.clone())
 }
 
-fn bulk_add(
-    pool: &DbPool,
+async fn bulk_add(
+    pool: &std::sync::Arc<DbPool>,
     id: &str,
     user_id: i64,
     entries: &[Value],
     fetched: Option<&HashMap<String, bool>>,
 ) -> Result<AddOne, WriteError> {
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(AddOne::Response(json_error(
             StatusCode::NOT_FOUND,
@@ -507,7 +507,7 @@ pub async fn handle_bulk_remove(Path(id): Path<String>, State(st): State<AppStat
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -517,14 +517,14 @@ pub async fn handle_bulk_remove(Path(id): Path<String>, State(st): State<AppStat
     let Some(entries) = bulk_entries(&body) else {
         return json_error(StatusCode::BAD_REQUEST, "cards must be 1-250 entries");
     };
-    match bulk_remove(&pool, &id, user.id, &entries) {
+    match bulk_remove(&pool, &id, user.id, &entries).await {
         Ok(res) => res,
         Err(e) => internal_fail("Failed to remove cards from list", "lists bulk-remove", &e),
     }
 }
 
-fn bulk_remove(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<Response, WriteError> {
-    let conn = pool.get()?;
+async fn bulk_remove(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, entries: &[Value]) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized"));
     }
@@ -602,7 +602,7 @@ pub async fn handle_remove_from_collection(Path(id): Path<String>, State(st): St
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -614,7 +614,7 @@ pub async fn handle_remove_from_collection(Path(id): Path<String>, State(st): St
     // Node wraps the whole flow in withAllocationLock; the transaction only
     // covers the non-dry pass (db.withTransaction, BEGIN IMMEDIATE).
     let _guard = alloc_lock().lock().await;
-    match remove_from_collection(&pool, &id, user.id, dry_run) {
+    match remove_from_collection(&pool, &id, user.id, dry_run).await {
         Ok(res) => res,
         Err(e) => internal_fail(
             "Failed to remove list cards from collection",
@@ -624,8 +624,8 @@ pub async fn handle_remove_from_collection(Path(id): Path<String>, State(st): St
     }
 }
 
-fn remove_from_collection(pool: &DbPool, id: &str, user_id: i64, dry_run: bool) -> Result<Response, WriteError> {
-    let conn = pool.get()?;
+async fn remove_from_collection(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, dry_run: bool) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized"));
     }
@@ -763,21 +763,21 @@ pub async fn handle_cheapest_printings(Path(id): Path<String>, State(st): State<
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match cheapest_printings(&pool, &id, user.id) {
+    match cheapest_printings(&pool, &id, user.id).await {
         Ok(res) => res,
         Err(e) => internal_fail("Failed to move cards to cheapest printings", "lists cheapest-printings", &e),
     }
 }
 
-fn cheapest_printings(pool: &DbPool, id: &str, user_id: i64) -> Result<Response, WriteError> {
-    let conn = pool.get()?;
+async fn cheapest_printings(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized"));
     }
@@ -880,7 +880,7 @@ pub async fn handle_printing(
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -894,14 +894,14 @@ pub async fn handle_printing(
         return json_error(StatusCode::BAD_REQUEST, "card_id is required");
     }
     let to_id = js_to_string(card_v);
-    match change_printing(&pool, &id, &card_id, user.id, &to_id, false) {
+    match change_printing(&pool, &id, &card_id, user.id, &to_id, false).await {
         Ok(Some(res)) => res,
         Ok(None) if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
         Ok(None) => {
             if !standalone_fetch(&st, &to_id).await {
                 return not_on_provider(&to_id);
             }
-            match change_printing(&pool, &id, &card_id, user.id, &to_id, true) {
+            match change_printing(&pool, &id, &card_id, user.id, &to_id, true).await {
                 Ok(Some(res)) => res,
                 Ok(None) => not_on_provider(&to_id),
                 Err(e) => internal_fail("Failed to change printing", "lists change-printing", &e),
@@ -913,15 +913,15 @@ pub async fn handle_printing(
 
 /// Ok(None) = hydration Forward (target printing not cached; Node hydrates
 /// or 404s `Card <id> not found on any card provider.`).
-fn change_printing(
-    pool: &DbPool,
+async fn change_printing(
+    pool: &std::sync::Arc<DbPool>,
     id: &str,
     from_id: &str,
     user_id: i64,
     to_id: &str,
     fetched: bool,
 ) -> Result<Option<Response>, WriteError> {
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(Some(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized")));
     }
@@ -1000,21 +1000,21 @@ pub async fn handle_remove_card(Path((id, card_id)): Path<(String, String)>, Sta
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match remove_card(&pool, &id, &card_id, user.id) {
+    match remove_card(&pool, &id, &card_id, user.id).await {
         Ok(res) => res,
         Err(e) => internal_fail("Failed to remove card from list", "lists remove-card", &e),
     }
 }
 
-fn remove_card(pool: &DbPool, id: &str, card_id: &str, user_id: i64) -> Result<Response, WriteError> {
-    let conn = pool.get()?;
+async fn remove_card(pool: &std::sync::Arc<DbPool>, id: &str, card_id: &str, user_id: i64) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized"));
     }

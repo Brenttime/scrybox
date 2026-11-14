@@ -460,7 +460,6 @@ async fn oversized_body_answers_the_413_shape() {
 #[test]
 fn post_search_history_does_not_park_the_runtime_worker_at_the_live_cap() {
     use std::sync::{Arc, mpsc};
-    use tokio::sync::Notify;
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = seeded_db(dir.path(), "park.db");
@@ -473,8 +472,10 @@ fn post_search_history_does_not_park_the_runtime_worker_at_the_live_cap() {
     );
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
-    let release = Arc::new(Notify::new());
-    let release_for_rt = release.clone();
+    // oneshot (not Notify): notify_waiters() stores no permit — a held task
+    // registering after the parent's 300 ms timer loses the release under
+    // load (same class as cardscan_park/marketplace, iter-15).
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let pool_for_rt = pool.clone();
     let db_for_rt = db_path.clone();
 
@@ -498,11 +499,10 @@ fn post_search_history_does_not_park_the_runtime_worker_at_the_live_cap() {
             let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
             {
                 let pool2 = pool_for_rt.clone();
-                let rel = release_for_rt.clone();
                 tokio::spawn(async move {
                     let held = pool2.get().unwrap();
                     let _ = held_tx.send(());
-                    rel.notified().await;
+                    let _ = release_rx.await;
                     drop(held);
                 });
             }
@@ -526,7 +526,7 @@ fn post_search_history_does_not_park_the_runtime_worker_at_the_live_cap() {
     // Pre-fix this never helps: the worker parked on the Condvar cannot run
     // the releasing task either, so recv_timeout below expires.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    release.notify_waiters();
+    let _ = release_tx.send(());
 
     let (status, body) = rx
         .recv_timeout(std::time::Duration::from_secs(10))

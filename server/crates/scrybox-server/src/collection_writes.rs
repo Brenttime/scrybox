@@ -24,7 +24,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection::{body_etag, etag_matches, json_num, sqlite_value, truthy, js_parse_int};
 use crate::db::DbPool;
 use crate::stats;
@@ -649,7 +649,7 @@ pub(crate) async fn standalone_unmatched(st: &AppState, req: Request) -> Respons
         if let Some(pool) = st.db.as_ref() {
             let is_get = method == Method::GET;
             if under("/api/admin", &lower) {
-                let user = match crate::settings::authenticate(pool, &parts.headers, is_get) {
+                let user = match crate::auth::authenticate_async(pool, crate::auth::bearer_token(&parts.headers).map(|s| s.to_string()).as_deref(), is_get).await {
                     Ok(u) => u,
                     Err(r) => return r,
                 };
@@ -756,12 +756,12 @@ pub async fn handle_cardlist(State(st): State<AppState>, req: Request) -> Respon
     }
 
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
 
-    match cardlist(&pool, user.id, &uri, &headers) {
+    match cardlist(&pool, user.id, &uri, &headers).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(error = ?e, "cardlist failed");
@@ -778,8 +778,8 @@ fn norm(v: Option<&Value>) -> String {
     }
 }
 
-fn cardlist(pool: &DbPool, user_id: i64, uri: &Uri, headers: &HeaderMap) -> Result<Response, WriteError> {
-    let conn = pool.get()?;
+async fn cardlist(pool: &std::sync::Arc<DbPool>, user_id: i64, uri: &Uri, headers: &HeaderMap) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
     // Node: `Number(unresolved && unresolved.count) > 0` — count is always
     // numeric from COUNT(*).
     let count = get_i64(
@@ -892,7 +892,7 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
     };
 
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -956,7 +956,7 @@ pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
     };
 
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -985,7 +985,7 @@ enum PutOutcome {
     Forward(String),
 }
 
-async fn put_entry(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> PutOutcome {
+async fn put_entry(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> PutOutcome {
     match put_inner(pool, id, user_id, body).await {
         Ok(PutOutcome::Response(r)) => PutOutcome::Response(r),
         Ok(PutOutcome::Forward(nc)) => PutOutcome::Forward(nc),
@@ -1002,8 +1002,8 @@ fn defined<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
     body.get(key)
 }
 
-async fn put_inner(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Result<PutOutcome, WriteError> {
-    let conn = pool.get()?;
+async fn put_inner(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Result<PutOutcome, WriteError> {
+    let conn = pool.get_async().await?;
 
     // Entry lookup — SELECT *, id bound as the raw TEXT route param exactly
     // like Node (INTEGER affinity does the numeric comparison).
@@ -1146,7 +1146,7 @@ async fn put_inner(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Resul
     // is materialised; current_entry is re-read under the lock anyway.
     drop(conn);
     let _guard = alloc_lock().lock().await;
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     let mut tx = Tx::begin(&conn)?;
 
     let current_entry = match get_row_map(
@@ -1239,7 +1239,7 @@ async fn put_inner(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Resul
 // DELETE /collection/:id
 // ---------------------------------------------------------------------------
 
-async fn delete_entry(pool: &DbPool, id: &str, user_id: i64) -> Response {
+async fn delete_entry(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
     match delete_inner(pool, id, user_id).await {
         Ok(r) => r,
         Err(e) => {
@@ -1249,9 +1249,9 @@ async fn delete_entry(pool: &DbPool, id: &str, user_id: i64) -> Response {
     }
 }
 
-async fn delete_inner(pool: &DbPool, id: &str, user_id: i64) -> Result<Response, WriteError> {
+async fn delete_inner(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Result<Response, WriteError> {
     let _guard = alloc_lock().lock().await;
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     let mut tx = Tx::begin(&conn)?;
 
     let entry = match get_row_map(
@@ -1301,7 +1301,7 @@ async fn delete_inner(pool: &DbPool, id: &str, user_id: i64) -> Result<Response,
 // POST /collection/bulk
 // ---------------------------------------------------------------------------
 
-async fn bulk(pool: &DbPool, user_id: i64, body: &Value) -> Result<Response, WriteError> {
+async fn bulk(pool: &std::sync::Arc<DbPool>, user_id: i64, body: &Value) -> Result<Response, WriteError> {
     // const { entry_ids = [], action, value } = req.body — a missing key
     // takes the [] default; an explicit null fails Array.isArray.
     let entry_ids_val = defined(body, "entry_ids").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
@@ -1324,10 +1324,10 @@ async fn bulk(pool: &DbPool, user_id: i64, body: &Value) -> Result<Response, Wri
     let id_params: Vec<SqlValue> = ids.iter().map(|i| SqlValue::Integer(*i)).collect();
 
     match action.as_str() {
-        "add_to_deck" => bulk_add_to_deck(pool, user_id, value.as_ref(), &id_params, &ph),
+        "add_to_deck" => bulk_add_to_deck(pool, user_id, value.as_ref(), &id_params, &ph).await,
         "delete" => bulk_delete(pool, user_id, &id_params, &ph).await,
         "trade" | "untrade" => {
-            let conn = pool.get()?;
+            let conn = pool.get_async().await?;
             let set = if action == "trade" { 1 } else { 0 };
             let mut params = vec![SqlValue::Integer(set)];
             params.extend(id_params.iter().cloned());
@@ -1349,7 +1349,7 @@ async fn bulk(pool: &DbPool, user_id: i64, body: &Value) -> Result<Response, Wri
             }
             // withAllocationLock around the single stack-key UPDATE.
             let _guard = alloc_lock().lock().await;
-            let conn = pool.get()?;
+            let conn = pool.get_async().await?;
             let mut params = vec![json_to_sql(value.as_ref())?];
             params.extend(id_params.iter().cloned());
             params.push(SqlValue::Integer(user_id));
@@ -1362,16 +1362,16 @@ async fn bulk(pool: &DbPool, user_id: i64, body: &Value) -> Result<Response, Wri
                 &json!({ "message": format!("Set {action} on {changes} card(s)"), "affected": changes }),
             ))
         }
-        "purchase_split" => bulk_purchase_split(pool, user_id, value.as_ref(), &id_params, &ph),
+        "purchase_split" => bulk_purchase_split(pool, user_id, value.as_ref(), &id_params, &ph).await,
         // Every BULK_ACTION has a branch above; anything reaching here would
         // be one Node itself has no branch for → falls to Unknown action.
         _ => Ok(json_error(StatusCode::BAD_REQUEST, "Unknown action")),
     }
 }
 
-async fn bulk_delete(pool: &DbPool, user_id: i64, id_params: &[SqlValue], ph: &str) -> Result<Response, WriteError> {
+async fn bulk_delete(pool: &std::sync::Arc<DbPool>, user_id: i64, id_params: &[SqlValue], ph: &str) -> Result<Response, WriteError> {
     let _guard = alloc_lock().lock().await;
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     let mut tx = Tx::begin(&conn)?;
     let mut params: Vec<SqlValue> = id_params.to_vec();
     params.push(SqlValue::Integer(user_id));
@@ -1444,8 +1444,8 @@ fn split_price(prices: &[f64], total: f64, method: &str) -> Vec<f64> {
         .collect()
 }
 
-fn bulk_purchase_split(
-    pool: &DbPool,
+async fn bulk_purchase_split(
+    pool: &std::sync::Arc<DbPool>,
     user_id: i64,
     value: Option<&Value>,
     id_params: &[SqlValue],
@@ -1474,7 +1474,7 @@ fn bulk_purchase_split(
         _ => "weighted",
     };
 
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     let mut params: Vec<SqlValue> = id_params.to_vec();
     params.push(SqlValue::Integer(user_id));
     let rows = get_rows_map(
@@ -1602,8 +1602,8 @@ pub(crate) fn validate_deck_addition(
     Ok(Ok(()))
 }
 
-fn bulk_add_to_deck(
-    pool: &DbPool,
+async fn bulk_add_to_deck(
+    pool: &std::sync::Arc<DbPool>,
     user_id: i64,
     value: Option<&Value>,
     id_params: &[SqlValue],
@@ -1614,7 +1614,7 @@ fn bulk_add_to_deck(
         Some(d) if d != 0 => d,
         _ => return Ok(json_error(StatusCode::BAD_REQUEST, "Invalid deck_id")),
     };
-    let conn = pool.get()?;
+    let conn = pool.get_async().await?;
     let deck = get_row_map(
         &conn,
         "SELECT id, checked_out FROM decks WHERE id = ? AND user_id = ?",
@@ -2099,7 +2099,7 @@ async fn fetch_card_then_replan(
         tracing::error!(error=%e, "add card: getCardById cache write failed");
         return FetchCardOutcome::Unusable;
     }
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return FetchCardOutcome::Unusable,
     };
@@ -2130,7 +2130,7 @@ pub(crate) async fn plan_add_standalone(
     merged: &Map<String, Value>,
 ) -> Result<StandalonePlan, WriteError> {
     let plan = {
-        let conn = pool.get().map_err(|_| WriteError::Bind)?;
+        let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
         plan_add_ex(&conn, merged, false)?
     };
     let plan = match plan {
@@ -2138,7 +2138,7 @@ pub(crate) async fn plan_add_standalone(
             if crate::cvscan::fetch_card_by_id(&st.scry, pool, &card_id).await.is_none() {
                 return Ok(StandalonePlan::NotFound(card_id));
             }
-            let conn = pool.get().map_err(|_| WriteError::Bind)?;
+            let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
             match plan_add_ex(&conn, merged, false)? {
                 // Cache write landed but the row is unreadable: Node's null.
                 AddPlan::FetchCard(card_id) => return Ok(StandalonePlan::NotFound(card_id)),
@@ -2152,7 +2152,7 @@ pub(crate) async fn plan_add_standalone(
     }
     // Forward = non-string id cache miss, or localized printing miss.
     let row = {
-        let conn = pool.get().map_err(|_| WriteError::Bind)?;
+        let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
         get_row_map(&conn, "SELECT * FROM card_cache WHERE id = ?1", &[json_to_sql(merged.get("card_id"))?])?
     };
     let Some(row) = row else { return Err(WriteError::Bind) };
@@ -2187,7 +2187,7 @@ pub(crate) async fn plan_add_standalone(
             }
         }
     }
-    let conn = pool.get().map_err(|_| WriteError::Bind)?;
+    let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
     Ok(StandalonePlan::Plan(plan_add_ex(&conn, merged, true)?))
 }
 
@@ -2210,7 +2210,7 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
         BodyOutcome::TooLarge => return too_large(),
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -2219,7 +2219,7 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     // arrays there).
     let empty = Map::new();
     let m = body.as_object().unwrap_or(&empty);
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error=?e, "add card pool failure");
@@ -2325,7 +2325,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         BodyOutcome::TooLarge => return too_large(),
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -2348,7 +2348,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
     let mut shared = body_map.unwrap_or_default();
     shared.remove("card_ids");
 
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error=?e, "bulk add pool failure");
@@ -2444,7 +2444,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         // Hybrid: Node authors the fetches itself (pre-7c Forward behavior).
         return crate::proxy(State(st), rebuild(parts, &bytes)).await;
     }
-    let conn = match pool.get() {
+    let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error=?e, "bulk add pool failure");
@@ -2602,5 +2602,86 @@ mod tx_tests {
             .query_row("SELECT COUNT(*) FROM parent WHERE id = 7", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "successful commit must persist");
+    }
+}
+
+#[cfg(test)]
+mod worker_park_tests {
+    //! LANE-A iter-14 (M5 family, audit follow-up to iter-13's search/health
+    //! root-catch): the per-request checkouts on the collection WRITE
+    //! handlers' hot paths — the `cardlist` probe below stands in for the
+    //! whole converted set (handle_cardlist/handle_entry/handle_bulk/
+    //! handle_add/handle_bulk_add and their helpers) — must not park the
+    //! runtime worker on the DbPool live cap. During the iter-78/81/82/83/12
+    //! bench freezes the workers themselves blocked in `pool.get()` while
+    //! the multi-leg builds held every live slot. `cardlist` now checks out
+    //! via `DbPool::get_async()` (idle-pop on the worker, blocking-pool hop
+    //! on miss), so a capped pool can only ever stall the BLOCKING pool.
+    //! RED before the conversion (measured): with `pool.get()` restored in
+    //! `cardlist`, the 150 ms heartbeat never fires and the test panics.
+
+    use super::*;
+    use crate::db::{DbPool, PoolConfig};
+    use axum::http::Uri;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cardlist_never_parks_a_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cardlist-park.db");
+        // DbPool opens READ_WRITE without CREATE — the file must exist.
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = std::sync::Arc::new(
+            DbPool::open_with(
+                &path,
+                PoolConfig { max: 1, cache_kb: 2048, mmap_kb: 0, live_max: 1 },
+            )
+            .unwrap(),
+        );
+        {
+            let c = pool.get().unwrap();
+            c.execute_batch(
+                "CREATE TABLE collection (id INTEGER PRIMARY KEY, card_id INTEGER, user_id INTEGER, quantity INTEGER, added_at TEXT);
+                 CREATE TABLE card_cache (id INTEGER PRIMARY KEY, name TEXT, set_id TEXT, number TEXT);
+                 INSERT INTO collection (card_id, user_id, quantity, added_at) VALUES (1, 1, 2, '2026-01-01');
+                 INSERT INTO card_cache (id, name, set_id, number) VALUES (1, 'Sol Ring', 'm19', '1');",
+            )
+            .unwrap();
+        }
+        // Occupy the only live slot: idle empty, live == live_max. Any
+        // further get() parks its calling thread on the live-cap Condvar.
+        let held = pool.get_owned().unwrap();
+        std::thread::spawn(move || {
+            // Release at 1.2 s so a RED run FAILS (the parked worker wakes,
+            // the runtime joins) instead of deadlocking the test binary.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            drop(held);
+        });
+
+        let p1 = std::sync::Arc::clone(&pool);
+        let probe = tokio::spawn(async move {
+            cardlist(
+                &p1,
+                1,
+                &Uri::from_static("/api/collection/cardlist"),
+                &HeaderMap::new(),
+            )
+            .await
+        });
+        let beat = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+        // Drive from the test's main (NON-worker) thread: if the probe
+        // parked the sole worker, the 150 ms heartbeat can never fire.
+        // (Build the timeout futures INSIDE the runtime context —
+        // tokio::time::timeout registers its timer at construction.)
+        tokio::time::timeout(std::time::Duration::from_millis(400), beat)
+            .await
+            .expect("cardlist parked the runtime worker (heartbeat starved)");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+            .await
+            .expect("cardlist never completed after the cap released")
+            .unwrap()
+            .unwrap();
+        assert!(resp.status().is_success(), "cardlist must answer through the async checkout");
     }
 }

@@ -43,7 +43,15 @@ fn mock_sidecar() -> &'static str {
                     let j = |s: String| {
                         (
                             axum::http::StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"))],
+                            [
+                                (axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json")),
+                                // Keep-alive reuse race (measured ~10% of binary runs): the
+                                // shared BytesClient pools one connection to this port across
+                                // pins; when the pool hands a detect request a connection the
+                                // server had just closed, the POST dies unretried → Up::Failed
+                                // → 502. close-after-response removes the reuse window.
+                                (axum::http::header::CONNECTION, axum::http::HeaderValue::from_static("close")),
+                            ],
                             axum::body::Body::from(s),
                         )
                     };
@@ -97,9 +105,24 @@ fn parked_probe(
     expected: u16,
 ) -> (u16, Vec<u8>, Arc<scrybox_server::db::DbPool>) {
     use std::sync::mpsc;
-    use tokio::sync::Notify;
 
-    std::env::set_var("CARDSCAN_URL", mock_sidecar());
+    // Set CARDSCAN_URL exactly ONCE per process, before ANY test reaches its
+    // request phase: concurrent std::env::set_var from parallel tests racing
+    // base_url()'s env snapshot (cardscan.rs module-load OnceLock) produced
+    // torn reads — the sidecar leg then died inside the runtime thread, the
+    // oneshot disconnected, and scan/frame flaked as 'never completed'
+    // (passing only under --test-threads=1). call_once blocks late arrivals
+    // until the single writer is done.
+    static URL_SET: std::sync::Once = std::sync::Once::new();
+    URL_SET.call_once(|| {
+        std::env::set_var("CARDSCAN_URL", mock_sidecar());
+        // Same race class as CARDSCAN_URL: the telemetry pin's raw
+        // set_var(SCAN_TELEMETRY_DIR) raced the other pins' concurrent env
+        // reads (torn reads starved the detect leg — detect failed
+        // 'never completed' at default parallelism, green under
+        // --test-threads=1). One writer, before any request phase.
+        std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
+    });
     let dir = std::env::temp_dir().join(format!("scrybox-cspark-{}", scrybox_server::auth_support::uuid_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = seed(&dir);
@@ -113,8 +136,15 @@ fn parked_probe(
     );
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
-    let release = Arc::new(Notify::new());
-    let release_for_rt = release.clone();
+    // oneshot (not Notify): notify_waiters() stores no permit, so a held
+    // task that registered after the parent's 300 ms timer lost the release
+    // under parallel load — the slot never freed and the handler sat on the
+    // live cap until the 10 s recv timeout (which mis-labelled the lost
+    // wakeup as a parking regression). oneshot::send stores the value, so a
+    // late registration still wakes. Red-before-green semantics are intact:
+    // pre-fix, the worker itself parks on the cap and the release task can
+    // never run regardless of how release is delivered.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let pool_for_rt = pool.clone();
     let db_for_rt = db_path.clone();
     let method_owned = method.to_string();
@@ -144,11 +174,10 @@ fn parked_probe(
             let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
             {
                 let pool2 = pool_for_rt.clone();
-                let rel = release_for_rt.clone();
                 tokio::spawn(async move {
                     let held = pool2.get().unwrap();
                     let _ = held_tx.send(());
-                    rel.notified().await;
+                    let _ = release_rx.await;
                     drop(held);
                 });
             }
@@ -176,7 +205,7 @@ fn parked_probe(
     // Pre-fix this never helps: the worker parked on the Condvar cannot run
     // the releasing task either, so recv_timeout below expires.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    release.notify_waiters();
+    let _ = release_tx.send(());
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
         panic!(
@@ -264,7 +293,6 @@ fn detect_does_not_park_the_runtime_worker_at_the_live_cap() {
 fn telemetry_does_not_park_the_runtime_worker_at_the_live_cap() {
     // Full standalone arm (NO sidecar leg): auth → body → record fold →
     // JSONL append via the existing spawn_blocking file hop.
-    std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
     let body = r#"{"session":"s-1","records":[{"ev":"tap"}]}"#;
     let (_s, bytes, pool) = parked_probe("POST", "/api/cardscan/telemetry", Some("application/json"), Some(body), 204);
     assert!(bytes.is_empty(), "204 carries no body, got {bytes:?}");
@@ -284,9 +312,12 @@ fn scan_match_does_not_park_the_runtime_worker_at_the_live_cap() {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 200]);
     let body = format!(r#"{{"image":"data:image/jpeg;base64,{b64}"}}"#);
-    // The fold answers 503 notBuilt (is_built gate fires before the ORT leg in
-    // the test env — no catalog built). Park-RED is the timeout panic in
-    // parked_probe, independent of this status, so the pin stays valid.
+    // Hermetic test env: no catalog is ever registered → is_built is
+    // deterministically false → Node's own 503-notBuilt arm (collection.js
+    // :304 res.status(503)); the iter-55 note's 'green' expected 200, which
+    // is not a status this arm can answer. Pre-fix the pin dies at
+    // recv_timeout ('never completed'), so the status expectation does not
+    // touch red-before-green.
     let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 503);
     let v = parse(&bytes);
     assert!(
