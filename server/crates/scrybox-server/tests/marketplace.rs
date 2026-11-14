@@ -1107,3 +1107,221 @@ async fn standalone_add_localized_miss_hydrates_natively() {
     assert_eq!(rows, vec![("mtg-aaa".into(), "German".into()), ("mtg-ccc".into(), "German".into())]);
     assert!(!scry.hits_for("GET /cards/10e/1/de").is_empty(), "printing-in-language lookup ran");
 }
+
+// ---------------------------------------------------------------------------
+// Livelock guard (REVIEW M5 family, iter-70/82 shape — bench ALL_mixed stall)
+// ---------------------------------------------------------------------------
+
+/// Shared harness: current-thread runtime whose DbPool has live_max=1 with
+/// the ONLY live slot held by a runtime task that frees it on `release`.
+/// If any handler step parks the worker on the pool's live-cap Condvar the
+/// release task can never run and the request never completes (iter-82
+/// ALL_mixed freeze). Returns (status, body) through a channel; the caller
+/// asserts with a recv_timeout — the red-before-green signal.
+#[allow(clippy::type_complexity)]
+#[allow(dead_code)]
+fn parked_probe(
+    method: &str,
+    uri: &str,
+    body: Option<&'static str>,
+    expected: u16,
+) -> (u16, Vec<u8>, Arc<scrybox_server::db::DbPool>) {
+    parked_probe_scoped(method, uri, body, expected, false)
+}
+
+/// Same harness; when `script_providers` is set, the ManaPool leg answers
+/// from a StubHttp scripted with `card_detail()` and the scryfall leg is a
+/// mock_scryfall server scripted with `card_batches()` — the preview/add
+/// folds run end to end (bulk fetch, cacheCards, owned-counts, plan/execute)
+/// while the pool's single live slot is held by a runtime task.
+#[allow(clippy::type_complexity)]
+fn parked_probe_scoped(
+    method: &str,
+    uri: &str,
+    body: Option<&'static str>,
+    expected: u16,
+    script_providers: bool,
+) -> (u16, Vec<u8>, Arc<scrybox_server::db::DbPool>) {
+    use std::sync::mpsc;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    stub_base_once();
+    let dir = std::env::temp_dir().join(format!("scrybox-mp-park-{}", scrybox_server::auth_support::uuid_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("bindarr.db");
+    std::fs::write(&db_path, []).unwrap();
+    let pool = Arc::new(
+        scrybox_server::db::DbPool::open_with(
+            &db_path,
+            scrybox_server::db::PoolConfig { max: 1, cache_kb: 1024, mmap_kb: 0, live_max: 1 },
+        )
+        .unwrap(),
+    );
+    pool.get().unwrap().execute_batch(auth_common::schema_fixture()).unwrap();
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO users (username, password_hash, role, share_token, manapool_email, manapool_token, manapool_enabled, manapool_saved_at, api_key)
+             VALUES ('mpmember','h','member','sh-mp','player@example.com','abcdefghij',1,'2026-01-02T03:04:05.000Z','bnd_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+             INSERT INTO sessions (token, user_id, expires_at) VALUES ('tok-mp-member-1',1,'2030-01-01 00:00:00');",
+        )
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let release = Arc::new(Notify::new());
+    let release_for_rt = release.clone();
+    let pool_for_rt = pool.clone();
+    let db_for_rt = db_path.clone();
+    let method_owned = method.to_string();
+    let uri_owned = uri.to_string();
+    let script_providers_owned = script_providers;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let cfg = Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                node_upstream: "http://127.0.0.1:1".to_string(),
+                static_dir: None,
+                rust_routes: ["marketplace".to_string()].into_iter().collect(),
+                db_path: Some(db_for_rt),
+                sidecar_url: None,
+            };
+            let mut st = AppState::new(cfg);
+            st.db = Some(pool_for_rt.clone());
+            if script_providers_owned {
+                // ManaPool stub answers with the card-detail twin; scryfall
+                // is a mock server scripted with the two-card collection
+                // batch, so the folds run their whole body (bulk fetch →
+                // cacheCards → owned-counts / plan+execute) while the pool
+                // cap is held.
+                st.mp_http = StubHttp::new(vec![(200, card_detail())]);
+                let (addr, scry) = mock_scryfall::spawn_mock().await;
+                *scry.collection_batches.lock().unwrap() = card_batches();
+                st.scry = Arc::new(mock_scryfall::scry_for(addr, 0.0));
+            }
+            let r = scrybox_server::app(st);
+
+            // Occupy the pool's single live slot from a runtime task: the
+            // ONLY way to free it is another task on this same worker.
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+            {
+                let pool2 = pool_for_rt.clone();
+                let rel = release_for_rt.clone();
+                tokio::spawn(async move {
+                    let held = pool2.get().unwrap();
+                    let _ = held_tx.send(());
+                    rel.notified().await;
+                    drop(held);
+                });
+            }
+            held_rx.await.unwrap();
+
+            let mut b = axum::http::Request::builder()
+                .method(method_owned.as_str())
+                .uri(uri_owned.as_str())
+                .header("authorization", concat!("Bearer ", "tok-mp-member-1"));
+            if let Some(body) = body {
+                b = b.header("content-type", "application/json");
+            }
+            let req = b.body(axum::body::Body::from(body.unwrap_or(""))).unwrap();
+            let resp = r.oneshot(req).await.unwrap();
+            let status = resp.status().as_u16();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+            let _ = tx.send((status, bytes));
+        });
+    });
+
+    // Give the request task time to reach its cap wait, then free the pool.
+    // Pre-fix this never helps: the worker parked on the Condvar cannot run
+    // the releasing task either, so recv_timeout below expires.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    release.notify_waiters();
+
+    let (status, bytes) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("{method} {uri} never completed: the handler parked the runtime worker on the DbPool live cap (synchronous pool.get()/authenticate inline on the worker)"));
+    assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
+    (status, bytes, pool)
+}
+
+#[test]
+fn accounts_get_does_not_park_the_runtime_worker_at_the_live_cap() {
+    let (_s, bytes, pool) = parked_probe("GET", "/api/marketplace/accounts", None, 200);
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let mp = &v["manapool"];
+    assert_eq!(mp["configured"], json!(true), "masked accountView expected, got {v}");
+    assert_eq!(mp["enabled"], json!(true));
+    assert!(mp["email"].as_str().map(|e| e.contains('•')).unwrap_or(false), "email must be masked: {v}");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn accounts_put_does_not_park_the_runtime_worker_at_the_live_cap() {
+    let (_s, bytes, pool) = parked_probe(
+        "PUT",
+        "/api/marketplace/accounts",
+        Some(r#"{"manapool":{"clear":true}}"#),
+        200,
+    );
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["ok"], json!(true), "clear-arm ok body expected, got {v}");
+    assert_eq!(v["accounts"]["manapool"]["configured"], json!(false));
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn recent_not_configured_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // user 1 has creds configured; the NOT-configured arm still exercises the
+    // checkout + gates hop. Use a route to recent for the configured arm and
+    // assert through StubHttp separately — here pin only the park property.
+    let (_s, _bytes, pool) = parked_probe("GET", "/api/marketplace/recent/manapool", None, 502);
+    // stub_base_once points MANAPOOL_API_BASE at stub.invalid; the real
+    // client cannot resolve it, so the configured arm answers the 502 twin
+    // after the DB hop proved the park property.
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn preview_ok_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // Full fold: auth → order_from_request checkout → ManaPool stub →
+    // scryfall mock → preview_fold checkout + cacheCards + owned-counts, all
+    // with the pool's single live slot held by a runtime task (iter-82
+    // ALL_mixed shape). Pre-fix the worker parks at the first inline
+    // pool.get() and the release task never runs.
+    let (_s, bytes, pool) = parked_probe_scoped(
+        "POST",
+        "/api/marketplace/preview",
+        Some(r#"{"source":"manapool","order_number":"11111111-2222-3333-4444-555555555555"}"#),
+        200,
+        true,
+    );
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["resolvedCount"], json!(2), "two-card fold expected, got {v}");
+    assert_eq!(v["cards"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+#[test]
+fn add_ok_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // Same harness on the WRITE fold: order_from_request + add_fold
+    // (checkout, cacheCards, plan_add/execute_add inserts) on the blocking
+    // pool while the live cap is held on the worker.
+    let (_s, bytes, pool) = parked_probe_scoped(
+        "POST",
+        "/api/marketplace/add",
+        Some(r#"{"source":"manapool","order_number":"11111111-2222-3333-4444-555555555555"}"#),
+        200,
+        true,
+    );
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["added"], json!(3), "2+1 copies expected, got {v}");
+    let n: i64 = pool
+        .get()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM collection WHERE user_id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "both stacks must be filed");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}

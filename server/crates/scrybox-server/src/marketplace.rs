@@ -69,7 +69,6 @@ use crate::db::DbPool;
 use crate::decks_reads::{js_number, js_trim, root_collator, rows_map};
 use crate::precons::bulk_fetch_by_identifier;
 use crate::search::js_parse_int;
-use crate::settings::authenticate;
 use crate::stats;
 use crate::AppState;
 
@@ -700,7 +699,7 @@ pub struct OrderLine {
     pub junk: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct OrderLines {
     pub lines: Vec<OrderLine>,
     pub card_copies: f64,
@@ -1158,25 +1157,38 @@ pub async fn route_recent(
     }
 }
 
+// M5 (REVIEW): every DB checkout in an async handler runs on the blocking
+// pool (iter-70/82 shape) — db.rs get() parks on the live-cap Condvar, and
+// a worker parked there starves the whole runtime (iter-82 ALL_mixed stall).
 async fn handle_accounts_get(State(st): State<AppState>, req: Request) -> Response {
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers = req.headers().clone();
-    let user = match authenticate(&pool, &headers, true) {
+    let user = match crate::auth::authenticate_async(&pool, crate::auth::bearer_token(&headers), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error=?e, "marketplace read pool");
-            return internal_error();
+    let resp = tokio::task::spawn_blocking(move || -> Response {
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error=?e, "marketplace read pool");
+                return internal_error();
+            }
+        };
+        match load_row(&conn, user.id) {
+            Ok(Some(row)) => json_response(StatusCode::OK, &account_view(&row)),
+            Ok(None) => json_error(StatusCode::NOT_FOUND, "User not found"),
+            Err(e) => {
+                tracing::error!(error=?e, "marketplace accounts load");
+                internal_error()
+            }
         }
-    };
-    match load_row(&conn, user.id) {
-        Ok(Some(row)) => json_response(StatusCode::OK, &account_view(&row)),
-        Ok(None) => json_error(StatusCode::NOT_FOUND, "User not found"),
+    })
+    .await;
+    match resp {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!(error=?e, "marketplace accounts load");
+            tracing::error!(error=%e, "marketplace accounts get hop");
             internal_error()
         }
     }
@@ -1196,7 +1208,7 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
         BodyOutcome::Invalid => return internal_error(),
         BodyOutcome::TooLarge => return too_large(),
     };
-    let user = match authenticate(&pool, &headers, false) {
+    let user = match crate::auth::authenticate_async(&pool, crate::auth::bearer_token(&headers), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -1206,6 +1218,10 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
         Some(v) => v.clone(),
         None => return json_error(StatusCode::BAD_REQUEST, "Nothing to save"),
     };
+    // M5: the whole load-merge-save RMW runs on the blocking pool — pool.get()
+    // can park on the live-cap Condvar, which must never happen on a worker.
+    let user_id = user.id;
+    let resp = tokio::task::spawn_blocking(move || -> Response {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -1213,7 +1229,7 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
             return internal_error();
         }
     };
-    let row = match load_row(&conn, user.id) {
+    let row = match load_row(&conn, user_id) {
         Ok(Some(r)) => r,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
         Err(e) => {
@@ -1265,12 +1281,12 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
     // SET, so the statement can never be empty.
     let sql = format!("UPDATE users SET {} WHERE id = ?", sets.join(", "));
     let mut all = params;
-    all.push(SqlValue::Integer(user.id));
+    all.push(SqlValue::Integer(user_id));
     if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(all.iter())) {
         tracing::error!(error=?e, "marketplace accounts update failed");
         return internal_error();
     }
-    let fresh = match load_row(&conn, user.id) {
+    let fresh = match load_row(&conn, user_id) {
         Ok(Some(r)) => r,
         Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
         Err(e) => {
@@ -1282,6 +1298,15 @@ async fn handle_accounts_put(State(st): State<AppState>, req: Request) -> Respon
     out.insert("ok".into(), json!(true));
     out.insert("accounts".into(), account_view(&fresh));
     json_response(StatusCode::OK, &Value::Object(out))
+    })
+    .await;
+    match resp {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error=%e, "marketplace accounts put hop");
+            internal_error()
+        }
+    }
 }
 
 async fn handle_recent(State(st): State<AppState>, source: String, req: Request) -> Response {
@@ -1290,7 +1315,7 @@ async fn handle_recent(State(st): State<AppState>, source: String, req: Request)
     let query = req.uri().query().unwrap_or("").to_string();
     // authenticateToken is the router's middleware: it answers BEFORE the
     // source gate.
-    let user = match authenticate(&pool, &headers, true) {
+    let user = match crate::auth::authenticate_async(&pool, crate::auth::bearer_token(&headers), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -1298,30 +1323,44 @@ async fn handle_recent(State(st): State<AppState>, source: String, req: Request)
     if source != "manapool" {
         return json_error(StatusCode::BAD_REQUEST, "unknown source");
     }
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error=?e, "marketplace read pool");
-            return internal_error();
+    // M5: read checkout + gates on the blocking pool (see handle_accounts_get).
+    let user_id = user.id;
+    let prep = tokio::task::spawn_blocking(move || -> Result<Result<Creds, Response>, ()> {
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error=?e, "marketplace read pool");
+                return Err(());
+            }
+        };
+        let row = match load_row(&conn, user_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(Err(json_error(StatusCode::NOT_FOUND, "User not found"))),
+            Err(e) => {
+                tracing::error!(error=?e, "marketplace recent load");
+                return Err(());
+            }
+        };
+        if js_falsy(row.get("manapool_email"))
+            || js_falsy(row.get("manapool_token"))
+            || js_falsy(row.get("manapool_enabled"))
+        {
+            return Ok(Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "ManaPool is not configured or is turned off",
+            )));
         }
+        Ok(Ok(Creds {
+            email: to_str_or_empty(row.get("manapool_email")),
+            token: to_str_or_empty(row.get("manapool_token")),
+        }))
+    })
+    .await;
+    let creds = match prep {
+        Ok(Ok(Ok(c))) => c,
+        Ok(Ok(Err(res))) => return res,
+        Ok(Err(())) | Err(_) => return internal_error(),
     };
-    let row = match load_row(&conn, user.id) {
-        Ok(Some(r)) => r,
-        Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
-        Err(e) => {
-            tracing::error!(error=?e, "marketplace recent load");
-            return internal_error();
-        }
-    };
-    if js_falsy(row.get("manapool_email"))
-        || js_falsy(row.get("manapool_token"))
-        || js_falsy(row.get("manapool_enabled"))
-    {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "ManaPool is not configured or is turned off",
-        );
-    }
     // `Math.max(0, parseInt(req.query.offset, 10) || 0)` — first query value;
     // a repeated key joins with ',' in qs, which parseInt reads as the first
     // number (or NaN) either way.
@@ -1330,10 +1369,6 @@ async fn handle_recent(State(st): State<AppState>, source: String, req: Request)
         .map(|(_, v)| v.into_owned());
     let offset = offset_raw.as_deref().and_then(js_parse_int).unwrap_or(0).max(0);
 
-    let creds = Creds {
-        email: to_str_or_empty(row.get("manapool_email")),
-        token: to_str_or_empty(row.get("manapool_token")),
-    };
     let http = st.mp_http.clone();
     match manapool_recent_order_summaries(http.as_ref(), &creds, RECENT_LIMIT, offset as f64).await
     {
@@ -1612,18 +1647,22 @@ fn val_or_none(v: &Value) -> Option<Value> {
 /// client failure, cacheCards DB failure, or the owned-counts DB failure).
 /// The connection is opened only AFTER the scryfall await (rusqlite guards
 /// are not Send — same discipline the slice-1 handlers follow).
+/// M5 (REVIEW): the checkout and every query after it run on the blocking
+/// pool (iter-70/82/83 shape) — pool.get() parks on the live-cap Condvar,
+/// which must never happen on a runtime worker. The last await (scryfall
+/// bulk fetch) precedes the hop; nothing after it awaits.
 async fn preview_fold(
     st: &AppState,
-    pool: &DbPool,
+    pool: &std::sync::Arc<DbPool>,
     user_id: i64,
     lines: &OrderLines,
     include_extras: bool,
 ) -> Result<Map<String, Value>, String> {
-    let mut m = Map::new();
     if lines.lines.is_empty() {
         // Node's early answer — deliberately MISSING totalCopies,
         // extrasIncluded and price_cents (the object literal stops at
         // sealedCount; the route spread never adds them back).
+        let mut m = Map::new();
         m.insert("cards".into(), json!([]));
         m.insert("totalListed".into(), json!(0));
         m.insert("resolvedCount".into(), json!(0));
@@ -1645,13 +1684,17 @@ async fn preview_fold(
             }
         }
     };
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("marketplace preview: cannot open connection");
-            return Err(e.to_string());
-        }
-    };
+    let pool = pool.clone();
+    let lines = lines.clone();
+    let hop = tokio::task::spawn_blocking(move || -> Result<Map<String, Value>, String> {
+        let mut m = Map::new();
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("marketplace preview: cannot open connection");
+                return Err(e.to_string());
+            }
+        };
     if !bulk.cards.is_empty() {
         let fresh: Vec<Map<String, Value>> =
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
@@ -1793,7 +1836,12 @@ async fn preview_fold(
         "price_cents".into(),
         if cents == 0.0 || cents.is_nan() { Value::Null } else { js_num_json(cents) },
     );
-    Ok(m)
+        Ok(m)
+    });
+    hop.await.map_err(|e| {
+        tracing::error!(error = %e, "marketplace preview: blocking hop panicked");
+        "Could not resolve the order lines".to_string()
+    })?
 }
 
 /// Number((Number(cents)/100).toFixed(2)) — toFixed rounds HALF-AWAY-FROM-
@@ -1828,6 +1876,11 @@ struct AddResult {
 }
 
 enum AddErr {
+    /// Node-free pre-pass found cards whose hydration leg (getCardById /
+    /// getPrintingInLang) needs the network, which cannot run on the
+    /// blocking hop. Nothing was written. The async leg resolves each
+    /// payload via `plan_add_standalone`, then reruns the real hop.
+    HydrateFirst(Vec<(usize, Map<String, Value>)>),
     /// Whole-request replay (scryfall leg, cache DB failure, plan Forward).
     /// `Some(message)` = a throw Node's route catch would answer as
     /// `500 {error: message}` (the Node-free leg answers it natively);
@@ -1838,6 +1891,13 @@ enum AddErr {
     Boom(String),
 }
 
+/// Node-free pre-pass result for one hydration-needing payload, resolved by
+/// the worker leg (`plan_add_standalone`) and carried into the real hop.
+enum ResolvedAdd {
+    Ready(AddPlan),
+    Reject(String),
+}
+
 /// addOrderToCollection twin. Groups are filed through the shared
 /// plan_add/execute_add pair exactly like the Secret Lair path, with the
 /// marketplace per-card fields (quantity, purchase_price, condition,
@@ -1845,7 +1905,7 @@ enum AddErr {
 /// per-card qty map, not rows.
 async fn add_fold(
     st: &AppState,
-    pool: &DbPool,
+    pool: &std::sync::Arc<DbPool>,
     user_id: i64,
     lines: &OrderLines,
     body: &Map<String, Value>,
@@ -1882,6 +1942,29 @@ async fn add_fold(
             }
         }
     };
+    // M5 (REVIEW): the checkout and every query after it run on the blocking
+    // pool (iter-70/82/83 shape) — pool.get() parks on the live-cap Condvar,
+    // which must never happen on a runtime worker. Nothing after the scryfall
+    // await above awaits; the guards stay on the blocking thread. The hop is
+    // a factory: node-free instances run it once in plan-only mode first,
+    // because the hydration leg (plan_add_standalone) needs the network and
+    // cannot run on a blocking thread.
+    use crate::collection_writes::plan_add_standalone;
+    let node_free = st.cfg.node_upstream.is_empty();
+    let pool_c = pool.clone();
+    let lines_c = lines.clone();
+    let body_c = body.clone();
+    let bulk_c = bulk.clone();
+    let uniq_c = uniq.clone();
+    let cond_c = cond.clone();
+    let run_hop = move |plan_only: bool, resolved: Vec<(usize, ResolvedAdd)>| {
+        let pool = pool_c.clone();
+        let lines = lines_c.clone();
+        let body = body_c.clone();
+        let bulk = bulk_c.clone();
+        let uniq = uniq_c.clone();
+        let cond = cond_c.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<AddResult>, AddErr> {
     // rusqlite guards are not Send: open only after the last await point.
     let conn = match pool.get() {
         Ok(c) => c,
@@ -1967,6 +2050,7 @@ async fn add_fold(
     // Two bulkAddToCollection calls, Normal group first, index restarting per
     // call — exactly the Secret Lair two-pass shape (all reads before any
     // write so a mid-add Forward can replay clean).
+    let mut hydrate: Vec<(usize, Map<String, Value>)> = Vec::new();
     for group in ["Normal", "Holofoil"] {
         let members: Vec<(usize, &AddPlanEntry)> =
             plan.iter().enumerate().filter(|(_, p)| p.printing == group).collect();
@@ -2004,20 +2088,32 @@ async fn add_fold(
             match plan_add(&conn, &merged) {
                 Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
                 Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
-                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
-                    // Node-free: hydrate natively (getCardById /
-                    // getPrintingInLang) before any write.
-                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
-                    let pl = match match st.db.as_ref() { Some(ap) => plan_add_standalone(st, ap, &merged).await, None => Err(crate::collection_writes::WriteError::Bind) } {
-                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
-                        Ok(StandalonePlan::Plan(pl)) => Planned::Ready(pl),
-                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
-                        Err(e) => {
-                            tracing::error!(error = ?e, "marketplace add: plan failed");
-                            Planned::Reject("Failed to add card".into())
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if node_free => {
+                    // Node-free: the hydration leg hits the network (scryfall
+                    // getCardById / localized printing), which a blocking
+                    // thread cannot await. The plan-only pre-pass collects
+                    // the payloads — nothing has been written — the worker
+                    // resolves them with `plan_add_standalone`, and the real
+                    // pass re-plans with the cache rows now present. A card
+                    // still unresolvable in the real pass answers Node's
+                    // per-card message (or the worker's not-found message).
+                    if plan_only {
+                        hydrate.push((index, merged.clone()));
+                    } else {
+                        match resolved.iter().find(|(i, _)| *i == index) {
+                            Some((_, ResolvedAdd::Ready(pp))) => {
+                                planned.push((index, (*p).clone(), Planned::Ready(pp.clone())))
+                            }
+                            Some((_, ResolvedAdd::Reject(msg))) => {
+                                planned.push((index, (*p).clone(), Planned::Reject(msg.clone())))
+                            }
+                            None => planned.push((
+                                index,
+                                (*p).clone(),
+                                Planned::Reject("Failed to add card".into()),
+                            )),
                         }
-                    };
-                    planned.push((index, (*p).clone(), pl));
+                    }
                 }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
@@ -2030,6 +2126,12 @@ async fn add_fold(
                     planned.push((index, (*p).clone(), Planned::Reject("Failed to add card".into())));
                 }
             }
+        }
+        if plan_only {
+            // Pre-pass: planning is read-only; the write loop never runs, so
+            // a hydration-needing card can replay clean after the worker
+            // hydrates it.
+            continue;
         }
         for (index, p, pl) in planned {
             let mut fail = |error: String, failed: &mut Vec<Value>| {
@@ -2070,14 +2172,78 @@ async fn add_fold(
             }
         }
     }
+    if plan_only {
+        if !hydrate.is_empty() {
+            return Err(AddErr::HydrateFirst(hydrate));
+        }
+        return Ok(None);
+    }
     let extras_held = lines.extras as f64;
-    Ok(AddResult {
+    Ok(Some(AddResult {
         added,
         failed,
         resolved: plan.len(),
         total_listed: uniq.len() as f64 + extras_held,
         unresolved: bulk.not_found,
-    })
+    }))
+        })
+    };
+    // Node-free pre-pass: plan everything on the blocking pool (read-only).
+    // If any card needs the network hydration leg, resolve those payloads on
+    // the worker via `plan_add_standalone` (the established node-free
+    // pattern — secret_lair, collection_writes) and rerun the real pass with
+    // the cache rows present. Nothing is written before hydration, matching
+    // Node's all-reads-before-any-write ordering.
+    let mut resolved: Vec<(usize, ResolvedAdd)> = Vec::new();
+    if node_free {
+        match run_hop(true, Vec::new()).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => {
+                return Err(AddErr::Replay(Some("plan pre-pass wrote".into())))
+            }
+            Ok(Err(AddErr::HydrateFirst(list))) => {
+                let Some(ap) = st.db.as_ref() else {
+                    return Err(AddErr::Replay(Some("db unavailable".into())));
+                };
+                use crate::collection_writes::StandalonePlan;
+                for (index, merged) in &list {
+                    match plan_add_standalone(st, ap, merged).await {
+                        Ok(StandalonePlan::Plan(pl @ AddPlan::Ready { .. })) => {
+                            resolved.push((*index, ResolvedAdd::Ready(pl)));
+                        }
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => {
+                            resolved.push((*index, ResolvedAdd::Reject(msg)));
+                        }
+                        Ok(StandalonePlan::NotFound(cid)) => {
+                            resolved.push((*index, ResolvedAdd::Reject(format!("Card ID {cid} not found."))));
+                        }
+                        // Forward again after the hydration leg (fetch
+                        // failed): Node's generic per-card failure message.
+                        Ok(_) => {
+                            resolved.push((*index, ResolvedAdd::Reject("Failed to add card".into())));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, "marketplace add: hydration leg failed");
+                            resolved.push((*index, ResolvedAdd::Reject("Failed to add card".into())));
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                tracing::error!(error = %e, "marketplace add: plan pre-pass panicked");
+                return Err(AddErr::Replay(Some("Could not add the order lines".into())));
+            }
+        }
+    }
+    let hop = run_hop(false, resolved);
+    let inner = hop
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "marketplace add: blocking hop panicked");
+            AddErr::Replay(Some("Could not add the order lines".into()))
+        })?;
+    inner?.ok_or_else(|| AddErr::Replay(Some("Could not add the order lines".into())))
 }
 
 // ---------------------------------------------------------------------------
@@ -2090,7 +2256,7 @@ async fn add_fold(
 /// sending a second response).
 async fn order_from_request(
     st: &AppState,
-    pool: &DbPool,
+    pool: &std::sync::Arc<DbPool>,
     body: &Value,
     user_id: i64,
 ) -> Result<(ParsedOrder, bool), Response> {
@@ -2105,36 +2271,47 @@ async fn order_from_request(
     if !order_number_shape_ok(&number) {
         return Err(json_error(StatusCode::BAD_REQUEST, "order_number is required"));
     }
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "marketplace: cannot open read connection");
-            return Err(internal_error());
+    // M5 (REVIEW): checkout + credential read on the blocking pool — the
+    // synchronous pool.get() parks on the live-cap Condvar (iter-70/82/83).
+    let pool_hop = pool.clone();
+    let prep = tokio::task::spawn_blocking(move || -> Result<Result<Creds, Response>, ()> {
+        let conn = match pool_hop.get() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "marketplace: cannot open read connection");
+                return Err(());
+            }
+        };
+        let row = match load_row(&conn, user_id) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "marketplace: credential lookup failed");
+                return Err(());
+            }
+        };
+        drop(conn);
+        let Some(row) = row else {
+            return Ok(Err(json_error(StatusCode::NOT_FOUND, "User not found")));
+        };
+        // The fetchManapoolOrder enabled-gate has to live here too (route
+        // comment): this lookup happens first, so a Settings switch-off would be
+        // cosmetic for preview/add without it.
+        if js_falsy(row.get("manapool_email"))
+            || js_falsy(row.get("manapool_token"))
+            || js_falsy(row.get("manapool_enabled"))
+        {
+            return Ok(Err(json_error(StatusCode::BAD_REQUEST, MP_NOT_CONNECTED_MSG)));
         }
-    };
-    let row = match load_row(&conn, user_id) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "marketplace: credential lookup failed");
-            return Err(internal_error());
-        }
-    };
-    drop(conn);
-    let Some(row) = row else {
-        return Err(json_error(StatusCode::NOT_FOUND, "User not found"));
-    };
-    // The fetchManapoolOrder enabled-gate has to live here too (route
-    // comment): this lookup happens first, so a Settings switch-off would be
-    // cosmetic for preview/add without it.
-    if js_falsy(row.get("manapool_email"))
-        || js_falsy(row.get("manapool_token"))
-        || js_falsy(row.get("manapool_enabled"))
-    {
-        return Err(json_error(StatusCode::BAD_REQUEST, MP_NOT_CONNECTED_MSG));
-    }
-    let creds = Creds {
-        email: js_to_string(row.get("manapool_email")),
-        token: js_to_string(row.get("manapool_token")),
+        Ok(Ok(Creds {
+            email: js_to_string(row.get("manapool_email")),
+            token: js_to_string(row.get("manapool_token")),
+        }))
+    })
+    .await;
+    let creds = match prep {
+        Ok(Ok(Ok(c))) => c,
+        Ok(Ok(Err(res))) => return Err(res),
+        Ok(Err(())) | Err(_) => return Err(internal_error()),
     };
     let fetched = match fetch_manapool_order(st.mp_http.as_ref(), &creds, &number).await {
         Ok(f) => f,
@@ -2216,7 +2393,7 @@ async fn handle_preview(st: AppState, req: Request) -> Response {
         BodyOutcome::TooLarge => return too_large(),
     };
     let Some(pool) = st.db.clone() else { return internal_error() };
-    let user = match authenticate(&pool, &headers, false) {
+    let user = match crate::auth::authenticate_async(&pool, crate::auth::bearer_token(&headers), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -2259,7 +2436,7 @@ async fn handle_add(st: AppState, req: Request) -> Response {
         BodyOutcome::TooLarge => return too_large(),
     };
     let Some(pool) = st.db.clone() else { return internal_error() };
-    let user = match authenticate(&pool, &headers, false) {
+    let user = match crate::auth::authenticate_async(&pool, crate::auth::bearer_token(&headers), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -2277,6 +2454,11 @@ async fn handle_add(st: AppState, req: Request) -> Response {
         }
         Err(AddErr::Replay(_)) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
         Err(AddErr::Boom(msg)) => return mp_error_json(msg),
+        // Internal to the node-free pre-pass; never escapes add_fold. Treat
+        // an escape like a hydration replay.
+        Err(AddErr::HydrateFirst(_)) => {
+            return replay_post(st, &headers, "/api/marketplace/add", &body).await
+        }
     };
     let mut out = Map::new();
     let mut order = Map::new();

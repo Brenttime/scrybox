@@ -1823,6 +1823,7 @@ fn lang_input(v: Option<&Value>) -> Option<String> {
 /// only caller-visible AddCardError the native path can reach (both throws
 /// in addCardToCollection are 400; the 404 requires the Scryfall fetch,
 /// which is a `Forward` here).
+#[derive(Clone)]
 pub(crate) enum AddPlan {
     Ready {
         card_id: SqlValue,

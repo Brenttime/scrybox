@@ -556,6 +556,7 @@ fn scryfall_uuid(v: Option<&Value>) -> Option<String> {
     Some(raw)
 }
 
+#[derive(Clone)]
 pub(crate) struct BulkOut {
     pub(crate) cards: Vec<Value>,
     /// (uniq-row index, normalized card) in RESPONSE order, Node's pairs.

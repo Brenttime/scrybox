@@ -436,3 +436,105 @@ async fn oversized_body_answers_the_413_shape() {
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(json_body(&b), json!({ "error": "Upload too large. Try exporting/importing in smaller batches." }));
 }
+
+// ---------------------------------------------------------------------------
+// Livelock guard (bench ALL_mixed stall, iter-78/81 memory note)
+// ---------------------------------------------------------------------------
+
+/// The native POST handler must never park a tokio worker thread on the
+/// DbPool live-cap Condvar. Historically it ran the auth gate through the
+/// synchronous `auth::authenticate` and the read-modify-write through
+/// synchronous `pool.get()` — INLINE ON THE WORKER (db.rs `get()` waits on
+/// the live-cap Condvar when every live slot is checked out). With the
+/// per-user user_lock held across those waits, the bench's 16-way mixed
+/// search legs froze the server ("16 ESTAB sidecar conns idle, handlers
+/// queued" — the iter-78/81 ALL_mixed stall, both Gate D arms).
+///
+/// Repro shape here: a single-worker runtime whose only live connection is
+/// held by a task that releases it only when notified. If any handler step
+/// parks the worker on the cap, the release task can never run, nothing on
+/// the runtime progresses, and the request never completes — even though a
+/// single POST is 2 ms in isolation. The fix (authenticate_async + the
+/// load/merge/save RMW on the blocking pool) keeps every cap wait OFF the
+/// runtime worker, so the release fires and the request answers.
+#[test]
+fn post_search_history_does_not_park_the_runtime_worker_at_the_live_cap() {
+    use std::sync::{Arc, mpsc};
+    use tokio::sync::Notify;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded_db(dir.path(), "park.db");
+    let pool = Arc::new(
+        scrybox_server::db::DbPool::open_with(
+            &db_path,
+            scrybox_server::db::PoolConfig { max: 1, cache_kb: 1024, mmap_kb: 0, live_max: 1 },
+        )
+        .unwrap(),
+    );
+
+    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let release = Arc::new(Notify::new());
+    let release_for_rt = release.clone();
+    let pool_for_rt = pool.clone();
+    let db_for_rt = db_path.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let cfg = Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                node_upstream: "http://127.0.0.1:9".to_string(),
+                static_dir: None,
+                rust_routes: ["search_history".to_string()].into_iter().collect(),
+                db_path: Some(db_for_rt),
+                sidecar_url: None,
+            };
+            let mut st = AppState::new(cfg);
+            st.db = Some(pool_for_rt.clone());
+            let r = app(st);
+
+            // Occupy the pool's single live slot from a runtime task: the
+            // ONLY way to free it is another task on this same worker.
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+            {
+                let pool2 = pool_for_rt.clone();
+                let rel = release_for_rt.clone();
+                tokio::spawn(async move {
+                    let held = pool2.get().unwrap();
+                    let _ = held_tx.send(());
+                    rel.notified().await;
+                    drop(held);
+                });
+            }
+            held_rx.await.unwrap();
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/search-history")
+                .header("authorization", "Bearer sess-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"q":"park probe"}"#))
+                .unwrap();
+            let resp = r.oneshot(req).await.unwrap();
+            let status = resp.status().as_u16();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+            let _ = tx.send((status, bytes));
+        });
+    });
+
+    // Give the POST task time to reach its cap wait, then free the pool.
+    // Pre-fix this never helps: the worker parked on the Condvar cannot run
+    // the releasing task either, so recv_timeout below expires.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    release.notify_waiters();
+
+    let (status, body) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("POST /api/search-history never completed: the handler parked the runtime worker on the DbPool live cap (synchronous pool.get()/authenticate inline on the worker)");
+    assert_eq!(status, 200);
+    let v = json_body(&body);
+    assert_eq!(v.as_array().map(|a| a.len()), Some(1), "response must be the merged history array: {v}");
+    assert_eq!(v[0]["q"], "park probe");
+    assert!(v[0]["at"].is_i64(), "at must be the integer ms stamp, got {v}");
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}

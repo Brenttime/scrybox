@@ -974,9 +974,12 @@ const RECENT_MAX: usize = 256;
 /// Gate D iter-22: the 1 GiB default was chosen to stop the 3 GB runaway,
 /// not as a target — per-leg bench attribution showed this budget alone
 /// (+379 MB VmHWM on collection_full_varied) overshoots the idle-66/
-/// peak-110 Gate D envelope. Default now 256 MiB, env-tunable
+/// peak-110 Gate D envelope. Default 256 MiB at iter-22; memory queue
+/// item 7 (MEMORY.md #10) lowers it to 64 MiB: the realistic mix never
+/// used more than a fraction of 256 while the number doubled the
+/// worst-case retained store. Env-tunable
 /// (SCRYBOX_COLLECTION_CACHE_MAX_MB) for hosts that want the old headroom.
-const STORE_MAX_BYTES_DEFAULT: u64 = 256 << 20; // 256 MiB
+const STORE_MAX_BYTES_DEFAULT: u64 = 64 << 20; // 64 MiB
 
 fn store_max_bytes() -> u64 {
     std::env::var("SCRYBOX_COLLECTION_CACHE_MAX_MB").ok()
@@ -2444,6 +2447,21 @@ mod store_budget {
             count_zero: false,
             qs: String::new(),
         }
+    }
+
+    #[test]
+    fn default_budget_is_64_mib_and_env_tunable() {
+        // Memory queue item 7 (MEMORY.md #10): the 256 MiB default was a
+        // runaway stop, not a target — Gate D attribution never used more
+        // than a fraction of it while it doubled the worst-case retained
+        // store. Pin the lowered value so a silent re-raise is a test
+        // failure, not a slow ratchet.
+        assert_eq!(STORE_MAX_BYTES_DEFAULT, 64 << 20);
+        std::env::set_var("SCRYBOX_COLLECTION_CACHE_MAX_MB", "5");
+        assert_eq!(store_max_bytes(), 5 << 20);
+        std::env::set_var("SCRYBOX_COLLECTION_CACHE_MAX_MB", "garbage");
+        assert_eq!(store_max_bytes(), STORE_MAX_BYTES_DEFAULT);
+        std::env::remove_var("SCRYBOX_COLLECTION_CACHE_MAX_MB");
     }
 
     #[test]
