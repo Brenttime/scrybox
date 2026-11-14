@@ -1433,6 +1433,26 @@ impl SearchCache {
     }
 }
 
+/// The inflight half of the single-flight (see [`crate::flight`]): the
+/// explicit finish only ran on the linear path; the paired
+/// [`crate::flight::SlotGuard`] reclaims the (revision-stamped) slot key on
+/// the panic path too.
+impl crate::flight::FlightCache for SearchCache {
+    type Slot = ComputeSlot;
+    fn flight_slot(&self, key: &str) -> Arc<Self::Slot> {
+        self.slot(key)
+    }
+    fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
+        if self.inner.lock().unwrap().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+            self.finish(key);
+        }
+    }
+    #[cfg(test)]
+    fn flight_len(&self, key: &str) -> usize {
+        self.inner.lock().unwrap().inflight.contains_key(key) as usize
+    }
+}
+
 /// Heap hygiene for the search legs (Gate D iter-24): the collection cache
 /// got its deferred `malloc_trim` on the refresher tick in iter 15; the
 /// search caches (iter-22 byte budget + rev pruning) churn the same
@@ -2235,7 +2255,7 @@ pub async fn handle(
             // and keeps the pre-build stamp.
             let cache = Arc::clone(&st.search_cache);
             let slot_key = format!("{key}\u{0}{rev_i}");
-            let slot = cache.slot(&slot_key);
+            let (slot, _slot_guard) = crate::flight::slot_guarded(&cache, &slot_key);
             let init_cache = Arc::clone(&cache);
             let init_st = st.clone();
             let init_pool = Arc::clone(&pool);
@@ -2523,7 +2543,7 @@ pub async fn handle(
                     ))))
                 })
                 .await;
-            cache.finish(&slot_key);
+            drop(_slot_guard);
             // get_or_try_init nests: outer Err carries a clone of the init
             // error, outer Ok wraps the stored Result.
             match res {
@@ -2691,7 +2711,7 @@ async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, i
     // one query. `Ok(None)` (never produced here) would mean "proxy".
     let cache = Arc::clone(&st.search_cache);
     let slot_key = format!("{key}\u{0}{rev_i}");
-    let slot = cache.slot(&slot_key);
+    let (slot, _slot_guard) = crate::flight::slot_guarded(&cache, &slot_key);
     let init_cache = Arc::clone(&cache);
     let init_key = key.clone();
     let build_pool = Arc::clone(&pool);
@@ -2722,7 +2742,7 @@ async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, i
             ))))
         })
         .await;
-    cache.finish(&slot_key);
+    drop(_slot_guard);
     match res {
         Ok(Ok(Some(e))) => respond_entry(e, inm.as_deref(), ae.as_deref(), None),
         Ok(Ok(None)) => unreachable!("collection-owned build never proxies"),
@@ -2784,7 +2804,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
 
     let cache = Arc::clone(&st.search_cache);
     let slot_key = format!("{key}\u{0}{rev_i}");
-    let slot = cache.slot(&slot_key);
+    let (slot, _slot_guard) = crate::flight::slot_guarded(&cache, &slot_key);
     let init_cache = Arc::clone(&cache);
     let init_key = key.clone();
     let build_pool = Arc::clone(&pool);
@@ -2826,7 +2846,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
             ))))
         })
         .await;
-    cache.finish(&slot_key);
+    drop(_slot_guard);
     match res {
         Ok(Ok(Some(e))) => respond_entry(e, inm.as_deref(), ae.as_deref(), Some((status, source))),
         Ok(Ok(None)) => crate::proxy(State(st.clone()), req).await,

@@ -381,6 +381,25 @@ impl CollQCache {
     }
 }
 
+/// The inflight half of the single-flight (see [`crate::flight`]): the walk's
+/// explicit finish only ran on the linear path; the paired guard reclaims
+/// the slot key on the panic path too.
+impl crate::flight::FlightCache for CollQCache {
+    type Slot = WalkSlot;
+    fn flight_slot(&self, key: &str) -> Arc<Self::Slot> {
+        self.slot(key)
+    }
+    fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
+        if self.inner.guard().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+            self.finish(key);
+        }
+    }
+    #[cfg(test)]
+    fn flight_len(&self, key: &str) -> usize {
+        self.inner.guard().inflight.contains_key(key) as usize
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -492,7 +511,7 @@ pub async fn get_names(st: AppState, cq: &Arc<CollectionQ>) -> NamesOutcome {
     else {
         return NamesOutcome::Proxy;
     };
-    let slot = st.collq_cache.slot(&key);
+    let (slot, _slot_guard) = crate::flight::slot_guarded(&st.collq_cache, &key);
     let init_st = st.clone();
     let init_cq = Arc::clone(cq);
     let init_key = key.clone();
@@ -552,7 +571,7 @@ pub async fn get_names(st: AppState, cq: &Arc<CollectionQ>) -> NamesOutcome {
             Ok(Ok((entry, true)))
         })
         .await;
-    st.collq_cache.finish(&key);
+    drop(_slot_guard);
     match res {
         Ok(Ok((e, resolved_now))) => NamesOutcome::Ready(e.clone(), *resolved_now),
         Ok(Err(NamesWalkErr::Invalid)) => NamesOutcome::InvalidQuery,

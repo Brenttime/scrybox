@@ -1083,6 +1083,26 @@ impl Default for CollectionCache {
     }
 }
 
+/// The inflight half of the single-flight (see [`crate::flight`]): the
+/// explicit finish only ran on the linear path; the paired
+/// [`crate::flight::SlotGuard`] reclaims the (rev-stamped) slot key on the
+/// panic path too (refresher spawn, request path).
+impl crate::flight::FlightCache for CollectionCache {
+    type Slot = ComputeSlot;
+    fn flight_slot(&self, key: &str) -> Arc<Self::Slot> {
+        self.slot(key)
+    }
+    fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
+        if self.inner.lock().unwrap().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+            self.finish(key);
+        }
+    }
+    #[cfg(test)]
+    fn flight_len(&self, key: &str) -> usize {
+        self.inner.lock().unwrap().inflight.contains_key(key) as usize
+    }
+}
+
 impl CollectionCache {
     pub fn new() -> Self {
         Self::default()
@@ -1417,11 +1437,10 @@ pub fn spawn_refresher(state: &AppState) {
                     retry_next_tick = true;
                     continue;
                 }
-                let slot = cache.slot(&skey);
+                let (slot, guard) = crate::flight::slot_guarded(&cache, &skey);
                 let cache2 = Arc::clone(&cache);
                 let pool3 = Arc::clone(&pool);
                 let key2 = key.clone();
-                let skey2 = skey.clone();
                 tokio::spawn(async move {
                     let init_cache = Arc::clone(&cache2);
                     let init_pool = Arc::clone(&pool3);
@@ -1454,7 +1473,7 @@ pub fn spawn_refresher(state: &AppState) {
                             cache2.refresh_failed(&key2);
                         }
                     }
-                    cache2.finish(&skey2);
+                    drop(guard);
                 });
             }
             if !retry_next_tick {
@@ -1602,7 +1621,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             // shared OnceCell slot, gated by the cross-key build semaphore.
             let cache = Arc::clone(&st.collection_cache);
             let skey = slot_key(&key, rp);
-            let slot = cache.slot(&skey);
+            let (slot, _slot_guard) = crate::flight::slot_guarded(&cache, &skey);
             let init_cache = Arc::clone(&cache);
             let init_pool = Arc::clone(&pool);
             let init_key = key.clone();
@@ -1620,7 +1639,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     Ok(r)
                 })
                 .await;
-            cache.finish(&skey);
+            drop(_slot_guard);
             // get_or_try_init nests: outer Err carries a clone of the init
             // error, outer Ok wraps the stored Result<Arc<CacheEntry>, String>.
             match res {

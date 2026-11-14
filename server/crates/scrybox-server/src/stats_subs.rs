@@ -666,7 +666,7 @@ async fn route(
             // body is identical either way). No SWR: Node's cached() has no
             // stale fallback for these names — a cold entry blocks and
             // computes.
-            let slot = cache.slot_for(&key);
+            let (slot, guard) = crate::flight::slot_guarded(&cache, &key);
             let init_cache = Arc::clone(&cache);
             let init_pool = Arc::clone(&pool);
             let init_key = key.clone();
@@ -689,7 +689,7 @@ async fn route(
                 Ok(r)
             };
             let res: Result<&Result<Arc<StatsEntry>, String>, String> = slot.get_or_try_init(init).await;
-            cache.finish_key(&key);
+            drop(guard);
             match res {
                 Ok(Ok(e)) => Ok((false, e.clone())),
                 Ok(Err(e)) => Err(e.clone()),
