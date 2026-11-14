@@ -347,7 +347,10 @@ async fn write_index(path: &Path, payload: &Value, set_names: &Map<String, Value
         .into_iter()
         .map(|(k, v)| (k.to_string(), Value::String(v)))
         .collect();
-        if truthy(obj.get("name").unwrap()) && truthy(obj.get("fileName").unwrap()) {
+        // The two keys are inserted unconditionally above; map(truthy) keeps
+        // the Node `if (obj.name && obj.fileName)` truth table without the
+        // checked-then-unwrapped panic edge (errors-maint L1).
+        if obj.get("name").map(truthy).unwrap_or(false) && obj.get("fileName").map(truthy).unwrap_or(false) {
             decks.push(Value::Object(obj));
         }
     }
@@ -386,10 +389,11 @@ async fn write_index(path: &Path, payload: &Value, set_names: &Map<String, Value
 fn set_name_map(payload: Option<&Value>) -> Map<String, Value> {
     let mut map = Map::new();
     for s in payload.and_then(|p| p.get("data")).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let code = s.get("code");
-        let name = s.get("name");
-        if code.map(truthy).unwrap_or(false) && name.map(truthy).unwrap_or(false) {
-            map.insert(js_string(code.unwrap()).to_uppercase(), name.unwrap().clone());
+        // let-else binding: same `code && name` truth table, no re-unwrap
+        // a few lines away (errors-maint L1).
+        let (Some(code), Some(name)) = (s.get("code"), s.get("name")) else { continue };
+        if truthy(code) && truthy(name) {
+            map.insert(js_string(code).to_uppercase(), name.clone());
         }
     }
     map
@@ -428,8 +432,14 @@ pub async fn get_precon_index(base: &str, index_path: &Path) -> Result<IndexOutc
         }
     };
     if !needs_fetch {
-        let (decks, mtgjson_date) = cached_fields(cached.as_ref().unwrap());
-        return Ok(IndexOutcome { decks, source: "cache", mtgjson_date });
+        // needs_fetch is `true` whenever `cached` is None (see the match
+        // above), so the cache arm can only run with Some; binding it here
+        // removes the .as_ref().unwrap() edge (errors-maint L1).
+        if let Some(c) = cached.as_ref() {
+            let (decks, mtgjson_date) = cached_fields(c);
+            return Ok(IndexOutcome { decks, source: "cache", mtgjson_date });
+        }
+        // Unreachable: fall through to the fetch path.
     }
     // Promise.all([client.get(INDEX_URL), client.get(SETLIST_URL).catch(→null)])
     let index_url = format!("{base}/DeckList.json");
@@ -493,8 +503,8 @@ pub async fn get_precon_card_list(base: &str, file_name: &str) -> Result<Value, 
     let mut cards: Vec<Value> = Vec::new();
     for (key, section) in [("mainBoard", "mainboard"), ("commander", "commander")] {
         for c in data.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-            let count = match c.get("count").and_then(|v| v.as_f64()) {
-                Some(f) if f.is_finite() => c.get("count").cloned().unwrap(),
+            let count = match c.get("count") {
+                Some(v) if v.as_f64().map_or(false, |f| f.is_finite()) => v.clone(),
                 _ => Value::from(1),
             };
             let scryfall_id = c
@@ -588,13 +598,13 @@ pub(crate) async fn bulk_fetch_by_identifier_opts(
                 identifiers.push(serde_json::json!({ "id": uuid }));
                 continue;
             }
-            let set_opt = row.get("set_id");
-            let num_opt = row.get("number");
-            let set_present = set_opt.map(|v| !v.is_null()).unwrap_or(false);
-            let num_present = num_opt.map(|v| !v.is_null()).unwrap_or(false);
-            if set_present && num_present {
-                let set_id = js_string(set_opt.unwrap()).to_lowercase();
-                let num = js_string(num_opt.unwrap());
+            // filter(!is_null) replaces the set_present/num_present flags the
+            // old checked-then-unwrapped shape needed (errors-maint L1).
+            let set_opt = row.get("set_id").filter(|v| !v.is_null());
+            let num_opt = row.get("number").filter(|v| !v.is_null());
+            if let (Some(set_v), Some(num_v)) = (set_opt, num_opt) {
+                let set_id = js_string(set_v).to_lowercase();
+                let num = js_string(num_v);
                 if !set_id.is_empty() && !num.is_empty() {
                     by_key_push(&mut by_key, format!("sn:{}|{}", set_id, num.to_lowercase()), i);
                     let mut idm = Map::new();

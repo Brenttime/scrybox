@@ -1957,7 +1957,10 @@ async fn merge_search_prices(st: &AppState, pool: &Arc<DbPool>, cards: &mut [Val
     // — last entry wins per id, then cap.
     let mut uniq: Vec<(String, usize)> = Vec::new();
     for i in &missing_idx {
-        let id = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()).unwrap();
+        // let-else: missing_idx entries always come from need_ids above, so
+        // the find hits; the guard keeps the panic edge out of the hot path
+        // (errors-maint L1).
+        let Some(id) = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()) else { continue };
         match uniq.iter().position(|(u, _)| *u == id) {
             Some(pos) => uniq[pos].1 = *i,
             None => uniq.push((id, *i)),
@@ -2026,7 +2029,8 @@ async fn merge_search_prices(st: &AppState, pool: &Arc<DbPool>, cards: &mut [Val
     let fresh_by_id: HashMap<String, Map<String, Value>> =
         priced.into_iter().map(|f| (card_id_of(&f), f)).collect();
     for i in &missing_idx {
-        let id = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()).unwrap();
+        // Same let-else binding as the dedup loop above (errors-maint L1).
+        let Some(id) = need_ids.iter().find(|(mi, _)| mi == i).map(|(_, id)| id.clone()) else { continue };
         if let Some(f) = fresh_by_id.get(&id) {
             if let Some(m) = cards[*i].as_object_mut() {
                 copy_prices(m, f);
@@ -2555,12 +2559,14 @@ pub async fn handle(
 fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, dyn_: Option<(&'static str, &'static str)>) -> Response {
     // (X-Catalog-Cache, X-Source) for this request; Node recomputes both per
     // request from the match-list entry's age, so the q leg passes them in
-    // rather than replaying baked bytes.
+    // rather than replaying baked bytes. Catalog-derived strings bind via
+    // .ok(): an unencodable value skips the header instead of panicking the
+    // search hot path (errors-maint L2).
     let (cat_status, src) = match dyn_ {
-        Some((s, src)) => (s, HeaderValue::from_static(src)),
+        Some((s, src)) => (s, Some(HeaderValue::from_static(src))),
         None => (
             entry.catalog.as_ref().map(|c| c.status).unwrap_or("cache"),
-            HeaderValue::from_str(entry.source).unwrap(),
+            HeaderValue::from_str(entry.source).ok(),
         ),
     };
     let tag = entry.etag.clone();
@@ -2578,17 +2584,23 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
         Some(c) => {
             let mut v: Vec<(header::HeaderName, HeaderValue)> = Vec::with_capacity(5);
             if let Some(t) = &c.total {
-                v.push((header::HeaderName::from_static("x-total-count"), HeaderValue::from_str(t).unwrap()));
+                if let Ok(h) = HeaderValue::from_str(t) {
+                    v.push((header::HeaderName::from_static("x-total-count"), h));
+                }
             }
             v.push((
                 header::HeaderName::from_static("x-catalog-complete"),
                 HeaderValue::from_static(if c.complete { "1" } else { "0" }),
             ));
             if let Some(u) = &c.upstream_total {
-                v.push((header::HeaderName::from_static("x-catalog-upstream-total"), HeaderValue::from_str(u).unwrap()));
+                if let Ok(h) = HeaderValue::from_str(u) {
+                    v.push((header::HeaderName::from_static("x-catalog-upstream-total"), h));
+                }
             }
             v.push((header::HeaderName::from_static("x-catalog-cache"), HeaderValue::from_static(cat_status)));
-            v.push((header::HeaderName::from_static("x-catalog-snapshot"), HeaderValue::from_str(&c.snapshot).unwrap()));
+            if let Ok(h) = HeaderValue::from_str(&c.snapshot) {
+                v.push((header::HeaderName::from_static("x-catalog-snapshot"), h));
+            }
             v
         }
     };
@@ -2613,7 +2625,9 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, HeaderValue::from_str(&tag).unwrap());
         if entry.x_source {
-            b = b.header("x-source", src);
+            if let Some(h) = src.clone() {
+                b = b.header("x-source", h);
+            }
         }
         if let Some((k, v)) = total_hdr {
             b = b.header(k, v);
@@ -2640,7 +2654,9 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
     }
     b = b.header(header::ETAG, HeaderValue::from_str(&tag).unwrap());
     if entry.x_source {
-        b = b.header("x-source", src);
+        if let Some(h) = src {
+            b = b.header("x-source", h);
+        }
     }
     if let Some((k, v)) = total_hdr {
         b = b.header(k, v);
@@ -3074,5 +3090,82 @@ mod poison_m2 {
         assert!(c.get("a", 1).is_some(), "reads must survive a poisoned store");
         c.insert("b".into(), entry(1, "body-B"));
         assert!(c.get("b", 1).is_some(), "writes must survive a poisoned store");
+    }
+}
+
+#[cfg(test)]
+mod headers_l2 {
+    //! REVIEW-errors-maint L2 (lane-A): respond_entry binds the four
+    //! catalog-derived header values through HeaderValue::from_str(..).ok().
+    //! Pre-fix these were .unwrap() — a control character in any of them
+    //! panicked the search hot path. Red before the fix (the poisoning
+    //! values panic the handler); green after (header skipped, response
+    //! intact). Valid values must still produce the full header set — the
+    //! parity-relevant control.
+    use super::*;
+
+    fn entry_with_catalog(snapshot: &str, total: Option<&str>, upstream: Option<&str>) -> SearchEntry {
+        SearchEntry {
+            rev: 1,
+            raw: Bytes::from_static(br#"{"cards":[]}"#),
+            gz: Bytes::from_static(br#""#),
+            etag: "W/\"l2\"".to_string(),
+            total: None,
+            source: "sidecar",
+            x_source: true,
+            catalog: Some(CatalogMeta {
+                total: total.map(|t| t.to_string()),
+                complete: true,
+                upstream_total: upstream.map(|u| u.to_string()),
+                status: "hit",
+                snapshot: snapshot.to_string(),
+            }),
+            stale: Arc::new(Vec::new()),
+        }
+    }
+
+    fn serve(e: SearchEntry) -> Response {
+        respond_entry(&Arc::new(e), None, None, None)
+    }
+
+    #[test]
+    fn valid_catalog_values_serve_the_full_header_set() {
+        let r = serve(entry_with_catalog("snap-2026-11-13", Some("123"), Some("456")));
+        assert_eq!(r.status(), StatusCode::OK);
+        let h = r.headers();
+        assert_eq!(h.get("x-catalog-snapshot").and_then(|v| v.to_str().ok()), Some("snap-2026-11-13"));
+        assert_eq!(h.get("x-total-count").and_then(|v| v.to_str().ok()), Some("123"));
+        assert_eq!(h.get("x-catalog-upstream-total").and_then(|v| v.to_str().ok()), Some("456"));
+        assert_eq!(h.get("x-source").and_then(|v| v.to_str().ok()), Some("sidecar"));
+        assert_eq!(h.get("x-catalog-cache").and_then(|v| v.to_str().ok()), Some("hit"));
+    }
+
+    #[test]
+    fn control_char_in_snapshot_skips_the_header_instead_of_panicking() {
+        let r = serve(entry_with_catalog("snap\nX-Evil: 1", None, None));
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get("x-catalog-snapshot").is_none(), "invalid snapshot must skip the header, not panic");
+        // The rest of the contract survives.
+        assert_eq!(r.headers().get("x-catalog-cache").and_then(|v| v.to_str().ok()), Some("hit"));
+    }
+
+    #[test]
+    fn control_char_in_total_and_upstream_skips_only_their_headers() {
+        let r = serve(entry_with_catalog("ok", Some("1 2\n"), Some("x\r\n")));
+        assert_eq!(r.status(), StatusCode::OK);
+        let h = r.headers();
+        assert!(h.get("x-total-count").is_none(), "invalid c.total must skip the header");
+        assert!(h.get("x-catalog-upstream-total").is_none(), "invalid upstream_total must skip the header");
+        assert_eq!(h.get("x-catalog-snapshot").and_then(|v| v.to_str().ok()), Some("ok"));
+    }
+
+    #[test]
+    fn control_char_in_source_skips_x_source_only() {
+        let mut e = entry_with_catalog("ok", None, None);
+        e.source = "bad\nvalue";
+        let r = serve(e);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get("x-source").is_none(), "invalid source must skip x-source, not panic");
+        assert_eq!(r.headers().get("x-catalog-snapshot").and_then(|v| v.to_str().ok()), Some("ok"));
     }
 }

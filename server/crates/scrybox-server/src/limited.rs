@@ -287,7 +287,11 @@ pub fn cost_pips(cost: &str) -> [f64; 6] {
             pips[5] += 1.0;
         } else if !colors.is_empty() {
             for c in &colors {
-                pips[pip_index(c).unwrap()] += 1.0 / colors.len() as f64;
+                // colors is filtered by COLOR_IDS, so pip_index is always
+                // Some; if-let keeps the invariant local (errors-maint L1).
+                if let Some(ix) = pip_index(c) {
+                    pips[ix] += 1.0 / colors.len() as f64;
+                }
             }
         }
     }

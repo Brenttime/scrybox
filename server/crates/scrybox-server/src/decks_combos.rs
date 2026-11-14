@@ -998,7 +998,7 @@ fn js_parse_float(s: &str) -> f64 {
     let prefix = &rest[..end.min(rest.len())];
     let prefix = match prefix.find('.') {
         Some(p) => match prefix[p + 1..].find('.') {
-            Some(_) => &prefix[..p + 1 + prefix[p + 1..].find('.').unwrap()],
+            Some(q) => &prefix[..p + 1 + q],
             None => prefix,
         },
         None => prefix,

@@ -86,6 +86,11 @@ fn put_deck(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Response {
     if js_falsy(name) {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     }
+    // js_falsy(None) is true — the 400 above already ran; let-else drops the
+    // checked-then-unwrapped bind below (errors-maint L1).
+    let Some(name_v) = name else {
+        return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
+    };
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update deck"),
@@ -93,7 +98,7 @@ fn put_deck(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Response {
     let changes = conn.execute(
         "UPDATE decks SET name = ?1, description = ?2 WHERE id = ?3 AND user_id = ?4",
         rusqlite::params_from_iter(
-            [js_bind(name.unwrap()), desc_or_empty(body.get("description")), SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)]
+            [js_bind(name_v), desc_or_empty(body.get("description")), SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)]
                 .iter(),
         ),
     );
@@ -376,6 +381,11 @@ fn create_deck(pool: &DbPool, user_id: i64, body: &Value) -> Response {
     if js_falsy(name) {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     }
+    // js_falsy(None) is true — the 400 above already ran; let-else drops the
+    // checked-then-unwrapped bind below (errors-maint L1).
+    let Some(name_v) = name else {
+        return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
+    };
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => return fail(&e),
@@ -396,7 +406,7 @@ fn create_deck(pool: &DbPool, user_id: i64, body: &Value) -> Response {
     if let Err(e) = conn.execute(
         "INSERT INTO decks (name, description, format, category, accent_color, target_size, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
-            js_bind(name.unwrap()),
+            js_bind(name_v),
             field("description", ""),
             field("format", "Standard"),
             field("category", "Competitive"),
@@ -544,6 +554,11 @@ fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddCard {
     if js_falsy(card_id_v) {
         return AddCard::Response(json_error(StatusCode::BAD_REQUEST, "card_id is required"));
     }
+    // js_falsy(None) is true — the 400 above already ran; let-else drops the
+    // two checked-then-unwrapped binds below (errors-maint L1).
+    let Some(card_id) = card_id_v else {
+        return AddCard::Response(json_error(StatusCode::BAD_REQUEST, "card_id is required"));
+    };
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => return AddCard::Response(fail(&e)),
@@ -565,7 +580,7 @@ fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddCard {
             "Check this deck in before changing its cards.",
         ));
     }
-    let card_probe = js_bind(card_id_v.unwrap());
+    let card_probe = js_bind(card_id);
     let cached = match get_row_map(
         &conn,
         "SELECT id FROM card_cache WHERE id = ?1",
@@ -606,7 +621,7 @@ fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddCard {
         .and_then(|r| r.get("card_id").cloned())
         // Node binds the raw body value for the else-branch (driver
         // coercion happens at bind time via json_to_sql_value).
-        .unwrap_or_else(|| card_id_v.unwrap().clone());
+        .unwrap_or_else(|| card_id.clone());
     // const { card_id, quantity = 1 } = req.body — destructuring default.
     let quantity = body.get("quantity").cloned().unwrap_or(Value::from(1));
     let qty_opt = js_parse_int_v(Some(&quantity));

@@ -535,8 +535,14 @@ pub async fn route_search(State(st): State<AppState>, req: Request) -> Response 
             // NOT the index row's keys.
             let mut merged: Vec<Value> = Vec::new();
             for (key, (base, foil)) in slots {
-                let ((Some(_), _) | (_, Some(_))) = (&base, &foil) else { continue };
-                let rep = base.as_ref().or(foil.as_ref()).unwrap();
+                let rep = match (base.as_ref(), foil.as_ref()) {
+                    // Node prefers the non-foil row when both exist; binding
+                    // it by match removes the checked-then-unwrapped edge
+                    // (errors-maint L1).
+                    (Some(b), _) => b,
+                    (None, Some(f)) => f,
+                    (None, None) => continue,
+                };
                 let stripped = base_name(rep.get("name"));
                 let mut m = Map::new();
                 m.insert("key".into(), Value::String(key));
