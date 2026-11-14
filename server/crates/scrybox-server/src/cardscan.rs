@@ -46,7 +46,7 @@ use hyper_util::client::legacy::Client;
 use rusqlite::{types::Value as SqlValue, Connection};
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::bearer_token;
 use crate::cards_tags::{json_error, read_body};
 use crate::collection::{body_etag, etag_matches};
 use crate::collection_writes::node_exact;
@@ -676,10 +676,17 @@ fn owns(st: &AppState) -> bool {
     st.owns("cardscan")
 }
 
-fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64, Response> {
-    let pool = st.db.as_ref().ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
+async fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64, Response> {
+    // M5 (REVIEW) same-class (iter-55): authenticate via get_async (idle-pop /
+    // blocking-pool hop, never a worker park) — marketplace iter-83/84 shape,
+    // cardscan_park status/detect/telemetry pins (red-before-fix measured).
+    let Some(pool) = st.db.clone() else {
+        return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"));
+    };
     let token = bearer_token(headers).map(|s| s.to_string());
-    let id = authenticate(pool, token.as_deref(), is_get).map(|u| u.id).map_err(|res| res)?;
+    let id = crate::auth::authenticate_async(&pool, token.as_deref(), is_get)
+        .await
+        .map(|u| u.id)?;
     // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
     // user's stats gen before the handler body (REVIEW-writes L1).
     if !is_get {
@@ -791,7 +798,7 @@ pub async fn handle_status(State(st): State<AppState>, req: Request) -> Response
         return crate::proxy(State(st), req).await;
     }
     let (parts, _body) = req.into_parts();
-    if let Err(res) = authed(&st, &parts.headers, true) {
+    if let Err(res) = authed(&st, &parts.headers, true).await {
         return node_exact(res).await;
     }
     match call_get("/api/health", Duration::from_millis(2500)).await {
@@ -834,7 +841,7 @@ pub async fn handle_detect(State(st): State<AppState>, req: Request) -> Response
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    if let Err(res) = authed(&st, req.headers(), false) {
+    if let Err(res) = authed(&st, req.headers(), false).await {
         return node_exact(res).await;
     }
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
@@ -1317,7 +1324,7 @@ pub async fn handle_telemetry(State(st): State<AppState>, req: Request) -> Respo
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
-    let uid = match authed(&st, req.headers(), false) {
+    let uid = match authed(&st, req.headers(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
