@@ -63,3 +63,12 @@ lto = false
 codegen-units = 16
 incremental = true
 debug = 0
+
+# LANE-B iter-44: jemalloc's C must not build at -O0. With the opt-in
+# `jemalloc` feature, `cargo test` builds tikv-jemalloc-sys at the dev
+# profile's opt-level and jemalloc 5.3.1 built unoptimized segfaults in
+# pac_decay_data_get on the first arena decay mallctl (gdb-verified on
+# brain; the same binary at -O2 boots clean). cc-rs takes its -O flag from
+# cargo's per-package OPT_LEVEL, so the pin is a per-package profile.
+[profile.dev.package.tikv-jemalloc-sys]
+opt-level = 2

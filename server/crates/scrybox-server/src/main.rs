@@ -26,6 +26,216 @@ use tracing_subscriber::EnvFilter;
 /// tokio's builder rejects 0, so a legal value is clamped to >= 1.
 const DEFAULT_BLOCKING_THREADS: usize = 16;
 
+// ── review/MEMORY.md ranked item 5 (memory queue item 5) ───────────────────
+// Opt-in jemalloc global allocator, `--features jemalloc`. The LD_PRELOAD
+// study (MEMORY.md #5) measured the jemalloc default config at HWM 651 /
+// settle 301 MB on the scen-varied mix and its tuned sibling
+// (narenas:2, dirty_decay 1 s, muzzy 0) at 466/262 — the best settle AND
+// the fastest of every config sampled, vs glibc arena2 as the incumbent
+// (#4's mallopt levers, already in collection.rs). Adopted as an OFF-by-
+// default cargo feature: response bytes are allocator-independent, but the
+// lane binary stays on glibc until the A/B verdict lands; enabling the
+// feature (and later the Dockerfile default) is an owner adoption.
+//
+// Scope note vs the LD_PRELOAD study: `#[global_allocator]` routes the
+// RUST heap through jemalloc only — C code linked into the process
+// (bundled SQLite) and the dynamically-loaded libonnxruntime keep calling
+// glibc malloc, because tikv-jemallocator's default build prefixes its
+// symbols (`_rjem_`) instead of interposing `malloc`. The Rust heap is
+// what the memory queue is about (serde bodies, RowStore, chunk pool — the
+// multi-MB request-path transients), but the probe numbers are NOT
+// directly comparable to the LD_PRELOAD rows; they re-baseline the A/B.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Boot-time jemalloc tuning: the MEMORY.md #5 owner bound. jemalloc reads
+/// its option string exactly once, at its own init — and with
+/// `#[global_allocator]` the Rust runtime allocates (initializing jemalloc)
+/// BEFORE `main()` runs, so post-main mallctl *writes* arrive too late:
+/// measured on brain, iter-44, `arenas.narenas` -> EPERM and the
+/// arena.<agg>.decay_ms writes -> EFAULT while arena.0 writes landed. The
+/// reliable lever is therefore the env: tikv-jemalloc-sys is a PREFIXED
+/// build (`_rjem_*` symbols via objcopy), and a prefixed jemalloc reads its
+/// options from `_RJEM_MALLOC_CONF` (uppercased crate prefix), NOT
+/// `MALLOC_CONF` (conf.c case 3: `JEMALLOC_CPREFIX "MALLOC_CONF"`; embedded
+/// strings of the linked binary confirm — measured on brain, iter-44: plain
+/// MALLOC_CONF left opt.narenas at the 4*ncpus default). `apply()` composes
+/// `<operator keys>,<our missing keys>` and re-execs the process once with
+/// `_RJEM_MALLOC_CONF` set (loop guard: if that env already equals the
+/// composed string there is no second exec; SCRYBOX_JEM_NO_REEXEC=1 skips
+/// the re-exec entirely and boots with plain jemalloc defaults). An
+/// operator's own key always wins: `plan()` omits any key already set in
+/// either `MALLOC_CONF` (intent — forwarded, since jemalloc ignores it for
+/// this build) or `_RJEM_MALLOC_CONF` (authoritative). After the (re-)exec
+/// `apply()` verifies through read-only mallctls (opt.narenas, arena.0
+/// decays) and logs the outcome; every step is best-effort — a failed
+/// re-exec just boots untuned.
+#[cfg(feature = "jemalloc")]
+mod jemalloc_cap {
+    use std::os::raw::{c_char, c_void};
+
+    /// Owner bound (MEMORY.md #5): 2 arenas, dirty pages decay back to the
+    /// OS in ~1 s, muzzy pages returned immediately (0 = no retention).
+    pub(super) const DEFAULT_NARENAS: usize = 2;
+    pub(super) const DEFAULT_DIRTY_DECAY_MS: i64 = 1_000;
+    pub(super) const DEFAULT_MUZZY_DECAY_MS: i64 = 0;
+
+    /// What `MALLOC_CONF` (if anything) already pins, so the in-code
+    /// defaults below do not override operator intent. Pure for tests.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Plan {
+        pub narenas: Option<usize>,
+        pub dirty_decay_ms: Option<i64>,
+        pub muzzy_decay_ms: Option<i64>,
+    }
+
+    /// `MALLOC_CONF` is a comma-separated `key:value` list; a key counts as
+    /// operator-set when a token starts with `key:` (exact key match —
+    /// `narenas:` must not be shadowed by e.g. a `min_narenas:` token).
+    fn conf_sets(malloc_conf: &str, key: &str) -> bool {
+        malloc_conf.split(',').any(|kv| kv.trim_start().starts_with(key))
+    }
+
+    pub(super) fn plan(malloc_conf: Option<&str>) -> Plan {
+        let set = |key: &str| malloc_conf.is_some_and(|c| conf_sets(c, key));
+        Plan {
+            narenas: (!set("narenas:")).then_some(DEFAULT_NARENAS),
+            dirty_decay_ms: (!set("dirty_decay_ms:")).then_some(DEFAULT_DIRTY_DECAY_MS),
+            muzzy_decay_ms: (!set("muzzy_decay_ms:")).then_some(DEFAULT_MUZZY_DECAY_MS),
+        }
+    }
+
+    /// The `MALLOC_CONF` string that must be in the environment for jemalloc
+    /// to boot tuned: operator tokens verbatim first (jemalloc applies
+    /// left-to-right, last write wins, so ours must come after — and
+    /// `plan()` guarantees we never add a key the operator set anyway),
+    /// then the plan's still-missing keys. `None` when the plan is empty
+    /// (operator already pins everything) — no re-exec needed. Pure.
+    pub(super) fn build_conf(existing: Option<&str>) -> Option<String> {
+        let p = plan(existing);
+        let mut ours: Vec<String> = Vec::new();
+        if let Some(n) = p.narenas {
+            ours.push(format!("narenas:{n}"));
+        }
+        if let Some(ms) = p.dirty_decay_ms {
+            ours.push(format!("dirty_decay_ms:{ms}"));
+        }
+        if let Some(ms) = p.muzzy_decay_ms {
+            ours.push(format!("muzzy_decay_ms:{ms}"));
+        }
+        if ours.is_empty() {
+            return None;
+        }
+        let ours = ours.join(",");
+        Some(match existing.filter(|c| !c.trim().is_empty()) {
+            Some(c) => format!("{c},{ours}"),
+            None => ours,
+        })
+    }
+
+    unsafe fn read<T>(name: &[u8], out: &mut T) -> i32 {
+        let mut cname: Vec<u8> = name.to_vec();
+        cname.push(0);
+        let mut len = std::mem::size_of::<T>();
+        tikv_jemalloc_sys::mallctl(
+            cname.as_ptr() as *const c_char,
+            out as *mut T as *mut c_void,
+            &mut len as *mut usize,
+            std::ptr::null_mut(),
+            0,
+        )
+    }
+
+    /// Read back what jemalloc actually booted with (read-only mallctls
+    /// work post-init). Best-effort operator/probe visibility.
+    fn verify_and_log(source: &str) {
+        let mut narenas: libc::c_uint = 0;
+        let mut dirty: i64 = -1;
+        let mut muzzy: i64 = -1;
+        let (r1, r2, r3) = unsafe {
+            (
+                read(b"opt.narenas", &mut narenas),
+                read(b"arena.0.dirty_decay_ms", &mut dirty),
+                read(b"arena.0.muzzy_decay_ms", &mut muzzy),
+            )
+        };
+        eprintln!(
+            "scrybox-server: jemalloc tuned [{source}] opt.narenas={narenas}(rc{r1}) arena0.dirty_decay_ms={dirty}(rc{r2}) arena0.muzzy_decay_ms={muzzy}(rc{r3}) {PREFIXED_MALLOC_CONF}={:?} MALLOC_CONF={:?}",
+            std::env::var(PREFIXED_MALLOC_CONF).unwrap_or_default(),
+            std::env::var("MALLOC_CONF").unwrap_or_default(),
+        );
+    }
+
+    /// A prefixed jemalloc reads its options env var under the UPPERCASED
+    /// crate symbol prefix (jemalloc conf.c case 3: `JEMALLOC_CPREFIX
+    /// "MALLOC_CONF"` — CPREFIX is the objcopy prefix uppercased; verified
+    /// against the embedded strings of the linked binary: `_RJEM_MALLOC_CONF`
+    /// and the `/etc/_rjem_malloc.conf` symlink arm). Lowercase
+    /// `_rjem_MALLOC_CONF` is silently ignored — measured, iter-44.
+    const PREFIXED_MALLOC_CONF: &str = "_RJEM_MALLOC_CONF";
+
+    /// Compose the tuning env and re-exec once with it set.
+    /// Runs at the very top of `main()`, before the tokio runtime exists.
+    pub(super) fn apply() {
+        // Operator intent: MALLOC_CONF (ignored by this prefixed build but
+        // honored as intent and forwarded), then the authoritative
+        // _RJEM_MALLOC_CONF (later tokens win in jemalloc's left-to-right
+        // parse, so it goes second).
+        let trimmed = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+        let plain = trimmed(std::env::var("MALLOC_CONF").ok());
+        let prefixed = trimmed(std::env::var(PREFIXED_MALLOC_CONF).ok());
+        let combined: Option<String> = match (plain.as_deref(), prefixed.as_deref()) {
+            (Some(p), Some(q)) => Some(format!("{p},{q}")),
+            (Some(p), None) => Some(p.to_string()),
+            (None, Some(q)) => Some(q.to_string()),
+            (None, None) => None,
+        };
+        // What _RJEM_MALLOC_CONF must contain for a tuned boot: operator
+        // tokens plus the still-missing owner-bound keys (build_conf), or
+        // just the operator tokens when they already pin everything.
+        let Some(want) = build_conf(combined.as_deref()).or(combined) else {
+            verify_and_log("nothing to tune");
+            return;
+        };
+        if prefixed.as_deref() == Some(want.as_str()) {
+            // Second boot (post-exec): _RJEM_MALLOC_CONF is exactly right.
+            verify_and_log("re-exec");
+            return;
+        }
+        if std::env::var("SCRYBOX_JEM_NO_REEXEC").is_ok_and(|v| !v.is_empty() && v != "0") {
+            verify_and_log("re-exec declined via SCRYBOX_JEM_NO_REEXEC (untuned jemalloc)");
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("scrybox-server: jemalloc tuning skipped (current_exe: {e})");
+                return;
+            }
+        };
+        eprintln!(
+            "scrybox-server: re-exec for jemalloc tuning {PREFIXED_MALLOC_CONF}={want:?} (SCRYBOX_JEM_NO_REEXEC=1 disables)"
+        );
+        let err = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env(PREFIXED_MALLOC_CONF, &want)
+                // The forwarded plain MALLOC_CONF must not survive the exec:
+                // on pass 2 it would re-prepend the operator tokens, making
+                // the composed string differ from _RJEM_MALLOC_CONF forever
+                // -> exec loop (measured, iter-44: narenas:8 grew one token
+                // per exec until timeout).
+                .env_remove("MALLOC_CONF")
+                .exec()
+        };
+        // Only reached if exec() failed: boot on jemalloc defaults rather
+        // than die.
+        eprintln!("scrybox-server: jemalloc tuning re-exec FAILED ({err}); continuing untuned");
+    }
+}
+
 fn blocking_threads_from_env() -> usize {
     std::env::var("SCRYBOX_BLOCKING_THREADS")
         .ok()
@@ -36,6 +246,8 @@ fn blocking_threads_from_env() -> usize {
 }
 
 fn main() {
+    #[cfg(feature = "jemalloc")]
+    jemalloc_cap::apply();
     // #[tokio::main] equivalent (multi-thread, enable_all) with the blocking
     // pool bounded — see DEFAULT_BLOCKING_THREADS.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -266,5 +478,94 @@ mod blocking_cap_tests {
         std::env::set_var("SCRYBOX_BLOCKING_THREADS", "");
         assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "empty -> default");
         clear();
+    }
+}
+
+#[cfg(all(test, feature = "jemalloc"))]
+mod jemalloc_cap_tests {
+    use super::jemalloc_cap::{plan, Plan, DEFAULT_DIRTY_DECAY_MS, DEFAULT_MUZZY_DECAY_MS, DEFAULT_NARENAS};
+
+    /// The MEMORY.md #5 owner bound pinned in code, and the operator-
+    /// precedence contract: an explicit `MALLOC_CONF` key must survive
+    /// untouched (same discipline as `arena_max_from_env` for
+    /// `MALLOC_ARENA_MAX` — we only fill in what the operator did not set).
+    #[test]
+    fn malloc_conf_parse_contract() {
+        assert_eq!(
+            (DEFAULT_NARENAS, DEFAULT_DIRTY_DECAY_MS, DEFAULT_MUZZY_DECAY_MS),
+            (2, 1_000, 0),
+            "owner bound: narenas=2, dirty decay 1 s, muzzy 0"
+        );
+        assert_eq!(
+            plan(None),
+            Plan { narenas: Some(2), dirty_decay_ms: Some(1_000), muzzy_decay_ms: Some(0) },
+            "unset MALLOC_CONF -> full in-code default"
+        );
+        assert_eq!(
+            plan(Some("")),
+            Plan { narenas: Some(2), dirty_decay_ms: Some(1_000), muzzy_decay_ms: Some(0) },
+            "empty MALLOC_CONF -> full in-code default"
+        );
+        assert_eq!(
+            plan(Some("narenas:8,dirty_decay_ms:10000")),
+            Plan { narenas: None, dirty_decay_ms: None, muzzy_decay_ms: Some(0) },
+            "operator keys untouched; unset key still gets the default"
+        );
+        assert_eq!(
+            plan(Some("muzzy_decay_ms:5000,background_thread:true")),
+            Plan { narenas: Some(2), dirty_decay_ms: Some(1_000), muzzy_decay_ms: None },
+            "key match is per-token: muzzy_decay_ms does NOT shadow dirty_decay_ms"
+        );
+        assert_eq!(
+            plan(Some(" tcache_max:65536 , narenas:4 ")),
+            Plan { narenas: None, dirty_decay_ms: Some(1_000), muzzy_decay_ms: Some(0) },
+            "tokens are trimmed before the key match"
+        );
+        assert_eq!(
+            plan(Some("prof:false,lg_prof_sample:19")),
+            Plan { narenas: Some(2), dirty_decay_ms: Some(1_000), muzzy_decay_ms: Some(0) },
+            "unrelated keys leave every default in place"
+        );
+    }
+
+    /// The re-exec contract: jemalloc reads MALLOC_CONF exactly once, at
+    /// its own init (the Rust runtime allocates before main()), so tuning
+    /// must reach the environment BEFORE exec. build_conf is the whole
+    /// decision — operator tokens verbatim first, only the missing keys
+    /// appended, and no re-exec at all when there is nothing to add.
+    #[test]
+    fn build_conf_reexec_composition() {
+        assert_eq!(
+            super::jemalloc_cap::build_conf(None).as_deref(),
+            Some("narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0"),
+            "unset MALLOC_CONF -> full tuning string"
+        );
+        assert_eq!(
+            super::jemalloc_cap::build_conf(Some("")).as_deref(),
+            Some("narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0"),
+            "empty-but-set MALLOC_CONF still needs the tuning"
+        );
+        assert_eq!(
+            super::jemalloc_cap::build_conf(Some("background_thread:true")),
+            Some("background_thread:true,narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0".into()),
+            "operator tokens stay verbatim and FIRST; ours appended"
+        );
+        assert_eq!(
+            super::jemalloc_cap::build_conf(Some("narenas:8,dirty_decay_ms:10000")),
+            Some("narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:0".into()),
+            "only the missing key is appended"
+        );
+        assert_eq!(
+            super::jemalloc_cap::build_conf(
+                Some("narenas:2,dirty_decay_ms:1000,muzzy_decay_ms:0")),
+            None,
+            "operator pins everything -> nothing to add, no re-exec"
+        );
+        assert_eq!(
+            super::jemalloc_cap::build_conf(
+                Some("muzzy_decay_ms:0,narenas:2,dirty_decay_ms:1000")),
+            None,
+            "order in the operator string does not matter"
+        );
     }
 }

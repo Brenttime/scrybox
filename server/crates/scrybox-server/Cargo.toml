@@ -52,3 +52,26 @@ flate2 = "1"
 # body_limits.rs: lazy counting request stream (REVIEW-auth H1 proofs).
 futures-util = "0.3"
 http-body = "1"
+
+# Memory queue item 5 (review/MEMORY.md #5): opt-in jemalloc global
+# allocator — the measured best settle config (LD_PRELOAD study:
+# narenas:2 + dirty_decay 1 s + muzzy 0 beat glibc arena2 on both HWM and
+# speed). OFF by default: the lane binary keeps glibc + the iter-#4 mallopt
+# tuning until the A/B verdict lands (PROGRESS-B iter-44). Build with
+# `--features jemalloc`; tikv-jemallocator's default features include
+# background_threads_runtime_support so decay purging does not wait on an
+# allocation event.
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+
+[dependencies.tikv-jemallocator]
+version = "0.7"
+optional = true
+
+# mallctl for the boot-time narenas/decay writes (the crate keeps its raw
+# bindings in a private module, so depend on -sys directly — same version
+# the allocator pulls, one compiled jemalloc).
+[dependencies.tikv-jemalloc-sys]
+version = "0.7"
+optional = true
