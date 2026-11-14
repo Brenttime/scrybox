@@ -447,6 +447,12 @@ pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
                 }
             }
         }
+        // MVP image: with no Node anywhere, an unmatched path is exactly
+        // Node's finalhandler arm (every route is ported; whatever reaches
+        // here had no Express route either) — answer its 404 "Cannot
+        // METHOD /path" instead of a dead-upstream 502.
+        drain_request_body(req.body_mut()).await;
+        return static_assets::express_default_404(req.method(), req.uri().path());
     }
     // statsCache.invalidateOnWrite twin: an authenticated non-GET /api write
     // bumps that user's stats generation so their cached /stats body is
@@ -1074,8 +1080,21 @@ pub fn app(state: AppState) -> Router {
             // Static hits are served by Rust; misses (API, SPA deep links,
             // /scan-assets, portal) go to Node unchanged.
             let fallback = axum::routing::any(proxy).with_state(state.clone());
-            router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            if state.cfg.node_upstream.is_empty() {
+                // Node-free: no Node stamps helmet/COEP/cors on the
+                // fallback's replies (unknown /api 401/404, static misses),
+                // so the secheaders twin must cover the fallback too.
+                let fallback = fallback.layer(axum::middleware::from_fn(crate::secheaders::guard));
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            } else {
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            }
         }
+        None if state.cfg.node_upstream.is_empty() => router.fallback_service(
+            axum::routing::any(proxy)
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn(crate::secheaders::guard)),
+        ),
         None => router.fallback(proxy),
     };
     router

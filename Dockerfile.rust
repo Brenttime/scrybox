@@ -31,8 +31,11 @@ RUN npm run build
 # =========================================
 # Stage 2: Rust single binary + runtime deps
 # =========================================
-FROM debian:12-slim AS production
-# glibc Debian, same reasoning as the Node image (issue #19): the ONNX
+FROM debian:13-slim AS production
+# glibc Debian 13 (glibc 2.41): the release binary is built on brain
+# (glibc 2.39) and references GLIBC_2.39 weak symbols (pidfd_spawnp/
+# pidfd_getpid from std::process); on bookworm (2.36) ld.so warned on every
+# exec. Same reasoning as the Node image (issue #19) for glibc: the ONNX
 # Runtime dylib and libscryjpeg are glibc-linked. apt installs only what the
 # Node image's equivalent layer had that Node itself did not provide:
 #   gosu            — entrypoint privilege drop (Gate D requirement)
@@ -48,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /usr/local/bin/curl-impersonate and fall back to plain curl. wget+ca-certs
 # are installed above, so no curl package is pulled for the download.
 RUN wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/releases/download/v2.1.0/curl-impersonate-v2.1.0.x86_64-linux-gnu.tar.gz" \
-  && tar xzf /tmp/ci.tgz -C /usr/local/bin curl-impersonate \
+  && tar xzf /tmp/ci.tgz --no-same-owner -C /usr/local/bin curl-impersonate \
   && chmod +x /usr/local/bin/curl-impersonate \
   && rm -f /tmp/ci.tgz \
   && /usr/local/bin/curl-impersonate --version | head -1
