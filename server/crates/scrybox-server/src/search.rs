@@ -2039,6 +2039,18 @@ use crate::util::json_error;
 // Handler
 // ---------------------------------------------------------------------------
 
+/// M5 (iter-13 freeze forensics): the per-request revision read used to be
+/// an inline `pool.get()` on the runtime worker. When the 8 live slots sat
+/// in multi-leg builds (the ALL_mixed shape), these parks froze whole
+/// workers on the live-cap Condvar — the exact bench-freeze stack seen in
+/// the POOLDIAG capture (`search::handle` parked at live=8/live_max=8).
+/// `get_async` idle-pops on the worker and hops to the blocking pool only
+/// when nothing is idle, so a stall can never pin a worker. Same SQL, same
+/// value, same error→None arms — parity-neutral by construction.
+async fn probe_revision(pool: &std::sync::Arc<DbPool>) -> Option<i64> {
+    pool.get_async().await.ok().and_then(|c| crate::db::current_revision(&c).ok().flatten())
+}
+
 pub async fn handle(
     method: Method,
     State(st): State<AppState>,
@@ -2193,10 +2205,7 @@ pub async fn handle(
     };
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
-    let rev = pool
-        .get()
-        .ok()
-        .and_then(|c| crate::db::current_revision(&c).ok().flatten());
+    let rev = probe_revision(&pool).await;
     let rev_i = rev.unwrap_or(-1);
 
     let key = p.cache_key();
@@ -2359,10 +2368,8 @@ pub async fn handle(
                             // our own cacheCards upsert so the entry survives
                             // its own write; any OTHER write that raced the
                             // build already pushed the counter higher.
-                            let post_rev = init_pool
-                                .get()
-                                .ok()
-                                .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                            let post_rev = probe_revision(&init_pool)
+                                .await
                                 .unwrap_or(rev_i);
                             (body, gz, etag, total, source, post_rev, Vec::new())
                             } else {
@@ -2483,10 +2490,8 @@ pub async fn handle(
                                 // Post-write rev stamp (see the walk arm):
                                 // re-read AFTER the merge's own cacheCards /
                                 // price writes so the entry survives them.
-                                let post_rev = init_pool
-                                    .get()
-                                    .ok()
-                                    .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                                let post_rev = probe_revision(&init_pool)
+                                    .await
                                     .unwrap_or(rev_i);
                                 (body, gz, etag, live_total, live_source, post_rev, Vec::new())
                             }
@@ -2499,10 +2504,8 @@ pub async fn handle(
                     // every later request would re-walk. Anything written by
                     // someone else before this read still invalidates as
                     // intended; the build itself performed no other writes.
-                    let store_rev = init_pool
-                        .get()
-                        .ok()
-                        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
+                    let store_rev = probe_revision(&init_pool)
+                        .await
                         .unwrap_or(rev_i);
                     Ok(Ok(Some(init_cache.insert(
                         init_key,
@@ -2663,11 +2666,7 @@ fn respond_entry(entry: &Arc<SearchEntry>, inm: Option<&str>, ae: Option<&str>, 
 /// rows are Node's `[]` too. A SQL failure mirrors Node's route-catch 500
 /// 'Search failed'.
 async fn serve_owned(st: AppState, pool: Arc<DbPool>, o: Box<CollectionOwned>, inm: Option<String>, ae: Option<String>) -> Response {
-    let rev_i = pool
-        .get()
-        .ok()
-        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
-        .unwrap_or(-1);
+    let rev_i = probe_revision(&pool).await.unwrap_or(-1);
 
     let key = o.cache_key();
     if let Some(e) = st.search_cache.get(&key, rev_i) {
@@ -2729,11 +2728,7 @@ async fn serve_collq(st: AppState, req: Request, pool: Arc<DbPool>, cq: Arc<coll
     let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
-    let rev_i = pool
-        .get()
-        .ok()
-        .and_then(|c| crate::db::current_revision(&c).ok().flatten())
-        .unwrap_or(-1);
+    let rev_i = probe_revision(&pool).await.unwrap_or(-1);
 
     let key = cq.cache_key();
 
@@ -3162,5 +3157,74 @@ mod headers_l2 {
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.headers().get("x-source").is_none(), "invalid source must skip x-source, not panic");
         assert_eq!(r.headers().get("x-catalog-snapshot").and_then(|v| v.to_str().ok()), Some("ok"));
+    }
+}
+
+/// M5 (iter-13 bench-freeze forensics): the per-request revision reads of
+/// `handle`/`serve_owned`/`serve_collq`/post-write stamps used to be an
+/// inline `pool.get()` on the runtime worker. The POOLDIAG capture from the
+/// frozen ALL_mixed run shows exactly that stack (`search::handle` parked
+/// at live=8/live_max=8 on the live-cap Condvar). This pin reproduces the
+/// shape: one live slot, already held, single runtime worker.
+#[cfg(test)]
+mod revision_probe_park_tests {
+    use super::*;
+    use crate::db::PoolConfig;
+    use std::sync::Arc;
+
+    #[test]
+    fn probe_revision_never_parks_a_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe-rev.db");
+        // DbPool opens READ_WRITE without CREATE — the file must exist.
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = Arc::new(
+            DbPool::open_with(&path, PoolConfig { max: 1, cache_kb: 2048, mmap_kb: 0, live_max: 1 })
+                .unwrap(),
+        );
+        {
+            let c = pool.get().unwrap();
+            c.execute_batch(
+                "CREATE TABLE collection_read_revision (id INTEGER PRIMARY KEY, revision INTEGER);
+                 INSERT INTO collection_read_revision VALUES (1, 7);",
+            )
+            .unwrap();
+        }
+        // Occupy the only live slot: idle empty, live == live_max. Any
+        // further get() parks its calling thread on the live-cap Condvar.
+        let held = pool.get_owned().unwrap();
+        std::thread::spawn(move || {
+            // Release at 1.2 s so a RED run FAILS (the parked worker wakes,
+            // the runtime joins) instead of deadlocking the test binary.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            drop(held);
+        });
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let p1 = Arc::clone(&pool);
+        let probe = rt.spawn(async move { probe_revision(&p1).await });
+        let beat = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+        // Drive from a NON-worker thread: if the probe parked the sole
+        // worker, the 150 ms heartbeat can never fire. (Build the timeout
+        // futures INSIDE block_on — tokio::time::timeout registers its
+        // timer at construction and panics outside the runtime context.)
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(400), beat)
+                .await
+                .expect("probe_revision parked the runtime worker (heartbeat starved)");
+        });
+        let rev = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+                .await
+                .expect("probe_revision never completed after the cap released")
+                .unwrap()
+        });
+        assert_eq!(rev, Some(7), "revision must read through the async checkout");
     }
 }

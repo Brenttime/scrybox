@@ -198,9 +198,18 @@ async fn probe(st: &AppState, store: bool) -> Response {
 /// package's content-based weak form (W/"{base64 sha1}"), pinned per body.
 /// Node's dbReady gate maps to "no SCRYBOX_DB_PATH / pool": the boot ladder
 /// runs before listen, so a missing pool is the only uninitialized state.
-fn native_health(st: &AppState) -> Response {
+async fn native_health(st: &AppState) -> Response {
     let (status, body): (StatusCode, &'static str) = match &st.db {
-        Some(pool) => match pool.get().ok().and_then(|c| c.query_row("SELECT 1", [], |_| Ok(())).ok()) {
+        // M5 (iter-13 freeze forensics): was an inline `pool.get()` on the
+        // runtime worker — the health probe itself parked behind the live
+        // cap during the bench freeze (POOLDIAG: health::native_health
+        // parked). get_async idle-pops on the worker, hops off on a miss.
+        Some(pool) => match pool
+            .get_async()
+            .await
+            .ok()
+            .and_then(|c| c.query_row("SELECT 1", [], |_| Ok(())).ok())
+        {
             Some(()) => (StatusCode::OK, "{\"status\":\"ok\"}"),
             None => (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"db_unavailable\"}"),
         },
@@ -225,7 +234,7 @@ fn native_health(st: &AppState) -> Response {
 
 pub async fn handle(State(st): State<AppState>) -> Response {
     if st.cfg.node_upstream.is_empty() {
-        return native_health(&st);
+        return native_health(&st).await;
     }
     if st.health_cache.is_enabled() {
         if let Some(res) = st.health_cache.fresh() {
