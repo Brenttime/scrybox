@@ -189,9 +189,52 @@ fn admin_gate(user: &crate::auth::AuthUser) -> Option<Response> {
     None
 }
 
+/// Node-zero: the method has no route here. Node runs the global
+/// normalJson (1 MiB strict → 413 / 500), the auth gate (+ requireAdmin on
+/// the admin router), then finalhandler's 404. Hybrid replays to Node.
+async fn standalone_miss(st: &AppState, req: Request, admin: bool) -> Response {
+    let pool = match st.db.clone() {
+        Some(p) if st.cfg.node_upstream.is_empty() => p,
+        _ => return crate::proxy(State(st.clone()), req).await,
+    };
+    use crate::collection_writes::{internal_error, parse_body, read_parts, too_large, BodyOutcome, BODY_NORMAL};
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return too_large();
+    }
+    match parse_body(&parts.headers, &bytes) {
+        BodyOutcome::TooLarge => return too_large(),
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::Parsed(_) => {}
+    }
+    let is_get = parts.method == axum::http::Method::GET;
+    let token = bearer_token(&parts.headers).map(|s| s.to_string());
+    let user = match authenticate(&pool, token.as_deref(), is_get) {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    if !is_get {
+        crate::stats::on_native_write(st, user.id);
+    }
+    if admin {
+        if let Some(res) = admin_gate(&user) {
+            return res;
+        }
+    }
+    crate::static_assets::express_default_404(&parts.method, parts.uri.path())
+}
+
+/// express answers HEAD through router.get; in Node-zero mode nobody else will.
+fn get_like(st: &AppState, m: &axum::http::Method) -> bool {
+    m == axum::http::Method::GET || (m == axum::http::Method::HEAD && st.cfg.node_upstream.is_empty())
+}
+
 pub async fn handle_catalog_languages(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("catalog_art") {
+    if !st.owns("catalog_art") {
         return crate::proxy(State(st), req).await;
+    }
+    if !get_like(&st, req.method()) {
+        return standalone_miss(&st, req, true).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -221,8 +264,14 @@ pub async fn handle_catalog_languages(State(st): State<AppState>, req: Request) 
             m
         }));
     }
+    // Node's MODEL_DIR defaults (CV_MODEL_DIR || <backend>/data/models);
+    // Node-zero takes the same default instead of forwarding.
     let model = match model_dir(&st) {
         Some(m) => m,
+        None if st.cfg.node_upstream.is_empty() => match crate::cvscan::model_dir_pub() {
+            Some(m) => m,
+            None => return crate::collection_writes::internal_error(),
+        },
         None => return crate::proxy(State(st.clone()), req).await,
     };
 
@@ -296,8 +345,11 @@ pub async fn handle_catalog_languages(State(st): State<AppState>, req: Request) 
 // ---------------------------------------------------------------------------
 
 pub async fn handle_scan_sets(State(st): State<AppState>, req: Request) -> Response {
-    if req.method() != axum::http::Method::GET || !st.owns("catalog_art") {
+    if !st.owns("catalog_art") {
         return crate::proxy(State(st), req).await;
+    }
+    if !get_like(&st, req.method()) {
+        return standalone_miss(&st, req, false).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;

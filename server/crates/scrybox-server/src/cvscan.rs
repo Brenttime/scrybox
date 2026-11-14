@@ -1589,6 +1589,9 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         Ok(v) => v,
         // strict bigJson rejects scalars/null/oversize — Node's parser owns
         // that error page; replay the untouched request.
+        // Node-zero: bigJson's SyntaxError reaches the global handler's 500
+        // (server.js:634) BEFORE the limiter counts the request.
+        Err(_) if cardscan::standalone(&st) => return crate::collection_writes::internal_error(),
         Err(_) => return crate::proxy(State(st), replay(parts, bytes, headers)).await,
     };
 
@@ -1683,6 +1686,15 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
     // No ORT dylib configured → the pipeline cannot run here; Node (with its
     // own bundled runtime) answers the whole request.
     if std::env::var("ORT_DYLIB_PATH").unwrap_or_default().is_empty() {
+        // Node-zero: no runtime and nobody to forward to — the model load
+        // failing inside Node's try is its catch-all 500.
+        if cardscan::standalone(&st) {
+            tracing::error!("scan-match: ORT_DYLIB_PATH unset in standalone mode");
+            return limit_headers(cardscan::res_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({ "error": "Scan match failed" }),
+            ));
+        }
         return crate::proxy(State(st), replay(parts, bytes, headers)).await;
     }
 
@@ -1757,6 +1769,14 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
             // would-fetch or DB oddity: whole-request replay to Node.
             Ok(Hydrate::Forward) | Err(_) => {
                 tracing::warn!(card = ?cand_map.get("cardId"), "scan-match hydrate Forward-to-Node");
+                // Standalone: Forward is impossible (fetch_exhausted); a DB
+                // fault is a throw inside Node's try → its 500.
+                if standalone {
+                    return limit_headers(cardscan::res_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &serde_json::json!({ "error": "Scan match failed" }),
+                    ));
+                }
                 return crate::proxy(State(st), replay(parts, bytes, headers)).await;
             }
         }
