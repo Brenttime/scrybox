@@ -623,6 +623,44 @@ fn hydrate_cards_forward(conn: &Connection, ids: &[String]) -> Result<Option<Vec
     Ok(Some(cards))
 }
 
+/// Standalone (no Node upstream) twin of hydrate()'s fetch lane: run
+/// getCardById's scryGet + cacheCards for every id hydrate() would read, so
+/// the caller can hydrate with fetch_on_miss = false (= Node's null arms)
+/// instead of Forwarding to an upstream that does not exist.
+fn standalone(st: &AppState) -> bool {
+    st.cfg.node_upstream.is_empty()
+}
+
+fn fetch_ids_of(result: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let ok = truthy(result.get("ok"));
+    if ok {
+        if let Some(v) = result.get("card").and_then(|c| c.get("id")).filter(|v| truthy(Some(v))) {
+            out.push(js_to_string(v));
+        }
+    } else if let Some(choices) = result.get("footer_ocr").and_then(|f| f.get("choices")).and_then(Value::as_array) {
+        if choices.len() > 1 {
+            for c in choices {
+                let v = match c.get("id") {
+                    Some(v) if truthy(Some(v)) => v.clone(),
+                    _ => c.get("scryfallId").cloned().unwrap_or(Value::Null),
+                };
+                if scry_id_ok(&v) {
+                    out.push(js_to_string(&v));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) async fn prefetch_ids(st: &AppState, ids: &[String]) {
+    let Some(pool) = st.db.as_ref() else { return };
+    for id in ids {
+        let _ = crate::cvscan::fetch_card_by_id(&st.scry, pool, &format!("mtg-{id}")).await;
+    }
+}
+
 fn owns(st: &AppState) -> bool {
     st.owns("cardscan")
 }
@@ -869,13 +907,18 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
             };
             let mut results: Vec<Value> = Vec::new();
             let mut forward = false;
+            let fetch_on_miss = !standalone(&st);
+            if !fetch_on_miss {
+                let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
+                prefetch_ids(&st, &ids).await;
+            }
             {
                 let conn = match st.db.as_ref().unwrap().get() {
                     Ok(c) => c,
                     Err(_) => return upstream_error(&Up::Failed),
                 };
                 for x in &results_in {
-                    match hydrate(&conn, x, true) {
+                    match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(mut m)) => {
                             m.insert("cached".into(), Value::Bool(truthy(x.get("cached"))));
                             results.push(Value::Object(m));
@@ -982,6 +1025,10 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
     }
     let headers = parts.headers.clone();
     let mut results: Vec<Value> = Vec::with_capacity(ids.len());
+    let fetch_on_miss = !standalone(&st);
+    if !fetch_on_miss {
+        prefetch_ids(&st, &ids).await;
+    }
     {
         let conn = match st.db.as_ref().unwrap().get() {
             Ok(c) => c,
@@ -1007,7 +1054,7 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
             synth.insert("title".into(), item.get("title").cloned().unwrap_or(Value::Null));
             synth.insert("card".into(), serde_json::json!({ "id": item.get("scryfallId").cloned().unwrap_or(Value::Null) }));
             synth.insert("footer_ocr".into(), serde_json::json!({ "resolved_by": item.get("via").cloned().unwrap_or(Value::Null) }));
-            match hydrate(&conn, &Value::Object(synth), true) {
+            match hydrate(&conn, &Value::Object(synth), fetch_on_miss) {
                 Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
                 Ok(Hydrate::Forward) | Ok(Hydrate::Throw) | Err(_) => {
                     drop(conn);
@@ -1048,6 +1095,10 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
         _ => vec![],
     };
     let headers = parts.headers.clone();
+    let is_standalone = standalone(&st);
+    if is_standalone && ids.len() >= 2 && ids.len() <= 8 && ids.iter().all(|id| scry_id_ok(&Value::String(id.clone()))) {
+        prefetch_ids(&st, &ids).await;
+    }
     let outcome = {
         let conn = match st.db.as_ref().unwrap().get() {
             Ok(c) => c,
@@ -1063,6 +1114,12 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
             res_json(StatusCode::OK, &Value::Object(m))
         }
         Ok(Choices::Null) => res_json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
+        ),
+        // Standalone: the fetch already ran — a still-missing id is
+        // hydrateChoices' `cards.every(Boolean) ? cards : null` → 400.
+        Ok(Choices::NeedsFetch) if is_standalone => res_json(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
         ),
@@ -1119,13 +1176,18 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
             };
             let mut results: Vec<Value> = Vec::new();
             let mut forward = false;
+            let fetch_on_miss = !standalone(&st);
+            if !fetch_on_miss {
+                let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
+                prefetch_ids(&st, &ids).await;
+            }
             {
                 let conn = match st.db.as_ref().unwrap().get() {
                     Ok(c) => c,
                     Err(_) => return upstream_error(&Up::Failed),
                 };
                 for x in &results_in {
-                    match hydrate(&conn, x, true) {
+                    match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
                         Ok(Hydrate::Forward) | Err(_) => {
                             forward = true;
