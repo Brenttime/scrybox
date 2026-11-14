@@ -444,8 +444,9 @@ pub fn on_proxied_write(st: &AppState, method: &Method, path: &str, headers: &He
     let cache = Arc::clone(&st.stats_cache);
     // Fire-and-forget: the proxied response must not wait on our bookkeeping.
     tokio::spawn(async move {
-        // ~5 us sync lookup; no need for a blocking hop (see auth.rs).
-        match crate::auth::authenticate(&pool, token.as_deref(), false) {
+        // REVIEW M5: async checkout — this task runs on a runtime worker,
+        // so the lookup must never park it (idle pop / blocking-pool hop).
+        match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
             Ok(user) => cache.bump(user.id),
             Err(_) => {} // unauth / API-key write: Node never bumps either
         }
@@ -1374,11 +1375,11 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let headers = req.headers();
 
     // authenticateToken runs before the route in Node (Bearer session token;
-    // API keys are GET-only, which this path is). Same 401/403 bodies. The
-    // lookup is ~5 us of cached SQLite — run inline on the worker, no
-    // blocking-pool hop (iter 6: that hop, not the SQL, was the hot-path cost).
+    // API keys are GET-only, which this path is). Same 401/403 bodies.
+    // REVIEW M5: async checkout so neither the lookup nor a pool stall can
+    // freeze the runtime worker.
     let token = crate::auth::bearer_token(headers).map(|s| s.to_string());
-    let user = match crate::auth::authenticate(&pool, token.as_deref(), true) {
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };

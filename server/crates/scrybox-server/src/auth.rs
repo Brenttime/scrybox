@@ -67,6 +67,11 @@ const API_KEY_SQL: &str = concat!(
 /// Takes the extracted bearer token (not the HeaderMap) so the hot path can
 /// run this synchronously on a runtime worker: the whole lookup measured
 /// ~5 us on the seeded fixture, cheaper than a spawn_blocking hop.
+///
+/// NOTE (REVIEW M5): `pool.get()` can open a connection / wait on the live
+/// cap, both of which block the calling thread. Callers on async-runtime
+/// workers on the hot request path should prefer [`authenticate_async`];
+/// this sync form stays for code already on a blocking thread.
 pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<AuthUser, Response> {
     let Some(token) = token else {
         return Err(json_error(StatusCode::UNAUTHORIZED, "Access denied. No token provided."));
@@ -78,7 +83,35 @@ pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<
             return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error"));
         }
     };
+    authenticate_on(&conn, token, is_get)
+}
 
+/// M5 twin of [`authenticate`] for handlers running on runtime workers:
+/// checks out through `DbPool::get_async()` (idle-only pop on the worker,
+/// blocking-pool hop when no connection is idle), so neither the auth
+/// lookup nor a pool stall can freeze the worker for up to `busy_timeout`.
+/// Same SQL, same bodies — parity is unaffected.
+pub async fn authenticate_async(
+    pool: &std::sync::Arc<DbPool>,
+    token: Option<&str>,
+    is_get: bool,
+) -> Result<AuthUser, Response> {
+    let Some(token) = token else {
+        return Err(json_error(StatusCode::UNAUTHORIZED, "Access denied. No token provided."));
+    };
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "auth: cannot open read connection");
+            return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error"));
+        }
+    };
+    authenticate_on(&conn, token, is_get)
+}
+
+/// The shared lookup body: Node's exact two queries, in order, on an
+/// already-held connection.
+fn authenticate_on(conn: &rusqlite::Connection, token: &str, is_get: bool) -> Result<AuthUser, Response> {
     // Node's exact two queries, in order. All seven columns come back
     // (middleware/auth.js selects them for req.user); the tuple maps
     // (user_id, username, role, share_token, share_enabled, api_key, oidc_sub).
@@ -122,5 +155,61 @@ pub fn authenticate(pool: &DbPool, token: Option<&str>, is_get: bool) -> Result<
             tracing::error!(error = %e, "auth: query failed");
             Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Authentication error"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn seeded_pool(tag: &str) -> DbPool {
+        let dir = std::env::temp_dir().join(format!("scrybox-authasync-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.db");
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, role TEXT,
+                        share_token TEXT, share_enabled INTEGER, api_key TEXT, oidc_sub TEXT);
+             CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INTEGER, expires_at TEXT);
+             INSERT INTO users VALUES (7, 'member', 'member', 'share-7', 1, 'apikey-7', NULL);
+             INSERT INTO sessions VALUES ('sess-7', 7, DATETIME('now', '+1 hour'));",
+        )
+        .unwrap();
+        drop(conn);
+        DbPool::open(&p, 2).unwrap()
+    }
+
+    #[test]
+    fn authenticate_async_session_key_and_reject_paths() {
+        // The M5 twin answers exactly like the sync authenticate: session
+        // hit, API-key hit (via_api_key), the read-only API-key 403 shape
+        // (Err response), and the unknown-token 401 (Err response).
+        let pool = Arc::new(seeded_pool("core"));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+        let p = Arc::clone(&pool);
+        let user = rt.block_on(async move { authenticate_async(&p, Some("sess-7"), true).await.unwrap() });
+        assert_eq!(user.id, 7);
+        assert!(!user.via_api_key);
+
+        let p = Arc::clone(&pool);
+        let user = rt.block_on(async move { authenticate_async(&p, Some("apikey-7"), true).await.unwrap() });
+        assert_eq!(user.id, 7);
+        assert!(user.via_api_key);
+
+        let p = Arc::clone(&pool);
+        assert!(rt.block_on(async move { authenticate_async(&p, Some("apikey-7"), false).await }).is_err());
+        let p = Arc::clone(&pool);
+        assert!(rt.block_on(async move { authenticate_async(&p, Some("nope"), true).await }).is_err());
+        let p = Arc::clone(&pool);
+        assert!(rt.block_on(async move { authenticate_async(&p, None, true).await }).is_err());
+
+        // Under the live cap the async path still completes (blocking hop).
+        let held = pool.get().unwrap();
+        let p = Arc::clone(&pool);
+        let user2 = rt.block_on(async move { authenticate_async(&p, Some("sess-7"), true).await.unwrap() });
+        assert_eq!(user2.id, 7);
+        drop((held, user2));
     }
 }

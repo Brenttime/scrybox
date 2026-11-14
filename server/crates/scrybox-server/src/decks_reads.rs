@@ -41,7 +41,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token, AuthUser};
+use crate::auth::{bearer_token, AuthUser};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, json_num, sqlite_value, wants_encoding};
 use crate::collection_writes::{
     internal_error, is_basic_land, json_error, node_exact, parse_body, read_parts, too_large, BodyOutcome,
@@ -73,7 +73,7 @@ pub async fn handle_list(State(st): State<AppState>, req: Request) -> Response {
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -183,7 +183,7 @@ where
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

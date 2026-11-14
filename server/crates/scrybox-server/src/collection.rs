@@ -1421,10 +1421,10 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     let headers = req.headers();
     let uri = req.uri().clone();
 
-    // authenticate (µs-cached SQLite; inline on the worker, no blocking-pool
-    // hop — iter 6).
+    // authenticate (REVIEW M5: async checkout — idle pop on the worker,
+    // blocking-pool hop when none is idle; never pins the worker).
     let token = auth::bearer_token(headers).map(|s| s.to_string());
-    let user = match auth::authenticate(&pool, token.as_deref(), true) {
+    let user = match auth::authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -1438,7 +1438,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     // Alloc shapes (full, include_allocation=1) additionally probe the deck
     // counter on the SAME connection — their checked_out_qty comes from
     // decks/deck_cards, which bump deck_list_revision only (C1).
-    let (rev, deck_rev) = match pool.get() {
+    // REVIEW M5: async checkout so the probe never parks the worker.
+    let (rev, deck_rev) = match pool.get_async().await {
         Ok(c) => (
             crate::db::current_revision(&c).ok().flatten(),
             p.needs_alloc()

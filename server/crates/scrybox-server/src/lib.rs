@@ -395,7 +395,7 @@ pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
             if let Some(pool) = st.db.as_ref() {
                 let token = auth::bearer_token(req.headers()).map(|s| s.to_string());
                 let is_get = req.method() == axum::http::Method::GET;
-                if let Err(res) = auth::authenticate(pool, token.as_deref(), is_get) {
+                if let Err(res) = auth::authenticate_async(pool, token.as_deref(), is_get).await {
                     drain_request_body(req.body_mut()).await;
                     return res;
                 }
