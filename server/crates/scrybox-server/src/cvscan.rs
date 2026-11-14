@@ -175,11 +175,21 @@ fn load_models() -> Result<Arc<Models>, String> {
     let dir = model_dir().ok_or("no CV_MODEL_DIR")?;
     let built = (|| -> Result<Arc<Models>, String> {
         let env = ort_env()?;
+        // iter-42 memory queue item 1 (owner ruling 2026-11-13 20:25): CPU
+        // memory arena + memory-pattern buffers OFF for the two resident scan
+        // sessions. Allocator options only — output tensors stay bit-for-bit
+        // identical — but the arena retained freed blocks for the whole
+        // process life (MEMORY.md scan_match row, +232 HWM). Node's
+        // onnxruntime-node keeps the arena on; the parity battery re-verifies
+        // the score bytes with it off, as the ruling mandates.
+        let eps = [ort::ep::CPU::default().with_arena_allocator(false).build()];
         let build = |file: PathBuf| -> Result<ort::session::Session, String> {
             let mut b = ort::session::Session::builder(env).map_err(|e| e.to_string())?;
             b = b.with_intra_threads(1).map_err(|e| e.to_string())?;
             b = b.with_inter_threads(1).map_err(|e| e.to_string())?;
             b = b.with_parallel_execution(false).map_err(|e| e.to_string())?;
+            b = b.with_memory_pattern(false).map_err(|e| e.to_string())?;
+            b = b.with_execution_providers(&eps).map_err(|e| e.to_string())?;
             b.commit_from_file(file).map_err(|e| e.to_string())
         };
         let corn = build(dir.join("cornelius.onnx"))?;
@@ -200,18 +210,231 @@ fn load_models() -> Result<Arc<Models>, String> {
 // Catalogs
 // ---------------------------------------------------------------------------
 
+/// A file-backed f32 slice: the local `<lang>.bin` embedding table is raw
+/// little-endian f32 on disk, so mmap it and let the page cache be the copy
+/// (RssFile, reclaimable under pressure) instead of heap-doubling on load
+/// (iter-42 memory queue item 1, owner ruling 2026-11-13 20:25).
+pub struct MmapF32 {
+    base: *mut libc::c_void,
+    bytes: usize,
+    // Keep the fd alive until munmap. Field order matters: _file is declared
+    // last so Drop(base/munmap) runs before the File closes.
+    _file: std::fs::File,
+}
+
+// SAFETY: the mapping is read-only, page-aligned, and independent of any
+// thread; two readers observe the same immutable bytes for the File's life.
+unsafe impl Send for MmapF32 {}
+unsafe impl Sync for MmapF32 {}
+
+impl MmapF32 {
+    fn map(file: std::fs::File, bytes: usize) -> Result<Self, String> {
+        use std::os::unix::io::AsRawFd;
+        if bytes == 0 || bytes % std::mem::size_of::<f32>() != 0 {
+            return Err(format!("mmap length {bytes} not f32-aligned"));
+        }
+        // SAFETY: fd is a live read-only file we keep alive in _file;
+        // MAP_PRIVATE prevents any write-back; length matches the verified
+        // file size; MAP_FAILED is checked before any use of base.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+        }
+        // mmap hands out page-aligned addresses — always f32-aligned; the
+        // check is paranoia against a platform surprise, mapped-or-not.
+        if (base as usize) % std::mem::size_of::<f32>() != 0 {
+            unsafe { libc::munmap(base, bytes) };
+            return Err("mmap base not f32-aligned".into());
+        }
+        Ok(MmapF32 { base, bytes, _file: file })
+    }
+}
+
+impl Drop for MmapF32 {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.base, self.bytes) };
+    }
+}
+
+impl std::ops::Deref for MmapF32 {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        // SAFETY: map() checked length divisibility, alignment and success.
+        unsafe { std::slice::from_raw_parts(self.base as *const f32, self.bytes / 4) }
+    }
+}
+
+/// Embedding table: heap-owned (npz path — DEFLATE decode forces a heap
+/// buffer) or file-mapped (local .bin path — zero-copy). Deref-coerces to
+/// &[f32] everywhere Catalog.cat is consumed.
+pub enum CatBuf {
+    Owned(Vec<f32>),
+    Mapped(std::sync::Arc<MmapF32>),
+}
+
+impl std::ops::Deref for CatBuf {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            CatBuf::Owned(v) => v,
+            CatBuf::Mapped(m) => m,
+        }
+    }
+}
+
+impl CatBuf {
+    /// Local .bin twin of the Node load: exact same byte-length contract and
+    /// little-endian f32 values; mmap first, heap fallback if mmap fails.
+    fn from_bin_file(file: std::fs::File, len: usize) -> Result<CatBuf, String> {
+        match MmapF32::map(file.try_clone().map_err(|e| e.to_string())?, len) {
+            Ok(m) => Ok(CatBuf::Mapped(std::sync::Arc::new(m))),
+            Err(_) => {
+                let mut buf = Vec::with_capacity(len);
+                use std::io::Read;
+                let mut f = file;
+                f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                Ok(CatBuf::Owned(
+                    buf.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                ))
+            }
+        }
+    }
+}
+
+/// All catalog ids in ONE packed UTF-8 buffer + u32 offsets (Node's
+/// `ids: string[]` for ~110k rows costs ~17 MB of per-String heap churn; one
+/// buffer + offsets is one allocation).
+#[derive(Default)]
+pub struct IdStore {
+    buf: String,
+    /// Byte offsets into buf, len == n + 1 (final entry = buf.len()).
+    offs: Vec<u32>,
+}
+
+impl IdStore {
+    pub fn from_vec(v: &[String]) -> IdStore {
+        let mut s = String::with_capacity(v.iter().map(|x| x.len()).sum());
+        let mut offs = Vec::with_capacity(v.len() + 1);
+        for id in v {
+            offs.push(s.len() as u32);
+            s.push_str(id);
+        }
+        offs.push(s.len() as u32);
+        IdStore { buf: s, offs }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offs.len().saturating_sub(1)
+    }
+
+    pub fn get(&self, i: usize) -> Option<&str> {
+        if i >= self.len() {
+            return None;
+        }
+        self.buf.get(self.offs[i] as usize..self.offs[i + 1] as usize)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.len()).map(move |i| self.get(i).unwrap_or_default())
+    }
+}
+
 pub struct Catalog {
     pub lang: String,
     pub local: bool,
     pub n: usize,
     pub dim: usize,
-    pub cat: Vec<f32>,
-    pub ids: Vec<String>,
+    pub cat: CatBuf,
+    pub ids: IdStore,
     /// rowSets(): per-row lowercased card_cache.set_id, built lazily.
     set_of: Mutex<Option<Arc<Vec<Option<String>>>>>,
 }
 
 static CATALOGS: Mutex<Option<HashMap<String, Arc<Catalog>>>> = Mutex::new(None);
+
+// ---------------------------------------------------------------------------
+// Idle unload (iter-42 memory queue item 1, owner ruling 2026-11-13 20:25:
+// "unload the session after idle"). The heavy ONNX sessions + embedding
+// catalog used to be retained forever in MODELS/CATALOGS — ~230 MB of VmHWM
+// with zero scan traffic after the first scan (review/MEMORY.md scan_match
+// row). Every scan stamps LAST_SCAN_MS; a 60s janitor drops the statics once
+// no scan has arrived for CV_SCAN_IDLE_SECS (default 900 = 15 min; 0
+// disables). The next scan lazy-loads everything again — same bytes, ~1-2 s
+// first hit. Divergence from Node (which caches for process life) is the
+// owner directive, and TTL-untouchable within a battery pass.
+// ---------------------------------------------------------------------------
+
+static LAST_SCAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JANITOR: OnceLock<()> = OnceLock::new();
+
+fn idle_ttl_ms() -> u64 {
+    match std::env::var("CV_SCAN_IDLE_SECS") {
+        Ok(v) if !v.is_empty() => v.parse::<u64>().unwrap_or(900).saturating_mul(1000),
+        _ => 900_000,
+    }
+}
+
+/// Called on every real scan use: stamps the activity clock and arms the
+/// process-lifetime janitor task (only when a tokio runtime exists — plain
+/// bins/tests just never unload, matching the pre-iter-42 behaviour).
+fn touch_scan_use() {
+    LAST_SCAN_MS.store(crate::util::now_ms_u64(), std::sync::atomic::Ordering::Relaxed);
+    JANITOR.get_or_init(|| {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    janitor_sweep(crate::util::now_ms_u64(), idle_ttl_ms());
+                }
+            });
+        }
+    });
+}
+
+/// One janitor tick: drop the cached sessions + catalogs if the last scan is
+/// older than the TTL. Pure over the statics + (now, ttl) for testability.
+/// Returns true when anything was actually released. In-flight scans hold
+/// their Arc clones, so clearing the statics can never pull a buffer out
+/// from under a running sweep.
+fn janitor_sweep(now: u64, ttl_ms: u64) -> bool {
+    if ttl_ms == 0 {
+        return false;
+    }
+    let last = LAST_SCAN_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < ttl_ms {
+        return false;
+    }
+    let had_models = {
+        let mut m = MODELS.guard();
+        let had = m.is_some();
+        *m = None;
+        had
+    };
+    let had_catalogs = {
+        let mut c = CATALOGS.guard();
+        let had = c.is_some();
+        *c = None;
+        had
+    };
+    if had_models || had_catalogs {
+        tracing::info!(
+            "cvscan idle-unload: sessions+catalogs released after {}ms without scan traffic",
+            now.saturating_sub(last)
+        );
+    }
+    had_models || had_catalogs
+}
 
 fn catalog_key(game: &str, use_lang: Option<&str>) -> String {
     format!("{game}{}", suffix(use_lang))
@@ -245,28 +468,32 @@ fn load_catalog(game: &str, lang: Option<&str>) -> Result<Arc<Catalog>, String> 
             .map(|v| v.as_str().unwrap_or_default().to_string())
             .collect();
         let n = ids.len();
-        let buf = std::fs::read(local_bin(&dir, game, use_lang.as_deref())).map_err(|e| e.to_string())?;
-        if buf.len() != n * dim * 4 {
+        let bin = local_bin(&dir, game, use_lang.as_deref());
+        let file = std::fs::File::open(&bin).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if len != n * dim * 4 {
             return Err(format!(
-                "local {game} catalog is {} bytes, expected {}",
-                buf.len(),
+                "local {game} catalog is {len} bytes, expected {}",
                 n * dim * 4
             ));
         }
-        let cat = buf
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // mmap-backed zero-copy f32 (iter-42); heap parse only if mmap fails.
+        let cat = CatBuf::from_bin_file(file, len)?;
+        let ids = IdStore::from_vec(&ids);
         Catalog { lang: use_lang.clone().unwrap_or_else(|| "English".into()), local: true, n, dim, cat, ids, set_of: Mutex::new(None) }
     } else {
-        let members = npz::load_npz(&catalog_path(&dir, game).to_string_lossy())?;
+        // Streaming member extraction (iter-42): only the two arrays this
+        // branch reads are decoded, straight off disk — no whole-56-MB-file
+        // buffer, no oracle_ids/source/spec parses, and the members are MOVED
+        // out of the map (the old v.clone() of the 56 MB f32 table plus the
+        // retained map was the measured VmHWM hotspot).
+        let mut members = npz::load_npz_members(&catalog_path(&dir, game).to_string_lossy(), &["embeddings", "card_ids"])?;
         let emb = members
-            .get("embeddings")
+            .remove("embeddings")
             .ok_or("npz: no embeddings")?
-            .as_ref()
             .map_err(|e| e.clone())?;
-        let f32s = match &emb.data {
-            NpyData::F32(v) => v.clone(),
+        let f32s = match emb.data {
+            NpyData::F32(v) => CatBuf::Owned(v),
             _ => return Err("npz embeddings not f4".into()),
         };
         if emb.shape.len() != 2 {
@@ -275,14 +502,14 @@ fn load_catalog(game: &str, lang: Option<&str>) -> Result<Arc<Catalog>, String> 
         let n = emb.shape[0];
         let dim = emb.shape[1];
         let ids_member = members
-            .get("card_ids")
+            .remove("card_ids")
             .ok_or("npz: no card_ids")?
-            .as_ref()
             .map_err(|e| e.clone())?;
-        let ids = match &ids_member.data {
-            NpyData::Str(v) => v.clone(),
+        let ids = match ids_member.data {
+            NpyData::Str(v) => IdStore::from_vec(&v),
             _ => return Err("npz card_ids not <U".into()),
         };
+        drop(members);
         Catalog { lang: "English".into(), local: false, n, dim, cat: f32s, ids, set_of: Mutex::new(None) }
     };
     let arc = Arc::new(cat);
@@ -338,8 +565,8 @@ fn row_sets(c: &Arc<Catalog>, game: &str, pool: &crate::db::DbPool) -> Result<Ar
         .ids
         .iter()
         .map(|raw| {
-            let id = raw.strip_suffix("_back").unwrap_or(raw).to_string();
-            let key = if c.local { id } else { format!("{game}-{id}") };
+            let id = raw.strip_suffix("_back").unwrap_or(raw);
+            let key = if c.local { id.to_string() } else { format!("{game}-{id}") };
             by_id.get(&key).filter(|s| !s.is_empty()).cloned()
         })
         .collect();
@@ -1066,6 +1293,8 @@ pub fn match_scan(
     cropped: bool,
     pool: &crate::db::DbPool,
 ) -> Result<Value, MatchError> {
+    // Activity stamp for the idle-unload janitor (iter-42, see CATALOGS).
+    touch_scan_use();
     let cats = load_all(game, lang).map_err(MatchError)?;
 
     // Set scoping is a per-catalog FILTER (drop catalogs with no rows in scope;
@@ -1144,7 +1373,7 @@ pub fn match_scan(
     let mut candidates: Vec<Map<String, Value>> = Vec::new();
     for (i, sim, ci) in &hits {
         let c = &search[*ci].0;
-        let raw = c.ids.get(*i).cloned().unwrap_or_default();
+        let raw = c.ids.get(*i).unwrap_or_default().to_string();
         let id = raw.strip_suffix("_back").unwrap_or(&raw).to_string();
         if !seen.insert(id.clone()) {
             continue;
@@ -1558,6 +1787,111 @@ mod tests {
 
     fn pt(x: f64, y: f64) -> Pt {
         Pt { x, y }
+    }
+
+    #[test]
+    fn id_store_packed_roundtrip_matches_string_vec() {
+        let src: Vec<String> = ["mtg-1234", "mtg-9_back", "", "ünïcödé-é"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let store = IdStore::from_vec(&src);
+        assert_eq!(store.len(), 4);
+        for (i, want) in src.iter().enumerate() {
+            assert_eq!(store.get(i), Some(want.as_str()), "row {i}");
+        }
+        assert_eq!(store.get(4), None);
+        assert_eq!(store.get(9999), None);
+        let collected: Vec<&str> = store.iter().collect();
+        assert_eq!(collected, vec!["mtg-1234", "mtg-9_back", "", "ünïcödé-é"]);
+        // The row_sets strip_suffix pattern must behave identically on the
+        // packed store as it did on Vec<String>.
+        assert_eq!(store.get(1).unwrap().strip_suffix("_back"), Some("mtg-9"));
+        assert_eq!(store.get(0).unwrap().strip_suffix("_back"), None);
+        // Empty store (n=0): offs = [0] only.
+        let empty = IdStore::from_vec(&[]);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.get(0), None);
+        assert_eq!(empty.iter().count(), 0);
+    }
+
+    #[test]
+    fn cat_buf_mmap_equals_heap_parse() {
+        let vals: Vec<f32> = vec![1.5, -2.25, 0.0, f32::MIN, 3.4028235e38, 0.1];
+        let mut raw = Vec::new();
+        for v in &vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("scrybox-catbuf-{}.bin", std::process::id()));
+        std::fs::write(&path, &raw).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len() as usize;
+        assert_eq!(len, vals.len() * 4);
+        let mapped = CatBuf::from_bin_file(file.try_clone().unwrap(), len).unwrap();
+        assert_eq!(&mapped[..], &vals[..], "mmap read-back must equal LE parse");
+        // Length not f32-aligned => mmap arm refuses, heap fallback still
+        // parses the whole 4-byte groups exactly like the old read path.
+        let mut odd = raw.clone();
+        odd.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&path, &odd).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let fallback = CatBuf::from_bin_file(file, odd.len()).unwrap();
+        assert_eq!(&fallback[..], &vals[..], "heap fallback chunks_exact(4)");
+        // Zero-length file: mmap arm refuses, fallback parses zero groups.
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let zero = CatBuf::from_bin_file(file, 0).unwrap();
+        assert_eq!(zero.len(), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn janitor_sweep_releases_only_after_ttl() {
+        // LAST_SCAN_MS / CATALOGS are process statics; only this test touches
+        // them (no scan traffic in the unit suite), and MODELS stays empty —
+        // the sweep must tolerate that too.
+        let dummy = |n: u32| {
+            Arc::new(Catalog {
+                lang: "English".into(),
+                local: false,
+                n: n as usize,
+                dim: 2,
+                cat: CatBuf::Owned(vec![0.0; n as usize * 2]),
+                ids: IdStore::from_vec(&(0..n).map(|i| format!("id-{i}")).collect::<Vec<String>>()),
+                set_of: Mutex::new(None),
+            })
+        };
+        {
+            let mut m = CATALOGS.guard();
+            *m = Some(HashMap::from([("mtg".to_string(), dummy(3))]));
+        }
+        // TTL not yet elapsed: keep everything.
+        LAST_SCAN_MS.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        assert!(!janitor_sweep(1_000_000 + 5_000, 900_000), "inside TTL must not unload");
+        assert!(CATALOGS.guard().is_some());
+        // TTL elapsed: release, and report that something was freed.
+        assert!(janitor_sweep(1_000_000 + 900_001, 900_000), "past TTL must unload");
+        assert!(CATALOGS.guard().is_none());
+        // Idempotent second sweep: nothing left, reports false, stays clear.
+        assert!(!janitor_sweep(1_000_000 + 2_000_000, 900_000));
+        // TTL 0 disables entirely even with a loaded catalog present.
+        {
+            let mut m = CATALOGS.guard();
+            *m = Some(HashMap::from([("mtg".to_string(), dummy(1))]));
+        }
+        assert!(!janitor_sweep(u64::MAX, 0), "TTL=0 disables");
+        assert!(CATALOGS.guard().is_some());
+        // Clean up + touch_scan_use re-arms the clock (no tokio runtime in
+        // tests => no janitor task armed, matching the pre-iter-42 bin).
+        {
+            let mut m = CATALOGS.guard();
+            *m = None;
+        }
+        let before = crate::util::now_ms_u64();
+        touch_scan_use();
+        let after = crate::util::now_ms_u64();
+        let stamped = LAST_SCAN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(stamped >= before && stamped <= after, "stamp is now_ms, not a unit slip");
     }
 
     #[test]
