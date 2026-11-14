@@ -100,7 +100,9 @@ async function runTestFile(file) {
 
 async function main() {
   if (RUST_MODE) {
-    console.log('E2E RUST MODE: scrybox-server standalone (Node-free), RUST_ROUTES=*.');
+    console.log('E2E RUST MODE: scrybox-server standalone (Node-free), RUST_ROUTES=*.'
+      + (process.env.SCRYBOX_E2E_DOCKER_IMAGE
+        ? ` Container arm: docker run ${process.env.SCRYBOX_E2E_DOCKER_IMAGE} (network host, DB dir bind-mounted).` : ''));
     const only = (process.env.E2E_ONLY || '').split(',').map(s => s.trim()).filter(Boolean);
     if (only.length) {
       files.length = 0;

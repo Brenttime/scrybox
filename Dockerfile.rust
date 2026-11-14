@@ -115,10 +115,10 @@ RUN set -eu; \
       mkdir -p "/staging$(dirname "$lib")"; \
       cp -p "$lib" "/staging$lib"; \
     done; \
-    mkdir -p /staging/opt/ort /staging/opt/lib /staging/usr/local/bin /staging/bin \
+    mkdir -p /staging/opt/ort/lib /staging/opt/lib /staging/usr/local/bin /staging/bin \
              /staging/etc/ssl/certs /staging/etc/ssl/private /staging/tmp; \
     cp -p /payload/bin/scrybox-server /staging/usr/local/bin/scrybox-server; \
-    cp -p /payload/ort/libonnxruntime.so.1 /staging/opt/ort/libonnxruntime.so.1; \
+    cp -p /payload/ort/libonnxruntime.so.1 /staging/opt/ort/lib/libonnxruntime.so.1; \
     cp -p /payload/lib/libscryjpeg.so /staging/opt/lib/libscryjpeg.so; \
     cp -p /usr/sbin/gosu /staging/usr/local/bin/gosu; \
     cp -p /usr/local/bin/curl-impersonate /staging/usr/local/bin/curl-impersonate; \
