@@ -1300,15 +1300,94 @@ impl CollectionCache {
 /// climbs to 32 MB, and `free` only trims the heap top), so a run that
 /// repeatedly rebuilds the ~27 MB full-collection body ratchets RSS upward
 /// even when the cache map holds only a few live bodies (iter-15: ~3 GB
-/// against a live set well under 1 GB). Two levers, set once at boot:
-/// allocations ≥ 64 MB always go through mmap (munmapped on free — covers
-/// gz members concatenated and future bigger bodies), and the trim threshold
-/// is pinned so `malloc_trim` can return the rest.
+/// against a live set well under 1 GB). Three levers, set once at boot
+/// (memory queue item 2 / review MEMORY.md #4, owner ruling 2026-11-13
+/// 20:25): allocations ≥ `ALLOC_MMAP_THRESHOLD_BYTES` always go through mmap
+/// (munmapped on free — covers the 27-32 MB full-collection bodies, gz
+/// members and the 32 MB chunk-pool buffers, which at the old 64 MB ceiling
+/// lived in the brk/arena heap and fragmented it — the 224 MB `[heap]`
+/// region in MEMORY.md's a2mmap0 sample); the trim threshold is pinned so
+/// `malloc_trim` can return the rest; and the arena count defaults to
+/// `ARENA_MAX_DEFAULT` IN CODE so the win no longer depends on the launcher
+/// exporting `MALLOC_ARENA_MAX` (an explicit, valid env value still wins —
+/// it is glibc's own boot-time setting and the operator's intent).
 pub(crate) fn tune_allocator() {
     #[cfg(target_env = "gnu")]
     unsafe {
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, ALLOC_MMAP_THRESHOLD_BYTES);
         libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 20);
+        if arena_max_from_env().is_none() {
+            libc::mallopt(libc::M_ARENA_MAX, ARENA_MAX_DEFAULT);
+        }
+    }
+}
+
+/// Owner-bound 4-8 MB (MEMORY.md #4: measured with no speed cost; the mmap/
+/// munmap per 27 MB build adds ~1 ms, negligible against the build cost).
+/// 8 MB keeps sub-body-sized working sets (search pages, chunk pieces)
+/// arena-side while every full build lands in mmap'd, free()-returned pages.
+pub(crate) const ALLOC_MMAP_THRESHOLD_BYTES: libc::c_int = 8 << 20;
+/// Matches the MALLOC_ARENA_MAX=2 both lanes already run (MEMORY.md #1:
+/// the single biggest env lever, −345 MB peak on this 4-core box).
+pub(crate) const ARENA_MAX_DEFAULT: libc::c_int = 2;
+
+/// `MALLOC_ARENA_MAX` honoured when set to a positive integer (glibc reads
+/// it itself at boot; the in-code default must not silently override an
+/// operator's value). Garbage/0/negative/unset → None → apply the default.
+fn arena_max_from_env() -> Option<libc::c_int> {
+    std::env::var("MALLOC_ARENA_MAX")
+        .ok()?
+        .trim()
+        .parse::<libc::c_int>()
+        .ok()
+        .filter(|v| *v > 0)
+}
+
+/// Idle-heap return (MEMORY.md #4): trim used to run ONLY when a prune or
+/// eviction freed ≥ `TRIM_DIRTY_BYTES` (64 MB), so during quiet periods the
+/// freed multi-MB blocks just sat in the arenas — MEMORY.md measured settle
+/// stuck at 388-443 MB because the trim never fired. This timer trims every
+/// 30 s while NEITHER cache has produced a body (both `computes` counters
+/// unchanged), i.e. only when no request-path compute is in flight or just
+/// landed; a full `malloc_trim` costs well under a ms at these heap sizes
+/// (iter-24 measurement), so a quiet 2 s poll is the whole cost.
+const IDLE_TRIM_TICK: Duration = Duration::from_secs(2);
+const IDLE_TRIM_QUIET_TICKS: u32 = 15;
+
+pub fn spawn_idle_trim_timer(state: &AppState) {
+    let collection = Arc::clone(&state.collection_cache);
+    let search = Arc::clone(&state.search_cache);
+    tune_allocator(); // idempotent; runs even when the collection/search groups are off
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(IDLE_TRIM_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: Option<(u64, u64)> = None;
+        let mut quiet_ticks: u32 = 0;
+        loop {
+            tick.tick().await;
+            if idle_trim_due(&mut last, (collection.computes(), search.computes()), &mut quiet_ticks) {
+                trim_heap();
+            }
+        }
+    });
+}
+
+/// Decision core of `spawn_idle_trim_timer`, pure for testing: returns true
+/// once per `IDLE_TRIM_QUIET_TICKS` consecutive ticks during which the
+/// computes pair was unchanged, resetting the streak whenever it fires or
+/// the counters move.
+fn idle_trim_due(last: &mut Option<(u64, u64)>, now: (u64, u64), quiet_ticks: &mut u32) -> bool {
+    if *last == Some(now) {
+        *quiet_ticks = quiet_ticks.saturating_add(1);
+    } else {
+        *last = Some(now);
+        *quiet_ticks = 0;
+    }
+    if *quiet_ticks >= IDLE_TRIM_QUIET_TICKS {
+        *quiet_ticks = 0;
+        true
+    } else {
+        false
     }
 }
 
@@ -2324,5 +2403,65 @@ mod poison_m2 {
             cache.inner.guard().entries.contains_key(&k2),
             "writes must survive a poisoned store"
         );
+    }
+}
+
+#[cfg(test)]
+mod alloc_tune {
+    //! Memory queue item 2 (MEMORY.md #4): tune_allocator's glibc levers
+    //! and the idle-trim timer's decision core.
+
+    use super::{
+        arena_max_from_env, idle_trim_due, ALLOC_MMAP_THRESHOLD_BYTES, ARENA_MAX_DEFAULT,
+        IDLE_TRIM_QUIET_TICKS,
+    };
+
+    #[test]
+    fn mmap_threshold_and_arena_cap_within_owner_bounds() {
+        // Owner ruling 2026-11-13 20:25: mmap threshold 4-8 MB, arena cap 2
+        // (the value both lanes already export). Guards against a silent
+        // re-bump back to the old 64 MB that left a 224 MB [heap] region.
+        assert!((4 << 20..=8 << 20).contains(&ALLOC_MMAP_THRESHOLD_BYTES));
+        assert_eq!(ARENA_MAX_DEFAULT, 2);
+    }
+
+    #[test]
+    fn arena_max_env_override() {
+        // Single test owns MALLOC_ARENA_MAX (env is process-global; no
+        // sibling test touches it). Explicit valid value wins over the
+        // in-code default; garbage must fall through to the default.
+        std::env::set_var("MALLOC_ARENA_MAX", "8");
+        assert_eq!(arena_max_from_env(), Some(8));
+        std::env::set_var("MALLOC_ARENA_MAX", " 3 ");
+        assert_eq!(arena_max_from_env(), Some(3), "value is trimmed");
+        std::env::set_var("MALLOC_ARENA_MAX", "0");
+        assert_eq!(arena_max_from_env(), None, "0 is nonsense, use the default");
+        std::env::set_var("MALLOC_ARENA_MAX", "-1");
+        assert_eq!(arena_max_from_env(), None);
+        std::env::set_var("MALLOC_ARENA_MAX", "abc");
+        assert_eq!(arena_max_from_env(), None);
+        std::env::remove_var("MALLOC_ARENA_MAX");
+        assert_eq!(arena_max_from_env(), None, "unset -> in-code default applies");
+    }
+
+    #[test]
+    fn idle_trim_fires_only_after_the_quiet_window() {
+        let mut last = None;
+        let mut q = 0;
+        // Activity on either counter keeps resetting: never trim mid-traffic.
+        for i in 0..(IDLE_TRIM_QUIET_TICKS * 2) {
+            let now = (i as u64 / 3, 0);
+            assert!(!idle_trim_due(&mut last, now, &mut q), "moving counters must not trim (tick {i})");
+        }
+        // Fully idle: fires exactly once per window, not every tick.
+        let mut fired = 0;
+        for _ in 0..(IDLE_TRIM_QUIET_TICKS * 2 + 1) {
+            if idle_trim_due(&mut last, (99, 99), &mut q) {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 2, "one trim per {IDLE_TRIM_QUIET_TICKS}-tick window");
+        // A compute immediately after a trim re-arms the full window.
+        assert!(!idle_trim_due(&mut last, (99, 100), &mut q));
     }
 }
