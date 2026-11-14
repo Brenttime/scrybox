@@ -43,7 +43,15 @@ fn mock_sidecar() -> &'static str {
                     let j = |s: String| {
                         (
                             axum::http::StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"))],
+                            [
+                                (axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json")),
+                                // Keep-alive reuse race (measured ~10% of binary runs): the
+                                // shared BytesClient pools one connection to this port across
+                                // pins; when the pool hands a detect request a connection the
+                                // server had just closed, the POST dies unretried → Up::Failed
+                                // → 502. close-after-response removes the reuse window.
+                                (axum::http::header::CONNECTION, axum::http::HeaderValue::from_static("close")),
+                            ],
                             axum::body::Body::from(s),
                         )
                     };
@@ -106,7 +114,15 @@ fn parked_probe(
     // (passing only under --test-threads=1). call_once blocks late arrivals
     // until the single writer is done.
     static URL_SET: std::sync::Once = std::sync::Once::new();
-    URL_SET.call_once(|| std::env::set_var("CARDSCAN_URL", mock_sidecar()));
+    URL_SET.call_once(|| {
+        std::env::set_var("CARDSCAN_URL", mock_sidecar());
+        // Same race class as CARDSCAN_URL: the telemetry pin's raw
+        // set_var(SCAN_TELEMETRY_DIR) raced the other pins' concurrent env
+        // reads (torn reads starved the detect leg — detect failed
+        // 'never completed' at default parallelism, green under
+        // --test-threads=1). One writer, before any request phase.
+        std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
+    });
     let dir = std::env::temp_dir().join(format!("scrybox-cspark-{}", scrybox_server::auth_support::uuid_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = seed(&dir);
@@ -277,7 +293,6 @@ fn detect_does_not_park_the_runtime_worker_at_the_live_cap() {
 fn telemetry_does_not_park_the_runtime_worker_at_the_live_cap() {
     // Full standalone arm (NO sidecar leg): auth → body → record fold →
     // JSONL append via the existing spawn_blocking file hop.
-    std::env::set_var("SCAN_TELEMETRY_DIR", std::env::temp_dir().join("scrybox-cspark-telemetry-dir"));
     let body = r#"{"session":"s-1","records":[{"ev":"tap"}]}"#;
     let (_s, bytes, pool) = parked_probe("POST", "/api/cardscan/telemetry", Some("application/json"), Some(body), 204);
     assert!(bytes.is_empty(), "204 carries no body, got {bytes:?}");
@@ -297,7 +312,13 @@ fn scan_match_does_not_park_the_runtime_worker_at_the_live_cap() {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 200]);
     let body = format!(r#"{{"image":"data:image/jpeg;base64,{b64}"}}"#);
-    let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 200);
+    // Hermetic test env: no catalog is ever registered → is_built is
+    // deterministically false → Node's own 503-notBuilt arm (collection.js
+    // :304 res.status(503)); the iter-55 note's 'green' expected 200, which
+    // is not a status this arm can answer. Pre-fix the pin dies at
+    // recv_timeout ('never completed'), so the status expectation does not
+    // touch red-before-green.
+    let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 503);
     let v = parse(&bytes);
     assert!(
         v["error"].is_string() && (v["notBuilt"].as_bool() == Some(true) || v["error"] == serde_json::json!("Scan match failed")),
