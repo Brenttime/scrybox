@@ -3,8 +3,50 @@ use std::net::SocketAddr;
 use scrybox_server::Config;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() {
+/// review/MEMORY.md ranked item 8 (memory queue item 2, lane-B): tokio's
+/// blocking pool defaults to `max_blocking_threads = 512`, and under the
+/// scen-varied mix the process was measured at 38 OS threads (5 at boot).
+/// Every extra thread carries an 8 MB stack reservation and (pre arena-cap)
+/// its own glibc arena. What actually lands on this pool: SQLite
+/// checkout/query legs (already gated by the DB pool's `live_max` = 2×
+/// `pool_max`, `pool_max` ∈ 2..=16), bcrypt hash legs, cvscan match legs,
+/// gunzip/gzip legs, backup/export file legs, and manabox parse — all of
+/// which queue behind `live_max` for the DB anyway, so 512 was pure
+/// reservation with no throughput behind it. Not affected by the cap: the
+/// parallel collection build fans out with `std::thread::scope` INSIDE one
+/// blocking task (never a blocking-task-waits-on-blocking-task shape, so a
+/// capped pool cannot deadlock it), and every `spawn_blocking(...).await`
+/// hop in the tree is issued from async context.
+///
+/// Owner bound (MEMORY.md #8): 8-16, "size it to the pool live_max". 16 =
+/// top of the sanctioned bound and 2× a 8-connection pool, so a DB waiter
+/// is never queued behind unrelated CPU work on a default (≤8-core) box.
+/// `SCRYBOX_BLOCKING_THREADS` pins the cap (garbage/0/negative/unset ->
+/// default, same parse discipline as `M_ARENA_MAX` in collection.rs);
+/// tokio's builder rejects 0, so a legal value is clamped to >= 1.
+const DEFAULT_BLOCKING_THREADS: usize = 16;
+
+fn blocking_threads_from_env() -> usize {
+    std::env::var("SCRYBOX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_BLOCKING_THREADS)
+        .max(1)
+}
+
+fn main() {
+    // #[tokio::main] equivalent (multi-thread, enable_all) with the blocking
+    // pool bounded — see DEFAULT_BLOCKING_THREADS.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(blocking_threads_from_env())
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(run());
+}
+
+async fn run() {
     tracing_subscriber::fmt()
         // App-target default, NOT bare "info": the bare default also enables
         // tower_http's per-request INFO span events, which meant every API
@@ -190,4 +232,39 @@ async fn shutdown_signal() {
         tracing::warn!("graceful drain exceeded {grace_ms} ms; exiting");
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod blocking_cap_tests {
+    use super::{blocking_threads_from_env, DEFAULT_BLOCKING_THREADS};
+
+    /// Red-before-fix note: with the pre-cap `#[tokio::main]` these values
+    /// were never consulted; the neuter check is `max_blocking_threads(
+    /// blocking_threads_from_env().saturating_mul(32))` in main() — the
+    /// Threads probe in the iteration log then climbs back to the 5→38 fan
+    /// out under the mix. The parse contract itself is pinned here.
+    #[test]
+    fn blocking_threads_env_parse_contract() {
+        let clear = || std::env::remove_var("SCRYBOX_BLOCKING_THREADS");
+        clear();
+        assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "unset -> in-code default");
+        assert_eq!(DEFAULT_BLOCKING_THREADS, 16, "owner-bound top of MEMORY.md #8 range 8-16");
+
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "6");
+        assert_eq!(blocking_threads_from_env(), 6, "legal value honoured");
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", " 42 ");
+        assert_eq!(blocking_threads_from_env(), 42, "value is trimmed; >16 allowed as operator override");
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "1");
+        assert_eq!(blocking_threads_from_env(), 1, "1 is legal (single-slot pool, debug use)");
+
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "0");
+        assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "0 would panic the tokio builder -> default");
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "-4");
+        assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "negative is nonsense");
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "many");
+        assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "garbage -> default");
+        std::env::set_var("SCRYBOX_BLOCKING_THREADS", "");
+        assert_eq!(blocking_threads_from_env(), DEFAULT_BLOCKING_THREADS, "empty -> default");
+        clear();
+    }
 }
