@@ -90,6 +90,12 @@ pub struct CollectionQ {
     /// against the fresh `remote:{membershipVersion}:{revision}` token per
     /// request (`check_remote_snapshot`).
     pub expected_snapshot: Option<String>,
+    /// `analyze(q).printing` — printing-level terms walk `unique:prints`
+    /// and intersect by exact card id (ownedByCardIds). Standalone only.
+    pub by_printing: bool,
+    /// Standalone sidecar mode: the parsed AST when `analyze().mode` is
+    /// 'local' — answerLocally's input for the engine-outage fallback.
+    pub fallback_ast: Option<crate::scryq::Node>,
 }
 
 impl CollectionQ {
@@ -108,15 +114,19 @@ impl CollectionQ {
         format!("{}\u{0}{}", self.cqc_q(), self.lang_code)
     }
     fn cqc_q(&self) -> String {
-        if self.scry_code == "en" {
+        let base = if self.scry_code == "en" {
             self.walk_base.clone()
         } else {
             format!("({})", self.walk_base)
-        }
+        };
+        if self.by_printing { format!("{base} unique:prints") } else { base }
     }
     /// The engine query: `runWalk` fetches `${q} unique:cards` (byPrinting is
     /// always false on this branch — printing operators fail the gate).
     pub fn walk_q(&self) -> String {
+        if self.by_printing {
+            return self.cqc_q();
+        }
         format!("{} unique:cards", self.cqc_q())
     }
     /// (limit, offset) when the caller asked for a window; None = unbounded.
@@ -519,7 +529,7 @@ pub async fn get_names(st: AppState, cq: &Arc<CollectionQ>) -> NamesOutcome {
                 return Ok(Ok((e, false)));
             }
             init_st.collq_cache.walks.fetch_add(1, Ordering::Relaxed);
-            let mut walk = match sidecar::walk_collection_names(&init_st, &init_base, &init_cq.walk_q(), &init_cq.lang_code, WALK_LIMIT).await {
+            let mut walk = match sidecar::walk_collection_names(&init_st, &init_base, &init_cq.walk_q(), &init_cq.lang_code, WALK_LIMIT, init_cq.by_printing).await {
                 Ok(w) => w,
                 Err(e) => return Ok(Err(e)),
             };
@@ -594,6 +604,17 @@ const OWNED_BASE: &str = "
     WHERE c.user_id = ? AND c.quantity > 0
       AND LOWER(TRIM(COALESCE(cc.name, ''))) IN (SELECT value FROM json_each(?))";
 
+/// ownedByCardIds' swap of the membership predicate.
+const OWNED_BASE_IDS: &str = "
+    FROM collection c
+    JOIN card_cache cc ON c.card_id = cc.id
+    WHERE c.user_id = ? AND c.quantity > 0
+      AND c.card_id IN (SELECT value FROM json_each(?))";
+
+fn owned_base(by_printing: bool) -> &'static str {
+    if by_printing { OWNED_BASE_IDS } else { OWNED_BASE }
+}
+
 /// The fully-built native response for the q leg.
 pub struct Built {
     pub raw: Vec<u8>,
@@ -661,7 +682,7 @@ pub fn build(pool: &DbPool, cq: &CollectionQ, entry: &Arc<QEntry>) -> BuildOutco
     let clean: Vec<String> = entry
         .names
         .iter()
-        .map(|n| n.trim().to_lowercase())
+        .map(|n| if cq.by_printing { n.clone() } else { n.trim().to_lowercase() })
         .filter(|n| !n.is_empty())
         .filter(|n| seen.insert(n.clone()))
         .collect();
@@ -684,7 +705,7 @@ pub fn build(pool: &DbPool, cq: &CollectionQ, entry: &Arc<QEntry>) -> BuildOutco
         total_header
     } else if cq.include_total {
         let membership = serde_json::to_string(&clean).unwrap_or_else(|_| "[]".into());
-        match owned_count(&conn, cq.user_id, &membership) {
+        match owned_count(&conn, cq.user_id, &membership, cq.by_printing) {
             Ok(n) => Some(n.to_string()),
             Err(e) => return BuildOutcome::Failed(e),
         }
@@ -759,7 +780,7 @@ pub fn check_remote_snapshot(
 fn owned_rows(conn: &Connection, cq: &CollectionQ, membership: &str) -> Result<Vec<Value>, String> {
     let window = cq.row_window();
     let mut sql = format!("SELECT {PROJECTION}");
-    sql.push_str(OWNED_BASE);
+    sql.push_str(owned_base(cq.by_printing));
     let mut params: Vec<Sql> = vec![Sql::Integer(cq.user_id), Sql::Text(membership.to_string())];
     if let Some((limit, offset)) = window {
         sql.push_str("\n    ORDER BY c.added_at DESC, c.id DESC LIMIT ? OFFSET ?");
@@ -783,8 +804,8 @@ fn owned_rows(conn: &Connection, cq: &CollectionQ, membership: &str) -> Result<V
     Ok(out)
 }
 
-fn owned_count(conn: &Connection, user_id: i64, membership: &str) -> Result<i64, String> {
-    let sql = format!("SELECT COUNT(*) AS n {OWNED_BASE}");
+fn owned_count(conn: &Connection, user_id: i64, membership: &str, by_printing: bool) -> Result<i64, String> {
+    let sql = format!("SELECT COUNT(*) AS n {}", owned_base(by_printing));
     let mut stmt = conn.prepare_cached(&sql).map_err(|e| format!("prepare count: {e}"))?;
     let mut rows = stmt
         .query(rusqlite::params![user_id, membership])
@@ -949,6 +970,12 @@ pub struct LocalQ {
     pub limit: i64,
     pub include_total: bool,
     pub expected_snapshot: Option<String>,
+    /// Full-grammar AST (standalone): when set, compileWhere runs over it
+    /// (scryq) instead of `leaves`.
+    pub ast: Option<crate::scryq::Node>,
+    /// answerLocally reached through the engine-outage catch: Node relabels
+    /// it cacheStatus/source 'local-fallback' (X-Source emitted).
+    pub outage_fallback: bool,
 }
 
 /// One token → accepted leaf, None (whole query leaves the leg) on anything
@@ -1058,6 +1085,8 @@ pub fn local_plan(
         limit,
         include_total,
         expected_snapshot,
+        ast: None,
+        outage_fallback: false,
     })
 }
 
@@ -1177,6 +1206,94 @@ fn compile_where(leaves: &[Leaf], p: &mut Vec<Sql>) -> String {
     } else {
         format!("AND ({})", parts.join(" AND "))
     }
+}
+
+/// rawQuerySql.compileRawQuery twin over the accepted local-leaf subset
+/// (runSearch's `answerLocally` for the database/internet raw-q leg):
+/// `SELECT cc.* FROM card_cache cc WHERE cc.language = ? AND <where>
+/// ORDER BY LOWER(cc.name), cc.set_id, cc.number, cc.id LIMIT ? OFFSET ?`
+/// plus the COUNT twin. Returns (sql, params, count_sql, count_params).
+pub fn compile_raw_query(leaves: &[Leaf], language: &str, limit: i64, offset: i64) -> (String, Vec<Sql>, String, Vec<Sql>) {
+    let mut p: Vec<Sql> = Vec::new();
+    let where_sql = compile_where(leaves, &mut p);
+    let base = "FROM card_cache cc WHERE cc.language = ?";
+    let sql = format!("SELECT cc.* {base}{where_sql} ORDER BY LOWER(cc.name), cc.set_id, cc.number, cc.id LIMIT ? OFFSET ?");
+    let count_sql = format!("SELECT COUNT(*) AS n {base}{where_sql}");
+    let mut params = vec![Sql::Text(language.to_string())];
+    params.extend(p.iter().cloned());
+    let mut count_params = params.clone();
+    params.push(Sql::Integer(limit));
+    params.push(Sql::Integer(offset));
+    count_params.truncate(1 + p.len());
+    (sql, params, count_sql, count_params)
+}
+
+/// The data-backed (analyze mode 'local') leaves of a raw query, when the
+/// whole query is inside the local-leaf subset; None otherwise (catalog
+/// operators, otag, or anything the subset cannot prove).
+pub fn raw_local_leaves(q: &str) -> Option<Vec<Leaf>> {
+    local_plan(0, q, false, 1, 1, false, None, false).map(|l| l.leaves)
+}
+
+/// toScryfall's `is:<TYPE_WORD>` → `t:` rewrite applied token-wise to a
+/// query outside walk_base's exact subset (the Scrybox extension Scryfall
+/// itself does not understand). Tokens inside quotes are left alone; a
+/// leading `-`/`(` and trailing `)` survive; hyphenated words become a
+/// quoted spaced type (`is:basic-land` → `t:"basic land"`).
+pub fn rewrite_is_types(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut in_q = false;
+    let mut tok = String::new();
+    let flush = |tok: &mut String, out: &mut String| {
+        if tok.is_empty() {
+            return;
+        }
+        let lead = tok.len() - tok.trim_start_matches(['-', '(']).len();
+        let body = &tok[lead..];
+        let trail = body.len() - body.trim_end_matches(')').len();
+        let core = &body[..body.len() - trail];
+        let mut done = false;
+        if core.len() > 3 && core[..3].eq_ignore_ascii_case("is:") && !core.contains('"') {
+            let v = core[3..].to_lowercase();
+            if TYPE_WORDS.contains(&v.as_str()) {
+                let r = v.replace('-', " ");
+                out.push_str(&tok[..lead]);
+                if r.contains(' ') {
+                    out.push_str(&format!("t:\"{r}\""));
+                } else {
+                    out.push_str(&format!("t:{r}"));
+                }
+                out.push_str(&body[body.len() - trail..]);
+                done = true;
+            }
+        }
+        if !done {
+            out.push_str(tok);
+        }
+        tok.clear();
+    };
+    for ch in q.chars() {
+        if in_q {
+            tok.push(ch);
+            if ch == '"' {
+                in_q = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_q = true;
+            tok.push(ch);
+            continue;
+        }
+        if is_js_ws(ch) {
+            flush(&mut tok, &mut out);
+            out.push(ch);
+        } else {
+            tok.push(ch);
+        }
+    }
+    flush(&mut tok, &mut out);
+    out
 }
 
 /// compileCollectionQuery's projection == Q_COLS (the walk leg's row order).
@@ -1303,7 +1420,13 @@ pub fn build_local(pool: &DbPool, lq: &LocalQ) -> LocalOutcome {
     }
 
     let mut params: Vec<Sql> = vec![Sql::Integer(lq.user_id)];
-    let where_sql = compile_where(&lq.leaves, &mut params);
+    let where_sql = match &lq.ast {
+        Some(ast) => match crate::scryq::compile_where(ast, &mut params) {
+            Ok(s) => s,
+            Err(e) => return LocalOutcome::Failed(e),
+        },
+        None => compile_where(&lq.leaves, &mut params),
+    };
     let eligible = if lq.tag_leg { "\n      AND cc.scryfall_search_eligible = 1" } else { "" };
     let base = format!("{LOCAL_BASE}{eligible}");
 

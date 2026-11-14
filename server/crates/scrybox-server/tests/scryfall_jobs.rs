@@ -19,7 +19,7 @@ use scrybox_server::{
     },
     card_norm::{default_search_eligible, normalize_card, oracle_id_for_card, scryfall_uuid},
     scryfall::{wait_ms, ScryOpts},
-    scry_jobs::{fetch_and_cache_sets, refresh_price_estimates, sweep_rows, update_collection_prices, update_collection_prices_chunked},
+    scry_jobs::{boot_price_catchup, fetch_and_cache_sets, refresh_price_estimates, sweep_rows, update_collection_prices, update_collection_prices_chunked},
 };
 
 fn seeded_db(dir: &std::path::Path, name: &str) -> Connection {
@@ -962,4 +962,32 @@ async fn sweep_autocommit_default_keeps_node_partial_write_shape() {
     assert_eq!(priced, 8, "cacheNormalizedCards commits as one autocommit up front (Node twin)");
     let ph: i64 = conn.query_row("SELECT COUNT(*) FROM price_history", [], |r| r.get(0)).unwrap();
     assert_eq!(ph, 5, "price rows 0..=4 had autocommitted before the poison");
+}
+
+/// server.js boot catch-up: refreshPriceEstimates runs even when the
+/// unforced sweep is not due (Rust previously skipped it with the sweep).
+#[tokio::test]
+async fn boot_catchup_refreshes_estimates_when_sweep_not_due() {
+    let (addr, mock) = spawn_mock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seeded_db(dir.path(), "bootest.db");
+    cache_normalized_cards(&conn, &[norm_card(&format!("mtg-{UUID1}"), "Shared Card", Some(3.0))]).unwrap();
+    cache_normalized_cards(&conn, &[norm_card("mtg-noprice-1", "Shared Card", None)]).unwrap();
+    conn.execute(
+        "UPDATE card_cache SET price_trend = NULL, price_normal = NULL, price_holofoil = NULL, price_etched = NULL, price_source = NULL WHERE id = 'mtg-noprice-1'",
+        [],
+    )
+    .unwrap();
+    mark_prices_swept(&conn, "mtg").unwrap(); // sweep not due
+    let scry = scry_for(addr, 0.001);
+    let (sweep, est) = boot_price_catchup(&conn, &scry).await.unwrap();
+    assert!(!sweep.swept);
+    assert!(est.is_some(), "estimates leg must run on boot");
+    assert!(mock.hits_for("POST /cards/collection").is_empty());
+    let (trend, flag): (Option<f64>, i64) = conn
+        .query_row("SELECT price_trend, price_estimated FROM card_cache WHERE id = 'mtg-noprice-1'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((trend, flag), (Some(3.0), 1));
 }

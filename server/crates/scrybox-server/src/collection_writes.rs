@@ -585,6 +585,104 @@ pub(crate) fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
     }
 }
 
+/// THE standalone (no Node upstream) answer for any request no native
+/// handler serves — the router fallback (`crate::proxy`) and every native
+/// handler's unowned method/shape land here. Mirrors server.js order for a
+/// request no Express route matches: the global `normalJson` parser (pre-auth,
+/// for EVERY path; skipped only for the large-body paths, whose matcher is
+/// the custom middleware's case-sensitive `req.path` test), then for `/api`
+/// (Express mounts are case-insensitive) the admin router's
+/// `authenticateToken, requireAdmin` under `/api/admin`, else the global
+/// `authenticateToken` gate, then the post-auth bigJson parsers (mounted, so
+/// case-insensitive; a body already parsed by normalJson is skipped), then
+/// finalhandler's `Cannot METHOD /path` 404 — METHOD/path being the ORIGINAL
+/// request's (HEAD stays HEAD, `/API/Foo/` stays as typed). Parser failures
+/// land in the generic error handler (413 too-large / 500 `Internal server
+/// error`).
+pub(crate) async fn standalone_unmatched(st: &AppState, req: Request) -> Response {
+    const LARGE: &[(&str, usize)] = &[
+        ("/api/import", BODY_BIG),
+        ("/api/scan-match", BODY_BIG),
+        ("/api/search", BODY_BIG),
+        ("/api/cardscan", BODY_BIG),
+        ("/api/manabox-sync", BODY_MANABOX),
+    ];
+    let method = req
+        .extensions()
+        .get::<crate::OrigMethod>()
+        .map(|m| m.0.clone())
+        .unwrap_or_else(|| req.method().clone());
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let lower = path.to_ascii_lowercase();
+    let under = |base: &str, p: &str| p == base || p.starts_with(&format!("{base}/"));
+    // server.js largeJsonPaths middleware: exact-case req.path test.
+    let skip_normal = LARGE.iter().any(|(p, _)| under(p, &path));
+    // app.use('/api/import', bigJson) etc.: case-insensitive mounts.
+    let big = LARGE.iter().find(|(p, _)| under(p, &lower)).map(|(_, cap)| *cap);
+    let read_cap = if skip_normal { big.unwrap_or(BODY_NORMAL) } else { BODY_NORMAL };
+    let (parts, bytes, oversize) = read_parts(req, read_cap).await;
+    let parse = |cap: usize| -> Option<Response> {
+        if !is_json_ct(&parts.headers) {
+            return None;
+        }
+        if oversize || bytes.len() > cap {
+            return Some(too_large());
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) if v.is_object() || v.is_array() => None,
+            _ => Some(internal_error()),
+        }
+    };
+    if !skip_normal {
+        if let Some(r) = parse(BODY_NORMAL) {
+            return r;
+        }
+    }
+    if under("/api", &lower) {
+        if let Some(pool) = st.db.as_ref() {
+            let is_get = method == Method::GET;
+            if under("/api/admin", &lower) {
+                let user = match crate::settings::authenticate(pool, &parts.headers, is_get) {
+                    Ok(u) => u,
+                    Err(r) => return r,
+                };
+                if let Some(r) = crate::settings::admin_gate(&user) {
+                    return r;
+                }
+            } else {
+                let token = bearer_token(&parts.headers).map(|s| s.to_string());
+                if let Err(r) = crate::auth::authenticate_async(pool, token.as_deref(), is_get).await {
+                    return r;
+                }
+            }
+        }
+        if skip_normal {
+            if let Some(cap) = big {
+                if let Some(r) = parse(cap) {
+                    return r;
+                }
+            }
+        }
+    }
+    crate::static_assets::express_default_404(&method, &path)
+}
+
+/// Unowned method on a native route: hybrid forwards to Node; standalone
+/// answers Node's no-route arms natively (see `standalone_unmatched`).
+pub(crate) async fn unowned(st: AppState, req: Request) -> Response {
+    if st.cfg.node_upstream.is_empty() {
+        return standalone_unmatched(&st, req).await;
+    }
+    crate::proxy(State(st), req).await
+}
+
 pub(crate) fn too_large() -> Response {
     json_error(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -636,7 +734,12 @@ pub(crate) fn rebuild(parts: axum::http::request::Parts, bytes: &[u8]) -> Reques
 /// `GET /collection/cardlist` — routes/collection.js:349.
 pub async fn handle_cardlist(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::GET {
-        return crate::proxy(State(st), req).await;
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'cardlist'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("cardlist".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -773,7 +876,7 @@ fn cardlist(pool: &DbPool, user_id: i64, uri: &Uri, headers: &HeaderMap) -> Resu
 pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     if method != Method::PUT && method != Method::DELETE {
-        return crate::proxy(State(st), req).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -800,8 +903,20 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
             // Rust does not port Node's Scryfall hydration (cardApi.js): hand
             // the untouched original request to Node so its own
             // getCardById/cache-retry path answers (and performs the write).
-            PutOutcome::Forward => {
+            PutOutcome::Forward(_) if !st.cfg.node_upstream.is_empty() => {
                 return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+            }
+            // Standalone: run Node's own fetch leg (cardApi.getCardById →
+            // scryGet + cacheCards), then re-run the port; a still-missing
+            // target is Node's `Card ID ${newCardId} not found.` 404.
+            PutOutcome::Forward(nc) => {
+                let _ = crate::cvscan::fetch_card_by_id(&st.scry, &pool, &nc).await;
+                match put_entry(&pool, &id, user.id, &body).await {
+                    PutOutcome::Response(r) => r,
+                    PutOutcome::Forward(nc) => {
+                        json_error(StatusCode::NOT_FOUND, &format!("Card ID {nc} not found."))
+                    }
+                }
             }
         }
     } else {
@@ -820,7 +935,12 @@ pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, re
 /// `POST /collection/bulk` — routes/collection.js:856.
 pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
-        return crate::proxy(State(st), req).await;
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'bulk'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("bulk".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -861,13 +981,14 @@ pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
 
 enum PutOutcome {
     Response(Response),
-    Forward,
+    /// Target printing (`newCardId`) missing from card_cache.
+    Forward(String),
 }
 
 async fn put_entry(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> PutOutcome {
     match put_inner(pool, id, user_id, body).await {
         Ok(PutOutcome::Response(r)) => PutOutcome::Response(r),
-        Ok(PutOutcome::Forward) => PutOutcome::Forward,
+        Ok(PutOutcome::Forward(nc)) => PutOutcome::Forward(nc),
         Err(e) => {
             tracing::error!(error = ?e, "Failed to update entry");
             PutOutcome::Response(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update entry"))
@@ -923,7 +1044,7 @@ async fn put_inner(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> Resul
             "SELECT * FROM card_cache WHERE id = ?1",
             &[SqlValue::Text(nc.clone())],
         )?;
-        let Some(target) = target else { return Ok(PutOutcome::Forward) };
+        let Some(target) = target else { return Ok(PutOutcome::Forward(nc.clone())) };
 
         let current_name = get_row_map(
             &conn,
@@ -1730,6 +1851,13 @@ pub(crate) enum AddPlan {
 /// no-op since v3). Node-strict order: card_id → printing → cache lookup →
 /// printingInLanguage → quantity/stack/pricing defaults.
 pub(crate) fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, WriteError> {
+    plan_add_ex(conn, merged, false)
+}
+
+/// `loc_exhausted`: the standalone getPrintingInLang network leg already
+/// ran (and cached whatever Scryfall answered in that language), so a
+/// still-missing localized row is Node's `null` → keep the picked row.
+fn plan_add_ex(conn: &Connection, merged: &Map<String, Value>, loc_exhausted: bool) -> Result<AddPlan, WriteError> {
     let card_id_v = merged.get("card_id");
     if js_falsy(card_id_v) {
         return Ok(AddPlan::Reject("card_id is required".into()));
@@ -1799,7 +1927,10 @@ pub(crate) fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result
                         };
                         row = loc;
                     }
-                    // Network fetch + cacheCards — Node's job.
+                    // getPrintingInLang null after its fetch leg: keep row.
+                    None if loc_exhausted => {}
+                    // Network fetch + cacheCards — Node's job (hybrid), or
+                    // the standalone leg in `plan_add_standalone`.
                     None => return Ok(AddPlan::Forward),
                 }
             }
@@ -1979,10 +2110,90 @@ async fn fetch_card_then_replan(
     }
 }
 
+/// Standalone (no Node upstream) outcome of one addCardToCollection plan.
+pub(crate) enum StandalonePlan {
+    Plan(AddPlan),
+    /// `AddCardError(404, `Card ID ${card_id} not found.`)`.
+    NotFound(String),
+}
+
+/// Standalone twin of addCardToCollection's pre-insert block INCLUDING its
+/// network legs (`cardApi.getCardById` and `printingInLanguage` →
+/// `getPrintingInLang`), so no plan ever needs a Node to forward to.
+/// Never returns `AddPlan::Forward`/`FetchCard`. A non-string card_id that
+/// misses card_cache is Node's `cardId.startsWith` TypeError → `Err`
+/// (the routes' generic 500 / per-entry 'Failed to add card').
+pub(crate) async fn plan_add_standalone(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    merged: &Map<String, Value>,
+) -> Result<StandalonePlan, WriteError> {
+    let plan = {
+        let conn = pool.get().map_err(|_| WriteError::Bind)?;
+        plan_add_ex(&conn, merged, false)?
+    };
+    let plan = match plan {
+        AddPlan::FetchCard(card_id) => {
+            if crate::cvscan::fetch_card_by_id(&st.scry, pool, &card_id).await.is_none() {
+                return Ok(StandalonePlan::NotFound(card_id));
+            }
+            let conn = pool.get().map_err(|_| WriteError::Bind)?;
+            match plan_add_ex(&conn, merged, false)? {
+                // Cache write landed but the row is unreadable: Node's null.
+                AddPlan::FetchCard(card_id) => return Ok(StandalonePlan::NotFound(card_id)),
+                p => p,
+            }
+        }
+        p => p,
+    };
+    if !matches!(plan, AddPlan::Forward) {
+        return Ok(StandalonePlan::Plan(plan));
+    }
+    // Forward = non-string id cache miss, or localized printing miss.
+    let row = {
+        let conn = pool.get().map_err(|_| WriteError::Bind)?;
+        get_row_map(&conn, "SELECT * FROM card_cache WHERE id = ?1", &[json_to_sql(merged.get("card_id"))?])?
+    };
+    let Some(row) = row else { return Err(WriteError::Bind) };
+    let language_default = Value::String("English".into());
+    let language = merged.get("language").unwrap_or(&language_default);
+    let (want_code, scry_code) = crate::search::lang_codes(lang_input(Some(language)).as_deref());
+    let set_raw = match row.get("set_id") {
+        Some(v) if truthy(v) => js_to_string(Some(v)),
+        _ => String::new(),
+    };
+    let set = set_raw.strip_prefix("mtg-").unwrap_or(&set_raw).to_lowercase();
+    let number = js_to_string(row.get("number"));
+    let name = crate::search::to_name(Some(&scry_code));
+    let path = format!(
+        "/cards/{}/{}/{}",
+        crate::sidecar::encode_uri_component(&set),
+        crate::sidecar::encode_uri_component(&number),
+        scry_code
+    );
+    if let Ok(Some(v)) = st.scry.get_opt(&path, &crate::scryfall::ScryOpts::default()).await {
+        if v.is_object() {
+            let norm = crate::sidecar::normalize_card(&v, &name);
+            let got = crate::search::lang_codes(norm.get("language").and_then(Value::as_str)).0;
+            if got == want_code {
+                let pool_w = Arc::clone(pool);
+                let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let conn = pool_w.get().map_err(|e| e.to_string())?;
+                    crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&norm))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            }
+        }
+    }
+    let conn = pool.get().map_err(|_| WriteError::Bind)?;
+    Ok(StandalonePlan::Plan(plan_add_ex(&conn, merged, true)?))
+}
+
 /// `POST /collection` — routes/collection.js route 3.
 pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
-        return crate::proxy(State(st), req).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
@@ -2014,7 +2225,19 @@ pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
         }
     };
-    let plan = match plan_add(&conn, m) {
+    let standalone = st.cfg.node_upstream.is_empty();
+    let planned = if standalone {
+        match plan_add_standalone(&st, &pool, m).await {
+            Ok(StandalonePlan::Plan(p)) => Ok(p),
+            Ok(StandalonePlan::NotFound(card_id)) => {
+                return json_error(StatusCode::NOT_FOUND, &format!("Card ID {card_id} not found."));
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        plan_add(&conn, m)
+    };
+    let plan = match planned {
         Ok(AddPlan::Reject(msg)) => return json_error(StatusCode::BAD_REQUEST, &msg),
         Ok(AddPlan::FetchCard(card_id)) => {
             // Node's cache-miss leg is cardApi.getCardById → scryGet
@@ -2072,13 +2295,20 @@ enum BulkEntry {
     /// getCardById fetch itself. Kept aside (pass 1 stays pure reads) so
     /// the legs can run sequentially, in request order, before any write.
     Fetch { merged: Map<String, Value>, card_id: Option<Value>, index: usize },
-    Forward,
+    /// Non-string id miss or localized-printing miss: hybrid forwards the
+    /// whole request; standalone resolves it via `plan_add_standalone`.
+    Forward { merged: Map<String, Value>, card_id: Option<Value>, index: usize },
 }
 
 /// routes/collection.js bulkAddToCollection + its route (BULK_ADD_MAX=250).
 pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
-        return crate::proxy(State(st), req).await;
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'bulk-add'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("bulk-add".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
@@ -2157,7 +2387,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         outcomes.push(match plan_add(&conn, &merged) {
             Ok(p @ AddPlan::Ready { .. }) => BulkEntry::Ready { plan: p, card_id, index },
             Ok(AddPlan::Reject(msg)) => BulkEntry::Failed { error: msg, card_id, index },
-            Ok(AddPlan::Forward) => BulkEntry::Forward,
+            Ok(AddPlan::Forward) => BulkEntry::Forward { merged, card_id, index },
             // A FetchCard entry with a deployed Node forwards the WHOLE
             // request (hybrid keeps byte-parity by letting Node author the
             // multi-entry fetches itself). Standalone rides the same
@@ -2173,7 +2403,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         });
     }
     drop(conn);
-    if outcomes.iter().any(|o| matches!(o, BulkEntry::Forward)) {
+    if !st.cfg.node_upstream.is_empty() && outcomes.iter().any(|o| matches!(o, BulkEntry::Forward { .. })) {
         return crate::proxy(State(st), rebuild(parts, &bytes)).await;
     }
 
@@ -2185,23 +2415,28 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
     if st.cfg.node_upstream.is_empty() {
         for i in 0..outcomes.len() {
             let (merged, card_id, index) = match &outcomes[i] {
-                BulkEntry::Fetch { merged, card_id, index } => {
+                BulkEntry::Fetch { merged, card_id, index }
+                | BulkEntry::Forward { merged, card_id, index } => {
                     (merged.clone(), card_id.clone(), *index)
                 }
                 _ => continue,
             };
             // Node: getCardById catch → null → AddCardError(404) — the bulk
-            // core's catch reports the AddCardError message per entry.
-            let cid_str = card_id.as_ref().map(|v| js_to_string(Some(v))).unwrap_or_default();
-            outcomes[i] = match fetch_card_then_replan(&st, &pool, &cid_str, &merged).await {
-                FetchCardOutcome::Ready(plan) => {
-                    BulkEntry::Ready { plan, card_id, index }
-                }
-                FetchCardOutcome::NotFound | FetchCardOutcome::Unusable => BulkEntry::Failed {
-                    error: format!("Card ID {cid_str} not found."),
+            // core's catch reports the AddCardError message per entry; a
+            // non-AddCardError (TypeError on a non-string id) is the
+            // generic per-card message.
+            outcomes[i] = match plan_add_standalone(&st, &pool, &merged).await {
+                Ok(StandalonePlan::Plan(AddPlan::Reject(error))) => BulkEntry::Failed { error, card_id, index },
+                Ok(StandalonePlan::Plan(plan)) => BulkEntry::Ready { plan, card_id, index },
+                Ok(StandalonePlan::NotFound(cid)) => BulkEntry::Failed {
+                    error: format!("Card ID {cid} not found."),
                     card_id,
                     index,
                 },
+                Err(e) => {
+                    tracing::error!(error=?e, "bulk add card failed");
+                    BulkEntry::Failed { error: "Failed to add card".into(), card_id, index }
+                }
             };
         }
     } else if outcomes.iter().any(|o| matches!(o, BulkEntry::Fetch { .. })) {
@@ -2256,7 +2491,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
             BulkEntry::Fetch { .. } => {
                 unreachable!("fetch entries resolve before the write pass")
             }
-            BulkEntry::Forward => unreachable!("handled by the pre-write forward"),
+            BulkEntry::Forward { .. } => unreachable!("handled by the pre-write forward"),
         }
     }
 

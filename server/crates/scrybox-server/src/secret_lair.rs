@@ -264,7 +264,9 @@ struct Preview {
 /// owned-count DB failure). MTGJSON-side throws stay Err(PreconError).
 enum PreviewFail {
     Answer(PreconError),
-    Forward,
+    /// Carries Node's `err.message` for the Node-free leg (the route catch
+    /// answers `500 {error: 'Secret Lair <op> failed: <message>'}`).
+    Forward(String),
 }
 
 async fn preview_secret_lair_drop(
@@ -350,16 +352,16 @@ async fn preview_secret_lair_drop(
             // Rust replays the WHOLE request so Node produces the exact
             // axios-shaped message (precons-import policy).
             tracing::warn!("secret-lair preview: scryfall bulk fetch failed ({e}); forwarding to Node");
-            return Err(PreviewFail::Forward);
+            return Err(PreviewFail::Forward(e));
         }
     };
 
-    let pool = st.db.clone().ok_or(PreviewFail::Forward)?;
+    let pool = st.db.clone().ok_or_else(|| PreviewFail::Forward("database unavailable".into()))?;
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
-            return Err(PreviewFail::Forward);
+            return Err(PreviewFail::Forward(e.to_string()));
         }
     };
 
@@ -368,7 +370,7 @@ async fn preview_secret_lair_drop(
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
         if let Err(e) = cache_normalized_cards(&conn, &fresh) {
             tracing::error!("secret-lair preview: cacheCards failed: {e}; forwarding to Node");
-            return Err(PreviewFail::Forward);
+            return Err(PreviewFail::Forward(e.to_string()));
         }
     }
 
@@ -434,7 +436,7 @@ async fn preview_secret_lair_drop(
             Ok(rows) => rows,
             Err(e) => {
                 tracing::error!("secret-lair preview: owned-count query failed: {e}; forwarding to Node");
-                return Err(PreviewFail::Forward);
+                return Err(PreviewFail::Forward(e.to_string()));
             }
         };
         let mut owned_lower: HashMap<String, f64> = HashMap::new();
@@ -681,7 +683,10 @@ pub async fn route_preview(State(st): State<AppState>, req: Request) -> Response
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             json_error(status, &format!("Secret Lair preview failed: {}", e.message))
         }
-        Err(PreviewFail::Forward) => replay_get(st, &headers, "/api/secret-lair/preview", query).await,
+        Err(PreviewFail::Forward(msg)) if st.cfg.node_upstream.is_empty() => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Secret Lair preview failed: {msg}"))
+        }
+        Err(PreviewFail::Forward(_)) => replay_get(st, &headers, "/api/secret-lair/preview", query).await,
     }
 }
 
@@ -740,7 +745,10 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return json_error(status, &format!("Secret Lair add failed: {}", e.message));
         }
-        Err(PreviewFail::Forward) => {
+        Err(PreviewFail::Forward(msg)) if st.cfg.node_upstream.is_empty() => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Secret Lair add failed: {msg}"));
+        }
+        Err(PreviewFail::Forward(_)) => {
             return replay_post(st, &headers, "/api/secret-lair/add", &body_req).await;
         }
     };
@@ -871,6 +879,22 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
                 }
                 Ok(AddPlan::Reject(msg)) => {
                     planned.push((index, entry.clone(), Planned::Reject(msg)));
+                }
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
+                    // Node-free: addCardToCollection's own hydration legs
+                    // (getCardById / getPrintingInLang) run natively —
+                    // still before any write, so pass 1 stays read-only.
+                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
+                    let p = match plan_add_standalone(&st, &pool, &merged).await {
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
+                        Ok(StandalonePlan::Plan(p)) => Planned::Ready(p),
+                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
+                        Err(e) => {
+                            tracing::error!(error = ?e, "secret-lair add: plan failed");
+                            Planned::Reject("Failed to add card".into())
+                        }
+                    };
+                    planned.push((index, entry.clone(), p));
                 }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("secret-lair add: hydration-needing card, forwarding to Node");

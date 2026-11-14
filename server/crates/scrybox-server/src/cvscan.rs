@@ -1283,6 +1283,141 @@ fn parse_set_list(set: Option<&Value>) -> Result<Vec<String>, ()> {
     Ok(s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(String::from).collect())
 }
 
+/// cvScan.scoreCards twin (the image-ranked search leg of searchCards):
+/// embed the captured image once, then rankCardsByEmbedding — per card the
+/// max dot product over every catalog row whose id (with `_back` stripped)
+/// is the card's id / `mtg-`-less id / scryfall_id / tcgplayer ids, f32
+/// operands accumulated in f64 exactly like the JS loop. Scored cards gain
+/// `score` and `__match: {score}` (inserted BEFORE `owned_qty`, which Node
+/// attaches only after ranking); the list is then stably sorted by score
+/// desc (unscored = -Infinity), ties by image_url presence. Any failure
+/// returns the cards untouched (Node's catch → `return cards`).
+pub fn score_cards(buf: &[u8], game: &str, cards: Vec<Value>, lang: &str, cropped: bool) -> Vec<Value> {
+    if cards.len() <= 1 || buf.is_empty() || !is_built(game, lang) {
+        return cards;
+    }
+    let lang_opt = if lang.is_empty() { None } else { Some(lang) };
+    let run = || -> Result<Vec<f32>, String> {
+        touch_scan_use();
+        let cats = load_all(game, lang_opt)?;
+        if cats.is_empty() {
+            return Err("no catalogs".into());
+        }
+        let models = load_models()?;
+        let decoded = decode_rgb(buf)?;
+        let det = if cropped { use_client_crop(&decoded) } else { detect_and_dewarp(&models.corn, &decoded)? };
+        let mut outs = run_session(&models.milo, to_tensor(&det.rgb, EMBED_SIZE), EMBED_SIZE, &["embedding"])?;
+        if outs.is_empty() {
+            return Err("no embedding".into());
+        }
+        Ok(outs.remove(0))
+    };
+    let emb = match run() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("cvScan.scoreCards failed: {e}");
+            return cards;
+        }
+    };
+    let cats = match load_all(game, lang_opt) {
+        Ok(c) => c,
+        Err(_) => return cards,
+    };
+    // idMap per catalog: raw id (\_back stripped) → row indices.
+    let maps: Vec<HashMap<String, Vec<usize>>> = cats
+        .iter()
+        .map(|c| {
+            let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, id) in c.ids.iter().enumerate().take(c.n) {
+                let raw = id.strip_suffix("_back").unwrap_or(id).to_string();
+                m.entry(raw).or_default().push(i);
+            }
+            m
+        })
+        .collect();
+    let js_str = |v: &Value| -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            other => crate::precons::js_string(other),
+        }
+    };
+    let truthy = |v: Option<&Value>| crate::collection::truthy(v.unwrap_or(&Value::Null));
+    let mut scored: Vec<(Option<f64>, Value)> = Vec::with_capacity(cards.len());
+    for card in cards {
+        let mut ids: Vec<String> = Vec::new();
+        let mut add = |s: String| {
+            if !ids.contains(&s) {
+                ids.push(s);
+            }
+        };
+        if truthy(card.get("id")) {
+            let id = js_str(card.get("id").unwrap());
+            add(id.clone());
+            add(id.strip_prefix("mtg-").unwrap_or(&id).to_string());
+        }
+        for k in ["scryfall_id", "tcgplayer_id", "tcgplayer_product_id"] {
+            if truthy(card.get(k)) {
+                add(js_str(card.get(k).unwrap()));
+            }
+        }
+        let mut max: Option<f64> = None;
+        for (c, m) in cats.iter().zip(maps.iter()) {
+            for pid in &ids {
+                if let Some(idx) = m.get(pid) {
+                    for &i in idx {
+                        let off = i * c.dim;
+                        let mut dot = 0f64;
+                        for d in 0..c.dim {
+                            dot += (emb.get(d).copied().unwrap_or(f32::NAN) as f64) * (c.cat[off + d] as f64);
+                        }
+                        if max.map_or(true, |m| dot > m) {
+                            max = Some(dot);
+                        }
+                    }
+                }
+            }
+        }
+        let card = match (max, card) {
+            (Some(sc), Value::Object(obj)) => {
+                let mut out = serde_json::Map::with_capacity(obj.len() + 2);
+                let had_owned = obj.contains_key("owned_qty");
+                let mut owned: Option<Value> = None;
+                for (k, v) in obj {
+                    if k == "owned_qty" {
+                        owned = Some(v);
+                        continue;
+                    }
+                    if k == "score" || k == "__match" {
+                        continue;
+                    }
+                    out.insert(k, v);
+                }
+                let num = serde_json::Number::from_f64(sc).map(Value::Number).unwrap_or(Value::Null);
+                out.insert("score".into(), num.clone());
+                let mut mm = serde_json::Map::new();
+                mm.insert("score".into(), num);
+                out.insert("__match".into(), Value::Object(mm));
+                if had_owned {
+                    out.insert("owned_qty".into(), owned.unwrap_or(Value::Null));
+                }
+                Value::Object(out)
+            }
+            (_, c) => c,
+        };
+        scored.push((max, card));
+    }
+    scored.sort_by(|(a, ca), (b, cb)| {
+        let a = a.unwrap_or(f64::NEG_INFINITY);
+        let b = b.unwrap_or(f64::NEG_INFINITY);
+        if a != b {
+            return b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        let img = |c: &Value| if truthy(c.get("image_url")) { 1 } else { 0 };
+        img(cb).cmp(&img(ca))
+    });
+    scored.into_iter().map(|(_, c)| c).collect()
+}
+
 /// Full pipeline; returns the res.json body (pre-hydration) in Node's key order.
 pub fn match_scan(
     buf: &[u8],
@@ -1481,6 +1616,7 @@ fn hydrate_candidate(
     conn: &rusqlite::Connection,
     cand: &Map<String, Value>,
     lang_name: &str,
+    fetch_exhausted: bool,
 ) -> Result<Hydrate, String> {
     use rusqlite::types::Value as SqlValue;
     let card_id = match cand.get("cardId") {
@@ -1490,7 +1626,12 @@ fn hydrate_candidate(
     let row = crate::decks_reads::one_row(conn, "SELECT * FROM card_cache WHERE id = ?1", &[SqlValue::Text(card_id.clone())])
         .map_err(|e| e.to_string())?;
     let Some(row) = row else {
-        // Node would scryGet(/cards/<uuid>) + cacheCards → Forward.
+        // Node would scryGet(/cards/<uuid>) + cacheCards → Forward. When the
+        // fetch leg already ran here (standalone), a miss is Node's
+        // `if (!card) return cand`.
+        if fetch_exhausted {
+            return Ok(Hydrate::Unchanged(cand.clone()));
+        }
         return Ok(Hydrate::Forward);
     };
     let card = Value::Object(crate::decks_reads::parse_card_row(&row).map_err(|_| "parseCardRow".to_string())?);
@@ -1524,6 +1665,9 @@ fn hydrate_candidate(
                     use_card = Value::Object(
                         crate::decks_reads::parse_card_row(&loc_row).map_err(|_| "parseCardRow".to_string())?,
                     );
+                }
+                None if fetch_exhausted => {
+                    // getPrintingInLang null → `localized || card`.
                 }
                 None => {
                     // Node would scryGet the localized printing → Forward.
@@ -1580,6 +1724,9 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         Ok(v) => v,
         // strict bigJson rejects scalars/null/oversize — Node's parser owns
         // that error page; replay the untouched request.
+        // Node-zero: bigJson's SyntaxError reaches the global handler's 500
+        // (server.js:634) BEFORE the limiter counts the request.
+        Err(_) if cardscan::standalone(&st) => return crate::collection_writes::internal_error(),
         Err(_) => return crate::proxy(State(st), replay(parts, bytes, headers)).await,
     };
 
@@ -1674,6 +1821,15 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
     // No ORT dylib configured → the pipeline cannot run here; Node (with its
     // own bundled runtime) answers the whole request.
     if std::env::var("ORT_DYLIB_PATH").unwrap_or_default().is_empty() {
+        // Node-zero: no runtime and nobody to forward to — the model load
+        // failing inside Node's try is its catch-all 500.
+        if cardscan::standalone(&st) {
+            tracing::error!("scan-match: ORT_DYLIB_PATH unset in standalone mode");
+            return limit_headers(cardscan::res_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({ "error": "Scan match failed" }),
+            ));
+        }
         return crate::proxy(State(st), replay(parts, bytes, headers)).await;
     }
 
@@ -1716,6 +1872,14 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Standalone (no Node upstream): there is nobody to Forward to, so run
+    // Node's own fetch legs here — getCardById / getPrintingInLang scryGet +
+    // cacheCards for every card_cache miss — then hydrate with misses mapped
+    // to Node's null arms instead of Forward.
+    let standalone = st.cfg.node_upstream.is_empty();
+    if standalone {
+        prefetch_missing(&st.scry, &pool, &cands, &lang_name).await;
+    }
     let conn = match pool.get() {
         Ok(c) => c,
         Err(_) => {
@@ -1734,18 +1898,137 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
                 continue;
             }
         };
-        match hydrate_candidate(&conn, &cand_map, &lang_name) {
+        match hydrate_candidate(&conn, &cand_map, &lang_name, standalone) {
             Ok(Hydrate::Done(m)) => hydrated.push(Value::Object(m)),
             Ok(Hydrate::Unchanged(m)) => hydrated.push(Value::Object(m)),
             // would-fetch or DB oddity: whole-request replay to Node.
             Ok(Hydrate::Forward) | Err(_) => {
                 tracing::warn!(card = ?cand_map.get("cardId"), "scan-match hydrate Forward-to-Node");
+                // Standalone: Forward is impossible (fetch_exhausted); a DB
+                // fault is a throw inside Node's try → its 500.
+                if standalone {
+                    return limit_headers(cardscan::res_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &serde_json::json!({ "error": "Scan match failed" }),
+                    ));
+                }
                 return crate::proxy(State(st), replay(parts, bytes, headers)).await;
             }
         }
     }
     result.insert("candidates".into(), Value::Array(hydrated));
     limit_headers(cardscan::res_json(StatusCode::OK, &Value::Object(result)))
+}
+
+/// `scryfallApi.getCardById` with its fetch leg: card_cache first, else
+/// `scryGet('/cards/<rawId>')` → `cacheCards([normalizeCard(data)])`. None =
+/// Node's null (404, transport error, or a throwing cache write).
+pub(crate) async fn fetch_card_by_id(
+    scry: &crate::scryfall::Scry,
+    pool: &Arc<crate::db::DbPool>,
+    card_id: &str,
+) -> Option<Map<String, Value>> {
+    use rusqlite::types::Value as SqlValue;
+    {
+        let conn = pool.get().ok()?;
+        if let Some(row) = crate::decks_reads::one_row(&conn, "SELECT * FROM card_cache WHERE id = ?1", &[SqlValue::Text(card_id.to_string())]).ok()? {
+            return crate::decks_reads::parse_card_row(&row).ok();
+        }
+    }
+    let raw = card_id.strip_prefix("mtg-").unwrap_or(card_id);
+    let path = format!("/cards/{}", crate::sidecar::encode_uri_component(raw));
+    let v = match scry.get_opt(&path, &crate::scryfall::ScryOpts::default()).await {
+        Ok(Some(v)) if v.is_object() => v,
+        _ => return None,
+    };
+    let norm = crate::sidecar::normalize_card(&v, &crate::search::to_name(None));
+    let pool = Arc::clone(pool);
+    let n2 = norm.clone();
+    let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = pool.get().map_err(|e| e.to_string())?;
+        crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&n2)).map_err(|e| e.to_string())
+    })
+    .await;
+    match wrote {
+        Ok(Ok(())) => Some(norm),
+        _ => None,
+    }
+}
+
+/// Standalone twin of the fetch halves of Node's `scryfallApi.getCardById`
+/// (`scryGet('/cards/<rawId>')` → `cacheCards([normalizeCard(data)])`) and
+/// `getPrintingInLang` (`scryGet('/cards/<set>/<number>/<code>')`, kept only
+/// when Scryfall really answered in that language). Every failure is Node's
+/// swallowed catch → null; the caller then hydrates with `fetch_exhausted`.
+pub(crate) async fn prefetch_missing(
+    scry: &crate::scryfall::Scry,
+    pool: &Arc<crate::db::DbPool>,
+    cands: &[Value],
+    lang_name: &str,
+) {
+    use rusqlite::types::Value as SqlValue;
+    let (want_code, scry_code) = crate::search::lang_codes(Some(lang_name));
+    let opts = crate::scryfall::ScryOpts::default();
+    let cache = |norm: Map<String, Value>| {
+        let pool = Arc::clone(pool);
+        async move {
+            let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let conn = pool.get().map_err(|e| e.to_string())?;
+                crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&norm))
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        }
+    };
+    for cand in cands {
+        let Some(card_id) = cand.get("cardId").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let lookup = |sql: &'static str, params: Vec<SqlValue>| -> Option<Map<String, Value>> {
+            let conn = pool.get().ok()?;
+            let row = crate::decks_reads::one_row(&conn, sql, &params).ok()??;
+            crate::decks_reads::parse_card_row(&row).ok()
+        };
+        let card = fetch_card_by_id(scry, pool, card_id).await;
+        let Some(card) = card else { continue };
+        if scry_code == "en" {
+            continue;
+        }
+        let js = |v: Option<&Value>| match v {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(o) => crate::mfx_payload::js_to_string(o),
+        };
+        let set = js(card.get("set_id")).to_lowercase();
+        let number = js(card.get("number"));
+        if set.is_empty() || number.is_empty() {
+            continue;
+        }
+        let name = crate::search::to_name(Some(&scry_code));
+        if lookup(
+            "SELECT * FROM card_cache WHERE set_id = ?1 AND number = ?2 AND language = ?3 LIMIT 1",
+            vec![SqlValue::Text(set.clone()), SqlValue::Text(number.clone()), SqlValue::Text(name.clone())],
+        )
+        .is_some()
+        {
+            continue;
+        }
+        let path = format!(
+            "/cards/{}/{}/{}",
+            crate::sidecar::encode_uri_component(&set),
+            crate::sidecar::encode_uri_component(&number),
+            scry_code
+        );
+        if let Ok(Some(v)) = scry.get_opt(&path, &opts).await {
+            if v.is_object() {
+                let norm = crate::sidecar::normalize_card(&v, &name);
+                let got = crate::search::lang_codes(norm.get("language").and_then(Value::as_str)).0;
+                if got == want_code {
+                    cache(norm).await;
+                }
+            }
+        }
+    }
 }
 
 fn replay(parts: axum::http::request::Parts, bytes: Vec<u8>, headers: HeaderMap) -> Request {
@@ -1784,6 +2067,102 @@ pub fn spawn_warm() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // MVP standalone: a card_cache miss used to Forward the whole scan-match
+    // request to Node — with no Node upstream that was a 502 for every scan
+    // whose candidate the install had never cached. The fetch legs now run
+    // locally (getCardById / getPrintingInLang twins).
+    async fn scry_mock() -> (crate::scryfall::Scry, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{routing::get, Router, extract::Path, response::IntoResponse};
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let h2 = hits.clone();
+        let card = |id: &str, lang: &str, name: &str| serde_json::json!({
+            "object": "card", "id": id, "name": name, "lang": lang, "printed_name": name,
+            "set": "eld", "set_name": "Throne of Eldraine", "collector_number": "126",
+            "rarity": "common", "type_line": "Instant", "cmc": 2.0, "color_identity": ["R"],
+            "image_uris": {"normal": "http://x/n.jpg"}, "prices": {"usd": "0.10"}
+        });
+        let r = Router::new()
+            .route("/cards/{id}", get({ let h = h2.clone(); move |Path(id): Path<String>| { let h = h.clone(); async move {
+                h.lock().unwrap().push(format!("/cards/{id}"));
+                if id == "aaaaaaaa-0000-0000-0000-000000000001" {
+                    axum::Json(card(&id, "en", "Fling")).into_response()
+                } else {
+                    (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"object":"error","status":404}))).into_response()
+                }
+            }}}))
+            .route("/cards/{set}/{num}/{lang}", get({ let h = h2.clone(); move |Path((set, num, lang)): Path<(String, String, String)>| { let h = h.clone(); async move {
+                h.lock().unwrap().push(format!("/cards/{set}/{num}/{lang}"));
+                axum::Json(card("aaaaaaaa-0000-0000-0000-0000000000ja", &lang, "Fling-ja")).into_response()
+            }}}));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, r).await.unwrap() });
+        let scry = crate::scryfall::Scry::new(crate::scryfall::ScryEnv {
+            local: false,
+            local_url: format!("http://{addr}"),
+            base_url: format!("http://{addr}"),
+            gap_scale: 0.0,
+        });
+        (scry, hits)
+    }
+
+    fn mvp_pool() -> (tempfile::TempDir, Arc<crate::db::DbPool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        rusqlite::Connection::open(&path).unwrap()
+            .execute_batch(include_str!("../tests/schema_fixture.sql")).unwrap();
+        (dir, Arc::new(crate::db::DbPool::open(path, 2).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn standalone_prefetch_hydrates_card_cache_miss() {
+        let (scry, hits) = scry_mock().await;
+        let (_d, pool) = mvp_pool();
+        let cands = vec![
+            serde_json::json!({"cardId": "mtg-aaaaaaaa-0000-0000-0000-000000000001", "score": 0.9}),
+            serde_json::json!({"cardId": "mtg-aaaaaaaa-0000-0000-0000-00000000dead", "score": 0.1}),
+        ];
+        prefetch_missing(&scry, &pool, &cands, "English").await;
+        let conn = pool.get().unwrap();
+        // Fetched + cached: hydrates fully (was Forward → standalone 502).
+        match hydrate_candidate(&conn, cands[0].as_object().unwrap(), "English", true).unwrap() {
+            Hydrate::Done(m) => {
+                assert_eq!(m["name"], "Fling");
+                assert_eq!(m["set"], "eld");
+                assert_eq!(m["number"], "126");
+            }
+            _ => panic!("expected Done after standalone fetch"),
+        }
+        // Scryfall 404: Node's `if (!card) return cand` — unchanged, never Forward.
+        match hydrate_candidate(&conn, cands[1].as_object().unwrap(), "English", true).unwrap() {
+            Hydrate::Unchanged(m) => assert_eq!(&Value::Object(m), &cands[1]),
+            _ => panic!("expected Unchanged for a Scryfall 404"),
+        }
+        // Proxy mode keeps the Forward contract.
+        assert!(matches!(
+            hydrate_candidate(&conn, cands[1].as_object().unwrap(), "English", false).unwrap(),
+            Hydrate::Forward
+        ));
+        // A second prefetch is served from card_cache (no refetch of the hit).
+        let n = hits.lock().unwrap().iter().filter(|h| h.ends_with("000000000001")).count();
+        prefetch_missing(&scry, &pool, &cands[..1], "English").await;
+        assert_eq!(hits.lock().unwrap().iter().filter(|h| h.ends_with("000000000001")).count(), n);
+    }
+
+    #[tokio::test]
+    async fn standalone_prefetch_fetches_localized_printing() {
+        let (scry, hits) = scry_mock().await;
+        let (_d, pool) = mvp_pool();
+        let cands = vec![serde_json::json!({"cardId": "mtg-aaaaaaaa-0000-0000-0000-000000000001"})];
+        prefetch_missing(&scry, &pool, &cands, "Japanese").await;
+        assert!(hits.lock().unwrap().iter().any(|h| h == "/cards/eld/126/ja"), "{:?}", hits.lock().unwrap());
+        let conn = pool.get().unwrap();
+        match hydrate_candidate(&conn, cands[0].as_object().unwrap(), "Japanese", true).unwrap() {
+            Hydrate::Done(m) => assert_eq!(m["card"]["language"], "Japanese"),
+            _ => panic!("expected localized Done"),
+        }
+    }
 
     fn pt(x: f64, y: f64) -> Pt {
         Pt { x, y }
@@ -2138,8 +2517,13 @@ mod tests {
         // rowSets() reads card_cache (set_id per catalog row), so the truth
         // capture's candidate set is DB-dependent: run against the same lane
         // DB node-truth.json was captured from, not an empty temp file.
-        let lane_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../data/bindarr.db");
+        // SCRYBOX_EVAL_DB points the test at a scratch COPY of the lane DB
+        // (agents must never open the live lane DB directly).
+        let lane_db = std::env::var_os("SCRYBOX_EVAL_DB")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../data/bindarr.db"));
         if !lane_db.exists() {
             eval_skip("lane DB absent");
             return;

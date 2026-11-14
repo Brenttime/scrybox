@@ -63,7 +63,7 @@ use serde_json::{json, Value};
 use crate::auth::{authenticate, bearer_token};
 use crate::collection_writes::{
     get_row_map, internal_error, js_falsy, js_to_string, json_error, json_response,
-    json_to_sql_value, node_exact, parse_body, read_parts, rebuild, too_large, BodyOutcome, Tx,
+    json_to_sql_value, node_exact, parse_body, read_parts, too_large, BodyOutcome, Tx,
 };
 use crate::decks_reads::{js_number, js_trim};
 use crate::db::DbPool;
@@ -76,6 +76,7 @@ use crate::AppState;
 /// /api/lists collection dispatcher: GET stays with lists_reads when that
 /// group is on, POST create is native here, everything else forwards.
 pub async fn route_collection(State(st): State<AppState>, req: Request) -> Response {
+    let req = crate::decks_reads::head_as_get(&st, req);
     if req.method() == Method::POST && st.owns("lists_writes") {
         return handle_create(State(st), req).await;
     }
@@ -136,12 +137,19 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
     }
     match create_list(&pool, user.id, &body) {
         CreateOutcome::Response(res) => res,
-        CreateOutcome::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
     }
 }
 
 /// PUT /api/lists/order (routes/lists.js:292).
 pub async fn handle_order(State(st): State<AppState>, req: Request) -> Response {
+    // Express has no static /order for any method but PUT: GET/HEAD/DELETE
+    // /api/lists/order match router.get|delete('/:id') with id = "order"
+    // (List not found / 404 JSON, delete no-op). Hybrid forwards those to
+    // Node; Node-free dispatches them to the /:id entry natively.
+    if req.method() != Method::PUT && st.cfg.node_upstream.is_empty() {
+        let req = crate::decks_reads::head_as_get(&st, req);
+        return crate::lists_reads::route_entry(Path("order".to_string()), State(st), req).await;
+    }
     if !st.owns("lists_writes") || req.method() != Method::PUT {
         return crate::proxy(State(st), req).await;
     }
@@ -653,11 +661,6 @@ pub(crate) fn js_bind(v: &Value) -> SqlValue {
 
 enum CreateOutcome {
     Response(Response),
-    /// (unit 7c: the uncached-name hydration gate is gone — the batched
-    /// `/cards/collection` resolve now runs natively in handle_create, so
-    /// uncached lines report unmatched exactly like Node. Variant kept for
-    /// genuinely Node-owned futures.)
-    Forward,
 }
 
 /// `bulkFetchByIdentifier([{name}…])` (no `upstream` pin — so the shared

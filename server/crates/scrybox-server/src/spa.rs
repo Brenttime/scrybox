@@ -91,8 +91,14 @@ pub async fn handle(State(st): State<AppState>, req: Request) -> Response<Body> 
             || path == "/models/cornelius.onnx"
             || path.starts_with("/scryfall-portal"));
     if path.starts_with("/api") || trio_off {
+        // Node-free (empty upstream): proxy() answers locally (auth gate /
+        // finalhandler 404) — nothing upstream stamped helmet/COEP/cors, so
+        // the guard must, exactly as Node's stack did before next().
+        let standalone = st.cfg.node_upstream.is_empty();
         let mut res = crate::proxy(State(st), req).await;
-        res.extensions_mut().insert(crate::secheaders::NodeProxied);
+        if !standalone {
+            res.extensions_mut().insert(crate::secheaders::NodeProxied);
+        }
         return res;
     }
     let root = st.cfg.static_dir.clone().unwrap_or_default();

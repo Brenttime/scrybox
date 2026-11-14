@@ -346,13 +346,17 @@ async fn run() {
     // Built before AppState so the weekly tick shares AppState.scryfall_sets
     // (REVIEW concurrency-jobs L4: no fresh per-tick memo).
     let state = scrybox_server::AppState::new(cfg.clone());
-    if std::env::var("RUST_JOBS").unwrap_or_default().split(',').any(|s| s.trim() == "scryfall") {
+    let jobs = scrybox_server::scry_jobs::JobSet::parse(
+        &std::env::var("RUST_JOBS").unwrap_or_default(),
+        cfg.node_upstream.is_empty(),
+    );
+    if jobs.any() {
         match cfg.db_path.clone() {
             Some(path) => {
-                tracing::info!(db = %path.display(), "Rust Scryfall jobs enabled (RUST_JOBS=scryfall)");
-                scrybox_server::scry_jobs::start_job_timers(path, state.scryfall_sets.clone());
+                tracing::info!(db = %path.display(), ?jobs, "Rust background jobs enabled (RUST_JOBS)");
+                scrybox_server::scry_jobs::start_job_timers_with(path, state.scryfall_sets.clone(), jobs);
             }
-            None => tracing::warn!("RUST_JOBS=scryfall set but SCRYBOX_DB_PATH missing; jobs not started"),
+            None => tracing::warn!("RUST_JOBS set but SCRYBOX_DB_PATH missing; jobs not started"),
         }
     }
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.expect("bind");

@@ -623,6 +623,55 @@ fn hydrate_cards_forward(conn: &Connection, ids: &[String]) -> Result<Option<Vec
     Ok(Some(cards))
 }
 
+/// Standalone (no Node upstream) twin of hydrate()'s fetch lane: run
+/// getCardById's scryGet + cacheCards for every id hydrate() would read, so
+/// the caller can hydrate with fetch_on_miss = false (= Node's null arms)
+/// instead of Forwarding to an upstream that does not exist.
+pub(crate) fn standalone(st: &AppState) -> bool {
+    st.cfg.node_upstream.is_empty()
+}
+
+fn fetch_ids_of(result: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let ok = truthy(result.get("ok"));
+    if ok {
+        if let Some(v) = result.get("card").and_then(|c| c.get("id")).filter(|v| truthy(Some(v))) {
+            out.push(js_to_string(v));
+        }
+    } else if let Some(choices) = result.get("footer_ocr").and_then(|f| f.get("choices")).and_then(Value::as_array) {
+        if choices.len() > 1 {
+            for c in choices {
+                let v = match c.get("id") {
+                    Some(v) if truthy(Some(v)) => v.clone(),
+                    _ => c.get("scryfallId").cloned().unwrap_or(Value::Null),
+                };
+                if scry_id_ok(&v) {
+                    out.push(js_to_string(&v));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) async fn prefetch_ids(st: &AppState, ids: &[String]) {
+    let Some(pool) = st.db.as_ref() else { return };
+    for id in ids {
+        let _ = crate::cvscan::fetch_card_by_id(&st.scry, pool, &format!("mtg-{id}")).await;
+    }
+}
+
+/// Node-zero: a forward site's replacement when no Node upstream exists.
+/// Hybrid mode keeps the byte-for-byte replay to Node; standalone answers
+/// Node's own global-handler 500 (`server.js:634` — body-parser SyntaxError
+/// and any other non-413 error: `{error:'Internal server error'}`).
+async fn forward_or_500(st: &AppState, req: Request) -> Response {
+    if standalone(st) {
+        return crate::collection_writes::internal_error();
+    }
+    crate::proxy(State(st.clone()), req).await
+}
+
 fn owns(st: &AppState) -> bool {
     st.owns("cardscan")
 }
@@ -799,8 +848,14 @@ pub async fn handle_detect(State(st): State<AppState>, req: Request) -> Response
     let headers = parts.headers.clone();
     let raw = match parse_raw_image(&parts.headers, &bytes) {
         Ok(Some(b)) if b.len() >= 100 => b,
+        // bigJson (outer, /api/cardscan) runs before the route: a json-CT
+        // body it rejects never reaches 'Missing image' — global 500.
+        Ok(None) if parse_outer_json(&parts.headers, &bytes).is_err() => {
+            return forward_or_500(&st, replay(parts, bytes, headers)).await
+        }
         Ok(_) => return res_json(StatusCode::BAD_REQUEST, &serde_json::json!({"ok":false,"error":"Missing image"})),
-        Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+        // Unreachable: oversize raw bodies 413 above (read cap == raw limit).
+        Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
     };
     // Node pins BOTH Content-Type and X-Scan-Source on the detect leg.
     match call_bytes("/api/detect-cards", raw, "image/jpeg", &[("x-scan-source", "browser-camera".into())]).await {
@@ -832,12 +887,17 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
         // req.body not a Buffer → Missing image — but only when the outer
         // bigJson actually parsed it: a json-CT body that bigJson chokes on
         // (binary junk) is Node's own 500, so Forward and let it answer.
-        Ok(None) if !ct_is(&parts.headers, "application/json")
-            || bytes.is_empty()
-            || serde_json::from_slice::<Value>(&bytes).is_ok() => {
+        // A short raw image is Node's `req.body.length < 100` arm.
+        Ok(Some(_)) => {
             return res_json(StatusCode::BAD_REQUEST, &serde_json::json!({"ok":false,"error":"Missing image"}))
         }
-        _ => return crate::proxy(State(st.clone()), replay(parts, bytes, headers.clone())).await,
+        // req.body not a Buffer → Missing image — but only when the outer
+        // bigJson actually parsed it (strict: scalars are SyntaxErrors).
+        Ok(None) if parse_outer_json(&parts.headers, &bytes).is_ok() => {
+            return res_json(StatusCode::BAD_REQUEST, &serde_json::json!({"ok":false,"error":"Missing image"}))
+        }
+        // bigJson SyntaxError → global 500 (raw Err is unreachable: 413 above).
+        _ => return forward_or_500(&st, replay(parts, bytes, headers.clone())).await,
     };
     let via = sanitize(
         headers.get("x-scan-client").and_then(|v| v.to_str().ok()).unwrap_or(""),
@@ -869,13 +929,18 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
             };
             let mut results: Vec<Value> = Vec::new();
             let mut forward = false;
+            let fetch_on_miss = !standalone(&st);
+            if !fetch_on_miss {
+                let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
+                prefetch_ids(&st, &ids).await;
+            }
             {
                 let conn = match st.db.as_ref().unwrap().get() {
                     Ok(c) => c,
                     Err(_) => return upstream_error(&Up::Failed),
                 };
                 for x in &results_in {
-                    match hydrate(&conn, x, true) {
+                    match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(mut m)) => {
                             m.insert("cached".into(), Value::Bool(truthy(x.get("cached"))));
                             results.push(Value::Object(m));
@@ -889,7 +954,9 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
                 }
             }
             if forward {
-                return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await;
+                // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
+                // false); only a SQLite fault lands here.
+                return forward_or_500(&st, replay(parts, bytes, headers)).await;
             }
             let cands = match js_or_array(&data_v, "candidates") {
                 Ok(a) => a,
@@ -961,7 +1028,7 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
-        Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+        Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
     };
     let items: Vec<Value> = match body.get("results") {
         Some(Value::Array(a)) if !a.is_empty() && a.len() <= 8 => a.clone(),
@@ -982,10 +1049,14 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
     }
     let headers = parts.headers.clone();
     let mut results: Vec<Value> = Vec::with_capacity(ids.len());
+    let fetch_on_miss = !standalone(&st);
+    if !fetch_on_miss {
+        prefetch_ids(&st, &ids).await;
+    }
     {
         let conn = match st.db.as_ref().unwrap().get() {
             Ok(c) => c,
-            Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+            Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
         };
         // Node maps each item through the SAME hydrate() with a synthetic
         // result: {ok:true, scene_number:x.number, title:x.title,
@@ -1007,11 +1078,11 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
             synth.insert("title".into(), item.get("title").cloned().unwrap_or(Value::Null));
             synth.insert("card".into(), serde_json::json!({ "id": item.get("scryfallId").cloned().unwrap_or(Value::Null) }));
             synth.insert("footer_ocr".into(), serde_json::json!({ "resolved_by": item.get("via").cloned().unwrap_or(Value::Null) }));
-            match hydrate(&conn, &Value::Object(synth), true) {
+            match hydrate(&conn, &Value::Object(synth), fetch_on_miss) {
                 Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
                 Ok(Hydrate::Forward) | Ok(Hydrate::Throw) | Err(_) => {
                     drop(conn);
-                    return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await;
+                    return forward_or_500(&st, replay(parts, bytes, headers)).await;
                 }
             }
         }
@@ -1041,17 +1112,21 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
-        Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+        Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
     };
     let ids: Vec<String> = match body.get("ids") {
         Some(Value::Array(a)) => a.iter().map(|v| js_to_string(v)).collect(),
         _ => vec![],
     };
     let headers = parts.headers.clone();
+    let is_standalone = standalone(&st);
+    if is_standalone && ids.len() >= 2 && ids.len() <= 8 && ids.iter().all(|id| scry_id_ok(&Value::String(id.clone()))) {
+        prefetch_ids(&st, &ids).await;
+    }
     let outcome = {
         let conn = match st.db.as_ref().unwrap().get() {
             Ok(c) => c,
-            Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+            Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
         };
         hydrate_choices(&conn, &ids)
     };
@@ -1066,9 +1141,13 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
         ),
-        Ok(Choices::NeedsFetch) | Err(_) => {
-            crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await
-        }
+        // Standalone: the fetch already ran — a still-missing id is
+        // hydrateChoices' `cards.every(Boolean) ? cards : null` → 400.
+        Ok(Choices::NeedsFetch) if is_standalone => res_json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"ok":false,"error":"Expected 2-8 card ids that exist"}),
+        ),
+        Ok(Choices::NeedsFetch) | Err(_) => forward_or_500(&st, replay(parts, bytes, headers)).await,
     }
 }
 
@@ -1091,7 +1170,7 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
         Ok(v) => v,
-        Err(_) => return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await,
+        Err(_) => return forward_or_500(&st, replay(parts, bytes, headers)).await,
     };
     let cards = match body.get("cards") {
         Some(Value::Array(a)) if !a.is_empty() && a.len() <= 8 => a.clone(),
@@ -1119,13 +1198,18 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
             };
             let mut results: Vec<Value> = Vec::new();
             let mut forward = false;
+            let fetch_on_miss = !standalone(&st);
+            if !fetch_on_miss {
+                let ids: Vec<String> = results_in.iter().flat_map(fetch_ids_of).collect();
+                prefetch_ids(&st, &ids).await;
+            }
             {
                 let conn = match st.db.as_ref().unwrap().get() {
                     Ok(c) => c,
                     Err(_) => return upstream_error(&Up::Failed),
                 };
                 for x in &results_in {
-                    match hydrate(&conn, x, true) {
+                    match hydrate(&conn, x, fetch_on_miss) {
                         Ok(Hydrate::Done(m)) => results.push(Value::Object(m)),
                         Ok(Hydrate::Forward) | Err(_) => {
                             forward = true;
@@ -1136,7 +1220,9 @@ pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
                 }
             }
             if forward {
-                return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await;
+                // Standalone: Hydrate::Forward cannot occur (fetch_on_miss is
+                // false); only a SQLite fault lands here.
+                return forward_or_500(&st, replay(parts, bytes, headers)).await;
             }
             let mut body = Map::new();
             body.insert("ok".into(), Value::Bool(true));
@@ -1183,7 +1269,7 @@ pub async fn handle_telemetry(State(st): State<AppState>, req: Request) -> Respo
         Ok(v) => v,
         Err(_) => {
             let headers = parts.headers.clone();
-            return crate::proxy(State(st.clone()), replay(parts, bytes, headers)).await;
+            return forward_or_500(&st, replay(parts, bytes, headers)).await;
         }
     };
     if std::env::var("SCAN_TELEMETRY").map(|v| v == "0").unwrap_or(false) {

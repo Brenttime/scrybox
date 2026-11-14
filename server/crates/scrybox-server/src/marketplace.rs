@@ -1618,7 +1618,7 @@ async fn preview_fold(
     user_id: i64,
     lines: &OrderLines,
     include_extras: bool,
-) -> Result<Map<String, Value>, ()> {
+) -> Result<Map<String, Value>, String> {
     let mut m = Map::new();
     if lines.lines.is_empty() {
         // Node's early answer — deliberately MISSING totalCopies,
@@ -1632,7 +1632,7 @@ async fn preview_fold(
         m.insert("sealedCount".into(), json!(0));
         return Ok(m);
     }
-    let uniq = build_uniq(lines, false).map_err(|_| ())?;
+    let uniq = build_uniq(lines, false)?;
     let rows = bulk_rows(&uniq);
     let bulk = if rows.is_empty() {
         crate::precons::BulkOut { cards: Vec::new(), pairs: Vec::new(), not_found: 0 }
@@ -1641,15 +1641,15 @@ async fn preview_fold(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("marketplace preview: scryfall bulk fetch failed ({e}); forwarding to Node");
-                return Err(());
+                return Err(e);
             }
         }
     };
     let conn = match pool.get() {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             tracing::error!("marketplace preview: cannot open connection");
-            return Err(());
+            return Err(e.to_string());
         }
     };
     if !bulk.cards.is_empty() {
@@ -1657,7 +1657,7 @@ async fn preview_fold(
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
         if let Err(e) = cache_normalized_cards(&conn, &fresh) {
             tracing::error!("marketplace preview: cacheCards failed: {e}; forwarding to Node");
-            return Err(());
+            return Err(e.to_string());
         }
     }
     let mut seen: HashSet<String> = HashSet::new();
@@ -1748,7 +1748,7 @@ async fn preview_fold(
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!("marketplace preview: owned-count query failed: {e}; forwarding to Node");
-                    return Err(());
+                    return Err(e.to_string());
                 }
             };
             let mut owned: Vec<(String, f64)> = Vec::new();
@@ -1829,7 +1829,10 @@ struct AddResult {
 
 enum AddErr {
     /// Whole-request replay (scryfall leg, cache DB failure, plan Forward).
-    Replay,
+    /// `Some(message)` = a throw Node's route catch would answer as
+    /// `500 {error: message}` (the Node-free leg answers it natively);
+    /// `None` = a plan_add hydration leg only Node can run.
+    Replay(Option<String>),
     /// addOrderToCollection threw — route answers status||500 with this
     /// message (the numeric-scryfall_id TypeError today).
     Boom(String),
@@ -1875,16 +1878,16 @@ async fn add_fold(
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("marketplace add: scryfall bulk fetch failed ({e}); forwarding to Node");
-                return Err(AddErr::Replay);
+                return Err(AddErr::Replay(Some(e)));
             }
         }
     };
     // rusqlite guards are not Send: open only after the last await point.
     let conn = match pool.get() {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
             tracing::error!("marketplace add: cannot open connection");
-            return Err(AddErr::Replay);
+            return Err(AddErr::Replay(Some(e.to_string())));
         }
     };
     if !bulk.cards.is_empty() {
@@ -1892,7 +1895,7 @@ async fn add_fold(
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
         if let Err(e) = cache_normalized_cards(&conn, &fresh) {
             tracing::error!("marketplace add: cacheCards failed: {e}; forwarding to Node");
-            return Err(AddErr::Replay);
+            return Err(AddErr::Replay(Some(e.to_string())));
         }
     }
     let mode = match body.get("printing_mode") {
@@ -2001,9 +2004,24 @@ async fn add_fold(
             match plan_add(&conn, &merged) {
                 Ok(pl @ AddPlan::Ready { .. }) => planned.push((index, (*p).clone(), Planned::Ready(pl))),
                 Ok(AddPlan::Reject(msg)) => planned.push((index, (*p).clone(), Planned::Reject(msg))),
+                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
+                    // Node-free: hydrate natively (getCardById /
+                    // getPrintingInLang) before any write.
+                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
+                    let pl = match match st.db.as_ref() { Some(ap) => plan_add_standalone(st, ap, &merged).await, None => Err(crate::collection_writes::WriteError::Bind) } {
+                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
+                        Ok(StandalonePlan::Plan(pl)) => Planned::Ready(pl),
+                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
+                        Err(e) => {
+                            tracing::error!(error = ?e, "marketplace add: plan failed");
+                            Planned::Reject("Failed to add card".into())
+                        }
+                    };
+                    planned.push((index, (*p).clone(), pl));
+                }
                 Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
                     tracing::debug!("marketplace add: hydration-needing card, forwarding to Node");
-                    return Err(AddErr::Replay);
+                    return Err(AddErr::Replay(None));
                 }
                 // Non-AddCardError: Node console.errors and reports the
                 // generic per-card message.
@@ -2212,7 +2230,13 @@ async fn handle_preview(st: AppState, req: Request) -> Response {
     let mut out = parsed.to_json();
     let preview = match preview_fold(&st, &pool, user.id, &parsed.lines, include_extras).await {
         Ok(m) => m,
-        Err(()) => {
+        Err(msg) if st.cfg.node_upstream.is_empty() => {
+            // Node-free: the route catch — `err.message || 'Could not
+            // resolve the order lines'` (axios errors carry no .status).
+            let msg = if msg.is_empty() { "Could not resolve the order lines".to_string() } else { msg };
+            return mp_error_json(msg);
+        }
+        Err(_) => {
             return replay_post(st, &headers, "/api/marketplace/preview", &body).await;
         }
     };
@@ -2247,7 +2271,11 @@ async fn handle_add(st: AppState, req: Request) -> Response {
     let body_obj = body.as_object().cloned().unwrap_or_default();
     let result = match add_fold(&st, &pool, user.id, &parsed.lines, &body_obj).await {
         Ok(r) => r,
-        Err(AddErr::Replay) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
+        Err(AddErr::Replay(Some(msg))) if st.cfg.node_upstream.is_empty() => {
+            let msg = if msg.is_empty() { "Adding to collection failed".to_string() } else { msg };
+            return mp_error_json(msg);
+        }
+        Err(AddErr::Replay(_)) => return replay_post(st, &headers, "/api/marketplace/add", &body).await,
         Err(AddErr::Boom(msg)) => return mp_error_json(msg),
     };
     let mut out = Map::new();

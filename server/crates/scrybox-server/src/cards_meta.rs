@@ -186,6 +186,26 @@ async fn scry_page(
         uri.push_str("&order=");
         uri.push_str(o);
     }
+    if base.is_empty() {
+        // Upstream leg (Node-free, no sidecar): scryGetRetried through the
+        // shared paced client.
+        return match st.scry.get_retried(&uri, &crate::scryfall::ScryOpts::default(), 4).await {
+            Ok(Some(json @ Value::Object(_))) => {
+                let data = json.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let has_more = json.get("has_more").map(|v| js_truthy(Some(v))).unwrap_or(false);
+                let total = match json.get("total_cards") {
+                    Some(Value::Number(n)) => n.as_f64(),
+                    _ => None,
+                };
+                Ok((data, has_more, total))
+            }
+            Ok(_) => Ok((Vec::new(), false, None)),
+            Err(e) => match e.status {
+                Some(s) => Err(WinErr::Status(s)),
+                None => Err(WinErr::Transport),
+            },
+        };
+    }
     let uri = uri.parse::<hyper::Uri>().map_err(|_| WinErr::Transport)?;
     let mut last: i32 = -1; // -1 = transport, else the last HTTP status
     for attempt in 0..4u8 {
@@ -389,6 +409,11 @@ fn gate_core(st: &AppState, headers: &HeaderMap, want: &Method) -> Result<(std::
 fn local_base(st: &AppState) -> Option<String> {
     if st.scry.env().local {
         Some(st.scry.env().local_url.clone())
+    } else if st.cfg.node_upstream.is_empty() {
+        // Node-free: Node's fetchWindow would ask api.scryfall.com through
+        // its paced queue; the empty base routes scry_page through the
+        // shared Scry client (same pacing/429 cooldown, relative URL).
+        Some(String::new())
     } else {
         None
     }
@@ -440,6 +465,33 @@ pub fn safe_free_text(q: &str) -> bool {
     })
 }
 
+/// The QuerySyntaxError message for the tokenizer-provable rejects
+/// (collq::definitely_invalid's subset): an unterminated quote throws in
+/// readQuoted during tokenization — before any paren is balanced — so it
+/// wins; otherwise unbalanced parens are the parser's 'Unbalanced
+/// parenthesis'. None = not provably invalid (the engine decides).
+pub fn provable_syntax_error(q: &str) -> Option<&'static str> {
+    if !crate::collq::definitely_invalid(q) {
+        return None;
+    }
+    let mut in_q = false;
+    let mut esc = false;
+    for c in q.chars() {
+        if in_q {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_q = false;
+            }
+        } else if c == '"' {
+            in_q = true;
+        }
+    }
+    Some(if in_q { "Unterminated quoted phrase — close it with \"" } else { "Unbalanced parenthesis" })
+}
+
 /// stats.js `exact`: `!"${n.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`.
 fn exact_name_query(n: &str) -> String {
     format!("!\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""))
@@ -482,6 +534,11 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
     let parsed: Option<Value> = if is_json_ct && !bytes.is_empty() {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v @ (Value::Object(_) | Value::Array(_))) => Some(v),
+            // Node-free: body-parser's error reaches the global handler —
+            // strict-mode SyntaxError → `500 {error:'Internal server error'}`.
+            _ if st.cfg.node_upstream.is_empty() => {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            }
             Ok(_) => return replay_post_raw(&st, &headers, "/api/cards/highlight", &bytes).await,
             Err(_) => return replay_post_raw(&st, &headers, "/api/cards/highlight", &bytes).await,
         }
@@ -515,7 +572,16 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
 
     // analyze(q) validation gate: bare words provably never throw; anything
     // else is Node's grammar to judge (raw replay before any engine call).
-    if !safe_free_text(&q) || local_base(&st).is_none() {
+    // Node-free: no parser twin to reproduce analyze()'s QuerySyntaxError
+    // text, so a non-bare query goes straight to the engine (valid queries
+    // answer identically; the tokenizer-provable rejects get Node's 400
+    // status with a generic message — see collq::definitely_invalid).
+    if st.cfg.node_upstream.is_empty() && !safe_free_text(&q) {
+        if let Some(msg) = provable_syntax_error(&q) {
+            return err_json(StatusCode::BAD_REQUEST, msg);
+        }
+    }
+    if (!safe_free_text(&q) && !st.cfg.node_upstream.is_empty()) || local_base(&st).is_none() {
         return replay_post_raw(&st, &headers, "/api/cards/highlight", &bytes).await;
     }
     let base = local_base(&st).unwrap();

@@ -190,6 +190,11 @@ struct Fix {
 }
 
 async fn fixture(routes: &[&str]) -> Fix {
+    fixture_mode(routes, false).await
+}
+
+/// `node_free` = SCRYBOX_NODE_UPSTREAM empty (production: no Node at all).
+async fn fixture_mode(routes: &[&str], node_free: bool) -> Fix {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), "secret_lair.db");
     let node = spawn_fake_node().await;
@@ -198,7 +203,7 @@ async fn fixture(routes: &[&str]) -> Fix {
     let (scry_addr, scry) = mock_scryfall::spawn_mock().await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
-        node_upstream: format!("http://{node}"),
+        node_upstream: if node_free { String::new() } else { format!("http://{node}") },
         static_dir: None,
         rust_routes: routes.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
         db_path: Some(db.clone()),
@@ -1018,4 +1023,72 @@ async fn search_name_key_run_collapse() {
     assert_eq!(arr[0]["key"], "animar soul");
     assert_eq!(arr[0]["fileName"], "a1.json", "first-wins within the collapsed run");
     assert_eq!(arr[1]["key"], "the 90s binder experience");
+}
+
+
+// ---------------------------------------------------------------------------
+// Node-free: Scryfall client errors answer the route catch natively.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn standalone_preview_scryfall_error_is_route_catch() {
+    let f = fixture_mode(&["secret_lair"], true).await;
+    warm(&f).await;
+    *f.mtg.deck.lock().unwrap() = deck_body(ok_cards());
+    f.scry.statuses.lock().unwrap().insert("POST /cards/collection".to_string(), vec![500]);
+    let (s, _h, b) = request(
+        &f.router, "GET", "/api/secret-lair/preview?fileName=test_drop_SL1.json", &MEMBER, None,
+    )
+    .await;
+    assert_eq!(s, 500);
+    assert_eq!(
+        String::from_utf8_lossy(&b),
+        r#"{"error":"Secret Lair preview failed: Request failed with status code 500"}"#
+    );
+}
+
+#[tokio::test]
+async fn standalone_add_scryfall_error_is_route_catch() {
+    let f = fixture_mode(&["secret_lair"], true).await;
+    warm(&f).await;
+    *f.mtg.deck.lock().unwrap() = deck_body(ok_cards());
+    f.scry.statuses.lock().unwrap().insert("POST /cards/collection".to_string(), vec![500]);
+    let (s, _h, b) = request(
+        &f.router, "POST", "/api/secret-lair/add", &MEMBER_JSON,
+        Some(r#"{"fileName":"test_drop_SL1.json"}"#),
+    )
+    .await;
+    assert_eq!(s, 500);
+    assert_eq!(
+        String::from_utf8_lossy(&b),
+        r#"{"error":"Secret Lair add failed: Request failed with status code 500"}"#
+    );
+    let conn = Connection::open(&f.db_path).unwrap();
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM collection", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+}
+
+/// Node-free: a localized printing absent from card_cache used to replay the
+/// whole add to Node (502 with no Node). Now the getPrintingInLang leg runs
+/// natively (mock: no Japanese printing → 404 → English rows kept, filed
+/// with language Japanese — Node's own fallback).
+#[tokio::test]
+async fn standalone_add_localized_miss_hydrates_natively() {
+    let f = fixture_mode(&["secret_lair"], true).await;
+    warm(&f).await;
+    *f.mtg.deck.lock().unwrap() = deck_body(ok_cards());
+    script_ok_scry(&f);
+    let (s, _, b) = request(
+        &f.router, "POST", "/api/secret-lair/add", &MEMBER_JSON,
+        Some(r#"{"fileName":"test_drop_SL1.json","language":"Japanese"}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "{}", String::from_utf8_lossy(&b));
+    let body = json_body(&b);
+    assert_eq!(body["added"], 2, "{body}");
+    assert_eq!(body["failed"], json!([]));
+    let rows = added_rows(&f);
+    assert_eq!(rows.iter().map(|r| (r.0.as_str(), r.3.as_str())).collect::<Vec<_>>(),
+        vec![("mtg-aaa", "Japanese"), ("mtg-ccc", "Japanese")]);
+    assert!(!f.scry.hits_for("GET /cards/10e/1/ja").is_empty(), "printing-in-language lookup ran");
 }

@@ -100,6 +100,25 @@ fn list_exists(conn: &Connection, id: &str, user_id: i64) -> Result<bool, WriteE
 // POST /api/lists/:id/cards — routes/lists.js:491
 // ---------------------------------------------------------------------------
 
+/// No Node upstream configured (production MVP image): every former
+/// Forward must be answered here.
+pub(crate) fn standalone(st: &AppState) -> bool {
+    st.cfg.node_upstream.is_empty()
+}
+
+/// Node-free twin of `cardApi.getCardById`'s fetch leg (scryGet
+/// `/cards/<rawId>` + cacheCards). true = a card came back (Node continues
+/// past `if (!apiCard)`), false = null (every failure is swallowed).
+pub(crate) async fn standalone_fetch(st: &AppState, card_id: &str) -> bool {
+    let Some(pool) = st.db.as_ref() else { return false };
+    crate::cvscan::fetch_card_by_id(&st.scry, pool, card_id).await.is_some()
+}
+
+/// `res.status(404).json({ error: `Card ${card_id} not found on any card provider.` })`.
+pub(crate) fn not_on_provider(card_id: &str) -> Response {
+    json_error(StatusCode::NOT_FOUND, &format!("Card {card_id} not found on any card provider."))
+}
+
 enum AddOne {
     Response(Response),
     /// card_cache miss for a string id: Node hydrates via Scryfall.
@@ -129,9 +148,21 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match add_one(&pool, &id, user.id, &body) {
+    match add_one(&pool, &id, user.id, &body, false) {
         AddOne::Response(res) => res,
-        AddOne::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        AddOne::Forward if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        // Node-free: run getCardById's fetch leg here (scryGet + cacheCards);
+        // null -> the route's 404, else continue past the cache gate.
+        AddOne::Forward => {
+            let cid = js_to_string(body.get("card_id"));
+            if !standalone_fetch(&st, &cid).await {
+                return not_on_provider(&cid);
+            }
+            match add_one(&pool, &id, user.id, &body, true) {
+                AddOne::Response(res) => res,
+                AddOne::Forward => not_on_provider(&cid),
+            }
+        }
     }
 }
 
@@ -234,7 +265,7 @@ fn inc_fold(
     Ok(())
 }
 
-fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddOne {
+fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddOne {
     const FAILED: &str = "Failed to add card to list";
     let fail = |e: &dyn std::fmt::Debug| internal_fail(FAILED, "lists add-card", e);
     let card_id_v = body.get("card_id");
@@ -267,7 +298,7 @@ fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddOne {
         Ok(c) => c,
         Err(e) => return AddOne::Response(fail(&e)),
     };
-    if cached.is_none() {
+    if cached.is_none() && !fetched {
         if !matches!(card_id_v, Some(Value::String(_))) {
             // Node reaches cardApi.getCardById, whose `cardId.startsWith`
             // throws TypeError on a non-string -> route catch -> generic 500.
@@ -326,9 +357,36 @@ pub async fn handle_bulk_add(Path(id): Path<String>, State(st): State<AppState>,
     let Some(entries) = bulk_entries(&body) else {
         return json_error(StatusCode::BAD_REQUEST, "cards must be 1-250 entries");
     };
-    match bulk_add(&pool, &id, user.id, &entries) {
+    match bulk_add(&pool, &id, user.id, &entries, None) {
         Ok(AddOne::Response(res)) => res,
-        Ok(AddOne::Forward) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(AddOne::Forward) if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(AddOne::Forward) => {
+            // Node-free: run getCardById's fetch for every uncached string id
+            // (sequential, like Node's loop), then replay with the verdicts.
+            let mut fetched: HashMap<String, bool> = HashMap::new();
+            for e in &entries {
+                if let Some(Value::String(cid)) = e.get("card_id") {
+                    if cid.is_empty() || fetched.contains_key(cid) {
+                        continue;
+                    }
+                    let cached = pool
+                        .get()
+                        .ok()
+                        .and_then(|c| get_row_map(&c, "SELECT id FROM card_cache WHERE id = ?1", &[SqlValue::Text(cid.clone())]).ok())
+                        .flatten()
+                        .is_some();
+                    if !cached {
+                        let ok = standalone_fetch(&st, cid).await;
+                        fetched.insert(cid.clone(), ok);
+                    }
+                }
+            }
+            match bulk_add(&pool, &id, user.id, &entries, Some(&fetched)) {
+                Ok(AddOne::Response(res)) => res,
+                Ok(AddOne::Forward) => internal_fail("Failed to add cards to list", "lists bulk-add", &"unresolved hydrate"),
+                Err(e) => internal_fail("Failed to add cards to list", "lists bulk-add", &e),
+            }
+        }
         Err(e) => internal_fail("Failed to add cards to list", "lists bulk-add", &e),
     }
 }
@@ -341,7 +399,13 @@ fn bulk_entries(body: &Value) -> Option<Vec<Value>> {
     Some(arr.clone())
 }
 
-fn bulk_add(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<AddOne, WriteError> {
+fn bulk_add(
+    pool: &DbPool,
+    id: &str,
+    user_id: i64,
+    entries: &[Value],
+    fetched: Option<&HashMap<String, bool>>,
+) -> Result<AddOne, WriteError> {
     let conn = pool.get()?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(AddOne::Response(json_error(
@@ -362,8 +426,18 @@ fn bulk_add(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<
         match get_row_map(&conn, "SELECT id FROM card_cache WHERE id = ?1", &[js_bind(cid)]) {
             Ok(Some(_)) => pre.push(Pre::Cached),
             Ok(None) => {
-                pre.push(if matches!(card_id, Some(Value::String(_))) {
-                    Pre::Hydrate
+                pre.push(if let Some(Value::String(s)) = card_id {
+                    match fetched {
+                        // Standalone replay: getCardById already ran.
+                        Some(m) => {
+                            if m.get(s).copied().unwrap_or(false) {
+                                Pre::Cached
+                            } else {
+                                Pre::Failed
+                            }
+                        }
+                        None => Pre::Hydrate,
+                    }
                 } else {
                     Pre::Failed
                 })
@@ -399,10 +473,12 @@ fn bulk_add(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<
             }
         }
     }
+    // `res.status(failed.length && !added ? 500 : 200).json({ added, failed })`
+    // — the 500 still carries the counts body, not the outer catch's error.
     if !failed.is_empty() && added == 0 {
-        return Ok(AddOne::Response(json_error(
+        return Ok(AddOne::Response(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to add cards to list",
+            &json!({ "added": added, "failed": failed }),
         )));
     }
     Ok(AddOne::Response(json_response(
@@ -818,16 +894,33 @@ pub async fn handle_printing(
         return json_error(StatusCode::BAD_REQUEST, "card_id is required");
     }
     let to_id = js_to_string(card_v);
-    match change_printing(&pool, &id, &card_id, user.id, &to_id) {
+    match change_printing(&pool, &id, &card_id, user.id, &to_id, false) {
         Ok(Some(res)) => res,
-        Ok(None) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(None) if !standalone(&st) => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(None) => {
+            if !standalone_fetch(&st, &to_id).await {
+                return not_on_provider(&to_id);
+            }
+            match change_printing(&pool, &id, &card_id, user.id, &to_id, true) {
+                Ok(Some(res)) => res,
+                Ok(None) => not_on_provider(&to_id),
+                Err(e) => internal_fail("Failed to change printing", "lists change-printing", &e),
+            }
+        }
         Err(e) => internal_fail("Failed to change printing", "lists change-printing", &e),
     }
 }
 
 /// Ok(None) = hydration Forward (target printing not cached; Node hydrates
 /// or 404s `Card <id> not found on any card provider.`).
-fn change_printing(pool: &DbPool, id: &str, from_id: &str, user_id: i64, to_id: &str) -> Result<Option<Response>, WriteError> {
+fn change_printing(
+    pool: &DbPool,
+    id: &str,
+    from_id: &str,
+    user_id: i64,
+    to_id: &str,
+    fetched: bool,
+) -> Result<Option<Response>, WriteError> {
     let conn = pool.get()?;
     if !list_exists(&conn, id, user_id)? {
         return Ok(Some(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized")));
@@ -851,7 +944,7 @@ fn change_printing(pool: &DbPool, id: &str, from_id: &str, user_id: i64, to_id: 
         "SELECT id FROM card_cache WHERE id = ?1",
         &[SqlValue::Text(to_id.to_string())],
     )?;
-    if to_cached.is_none() {
+    if to_cached.is_none() && !fetched {
         return Ok(None);
     }
     let ka = sql_card_key("a");

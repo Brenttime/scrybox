@@ -58,6 +58,7 @@ use crate::AppState;
 /// GET /api/decks. Non-GET shapes never mount here (POST /api/decks stays
 /// fully proxied); defensive proxy anyway.
 pub async fn handle_list(State(st): State<AppState>, req: Request) -> Response {
+    let req = head_as_get(&st, req);
     if !st.owns("decks_reads") || st.db.is_none() || req.method() != Method::GET {
         return crate::proxy(State(st), req).await;
     }
@@ -155,6 +156,7 @@ pub async fn handle_locations(Path(id): Path<String>, State(st): State<AppState>
 /// Dispatcher for the /api/decks/{id} shape shared by the two decks groups.
 /// Method + kill-switch decides; anything this pair does not own proxies.
 pub async fn route_entry(Path(id): Path<String>, State(st): State<AppState>, req: Request) -> Response {
+    let req = head_as_get(&st, req);
     if req.method() == Method::GET && st.owns("decks_reads") {
         return handle_detail(Path(id), State(st), req).await;
     }
@@ -164,12 +166,26 @@ pub async fn route_entry(Path(id): Path<String>, State(st): State<AppState>, req
     crate::proxy(State(st), req).await
 }
 
+/// Express routes HEAD through the matching GET handler (router.get also
+/// answers HEAD; Node's http layer drops the body, headers incl.
+/// Content-Length/ETag stay). With no Node upstream the method-mismatch
+/// proxy leg would answer finalhandler's 404 instead, so standalone serves
+/// HEAD as GET — hyper strips the body on the wire for a HEAD request.
+/// Hybrid keeps forwarding HEAD to Node untouched.
+pub(crate) fn head_as_get(st: &AppState, mut req: Request) -> Request {
+    if req.method() == Method::HEAD && st.cfg.node_upstream.is_empty() {
+        *req.method_mut() = Method::GET;
+    }
+    req
+}
+
 /// Shared prologue: kill switch, body-parse-before-auth, auth gate.
 pub(crate) async fn guard_get<F, Fut>(st: AppState, req: Request, group: &str, f: F) -> Response
 where
     F: FnOnce(Arc<DbPool>, HeaderMap, AuthUser) -> Fut,
     Fut: std::future::Future<Output = Response>,
 {
+    let req = head_as_get(&st, req);
     if !st.owns(group) || st.db.is_none() || req.method() != Method::GET {
         return crate::proxy(State(st), req).await;
     }
