@@ -130,16 +130,51 @@ pub fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
 /// `iters:salt:hash` (or legacy `salt:hash` @ 10000 iterations), pbkdf2
 /// 64-byte sha512, timing-safe compare. CPU-heavy (~100 ms at 210k iters) —
 /// callers must run it on the blocking pool.
-pub fn verify_password(password: &str, stored_hash: &str) -> bool {
+///
+/// `Err(())` mirrors Node's `pbkdf2Sync` throwing (iteration count NaN,
+/// < 1 or > INT32_MAX) — callers map it to their 500 arm, as Node's
+/// try/catch does. Never runs PBKDF2 with a garbage count.
+pub fn verify_password_checked(password: &str, stored_hash: &str) -> Result<bool, ()> {
     if stored_hash.is_empty() {
-        return false;
+        return Ok(false);
     }
     let parts: Vec<&str> = stored_hash.split(':').collect();
     let (iterations, salt, hash) = match parts.len() {
-        3 => (parts[0].parse::<u32>().unwrap_or(u32::MAX), parts[1], parts[2]),
+        3 => match js_parse_int(parts[0]) {
+            Some(n) if (1..=i32::MAX as i64).contains(&n) => (n as u32, parts[1], parts[2]),
+            _ => return Err(()),
+        },
         2 => (10000, parts[0], parts[1]),
-        _ => return false,
+        _ => return Ok(false),
     };
+    Ok(verify_with(password, salt, hash, iterations))
+}
+
+/// Boolean convenience over [`verify_password_checked`] (a Node throw
+/// counts as "not verified").
+pub fn verify_password(password: &str, stored_hash: &str) -> bool {
+    verify_password_checked(password, stored_hash).unwrap_or(false)
+}
+
+/// `parseInt(s, 10)`: leading whitespace, optional sign, longest digit
+/// prefix; `None` = NaN. Saturates (any overflow is out of range anyway).
+fn js_parse_int(s: &str) -> Option<i64> {
+    let t = s.trim_start();
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let digits: &str = &t[..t.bytes().take_while(u8::is_ascii_digit).count()];
+    if digits.is_empty() {
+        return None;
+    }
+    let v = digits.bytes().fold(0i64, |a, d| a.saturating_mul(10).saturating_add((d - b'0') as i64));
+    Some(if neg { -v } else { v })
+}
+
+fn verify_with(password: &str, salt: &str, hash: &str, iterations: u32) -> bool {
+    // Node's Buffer.from(hash,'hex') — see hex_decode.
     let Some(stored) = hex_decode(hash) else { return false };
     let verify = pbkdf2_sha512(password.as_bytes(), salt.as_bytes(), iterations);
     if stored.len() != verify.len() {

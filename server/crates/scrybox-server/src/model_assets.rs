@@ -29,6 +29,7 @@ use crate::cards_tags::json_response;
 use crate::collection_writes::node_exact;
 use crate::cvscan;
 use crate::AppState;
+use crate::poison::LockExt;
 
 const HF: &str = "https://huggingface.co";
 
@@ -116,20 +117,56 @@ impl DlJob {
 static CURRENT: Mutex<Option<DlJob>> = Mutex::new(None);
 static LAST: Mutex<Option<Value>> = Mutex::new(None);
 
+/// Review M1: clears `CURRENT` into `LAST` (phase "error") if the job
+/// future unwinds or is dropped before its own `finally` ran, so a panic
+/// never leaves the download stuck as "already running".
+struct JobGuard;
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        CURRENT.clear_poison();
+        LAST.clear_poison();
+        let mut cur = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut j) = cur.take() {
+            j.phase = "error".into();
+            if j.message.is_empty() {
+                j.message = "job aborted".into();
+            }
+            let mut v = j.to_value();
+            if let Some(o) = v.as_object_mut() {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                o.insert("finishedAt".into(), ms.into());
+            }
+            *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+        }
+    }
+}
+
+/// Spawn a job future with the M1 guard held for its whole lifetime.
+fn spawn_guarded<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _guard = JobGuard;
+        fut.await;
+    })
+}
+
 fn with_current<F: FnOnce(&mut DlJob)>(f: F) {
-    if let Some(j) = CURRENT.lock().unwrap().as_mut() {
+    if let Some(j) = CURRENT.guard().as_mut() {
         f(j);
     }
 }
 
 /// modelAssets `state()`.
 pub fn state() -> Value {
-    CURRENT.lock().unwrap().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
+    CURRENT.guard().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
 }
 
 /// modelAssets `lastResult()`.
 pub fn last_result() -> Value {
-    LAST.lock().unwrap().clone().unwrap_or(Value::Null)
+    LAST.guard().clone().unwrap_or(Value::Null)
 }
 
 fn is_present(dir: &Path, a: &Asset) -> bool {
@@ -190,7 +227,7 @@ pub fn status(st_model: Option<&PathBuf>) -> Value {
 /// modelAssets `start(what)` — Ok(state snapshot) or Err(message) for 409.
 pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
     let what = what.to_string();
-    let mut cur = CURRENT.lock().unwrap();
+    let mut cur = CURRENT.guard();
     if cur.is_some() {
         return Err("a download is already running".into());
     }
@@ -216,7 +253,7 @@ pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
 
     let dir = model_dir(st_model.as_ref());
     let wanted_n = wanted.len();
-    tokio::spawn(async move {
+    spawn_guarded(async move {
         let mut base = 0u64;
         let mut fetched = 0usize;
         let result: Result<(), String> = async {
@@ -254,7 +291,7 @@ pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
             }
         }
         let snap = {
-            let mut m = CURRENT.lock().unwrap().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null);
+            let mut m = CURRENT.guard().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null);
             if let Some(o) = m.as_object_mut() {
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -264,8 +301,8 @@ pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
             }
             m
         };
-        *LAST.lock().unwrap() = Some(snap);
-        *CURRENT.lock().unwrap() = None;
+        *LAST.guard() = Some(snap);
+        *CURRENT.guard() = None;
     });
     Ok(reply)
 }
@@ -463,5 +500,29 @@ pub async fn handle_models(State(st): State<AppState>, mut req: Request) -> Resp
             let (parts, _) = req.into_parts();
             crate::proxy(State(st), Request::from_parts(parts, Body::empty())).await
         }
+    }
+}
+
+#[cfg(test)]
+mod m1_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn m1_panicking_download_clears_current() {
+        *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(DlJob {
+            what: "models".into(),
+            name: "x".into(),
+            done: 0,
+            total: 1,
+            phase: "downloading".into(),
+            message: String::new(),
+        });
+        let h = spawn_guarded(async {
+            let _held = CURRENT.guard();
+            panic!("boom");
+        });
+        assert!(h.await.unwrap_err().is_panic());
+        assert!(CURRENT.guard().is_none(), "CURRENT stuck after panic");
+        assert_eq!(LAST.guard().as_ref().unwrap()["phase"], "error");
     }
 }

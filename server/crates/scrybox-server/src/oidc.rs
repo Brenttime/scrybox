@@ -15,6 +15,7 @@ use hyper_util::rt::TokioExecutor;
 use serde_json::{Map, Value};
 
 use crate::auth_support::*;
+use crate::poison::LockExt;
 
 const STATE_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOCK_SKEW_SECONDS: u64 = 60;
@@ -210,7 +211,7 @@ pub async fn get_discovery(force_refresh: bool) -> Result<Value, String> {
     assert_issuer_transport(&issuer)?;
     let now = now_ms();
     if !force_refresh {
-        if let Some(c) = disc_cache().lock().unwrap().as_ref() {
+        if let Some(c) = disc_cache().guard().as_ref() {
             if c.expires_ms > now {
                 return Ok(c.doc.clone());
             }
@@ -234,15 +235,14 @@ pub async fn get_discovery(force_refresh: bool) -> Result<Value, String> {
         ));
     }
     disc_cache()
-        .lock()
-        .unwrap()
+        .guard()
         .replace(DiscCache { doc: doc.clone(), expires_ms: now + 60 * 60 * 1000 });
     Ok(doc)
 }
 
 #[cfg(test)]
 pub fn reset_discovery_cache() {
-    *disc_cache().lock().unwrap() = None;
+    *disc_cache().guard() = None;
 }
 
 // ---- state token ------------------------------------------------------------

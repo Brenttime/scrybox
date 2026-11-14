@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, json_num, wants_encoding};
 use crate::db::DbPool;
 use crate::AppState;
+use crate::poison::LockExt;
 
 const MAX_ITEMS: usize = 100;
 /// JS `slice(0, 500)` — UTF-16 CODE units, not chars.
@@ -258,7 +259,7 @@ fn save(pool: &DbPool, user_id: i64, list: &[(String, Option<f64>)]) -> Result<(
 /// (`chains` Map); the same guarantee here, keyed by user id.
 fn user_lock(user_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     static CHAINS: Mutex<Option<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> = Mutex::new(None);
-    let mut map = CHAINS.lock().unwrap();
+    let mut map = CHAINS.guard();
     let map = map.get_or_insert_with(HashMap::new);
     Arc::clone(map.entry(user_id).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
 }

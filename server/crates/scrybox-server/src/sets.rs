@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, wants_encoding};
 use crate::scryfall::{Scry, ScryOpts};
 use crate::AppState;
+use crate::poison::LockExt;
 
 /// Node's getScryfallSets memo TTL (cardSets.js SCRYFALL_SETS_TTL_MS).
 pub const SCRYFALL_SETS_TTL_MS: i64 = 6 * 60 * 60 * 1000;
@@ -33,7 +34,7 @@ pub async fn scryfall_sets(scry: &Scry, memo: &ScryfallSetsMemo) -> Vec<Value> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     {
-        let guard = memo.lock().unwrap();
+        let guard = memo.guard();
         if let Some((at, list)) = guard.as_ref() {
             if now - *at < SCRYFALL_SETS_TTL_MS {
                 return list.clone();
@@ -50,7 +51,7 @@ pub async fn scryfall_sets(scry: &Scry, memo: &ScryfallSetsMemo) -> Vec<Value> {
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let mut guard = memo.lock().unwrap();
+    let mut guard = memo.guard();
     if !fetched.is_empty() {
         *guard = Some((now, fetched.clone()));
     } else if guard.is_none() {

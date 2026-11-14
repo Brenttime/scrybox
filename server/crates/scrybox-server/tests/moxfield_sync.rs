@@ -1308,3 +1308,99 @@ async fn routes_delete_author_and_forced_sync_shapes() {
     assert_eq!(body["authors"][0]["moxfield_user"], json!("Guido"));
     assert_eq!(body["authors"][0]["total_decks"], json!(0));
 }
+
+// ---------------------------------------------------------------------------
+// TOTORO review fixes: scheduler robustness, author delete, in_flight, curl cap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tick_without_db_is_a_noop() {
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: "http://127.0.0.1:1".to_string(),
+        static_dir: None,
+        rust_routes: Default::default(),
+        db_path: None,
+        sidecar_url: None,
+    };
+    let st = AppState::new(cfg);
+    assert!(st.db.is_none());
+    moxfield::tick(&st).await; // pre-fix: None.unwrap() panic
+    moxfield::spawn_scheduler(&st); // must not start anything
+}
+
+#[test]
+fn in_flight_guard_clears_on_panic() {
+    let r = std::panic::catch_unwind(|| {
+        let _g = moxfield::try_in_flight(77001).unwrap();
+        assert!(moxfield::try_in_flight(77001).is_none());
+        panic!("boom");
+    });
+    assert!(r.is_err());
+    assert!(moxfield::try_in_flight(77001).is_some(), "author stuck in flight after panic");
+}
+
+#[tokio::test]
+async fn remove_author_deletes_tracked_rows_without_fk_cascade() {
+    let fx = seeded_db("rmauthor_nofk.db");
+    let (maddr, _mock) = spawn_mfx_mock().await;
+    let st = engine_state(&fx, mfx_client(maddr), None);
+    let conn = conn_of(&fx);
+    conn.execute("INSERT INTO moxfield_authors (id, user_id, moxfield_user) VALUES (3, 1, 'NoFk')", []).unwrap();
+    conn.execute(
+        "INSERT INTO moxfield_decks (author_id, public_id, name, enabled) VALUES (3,'n1','N',0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    // Pin the pooled connection's FK state OFF (Node-unlike Rust pool never
+    // promises it ON): the delete must not depend on ON DELETE CASCADE.
+    {
+        let c = st.db.as_ref().unwrap().get().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    }
+    remove_author(&st, 1, Some(3)).await.unwrap();
+    let conn = conn_of(&fx);
+    assert_eq!(rows_len(&conn, "SELECT 1 FROM moxfield_decks WHERE author_id=3", &[]), 0);
+}
+
+#[tokio::test]
+async fn manual_sync_waits_for_scheduler_in_flight() {
+    let fx = seeded_db("manual_wait.db");
+    let (maddr, mock) = spawn_mfx_mock().await;
+    set_user(&mock, json!([{"userName": "Waiter"}]));
+    set_pages(&mock, vec![json!({"data": [], "totalPages": 1})]);
+    let conn = conn_of(&fx);
+    conn.execute("INSERT INTO moxfield_authors (id, user_id, moxfield_user) VALUES (77002, 1, 'Waiter')", []).unwrap();
+    drop(conn);
+    let router = router_for(&fx, "http://127.0.0.1:1", mfx_client(maddr)).await;
+
+    let guard = moxfield::try_in_flight(77002).unwrap();
+    let req = with_auth(
+        Request::post("/api/moxfield/authors/77002/sync-decklist").body(Body::empty()).unwrap(),
+        "tok-session",
+    );
+    let handle = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(!handle.is_finished(), "manual sync ran while scheduler had the author in flight");
+    assert!(mock.hits_for("GET /v2/").is_empty());
+    drop(guard);
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), handle).await.unwrap().unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // the route released its own guard
+    assert!(moxfield::try_in_flight(77002).is_some());
+}
+
+#[tokio::test]
+async fn curl_output_over_max_buffer_kills_child_early() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("fake-curl");
+    std::fs::write(&bin, "#!/bin/sh\nhead -c 11000000 /dev/zero\nexec sleep 60\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let api = MfxApi { base_url: "http://127.0.0.1:1".into(), curl_bin: bin.to_string_lossy().into() };
+    let t0 = std::time::Instant::now();
+    let err = api.get("/v2/x", &[]).await.unwrap_err();
+    assert!(t0.elapsed() < std::time::Duration::from_secs(15), "took {:?}", t0.elapsed());
+    assert!(format!("{err:?}").contains("maxBuffer"), "{err:?}");
+}

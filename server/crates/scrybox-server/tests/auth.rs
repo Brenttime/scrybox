@@ -109,7 +109,7 @@ fn client_ip_key_trust_matrix() {
     assert_eq!(client_ip_key(Some(peer.ip()), &h, &Trust::Hops(2)), "203.0.113.5");
     let mut h2 = HeaderMap::new();
     h2.insert("x-forwarded-for", "not, an, ip".parse().unwrap());
-    assert_eq!(client_ip_key(Some(peer.ip()), &h2, &Trust::Hops(1)), "127.0.0.1");
+    assert_eq!(client_ip_key(Some(peer.ip()), &h2, &Trust::Hops(1)), "ip"); // proxy-addr: chosen hop verbatim (REVIEW-auth L4)
 }
 
 #[test]
@@ -900,4 +900,130 @@ async fn oidc_disabled_answers_like_node() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
         assert_eq!(body, "{\"error\":\"OIDC authentication is not enabled.\"}");
     }
+}
+
+// ===========================================================================
+// TOTORO review fixes (REVIEW-auth.md M1, M2, L1, L2, L4)
+// ===========================================================================
+
+/// M1: Node takes a token only when the header startsWith('Bearer ')
+/// (case-sensitive, one space) — other schemes are "No token provided".
+#[tokio::test]
+async fn bearer_requires_exact_prefix_like_node() {
+    let (r, pool) = build_router(&["auth"]);
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO users (id, username, password_hash, role, share_token, share_enabled, api_key) VALUES (1,'user1','oidc_locked:unused','admin','tok-1',1,'tok-api');
+             INSERT INTO sessions (token, user_id, expires_at) VALUES ('tok-u1',1,'2999-01-01 00:00:00');")
+        .unwrap();
+    for hv in ["Token tok-u1", "bearer tok-u1", "Basic tok-u1", "BEARER tok-u1", "Bearer  tok-u1"] {
+        let h = vec![("authorization", hv.to_string())];
+        let (status, _, body) = request(&r, peer(), "GET", "/api/auth/me", &h, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{hv}");
+        assert_eq!(body, "{\"error\":\"Access denied. No token provided.\"}", "{hv}");
+    }
+    // split(' ')[1] after the prefix: trailing segments ignored.
+    let h = vec![("authorization", "Bearer tok-u1 extra".to_string())];
+    let (status, _, _) = request(&r, peer(), "GET", "/api/auth/me", &h, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// M2: a key spray of live buckets must not cost an O(n) scan per hit.
+#[test]
+fn limiter_key_spray_is_amortised_and_semantics_hold() {
+    let lim = FixedWindowLimiter::new(3, 900_000);
+    let t0 = std::time::Instant::now();
+    for i in 0..60_000u32 {
+        lim.hit(&format!("k{i}"), 1_000);
+    }
+    for i in 60_000..80_000u32 {
+        lim.hit(&format!("k{i}"), 2_000);
+    }
+    assert!(t0.elapsed() < std::time::Duration::from_secs(3), "spray took {:?}", t0.elapsed());
+    // window semantics unchanged after pruning cycles
+    let v = lim.hit("k1", 3_000);
+    assert_eq!((v.blocked, v.remaining, v.reset_secs), (false, 1, 898));
+    // expired windows (pruned or not) restart fresh
+    let v = lim.hit("k1", 1_000_000);
+    assert_eq!((v.blocked, v.remaining, v.reset_secs), (false, 2, 900));
+}
+
+/// L4: proxy-addr returns the chosen hop verbatim when it doesn't parse.
+#[test]
+fn client_ip_key_hops_keeps_unparseable_entry() {
+    let mut h = HeaderMap::new();
+    h.insert("x-forwarded-for", "garbage".parse().unwrap());
+    let p: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    assert_eq!(client_ip_key(Some(p.ip()), &h, &Trust::Hops(1)), "garbage");
+}
+
+/// L1: a corrupted iteration count makes Node's pbkdf2Sync throw → 500,
+/// immediately (never a multi-hour PBKDF2).
+#[tokio::test]
+async fn login_with_corrupted_hash_iterations_is_500_fast() {
+    let (r, pool) = build_router(&["auth"]);
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO users (id, username, password_hash, role, share_token, share_enabled) VALUES
+              (1,'bad1','abc:0123456789abcdef:00','member','t1',0),
+              (2,'bad2','0:0123456789abcdef:00','member','t2',0);",
+        )
+        .unwrap();
+    for u in ["bad2", "bad1"] {
+        let t0 = std::time::Instant::now();
+        let (status, _, body) = request(
+            &r,
+            peer(),
+            "POST",
+            "/api/auth/login",
+            &json_ct(),
+            Some(format!("{{\"username\":\"{u}\",\"password\":\"whatever1\"}}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{u}");
+        assert_eq!(body, "{\"error\":\"Login failed\"}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+    // parseInt prefix semantics: '10000abc' → 10000 (legacy vector still verifies)
+    assert!(scrybox_server::auth_support::verify_password(
+        "legacypw",
+        "10000abc:0123456789abcdef:725b920e3fbc3b4e902d65d5ad631559d2c6a789b459b70c0c3d1262d7ce493de420d2ee023c1e53fab08770458623691d70b9adece2a61ae871c0b595d3f76c"
+    ));
+}
+
+/// L2: JS `.length` counts UTF-16 units — four emoji are 8 and pass the
+/// length check (so a wrong current password yields 401, not 400);
+/// `password: null` throws in Node → 500.
+#[tokio::test]
+async fn settings_password_length_is_utf16_and_null_is_500() {
+    let (r, pool) = build_router(&["auth"]);
+    seed_password_users(&pool);
+    pool.get()
+        .unwrap()
+        .execute_batch("INSERT INTO sessions (token, user_id, expires_at) VALUES ('tok-u2',2,'2999-01-01 00:00:00');")
+        .unwrap();
+    let (status, _, body) = request(
+        &r,
+        peer(),
+        "PUT",
+        "/api/auth/settings",
+        &merge(&bearer("tok-u2"), &json_ct()),
+        Some("{\"password\":\"\u{1F600}\u{1F600}\u{1F600}\u{1F600}\",\"current_password\":\"nope\"}".into()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, "{\"error\":\"Current password is incorrect\"}");
+    let (status, _, body) = request(
+        &r,
+        peer(),
+        "PUT",
+        "/api/auth/settings",
+        &merge(&bearer("tok-u2"), &json_ct()),
+        Some("{\"password\":null}".into()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, "{\"error\":\"Failed to update settings\"}");
 }

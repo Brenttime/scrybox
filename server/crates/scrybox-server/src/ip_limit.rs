@@ -13,6 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 
 use axum::http::HeaderMap;
+use crate::poison::LockExt;
 
 /// Opaque trust-rule detail of `Trust::Rules` (built only by
 /// `Trust::from_env_value`); public only because the variant field is.
@@ -186,8 +187,12 @@ pub fn client_ip_key(peer: Option<IpAddr>, headers: &HeaderMap, trust: &Trust) -
             // trust n proxies: the socket plus the n-1 rightmost XFF entries
             // are the proxies; the client is the entry just left of them.
             let idx = xff.len().saturating_sub(*n);
-            match xff.get(idx).and_then(|s| s.parse::<IpAddr>().ok()) {
-                Some(ip) => key_for(ip),
+            // proxy-addr returns an unparseable chosen entry verbatim.
+            match xff.get(idx) {
+                Some(entry) => match entry.parse::<IpAddr>() {
+                    Ok(ip) => key_for(ip),
+                    Err(_) => entry.clone(),
+                },
                 None => key_for(socket),
             }
         }
@@ -233,8 +238,19 @@ pub fn client_ip_key(peer: Option<IpAddr>, headers: &HeaderMap, trust: &Trust) -
 pub struct FixedWindowLimiter {
     window_ms: u64,
     limit: u64,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<Buckets>,
 }
+
+/// Bucket map plus an adaptive prune threshold: expired windows are swept
+/// only when the map outgrows `high_water`, after which the threshold is
+/// reset to twice the surviving size — amortised O(1) per hit instead of
+/// an O(n) scan under the mutex on every request once the map is large.
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    high_water: usize,
+}
+
+const PRUNE_FLOOR: usize = 4096;
 
 struct Bucket {
     reset_ms: u64,
@@ -250,18 +266,25 @@ pub struct Verdict {
 
 impl FixedWindowLimiter {
     pub fn new(limit: u64, window_ms: u64) -> Self {
-        Self { window_ms, limit, buckets: Mutex::new(HashMap::new()) }
+        Self {
+            window_ms,
+            limit,
+            buckets: Mutex::new(Buckets { map: HashMap::new(), high_water: PRUNE_FLOOR }),
+        }
     }
 
     pub fn hit(&self, key: &str, now_ms: u64) -> Verdict {
-        let mut b = self.buckets.lock().unwrap();
-        // Opportunistic prune so a hostile key spray cannot grow the map
-        // without bound (Node's MemoryStore schedules per-key expiry
-        // timers; a prune at write time is behaviourally identical).
-        if b.len() > 4096 {
-            b.retain(|_, v| v.reset_ms > now_ms);
+        let mut guard = self.buckets.guard();
+        let bs = &mut *guard;
+        // Prune expired windows so a key spray cannot grow the map without
+        // bound (Node's MemoryStore expires keys per window; dropping an
+        // expired bucket is behaviourally identical since a fresh hit
+        // would reset it anyway). Amortised: see `Buckets`.
+        if bs.map.len() > bs.high_water {
+            bs.map.retain(|_, v| v.reset_ms > now_ms);
+            bs.high_water = (bs.map.len() * 2).max(PRUNE_FLOOR);
         }
-        let entry = b.entry(key.to_string()).or_insert(Bucket {
+        let entry = bs.map.entry(key.to_string()).or_insert(Bucket {
             reset_ms: now_ms + self.window_ms,
             total: 0,
         });
