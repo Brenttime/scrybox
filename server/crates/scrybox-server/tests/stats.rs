@@ -919,3 +919,114 @@ async fn native_write_bumps_gen_so_stats_read_your_writes() {
     assert_eq!(s401, StatusCode::UNAUTHORIZED);
     assert_eq!(xsc(&request(&r, "GET", "/api/stats", &auth()).await.1), "hit");
 }
+
+// --- connection-starvation pins (iter-83, ALL_mixed freeze family) --------
+//
+// iter-78/81/82 left one frozen shape on the bench: two concurrent cold
+// stats builds (each `fetch_all` holds 1 conn per leg WHILE the other legs
+// wait for theirs) plus ordinary single-conn load (search-history RMW, auth,
+// revision probes) collectively filled the pool's live cap -> every leg
+// parked on the live Condvar holding its slot, every queued handler parked
+// waiting for a slot no leg would return until its build finished ->
+// all-futex_wait freeze (srv log: "stats build elapsed_ms=3857..6388" vs
+// ~10 ms in isolation, then the RMW storm timing out at 000). Two fixes are
+// pinned here: the pool build gate (db.rs `acquire_build_gate`, taken by
+// fetch_all BEFORE any leg checkout) and the phase-1 async checkout
+// (handler: get_async instead of inline get on the runtime worker).
+
+
+
+#[test]
+fn stats_phase1_probe_does_not_park_the_runtime_worker_at_the_live_cap() {
+    // Mirror of iter-82's search_history pin for the /api/stats request
+    // path. GREEN PIN here; the RED for this defect class was measured on
+    // the live bench (iter-82 verify-stall: 266 s frozen GETs while the
+    // RMW storm timed out at 000, srv-verify.log). It cannot be made
+    // deterministically red in-process any more: authenticate_async's
+    // blocking-pool hop (iter-82) absorbs the single-conn contention before
+    // the phase-1 probe runs, and get_async's idle-pop then serves phase 1
+    // without ever needing the cap — precisely the behaviour this pin
+    // freezes. It asserts the two properties that were violated: the cold
+    // request completes with ALL live slots held by a runtime task (the
+    // handler must never park the worker), and every checkout returns.
+    // Path: a current_thread runtime whose pool has its single live slot
+    // held by a runtime task that only frees it when notified. The phase-1
+    // revision probe pre-fix ran pool.get() INLINE on the worker (stats.rs
+    // handle()) — the worker parked on the Condvar, the releasing task
+    // never ran, and every route on that runtime froze (the ALL_mixed
+    // 266 s GET /api/search-history hang class). Post-fix the probe and
+    // auth gate both go through get_async's blocking-pool hop.
+    use std::sync::{Arc, mpsc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded_stats_db(dir.path(), "park.db");
+    let pool = Arc::new(
+        scrybox_server::db::DbPool::open_with(
+            &db_path,
+            scrybox_server::db::PoolConfig { max: 1, cache_kb: 1024, mmap_kb: 0, live_max: 1 },
+        )
+        .unwrap(),
+    );
+
+    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let pool_for_rt = Arc::clone(&pool);
+    let db_for_rt = db_path.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let cfg = Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                node_upstream: "http://127.0.0.1:9".to_string(),
+                static_dir: None,
+                rust_routes: ["stats".to_string()].into_iter().collect(),
+                db_path: Some(db_for_rt),
+                sidecar_url: None,
+            };
+            let mut st = AppState::new(cfg);
+            st.db = Some(pool_for_rt.clone());
+            let r = app(st);
+
+            // Occupy the pool's only live slot from a runtime task, and
+            // schedule the RELEASE as another runtime task: the ONLY way
+            // the conn can ever come back is the worker staying free to
+            // poll tasks. A handler that parks the worker on the Condvar
+            // deadlocks the release with it — exactly the ALL_mixed shape.
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+            {
+                let pool2 = Arc::clone(&pool_for_rt);
+                tokio::spawn(async move {
+                    let held = pool2.get().unwrap();
+                    let _ = held_tx.send(());
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    drop(held);
+                });
+            }
+            held_rx.await.unwrap();
+
+            let req = Request::builder()
+                .method("GET")
+                .uri("/api/stats")
+                .header("authorization", "Bearer tok-stats-rich")
+                .body(Body::empty())
+                .unwrap();
+            let resp = r.oneshot(req).await.unwrap();
+            let status = resp.status().as_u16();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+            let _ = tx.send((status, bytes));
+        });
+    });
+
+    let (status, body) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("GET /api/stats never completed: the handler parked the runtime worker on the DbPool live cap (inline pool.get() in the phase-1 probe)");
+    assert_eq!(status, 200, "body: {}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body).expect("stats body must be JSON");
+    assert_eq!(
+        v["summary"]["totalCards"].as_i64(),
+        Some(17),
+        "expected the seeded stats body, got {}",
+        String::from_utf8_lossy(&body[..body.len().min(200)])
+    );
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}

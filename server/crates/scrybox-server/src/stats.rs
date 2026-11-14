@@ -43,7 +43,7 @@ use crate::collection::{
     body_etag, etag_matches, gzip_bytes, json_num, resolve_card_price, sqlite_value, truthy,
     wants_encoding,
 };
-use crate::db::DbPool;
+use crate::db::{DbPool, PoolConfig};
 use crate::stats_sql::{AGGREGATE_SQL, DECK_ROWS_SQL, OWNERSHIP_SQL, RECENT_ADDED_SQL, TOP_VALUABLE_SQL};
 use crate::AppState;
 
@@ -1158,15 +1158,34 @@ fn is_vintage_set(id: &str) -> bool {
 /// consistency class: every query is internally consistent at its own start.
 /// aggregate (~490 ms) dominates; top/recent/decks→ownership (< 100 ms
 /// combined) overlap it. Assembly below consumes the fetched rows unchanged.
-struct QueryRows {
-    aggregate: Map<String, Value>,
-    top: Vec<Map<String, Value>>,
-    recent: Vec<Map<String, Value>>,
-    deck_rows: Vec<Map<String, Value>>,
-    ownership: Vec<Map<String, Value>>,
+pub struct QueryRows {
+    pub aggregate: Map<String, Value>,
+    pub top: Vec<Map<String, Value>>,
+    pub recent: Vec<Map<String, Value>>,
+    pub deck_rows: Vec<Map<String, Value>>,
+    pub ownership: Vec<Map<String, Value>>,
 }
 
-fn fetch_all(pool: &DbPool, user_id: i64) -> Result<QueryRows, String> {
+/// Legs fetch_all spawns, each checking out its own connection. Kept next to
+/// the spawn site and pinned against `db::STATS_BUILD_LEGS` (the build-gate
+/// sizing constant) by a test — if they drift, the gate's progress proof is
+/// void.
+const FETCH_ALL_LEGS: usize = 4;
+
+/// White-box: exposed for the starvation-pileup tests (tests/stats.rs).
+/// Production callers go through `build_body`.
+pub fn fetch_all(pool: &DbPool, user_id: i64) -> Result<QueryRows, String> {
+    // Hold-while-waiting guard (iter-78/81/82 ALL_mixed freeze): every leg
+    // below holds its checkout while the OTHER legs wait for theirs, so
+    // unbounded concurrent builds can collectively fill `live_max` and park
+    // the whole pool on the live-cap Condvar (a leg can't be returned until
+    // its build finishes; single-conn handlers queue behind them forever).
+    // The pool's build gate caps how many builds may be in that state so
+    // `live_max` always keeps a completing build's worth of slots free;
+    // this call blocks for a permit BEFORE taking any connection, so it can
+    // never contribute to the wait-for graph.
+    debug_assert_eq!(FETCH_ALL_LEGS, crate::db::STATS_BUILD_LEGS);
+    let _build_slot = pool.acquire_build_gate();
     let now = now_ms();
     let cutoff7 = iso_utc_ms(now - 7 * DAY_MS);
     let cutoff30 = iso_utc_ms(now - 30 * DAY_MS);
@@ -1465,8 +1484,16 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     // request's key, exactly like Node's cached() wrapper.
     let outcome = async move {
         let (hit, key) = {
+            // REVIEW M5 (iter-82 follow-up): this ran `pool.get()` INLINE on
+            // the runtime worker — under the ALL_mixed load the live cap
+            // saturated and each cold /api/stats request parked a worker on
+            // the pool Condvar, freezing the whole runtime (unrelated
+            // routes, incl. the RMW storm, then timed out at 000). Async
+            // checkout: idle-only pop on the worker, full get() on the
+            // blocking pool.
             let conn = pool
-                .get()
+                .get_async()
+                .await
                 .map_err(|e| format!("read pool: {e}"))?;
             let gen = cache.touch(user_id);
             let rev = StatsCache::db_revision(&conn);
@@ -1951,5 +1978,144 @@ mod poison_m2 {
         assert_eq!(c.gen_of(7), 2, "bump must survive a poisoned store");
         assert_eq!(c.touch(7), 2, "touch must survive a poisoned store");
         assert_eq!(c.active_users(Duration::from_secs(60)), vec![7], "active set survives");
+    }
+}
+
+#[cfg(test)]
+mod starvation_tests {
+    //! iter-83 ALL_mixed freeze pins (white-box: uses the pool's
+    //! cfg(test)-only after_checkout_hook, hence lives in-crate).
+    use super::*;
+    use crate::db::{DbPool, PoolConfig};
+
+    fn seed_starve_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("starve.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS collection_snapshot (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0);
+             INSERT OR IGNORE INTO collection_snapshot (id, revision) VALUES (1, 0);",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../tests/schema_fixture.sql")).unwrap();
+        conn.execute_batch(include_str!("../tests/stats_seed.sql")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO collection_read_revision (id, revision) VALUES (1, 1);
+             INSERT OR IGNORE INTO deck_list_revision (id, revision) VALUES (1, 0);
+             INSERT OR IGNORE INTO stats_aux_revision (id, revision) VALUES (1, 0);",
+        )
+        .unwrap();
+        drop(conn);
+        path
+    }
+
+    #[test]
+    fn two_concurrent_fetch_all_builds_do_not_starve_at_the_live_cap() {
+        // The freeze's necessary condition (iter-78/81/82 ALL_mixed): TWO
+        // builds holding pool connections SIMULTANEOUSLY — each build's
+        // legs hold while sibling legs still need slots, so at the cap the
+        // pool fills with conns that only a *finishing* build could free.
+        // The pool build gate makes that state unproducible (capacity
+        // always keeps a completing build's worth of slots free).
+        // Deterministic driver: the after_checkout_hook parks every leg
+        // RIGHT AFTER it takes its conn; the test releases only while at
+        // most one build's legs (<= FETCH_ALL_LEGS) are holding at once —
+        // more than that IS the frozen state, so it refuses and the
+        // recv_timeout proves the hang.
+        //   * Permissive gate (MEASURED red, see iter-83 log): both builds
+        //     check in (8 legs <= live_max=8), the driver sees >4 held,
+        //     refuses, and recv_timeout fires: the bench freeze.
+        //   * Fixed gate: build B parks on acquire_build_gate BEFORE any
+        //     checkout, so at most 4 legs ever hold, the driver releases,
+        //     and both fetch_all calls complete.
+        let dir = tempfile::tempdir().unwrap();
+        let path = seed_starve_db(dir.path());
+        let pool = std::sync::Arc::new(
+            DbPool::open_with(&path, PoolConfig { max: 4, cache_kb: 2048, mmap_kb: 0, live_max: 8 }).unwrap(),
+        );
+        assert_eq!(pool.build_gate_capacity(), 1, "gate must serialise at this cap");
+
+        let holding: std::sync::Arc<std::sync::Mutex<usize>> = Default::default();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (h_hold, h_rel) = (std::sync::Arc::clone(&holding), std::sync::Arc::clone(&released));
+        pool.set_after_checkout_hook(Some(std::sync::Arc::new(move || {
+            *h_hold.lock().unwrap() += 1;
+            while !h_rel.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            *h_hold.lock().unwrap() -= 1;
+        })));
+
+        let pool1 = std::sync::Arc::clone(&pool);
+        let pool2 = std::sync::Arc::clone(&pool);
+        let (tx, rx) = std::sync::mpsc::channel::<(u8, Result<usize, String>)>();
+        let tx1 = tx.clone();
+        std::thread::spawn(move || {
+            let r = fetch_all(&pool1, 1).map(|q| q.top.len());
+            let _ = tx1.send((1, r));
+        });
+        std::thread::spawn(move || {
+            let r = fetch_all(&pool2, 2).map(|q| q.top.len());
+            let _ = tx.send((2, r));
+        });
+
+        // Driver thread: watch the hold set while legs pile up, then
+        // ALWAYS release (a driver that conditioned release on completion
+        // would itself form a circular wait). More than one build's worth
+        // of legs holding at once is the frozen state -> red assertion.
+        let drv_hold = std::sync::Arc::clone(&holding);
+        let drv_rel = std::sync::Arc::clone(&released);
+        let driver = std::thread::spawn(move || {
+            let mut worst = 0usize;
+            let mut waves = 0;
+            while waves < 4 {
+                // wait for a wave of legs to check in
+                let mut waited = std::time::Instant::now();
+                while *drv_hold.lock().unwrap() == 0 {
+                    if waited.elapsed() > std::time::Duration::from_secs(10) {
+                        return worst; // nobody checks in; test times out
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // settle so all concurrently-admitted legs have checked in
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                worst = worst.max(*drv_hold.lock().unwrap());
+                drv_rel.store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while *drv_hold.lock().unwrap() > 0 {
+                    if std::time::Instant::now() > deadline {
+                        return worst; // legs never drained despite release
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                drv_rel.store(false, std::sync::atomic::Ordering::SeqCst);
+                waves += 1;
+            }
+            worst
+        });
+
+        let mut done = 0;
+        while done < 2 {
+            let (who, res) = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("a fetch_all never completed: concurrent multi-conn builds starved at the live cap");
+            assert!(res.is_ok(), "fetch_all(user {who}) failed: {:?}", res.err());
+            done += 1;
+            if done == 2 {
+                break;
+            }
+        }
+        let worst = driver.join().unwrap();
+        assert!(
+            worst <= FETCH_ALL_LEGS,
+            "two builds held pool connections simultaneously ({worst} legs > {FETCH_ALL_LEGS}) — the ALL_mixed starvation precondition"
+        );
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        pool.set_after_checkout_hook(None);
+        assert!(pool.build_gate_held() <= 1, "gate held beyond capacity");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pool.live_count() > 0 {
+            assert!(std::time::Instant::now() < deadline, "build connections never returned");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

@@ -95,6 +95,39 @@ impl PoolConfig {
     }
 }
 
+/// Legs `stats::fetch_all` checks out at once (aggregate, topValuable,
+/// recentAdditions, decks+ownership — one connection each, held for the
+/// whole leg). The build gate sizes itself against this so the pool can
+/// prove forward progress; `stats.rs` asserts the two stay in sync.
+pub const STATS_BUILD_LEGS: usize = 4;
+
+/// Live slots the build gate always keeps free for SINGLE-connection work
+/// (search-history RMW load/save, auth sessions, revision probes, collection
+/// count queries). With the default serving pool (live_max = 2*max = 8 on a
+/// 4-core box) and BUILD_BUDGET=2, two stats builds could otherwise occupy
+/// all 8 slots while their legs wait on the live-cap Condvar FOR EACH OTHER
+/// (a leg parks holding its own conn), and every queued single-conn handler
+/// parks waiting for a slot no leg will ever return until its build
+/// completes -> circular wait, the bench ALL_mixed all-futex_wait freeze
+/// (iter-78/81/82 verify-stall: builds at 4-6 s elapsed vs 10 ms in
+/// isolation, then the RMW storm timing out at 000).
+const BUILD_GATE_RESERVE: usize = STATS_BUILD_LEGS;
+
+/// A taken build-gate permit: one slot for a whole multi-connection build
+/// (see `DbPool::acquire_build_gate`). Returns the permit on drop.
+pub struct BuildGateGuard<'a> {
+    pool: &'a DbPool,
+    held: bool,
+}
+
+impl Drop for BuildGateGuard<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.pool.release_build_gate();
+        }
+    }
+}
+
 /// Pool of ready-to-use read connections. Idle connections are kept up to
 /// `max`; checkouts beyond the idle list open fresh connections only while
 /// fewer than `live_max` are LIVE — past that, `get()` waits on a Condvar
@@ -115,6 +148,20 @@ pub struct DbPool {
     /// M5: number of `get_async()` calls that found no idle connection and
     /// had to hop to the blocking pool (observability + the cap tests).
     blocking_fallbacks: AtomicUsize,
+    /// Concurrent multi-connection builds holding a build-gate permit
+    /// (see `acquire_build_gate`); `build_gate_capacity` is their ceiling.
+    build_gate: Mutex<usize>,
+    build_gate_cv: std::sync::Condvar,
+    build_gate_capacity: usize,
+    /// Test-only observation point fired inside `get_conn()` right AFTER a
+    /// checkout succeeds (never in production builds): lets the starvation
+    /// tests hold legs at the cap deterministically instead of racing
+    /// query durations. Same shape as the search_history park-test's
+    /// release-on-notify hold.
+    #[cfg(test)]
+    after_checkout_hook: std::sync::RwLock<
+        Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    >,
 }
 
 struct PoolState {
@@ -137,6 +184,16 @@ impl DbPool {
         // live_max is honoured as given (from_env clamps it to >= max for
         // boot configs; explicit configs may set a tighter cap on purpose).
         let live_max = cfg.live_max.max(1);
+        // Build-gate sizing: `k` permitted builds may hold `k *
+        // STATS_BUILD_LEGS` live slots; the reserve guarantees the rest of
+        // the server (single-conn handlers) can always run, and a permitted
+        // build can always reach its full leg count -> guaranteed finish ->
+        // guaranteed permit recycling. live_max below the reserve leaves one
+        // permitted build (its legs then simply serialize on the cap; each
+        // leg RETURNS its conn when done, so a single build can never
+        // deadlock against itself).
+        let build_gate_capacity =
+            (live_max.saturating_sub(BUILD_GATE_RESERVE) / STATS_BUILD_LEGS).max(1);
         Ok(Self {
             path,
             state: Mutex::new(PoolState { idle: Vec::new(), live: 0 }),
@@ -145,6 +202,11 @@ impl DbPool {
             live_max,
             cfg,
             blocking_fallbacks: AtomicUsize::new(0),
+            build_gate: Mutex::new(0),
+            build_gate_cv: std::sync::Condvar::new(),
+            build_gate_capacity,
+            #[cfg(test)]
+            after_checkout_hook: std::sync::RwLock::new(None),
         })
     }
 
@@ -182,7 +244,22 @@ impl DbPool {
     /// fallback (REVIEW M5); today's inline call sites already block in
     /// `connect()`, so the wait adds no new class of blocking.
     pub fn get(&self) -> rusqlite::Result<PooledConn<'_>> {
-        Ok(PooledConn { pool: self, conn: Some(self.get_conn()?) })
+        let conn = self.get_conn()?;
+        #[cfg(test)]
+        if let Some(hook) = &*self.after_checkout_hook.read().unwrap() {
+            hook();
+        }
+        Ok(PooledConn { pool: self, conn: Some(conn) })
+    }
+
+    /// Install (or clear with `None`) the test-only post-checkout hook; see
+    /// the `after_checkout_hook` field. Test binaries only.
+    #[cfg(test)]
+    pub fn set_after_checkout_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        *self.after_checkout_hook.write().unwrap() = hook;
     }
 
     /// Core of `get()`: the idle-pop / permit-reserve / Condvar-wait loop
@@ -290,6 +367,47 @@ impl DbPool {
     /// had to hop to the blocking pool (M5 observability + cap tests).
     pub fn blocking_fallbacks(&self) -> usize {
         self.blocking_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Take one build-gate permit BEFORE checking out a multi-connection
+    /// build's legs (stats `fetch_all`: 4 conns each). Capacity is
+    /// `(live_max - BUILD_GATE_RESERVE) / STATS_BUILD_LEGS` (min 1), so
+    /// gated builds can never collectively hold more than
+    /// `live_max - BUILD_GATE_RESERVE` live slots: at least one build's legs
+    /// can always complete, return their conns, and free the way for the
+    /// rest — the hold-while-waiting circular wait behind the ALL_mixed
+    /// freeze becomes unproducible. Waiters hold NO connection while parked
+    /// here (the acquire precedes every leg checkout), so the gate itself
+    /// cannot enter the wait-for graph. Callers on a runtime worker must go
+    /// through the spawn_blocking hop (`stats.rs` computes on blocking
+    /// threads already).
+    pub fn acquire_build_gate(&self) -> BuildGateGuard<'_> {
+        let mut held = self.build_gate.guard();
+        loop {
+            if *held < self.build_gate_capacity {
+                *held += 1;
+                return BuildGateGuard { pool: self, held: true };
+            }
+            held = self
+                .build_gate_cv
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn release_build_gate(&self) {
+        *self.build_gate.guard() -= 1;
+        self.build_gate_cv.notify_all();
+    }
+
+    /// Observability + the gate sizing tests.
+    pub fn build_gate_capacity(&self) -> usize {
+        self.build_gate_capacity
+    }
+
+    /// Observability: builds currently holding a gate permit.
+    pub fn build_gate_held(&self) -> usize {
+        *self.build_gate.guard()
     }
 
     /// White-box: connections currently checked out / currently open
@@ -851,5 +969,53 @@ mod tests {
         let r = pool.try_get();
         assert!(r.is_err(), "connect failure must surface as Err, not a poison panic");
         assert_eq!(pool.live_count(), 0, "the rollback path ran under the poisoned mutex");
+    }
+
+    // ---- Build gate (iter-83 ALL_mixed connection-starvation freeze) ------
+
+    #[test]
+    fn build_gate_sizing_keeps_a_reserve_for_single_conn_work() {
+        // The gate must permit at most floor((live_max - 4 legs) / 4 legs)
+        // concurrent builds (min 1), so builds can never collectively hold
+        // the live cap: with the serving default (live_max = 2*max) at
+        // least one full build's worth of slots stays free for the RMW/
+        // auth/probe handlers that queue on the live Condvar.
+        let (_p, pool) = capped_pool("gate-size", 4, 8);
+        assert_eq!(pool.build_gate_capacity(), 1, "live_max=8 -> one build, 4 slots reserved");
+        let (_p, pool) = capped_pool("gate-size16", 8, 16);
+        assert_eq!(pool.build_gate_capacity(), 3, "live_max=16 -> 3 builds (12 held), 4 free");
+        // Sub-reserve pools (the scratch twin: live_max=1) must still allow
+        // ONE build — its legs serialize on the cap and each leg RETURNS
+        // its conn when done, so a lone build can never self-deadlock.
+        let (_p, pool) = capped_pool("gate-size1", 1, 1);
+        assert_eq!(pool.build_gate_capacity(), 1);
+    }
+
+    #[test]
+    fn build_gate_serializes_beyond_capacity_and_recycles() {
+        // Third acquirer parks until a permit holder DROPS (guard-based
+        // return), then proceeds: the permit is recycled, not leaked.
+        let (_p, pool) = capped_pool("gate-serial", 4, 8); // capacity 1
+        let pool = std::sync::Arc::new(pool);
+        let a = pool.acquire_build_gate();
+        assert_eq!(pool.build_gate_held(), 1);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let poolr = std::sync::Arc::clone(&pool);
+        let h = std::thread::spawn(move || {
+            let _b = poolr.acquire_build_gate(); // must wait for `a`
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "second build passed the gate beyond capacity"
+        );
+        drop(a);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("released permit was not handed to the parked acquirer");
+        h.join().unwrap();
+        assert_eq!(pool.build_gate_held(), 0);
+        // Recycled: a fresh acquire succeeds immediately.
+        let _c = pool.acquire_build_gate();
+        assert_eq!(pool.build_gate_held(), 1);
     }
 }
