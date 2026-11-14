@@ -198,11 +198,7 @@ fn json_response(status: StatusCode, map: &Map<String, Value>) -> Response {
         .into_response()
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    let mut m = Map::new();
-    m.insert("error".into(), Value::String(msg.to_string()));
-    json_response(status, &m)
-}
+use crate::util::json_error;
 
 /// The route-catch shape server.js's error middleware answers for a throw
 /// inside a ported handler. Node's un-wrapped async arms DIE instead (the

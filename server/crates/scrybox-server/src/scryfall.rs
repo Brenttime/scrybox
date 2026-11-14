@@ -26,7 +26,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use http_body_util::BodyExt;
@@ -49,9 +49,7 @@ pub const DEFAULT_COOLDOWN_MS: i64 = 60_000;
 pub const CARD_ENDPOINTS_KEY: &str = r"^\/cards\/(search|named|random|collection)\b";
 pub const MANIFEST_KEY: &str = r"^\/cards\/manifest\b";
 
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
-}
+use crate::util::now_ms;
 
 /// Env-derived configuration (mirrors the Node constants).
 #[derive(Clone, Debug)]

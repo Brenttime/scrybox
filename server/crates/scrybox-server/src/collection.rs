@@ -26,7 +26,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use bytes::Bytes;
 use rusqlite::{types::ValueRef, Row};
@@ -114,33 +114,9 @@ pub struct CollectionParams {
 }
 
 /// JS `parseInt(x, 10)`: leading whitespace, optional sign, ASCII digits,
-/// stop at the first non-digit; None for NaN.
-pub(crate) fn js_parse_int(s: &str) -> Option<i64> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r') {
-        i += 1;
-    }
-    let neg = match bytes.get(i) {
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        _ => false,
-    };
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i].parse::<i64>().ok().map(|v| if neg { -v } else { v }).or(if neg { Some(i64::MIN) } else { Some(i64::MAX) })
-}
+/// stop at the first non-digit; None for NaN. Shared implementation lives in
+/// `crate::util` (iter-41 consolidation).
+pub(crate) use crate::util::js_parse_int;
 
 pub fn parse_params(user_id: i64, raw_query: Option<&str>) -> CollectionParams {
     let pairs: Vec<(String, String)> = raw_query
@@ -1609,14 +1585,7 @@ pub(crate) fn wants_encoding(ae: Option<&str>, needle: &str, len: usize) -> bool
     len >= 1024 && ae.map(|a| a.to_ascii_lowercase().contains(needle)).unwrap_or(false)
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(serde_json::json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 // ---------------------------------------------------------------------------
 // Handler

@@ -502,6 +502,8 @@ pub struct ParsedLine {
     pub qty: SqlValue,
     pub name: String,
     pub set_ref: String,
+    // set/number mirror Node's parseListLine result fields (parsed but only
+    // consumed by the SQL via set_ref today) — kept for structure parity.
     #[allow(dead_code)]
     pub set: String,
     #[allow(dead_code)]

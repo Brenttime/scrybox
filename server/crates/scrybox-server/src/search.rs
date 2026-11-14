@@ -34,7 +34,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use bytes::Bytes;
 use rusqlite::{Connection, Row};
@@ -160,33 +160,8 @@ impl SearchQuery {
     }
 }
 
-/// JS `parseInt(x, 10)` (same port as collection.rs).
-pub(crate) fn js_parse_int(s: &str) -> Option<i64> {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r') {
-        i += 1;
-    }
-    let neg = match bytes.get(i) {
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        _ => false,
-    };
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    s[start..i].parse::<i64>().ok().map(|v| if neg { -v } else { v }).or(if neg { Some(i64::MIN) } else { Some(i64::MAX) })
-}
+/// JS `parseInt(x, 10)` (shared implementation in `crate::util`).
+pub(crate) use crate::util::js_parse_int;
 
 /// JS `(numberQuery || '').trim().replace(/^#/, '').split('/')[0].trim()`.
 fn clean_number(raw: &str) -> String {
@@ -1495,12 +1470,7 @@ const RAW_PAGE_TTL_MS: i64 = 5 * 60 * 1000;
 /// `PRINTS` — every printing, no MTGO/Arena-only rebalances.
 const LIVE_PRINTS: &str = " unique:prints -is:digital";
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 struct RawPage {
     data: Vec<Value>,
@@ -2059,14 +2029,7 @@ async fn merge_search_prices(st: &AppState, pool: &Arc<DbPool>, cards: &mut [Val
     }
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(serde_json::json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 // ---------------------------------------------------------------------------
 // Handler

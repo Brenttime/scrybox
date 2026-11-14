@@ -84,6 +84,7 @@ pub mod shared;
 pub mod spa;
 pub mod static_assets;
 pub mod tls;
+pub mod util;
 
 /// Runtime configuration. Read from env in `main`; built directly in tests.
 #[derive(Clone, Debug)]

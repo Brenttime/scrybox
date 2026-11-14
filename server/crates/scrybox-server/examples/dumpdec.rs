@@ -1,3 +1,5 @@
+// Debug tool: dump vips-twin decode raw bytes. usage:
+//   cargo run --release --example dumpdec -- <img> <out.raw>
 use std::io::Write;
 fn main() {
     let a: Vec<String> = std::env::args().collect();

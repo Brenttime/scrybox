@@ -4,7 +4,7 @@
 
 use axum::{
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use rusqlite::OptionalExtension;
 
@@ -39,14 +39,7 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     raw.split(' ').nth(1).filter(|s| !s.is_empty())
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(serde_json::json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 // Built once (concat! of consts): the handlers call this on the hot request
 // path and prepare_cached hashes the SQL text on every call.

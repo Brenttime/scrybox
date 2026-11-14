@@ -476,12 +476,7 @@ pub fn parse_commander(page: &str) -> Result<Vec<Value>, String> {
 // build / getRules (rules.js module state)
 // ---------------------------------------------------------------------------
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 fn cr_link_re(base: &str) -> Regex {
     // JS /https:\/\/media\.wizards\.com\/[^"']*?\.txt/g with the base swapped

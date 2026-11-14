@@ -24,7 +24,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde_json::{json, Map, Value};
 
@@ -455,14 +455,7 @@ fn fresh_allows_304(headers: &axum::http::HeaderMap) -> bool {
     }
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        axum::Json(json!({ "error": msg })),
-    )
-        .into_response()
-}
+use crate::util::json_error;
 
 // ---------------------------------------------------------------------------
 // Unit tests (pure semantics; live parity is bench/parity.mjs shrd_*)

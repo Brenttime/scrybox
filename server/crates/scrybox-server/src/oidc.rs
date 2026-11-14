@@ -5,7 +5,6 @@
 //! like Node.
 
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use http_body_util::BodyExt;
@@ -20,9 +19,7 @@ use crate::poison::LockExt;
 const STATE_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 
-pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+pub use crate::util::now_ms_u64 as now_ms;
 
 fn env(k: &str) -> String {
     std::env::var(k).unwrap_or_default()

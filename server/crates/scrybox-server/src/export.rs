@@ -139,28 +139,10 @@ fn str_or_empty(v: Option<&Value>) -> String {
     }
 }
 
-/// `parseInt(s, 10)` over `String(v)`; None = NaN.
+/// `parseInt(s, 10)` over `String(v)`; None = NaN (overflow included —
+/// `crate::util`'s non-saturating arm, matching the old local copy).
 fn js_parse_int_str(v: &Value) -> Option<i64> {
-    let s = js_string(v);
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
-        i += 1;
-    }
-    let neg = i < b.len() && b[i] == b'-';
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let d0 = i;
-    while i < b.len() && (b[i] as char).is_ascii_digit() {
-        i += 1;
-    }
-    if i == d0 {
-        return None;
-    }
-    let digits: String = s[d0..i].chars().collect();
-    let n: i64 = digits.parse().ok()?;
-    Some(if neg { -n } else { n })
+    crate::util::js_parse_int_nonsat(&js_string(v))
 }
 
 /// `parseFloat(s) || 0` for the (unused-in-the-write-path) CSV strategy.

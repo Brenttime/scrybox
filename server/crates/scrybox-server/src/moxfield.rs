@@ -1785,12 +1785,7 @@ pub async fn wait_in_flight(author_id: i64) -> InFlightGuard {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::util::now_ms;
 
 fn read_intervals(conn: &Connection) -> (i64, i64) {
     let row = query_one(

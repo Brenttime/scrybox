@@ -244,6 +244,8 @@ pub struct Rejected {
     pub line: Option<i64>,
     pub name: String,
     pub reason: String,
+    // Parity mirror of Node's rejected-row shape; the route only reports
+    // line/name/reason, quantity is kept for the (not yet ported) report.
     #[allow(dead_code)]
     pub quantity: Option<i64>,
 }
