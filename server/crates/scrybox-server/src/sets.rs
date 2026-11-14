@@ -183,15 +183,20 @@ pub async fn handle(
     let query = req.uri().query().map(|s| s.to_string());
 
     // authenticateToken: Bearer session; API keys are GET-only (allowed).
+    // M5 family (marketplace iter-83/84 shape): the auth lookup and every
+    // checkout below go through the async hop / a spawn_blocking hop.
+    // DbPool::get() parks on the live-cap Condvar; a runtime worker parked
+    // there starves the whole runtime.
     let token = crate::auth::bearer_token(&headers).map(|s| s.to_string());
-    if let Err(res) = crate::auth::authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = crate::auth::authenticate_async(&pool, token.as_deref(), true).await {
         return res;
     }
 
     let tree = query_param(query.as_deref(), "tree").as_deref() == Some("1");
 
-    let read = (|| -> Result<Vec<Map<String, Value>>, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+    let pool_for_read = pool.clone();
+    let read = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>, String> {
+        let conn = pool_for_read.get().map_err(|e| format!("read pool: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, series, printed_total, total, release_date, set_code, symbol_url, logo_url
@@ -223,7 +228,10 @@ pub async fn handle(
             sets.push(r.map_err(|e| e.to_string())?);
         }
         Ok(sets)
-    })();
+    })
+    .await
+    .map_err(|e| format!("sets read task: {e}"))
+    .and_then(|r| r);
 
     let mut sets = match read {
         Ok(s) => s,
@@ -246,11 +254,13 @@ pub async fn handle(
         // promos…) offered by the parent, separable so a token-less user
         // can drop them.
         let scryfall_list = scryfall_sets(&st.scry, &st.scryfall_sets).await;
-        let exclusions = pool
-            .get()
-            .ok()
-            .map(|c| scan_exclusions(&c))
-            .unwrap_or(Exclusions { tokens: false, art_cards: false, jumpstart: false, promos: false });
+        let pool_for_ex = pool.clone();
+        let exclusions = tokio::task::spawn_blocking(move || {
+            pool_for_ex.get().ok().map(|c| scan_exclusions(&c))
+        })
+        .await
+        .unwrap_or(None)
+        .unwrap_or(Exclusions { tokens: false, art_cards: false, jumpstart: false, promos: false });
         let child_map = build_child_map(&scryfall_list, &exclusions);
         let child_codes: Vec<String> = child_map
             .values()
