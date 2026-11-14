@@ -37,6 +37,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::db::{self, DbPool};
+use crate::poison::{self, LockExt};
 
 /// Wrap a `BEGIN` so an early `?`/panic still issues `ROLLBACK` before the
 /// pooled connection goes back to the pool.
@@ -127,7 +128,7 @@ impl NameIndex {
         if self.rev.load(Ordering::Acquire) != rev {
             return None;
         }
-        self.snapshot.read().unwrap().clone()
+        self.snapshot.guard().clone()
     }
 
     /// (Re)build so a snapshot for `rev` exists (~30 ms for 37k rows);
@@ -150,7 +151,7 @@ impl NameIndex {
         }
         match self.build_snapshot(pool, rev) {
             Ok(snap) => {
-                *self.snapshot.write().unwrap() = Some(Arc::new(snap));
+                *poison::write(&self.snapshot) = Some(Arc::new(snap));
                 self.rev.store(rev, Ordering::Release);
             }
             Err(e) => tracing::debug!(error = %e, rev, "name index rebuild skipped"),
@@ -266,14 +267,14 @@ impl OwnedCache {
         if self.disabled {
             return None;
         }
-        if let Some(slot) = self.slots.read().unwrap().get(&user_id).cloned() {
+        if let Some(slot) = self.slots.guard().get(&user_id).cloned() {
             if slot.rev == rev {
                 return Some(slot.qty_by_key.clone());
             }
         }
         let Ok(_guard) = self.build.try_lock() else { return None };
         // Re-check: a parallel request may have built it while we waited.
-        if let Some(slot) = self.slots.read().unwrap().get(&user_id).cloned() {
+        if let Some(slot) = self.slots.guard().get(&user_id).cloned() {
             if slot.rev == rev {
                 return Some(slot.qty_by_key.clone());
             }
@@ -281,7 +282,7 @@ impl OwnedCache {
         match self.build_slot(pool, user_id, rev) {
             Ok(slot) => {
                 let map = slot.qty_by_key.clone();
-                self.slots.write().unwrap().insert(user_id, Arc::new(slot));
+                poison::write(&self.slots).insert(user_id, Arc::new(slot));
                 Some(map)
             }
             Err(e) => {

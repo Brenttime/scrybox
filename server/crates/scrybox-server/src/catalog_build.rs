@@ -53,6 +53,7 @@ use crate::cvscan;
 use crate::sets::{scan_exclusions, Exclusions, ScryfallSetsMemo};
 use crate::scryfall::Scry;
 use crate::AppState;
+use crate::poison::LockExt;
 
 /// catalog.js `UA` — backend/package.json version read at require time.
 /// Pinned against backend/package.json by the `scrybox_ua_version` test;
@@ -132,28 +133,28 @@ fn spawn_guarded<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) -
 }
 
 fn with_current<F: FnOnce(&mut Job)>(f: F) {
-    if let Some(j) = CURRENT.lock().unwrap().as_mut() {
+    if let Some(j) = CURRENT.guard().as_mut() {
         f(j);
     }
 }
 
 fn cancelled() -> bool {
-    CURRENT.lock().unwrap().as_ref().map(|j| j.cancelled).unwrap_or(false)
+    CURRENT.guard().as_ref().map(|j| j.cancelled).unwrap_or(false)
 }
 
 /// catalog.js `state()` — snapshot copy or null.
 pub fn state() -> Value {
-    CURRENT.lock().unwrap().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
+    CURRENT.guard().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
 }
 
 /// catalog.js `lastResult()` — the state() snapshot taken in `finally`.
 pub fn last_result() -> Value {
-    LAST.lock().unwrap().clone().unwrap_or(Value::Null)
+    LAST.guard().clone().unwrap_or(Value::Null)
 }
 
 /// catalog.js `stop()` — flip the flag on the running build.
 pub fn stop() -> bool {
-    match CURRENT.lock().unwrap().as_mut() {
+    match CURRENT.guard().as_mut() {
         Some(j) => {
             j.cancelled = true;
             true
@@ -164,8 +165,8 @@ pub fn stop() -> bool {
 
 #[cfg(test)]
 pub fn reset_for_test() {
-    *CURRENT.lock().unwrap() = None;
-    *LAST.lock().unwrap() = None;
+    *CURRENT.guard() = None;
+    *LAST.guard() = None;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +416,7 @@ pub struct JobCore {
 /// Err(message) for the route's 409.
 pub fn start(core: JobCore, langs: &[LangEntry], game_v: Option<&Value>, lang_v: Option<&Value>, opts: StartOpts) -> Result<Value, String> {
     // Node checks `current` first, then the game — order is observable.
-    let mut cur = CURRENT.lock().unwrap();
+    let mut cur = CURRENT.guard();
     if cur.is_some() {
         return Err("a catalog build is already running".into());
     }
@@ -533,7 +534,7 @@ async fn run_job(
 ) {
     let result: Result<String, String> = async {
         let model = model.ok_or("no CV_MODEL_DIR")?;
-        let job = CURRENT.lock().unwrap().clone().ok_or("job vanished")?;
+        let job = CURRENT.guard().clone().ok_or("job vanished")?;
         let ctx = JobCtx { game: job.game, lang: job.lang, sets: job.sets, model, scry, memo, langs };
 
         let cached = if skip_cache {
@@ -578,8 +579,8 @@ async fn run_job(
     }
     // finally: last = state(); current = null.
     let snap = state();
-    let mut cur = CURRENT.lock().unwrap();
-    *LAST.lock().unwrap() = Some(snap);
+    let mut cur = CURRENT.guard();
+    *LAST.guard() = Some(snap);
     *cur = None;
 }
 
@@ -1128,13 +1129,13 @@ mod tests {
             cancelled: false,
         });
         let h = spawn_guarded(async {
-            let _held = CURRENT.lock().unwrap();
+            let _held = CURRENT.guard();
             panic!("boom");
         });
         assert!(h.await.unwrap_err().is_panic());
-        assert!(CURRENT.lock().unwrap().is_none(), "CURRENT stuck after panic");
+        assert!(CURRENT.guard().is_none(), "CURRENT stuck after panic");
         assert!(state().is_null());
-        assert_eq!(LAST.lock().unwrap().as_ref().unwrap()["phase"], "error");
+        assert_eq!(LAST.guard().as_ref().unwrap()["phase"], "error");
     }
 
     fn seed_conn() -> rusqlite::Connection {

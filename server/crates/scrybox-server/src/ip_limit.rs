@@ -13,6 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 
 use axum::http::HeaderMap;
+use crate::poison::LockExt;
 
 /// Opaque trust-rule detail of `Trust::Rules` (built only by
 /// `Trust::from_env_value`); public only because the variant field is.
@@ -273,7 +274,7 @@ impl FixedWindowLimiter {
     }
 
     pub fn hit(&self, key: &str, now_ms: u64) -> Verdict {
-        let mut guard = self.buckets.lock().unwrap();
+        let mut guard = self.buckets.guard();
         let bs = &mut *guard;
         // Prune expired windows so a key spray cannot grow the map without
         // bound (Node's MemoryStore expires keys per window; dropping an

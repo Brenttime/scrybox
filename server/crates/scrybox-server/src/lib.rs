@@ -64,6 +64,7 @@ pub mod moxfield;
 pub mod moxfield_api;
 pub mod model_assets;
 pub mod name_index;
+pub mod poison;
 pub mod precons;
 pub mod rules;
 pub mod scryfall;

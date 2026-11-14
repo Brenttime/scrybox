@@ -47,6 +47,7 @@ use tokio::sync::OnceCell;
 use rusqlite::{types::Value as Sql, Connection};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use crate::poison::LockExt;
 
 use crate::{
     collection::{parse_array_col, resolve_card_price, sqlite_value, truthy},
@@ -363,20 +364,20 @@ impl CollQCache {
         self.walks.load(Ordering::Relaxed)
     }
     fn mem_get(&self, key: &str) -> Option<Arc<QEntry>> {
-        self.inner.lock().unwrap().entries.get(key).cloned()
+        self.inner.guard().entries.get(key).cloned()
     }
     fn mem_put(&self, key: String, e: Arc<QEntry>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.guard();
         if g.entries.len() > 256 {
             g.entries.clear();
         }
         g.entries.insert(key, e);
     }
     fn slot(&self, key: &str) -> Arc<WalkSlot> {
-        self.inner.lock().unwrap().inflight.entry(key.to_string()).or_default().clone()
+        self.inner.guard().inflight.entry(key.to_string()).or_default().clone()
     }
     fn finish(&self, key: &str) {
-        self.inner.lock().unwrap().inflight.remove(key);
+        self.inner.guard().inflight.remove(key);
     }
 }
 

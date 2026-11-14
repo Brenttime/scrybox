@@ -11,9 +11,10 @@
 //! `backend/src/db.js` so readers get the same page-cache/mmap behaviour
 //! Node configured.
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{path::PathBuf, sync::Mutex, sync::PoisonError};
 
 use rusqlite::Connection;
+use crate::poison::LockExt;
 
 /// Per-pool SQLite tuning (Gate D final-phase DB tuning).
 ///
@@ -144,7 +145,7 @@ impl DbPool {
     /// fallback (REVIEW M5); today's inline call sites already block in
     /// `connect()`, so the wait adds no new class of blocking.
     pub fn get(&self) -> rusqlite::Result<PooledConn<'_>> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.guard();
         loop {
             if let Some(c) = st.idle.pop() {
                 st.live += 1;
@@ -157,7 +158,7 @@ impl DbPool {
                 st.live += 1;
                 drop(st);
                 let opened = Self::connect(&self.path, self.cfg);
-                st = self.state.lock().unwrap();
+                st = self.state.guard();
                 match opened {
                     Ok(c) => return Ok(PooledConn { pool: self, conn: Some(c) }),
                     Err(e) => {
@@ -167,7 +168,10 @@ impl DbPool {
                     }
                 }
             }
-            st = self.live_cv.wait(st).unwrap();
+            // Recovered (not panicked) on a poisoned mutex: the panic that
+            // poisoned it may have skipped its live_cv.notify, so re-check
+            // the predicate here rather than trusting a "wake".
+            st = self.live_cv.wait(st).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -176,7 +180,7 @@ impl DbPool {
     /// be reserved → same path as `get()`). For async-inline probe paths
     /// that must never park a runtime worker; fall back to spawn_blocking.
     pub fn try_get(&self) -> rusqlite::Result<Option<PooledConn<'_>>> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.guard();
         if let Some(c) = st.idle.pop() {
             st.live += 1;
             return Ok(Some(PooledConn { pool: self, conn: Some(c) }));
@@ -188,7 +192,7 @@ impl DbPool {
             match opened {
                 Ok(c) => Ok(Some(PooledConn { pool: self, conn: Some(c) })),
                 Err(e) => {
-                    self.state.lock().unwrap().live -= 1;
+                    self.state.guard().live -= 1;
                     self.live_cv.notify_all();
                     Err(e)
                 }
@@ -201,11 +205,11 @@ impl DbPool {
     /// White-box: connections currently checked out / currently open
     /// (idle + live). Used by the pool-cap tests.
     pub fn live_count(&self) -> usize {
-        self.state.lock().unwrap().live
+        self.state.guard().live
     }
 
     pub fn open_count(&self) -> usize {
-        let st = self.state.lock().unwrap();
+        let st = self.state.guard();
         st.live + st.idle.len()
     }
 
@@ -215,7 +219,7 @@ impl DbPool {
     /// never past `live_max` total open.
     pub fn warm(&self, n: usize) {
         let want = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.guard();
             let target = n.min(self.max).min(self.live_max);
             target.saturating_sub(st.live + st.idle.len())
         };
@@ -223,14 +227,14 @@ impl DbPool {
             // Reserve a permit around the open so concurrent `get()`s
             // cannot push the total past live_max while we connect.
             {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.guard();
                 if st.live + st.idle.len() >= self.live_max {
                     break;
                 }
                 st.live += 1;
             }
             let opened = Self::connect(&self.path, self.cfg);
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.guard();
             st.live -= 1;
             match opened {
                 Ok(c) if st.idle.len() < self.max => st.idle.push(c),
@@ -241,7 +245,7 @@ impl DbPool {
     }
 
     fn put(&self, conn: Connection) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.guard();
         if st.idle.len() < self.max {
             st.idle.push(conn);
         } else {
@@ -249,7 +253,7 @@ impl DbPool {
             // SQLite teardown IO never holds the pool mutex.
             drop(st);
             drop(conn);
-            st = self.state.lock().unwrap();
+            st = self.state.guard();
         }
         st.live = st.live.saturating_sub(1);
         // notify_all (not notify_one): each return frees exactly one
@@ -520,5 +524,70 @@ mod tests {
         assert_eq!(pool.open_count(), 4);
         let _c = pool.get().unwrap();
         assert_eq!(pool.open_count(), 4, "hit-path checkout must reuse an idle conn");
+    }
+
+    // --- REVIEW-errors-maint M2: the pool's state mutex must survive a
+    // poisoning panic (pre-fix, state was `lock().unwrap()` at the old
+    // db.rs:95/108/117: one panic under the guard took down every
+    // DB-backed route in the process forever). ---
+
+    fn poison_pool_state(pool: &DbPool) {
+        // Poison while HELD, WITHOUT mutating: poisoning is a property of
+        // the mutex, not of PoolState. Exactly what a real panic inside a
+        // route/job would leave behind.
+        let h = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _st = pool.state.lock().unwrap();
+                panic!("simulated panic while holding the pool state lock");
+            })
+            .join()
+        });
+        assert!(h.is_err(), "precondition: the poisoning thread must panic");
+    }
+
+    #[test]
+    fn pool_survives_poisoned_state_mutex() {
+        let (_p, pool) = capped_pool("poison", 1, 2);
+        poison_pool_state(&pool);
+        // Pre-fix the next lines panicked with "mutex is poisoned".
+        let c = pool.get().expect("M2: get() must survive a poisoned state mutex");
+        assert_eq!(pool.live_count(), 1, "live accounting must keep working");
+        let t = pool
+            .try_get()
+            .expect("M2: try_get() must survive a poisoned state mutex")
+            .expect("a permit must be available");
+        assert_eq!(pool.live_count(), 2);
+        drop((c, t));
+        assert_eq!(pool.live_count(), 0, "put() path must keep working");
+    }
+
+    #[test]
+    fn poisoned_pool_get_still_returns_a_connection() {
+        // Poison while a checkout is live, then checkout + return must
+        // both keep working through the poisoned mutex (the pass that pops
+        // idle / reserves live is the hot path).
+        let (_p, pool) = capped_pool("poison2", 1, 2);
+        let _c = pool.get().unwrap();
+        poison_pool_state(&pool);
+        let c2 = pool
+            .get()
+            .expect("M2: a checkout after poisoning must not panic on the mutex");
+        assert_eq!(pool.live_count(), 2);
+        drop((c2, _c)); // put() path runs under the poisoned mutex
+        assert_eq!(pool.live_count(), 0);
+    }
+
+    #[test]
+    fn poisoned_pool_try_get_returns_err_not_panic_when_connect_fails() {
+        // The connect-error arm (live -= 1 + notify_all under the mutex)
+        // must answer Err, not a poison panic.
+        let (_p, pool) = capped_pool("poison3", 1, 1); // eager connect ok
+        poison_pool_state(&pool);
+        std::fs::remove_file(&_p).unwrap(); // every NEW connect now fails;
+        // the idle list is empty (open_with opens lazily per checkout), so
+        // try_get takes the connect path under the poisoned mutex.
+        let r = pool.try_get();
+        assert!(r.is_err(), "connect failure must surface as Err, not a poison panic");
+        assert_eq!(pool.live_count(), 0, "the rollback path ran under the poisoned mutex");
     }
 }

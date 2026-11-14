@@ -78,6 +78,7 @@ use serde_json::{Map, Value};
 use crate::auth::{authenticate, bearer_token};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, json_num, wants_encoding};
 use crate::db::DbPool;
+use crate::poison::LockExt;
 use crate::decks_reads::{js_trim, sql_card_key};
 use crate::lists_reads::{qs_get, QsVal};
 use crate::mfx_payload::js_truthy;
@@ -1131,7 +1132,7 @@ pub async fn handle_cotd(State(st): State<AppState>, req: Request) -> Response {
         }
         _ => eastern_day(now_ms()),
     };
-    if let Some(hit) = cotd_cache().lock().unwrap().0.get(&day) {
+    if let Some(hit) = cotd_cache().guard().0.get(&day) {
         return res_json(hit, &cond);
     }
     // Node's whole body sits in one try: EVERY throw → the 502 below.
@@ -1217,7 +1218,7 @@ pub async fn handle_cotd(State(st): State<AppState>, req: Request) -> Response {
         ("card", card),
     ]);
     {
-        let mut c = cotd_cache().lock().unwrap();
+        let mut c = cotd_cache().guard();
         if !c.0.contains_key(&day) {
             c.1.push_back(day.clone());
         }

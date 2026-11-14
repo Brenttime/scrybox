@@ -37,6 +37,7 @@ use hyper::{
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use serde_json::Value;
+use crate::poison::LockExt;
 
 pub const UPSTREAM_BASE: &str = "https://api.scryfall.com";
 /// axios client timeout in the Node client (scryfallApi.js).
@@ -328,8 +329,7 @@ impl Scry {
             let hit = self
                 .inner
                 .breaker
-                .lock()
-                .unwrap()
+                .guard()
                 .get(&abs)
                 .map(|expiry| *expiry > now_ms())
                 .unwrap_or(false);
@@ -340,13 +340,13 @@ impl Scry {
         match self.request(Method::GET, url, None, opts).await {
             Ok(v) => {
                 if opts.breaker {
-                    self.inner.breaker.lock().unwrap().remove(&abs);
+                    self.inner.breaker.guard().remove(&abs);
                 }
                 Ok(v)
             }
             Err(e) if e.is_status(404) => {
                 if opts.breaker {
-                    self.inner.breaker.lock().unwrap().insert(abs, now_ms() + BREAKER_TTL_MS);
+                    self.inner.breaker.guard().insert(abs, now_ms() + BREAKER_TTL_MS);
                 }
                 Ok(None)
             }
@@ -515,18 +515,17 @@ impl Scry {
         let (abs, _) = self.resolve(url, opts);
         self.inner
             .breaker
-            .lock()
-            .unwrap()
+            .guard()
             .get(&abs)
             .map(|expiry| *expiry > now_ms())
             .unwrap_or(false)
     }
 
     pub fn asked_oracle_taken(&self, oid: &str) -> bool {
-        self.inner.asked_oracle.lock().unwrap().contains(oid)
+        self.inner.asked_oracle.guard().contains(oid)
     }
     pub fn mark_asked_oracle(&self, oid: &str) {
-        self.inner.asked_oracle.lock().unwrap().insert(oid.to_string());
+        self.inner.asked_oracle.guard().insert(oid.to_string());
     }
 }
 

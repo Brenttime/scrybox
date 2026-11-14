@@ -29,6 +29,7 @@ use crate::cards_tags::json_response;
 use crate::collection_writes::node_exact;
 use crate::cvscan;
 use crate::AppState;
+use crate::poison::LockExt;
 
 const HF: &str = "https://huggingface.co";
 
@@ -153,19 +154,19 @@ fn spawn_guarded<F: std::future::Future<Output = ()> + Send + 'static>(fut: F) -
 }
 
 fn with_current<F: FnOnce(&mut DlJob)>(f: F) {
-    if let Some(j) = CURRENT.lock().unwrap().as_mut() {
+    if let Some(j) = CURRENT.guard().as_mut() {
         f(j);
     }
 }
 
 /// modelAssets `state()`.
 pub fn state() -> Value {
-    CURRENT.lock().unwrap().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
+    CURRENT.guard().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null)
 }
 
 /// modelAssets `lastResult()`.
 pub fn last_result() -> Value {
-    LAST.lock().unwrap().clone().unwrap_or(Value::Null)
+    LAST.guard().clone().unwrap_or(Value::Null)
 }
 
 fn is_present(dir: &Path, a: &Asset) -> bool {
@@ -226,7 +227,7 @@ pub fn status(st_model: Option<&PathBuf>) -> Value {
 /// modelAssets `start(what)` — Ok(state snapshot) or Err(message) for 409.
 pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
     let what = what.to_string();
-    let mut cur = CURRENT.lock().unwrap();
+    let mut cur = CURRENT.guard();
     if cur.is_some() {
         return Err("a download is already running".into());
     }
@@ -290,7 +291,7 @@ pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
             }
         }
         let snap = {
-            let mut m = CURRENT.lock().unwrap().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null);
+            let mut m = CURRENT.guard().as_ref().map(|j| j.to_value()).unwrap_or(Value::Null);
             if let Some(o) = m.as_object_mut() {
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -300,8 +301,8 @@ pub fn start(what: &str, st_model: Option<PathBuf>) -> Result<Value, String> {
             }
             m
         };
-        *LAST.lock().unwrap() = Some(snap);
-        *CURRENT.lock().unwrap() = None;
+        *LAST.guard() = Some(snap);
+        *CURRENT.guard() = None;
     });
     Ok(reply)
 }
@@ -517,11 +518,11 @@ mod m1_tests {
             message: String::new(),
         });
         let h = spawn_guarded(async {
-            let _held = CURRENT.lock().unwrap();
+            let _held = CURRENT.guard();
             panic!("boom");
         });
         assert!(h.await.unwrap_err().is_panic());
-        assert!(CURRENT.lock().unwrap().is_none(), "CURRENT stuck after panic");
-        assert_eq!(LAST.lock().unwrap().as_ref().unwrap()["phase"], "error");
+        assert!(CURRENT.guard().is_none(), "CURRENT stuck after panic");
+        assert_eq!(LAST.guard().as_ref().unwrap()["phase"], "error");
     }
 }

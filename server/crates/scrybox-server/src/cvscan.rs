@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cardscan;
 use crate::npz::{self, NpyData};
+use crate::poison::LockExt;
 
 const CORN_SIZE: usize = 384;
 const EMBED_SIZE: usize = 448;
@@ -167,7 +168,7 @@ fn ort_env() -> Result<&'static ort::environment::Environment, String> {
 }
 
 fn load_models() -> Result<Arc<Models>, String> {
-    let mut slot = MODELS.lock().unwrap();
+    let mut slot = MODELS.guard();
     if let Some(res) = slot.as_ref() {
         return res.clone();
     }
@@ -225,7 +226,7 @@ fn load_catalog(game: &str, lang: Option<&str>) -> Result<Arc<Catalog>, String> 
     };
     let key = catalog_key(game, use_lang.as_deref());
     {
-        let map = CATALOGS.lock().unwrap();
+        let map = CATALOGS.guard();
         if let Some(c) = map.as_ref().and_then(|m| m.get(&key)) {
             return Ok(c.clone());
         }
@@ -286,7 +287,7 @@ fn load_catalog(game: &str, lang: Option<&str>) -> Result<Arc<Catalog>, String> 
     };
     let arc = Arc::new(cat);
     {
-        let mut map = CATALOGS.lock().unwrap();
+        let mut map = CATALOGS.guard();
         let m = map.get_or_insert_with(HashMap::new);
         m.insert(key, arc.clone());
     }
@@ -310,7 +311,7 @@ fn load_all(game: &str, lang: Option<&str>) -> Result<Vec<Arc<Catalog>>, String>
 /// set ids; unknown rows → None ("not in your sets").
 fn row_sets(c: &Arc<Catalog>, game: &str, pool: &crate::db::DbPool) -> Result<Arc<Vec<Option<String>>>, String> {
     {
-        let g = c.set_of.lock().unwrap();
+        let g = c.set_of.guard();
         if let Some(v) = g.as_ref() {
             return Ok(v.clone());
         }
@@ -343,7 +344,7 @@ fn row_sets(c: &Arc<Catalog>, game: &str, pool: &crate::db::DbPool) -> Result<Ar
         })
         .collect();
     let arc = Arc::new(set_of);
-    *c.set_of.lock().unwrap() = Some(arc.clone());
+    *c.set_of.guard() = Some(arc.clone());
     Ok(arc)
 }
 
@@ -876,7 +877,7 @@ pub fn reload(game: &str, lang: &str) {
     };
     let lang_opt = if lang.is_empty() { None } else { Some(lang) };
     let use_lang = if has_local(&dir, game, lang_opt) { lang_opt } else { None };
-    let mut map = CATALOGS.lock().unwrap();
+    let mut map = CATALOGS.guard();
     if let Some(m) = map.as_mut() {
         m.remove(&catalog_key(game, use_lang));
         m.remove(game);

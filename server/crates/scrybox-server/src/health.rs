@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::{json_error, strip_hop_by_hop, AppState};
+use crate::poison::LockExt;
 
 pub const DEFAULT_PROBE_TICK_MS: u64 = 500;
 pub const DEFAULT_TTL_MS: u64 = 1_000;
@@ -81,16 +82,16 @@ impl HealthCache {
     /// Test/ops hook: retune the prober/TTL at any time (the ticker re-reads
     /// the tick each cycle; the TTL is consulted per request).
     pub fn set_intervals(&self, tick: Duration, ttl: Duration) {
-        *self.tick.lock().unwrap() = tick;
-        *self.ttl.lock().unwrap() = ttl;
+        *self.tick.guard() = tick;
+        *self.ttl.guard() = ttl;
     }
 
     fn tick_dur(&self) -> Duration {
-        *self.tick.lock().unwrap()
+        *self.tick.guard()
     }
 
     fn ttl_dur(&self) -> Duration {
-        *self.ttl.lock().unwrap()
+        *self.ttl.guard()
     }
 
     fn store(&self, status: StatusCode, headers: HeaderMap, body: Bytes) {
@@ -117,16 +118,16 @@ impl HealthCache {
                 Some((name, value))
             })
             .collect();
-        *self.entry.lock().unwrap() = Some(Cached { status, headers, body, at: Instant::now() });
+        *self.entry.guard() = Some(Cached { status, headers, body, at: Instant::now() });
     }
 
     fn clear(&self) {
-        *self.entry.lock().unwrap() = None;
+        *self.entry.guard() = None;
     }
 
     /// A clone of the cached response while it is younger than the TTL.
     pub fn fresh(&self) -> Option<Response> {
-        let entry = self.entry.lock().unwrap();
+        let entry = self.entry.guard();
         let c = entry.as_ref()?;
         if c.at.elapsed() >= self.ttl_dur() {
             return None;
