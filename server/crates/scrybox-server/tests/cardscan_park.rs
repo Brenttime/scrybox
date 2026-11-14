@@ -284,7 +284,10 @@ fn scan_match_does_not_park_the_runtime_worker_at_the_live_cap() {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 200]);
     let body = format!(r#"{{"image":"data:image/jpeg;base64,{b64}"}}"#);
-    let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 200);
+    // The fold answers 503 notBuilt (is_built gate fires before the ORT leg in
+    // the test env — no catalog built). Park-RED is the timeout panic in
+    // parked_probe, independent of this status, so the pin stays valid.
+    let (_s, bytes, pool) = parked_probe("POST", "/api/scan-match", Some("application/json"), Some(Box::leak(body.into_boxed_str())), 503);
     let v = parse(&bytes);
     assert!(
         v["error"].is_string() && (v["notBuilt"].as_bool() == Some(true) || v["error"] == serde_json::json!("Scan match failed")),
