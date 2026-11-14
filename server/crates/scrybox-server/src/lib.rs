@@ -49,6 +49,7 @@ pub mod decks_writes;
 pub mod decks_reads;
 pub mod decks_combos;
 pub mod export;
+pub mod flight;
 pub mod npz;
 pub mod settings;
 pub mod limited;

@@ -176,6 +176,26 @@ impl Default for StatsCache {
     }
 }
 
+/// The inflight half of the single-flight (see [`crate::flight`]): the
+/// explicit finish only ran on the linear path; the paired
+/// [`crate::flight::SlotGuard`] reclaims the slot key on the panic path too
+/// (refresher tick, boot warm, SWR background rebuild, request path).
+impl crate::flight::FlightCache for StatsCache {
+    type Slot = ComputeSlot;
+    fn flight_slot(&self, key: &str) -> Arc<Self::Slot> {
+        self.slot(key)
+    }
+    fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
+        if self.inner.lock().unwrap().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+            self.finish(key);
+        }
+    }
+    #[cfg(test)]
+    fn flight_len(&self, key: &str) -> usize {
+        self.inner.lock().unwrap().inflight.contains_key(key) as usize
+    }
+}
+
 impl StatsCache {
     pub fn new() -> Self {
         Self::default()
@@ -255,14 +275,6 @@ impl StatsCache {
 
     pub(crate) fn get_entry(&self, key: &str) -> Option<Arc<StatsEntry>> {
         self.get(key)
-    }
-
-    pub(crate) fn slot_for(&self, key: &str) -> Arc<ComputeSlot> {
-        self.slot(key)
-    }
-
-    pub(crate) fn finish_key(&self, key: &str) {
-        self.finish(key)
     }
 
     /// The live data revision (statsCache.dataRevision), read off the pool.
@@ -941,7 +953,7 @@ pub fn spawn_refresher(state: &AppState) {
             };
             for user_id in users {
                 let Some(key) = cache.refresh_due(user_id, rev.as_deref()) else { continue };
-                let slot = cache.slot(&key);
+                let (slot, guard) = crate::flight::slot_guarded(&cache, &key);
                 let cache2 = Arc::clone(&cache);
                 let pool3 = Arc::clone(&pool);
                 let key2 = key.clone();
@@ -979,7 +991,7 @@ pub fn spawn_refresher(state: &AppState) {
                             cache2.refresh_failed(user_id);
                         }
                     }
-                    cache2.finish(&key2);
+                    drop(guard);
                 });
             }
         }
@@ -1062,7 +1074,7 @@ pub fn spawn_boot_warm(state: &AppState) {
             if cache.get_entry(&key).is_some() {
                 continue;
             }
-            let slot = cache.slot(&key);
+            let (slot, guard) = crate::flight::slot_guarded(&cache, &key);
             let cache2 = Arc::clone(&cache);
             let pool3 = Arc::clone(&pool);
             let key2 = key.clone();
@@ -1078,7 +1090,7 @@ pub fn spawn_boot_warm(state: &AppState) {
             // request path; a warm failure is silently left for the request
             // path to retry (no backoff needed — this runs once).
             let _ = slot.get_or_try_init(init).await;
-            cache.finish(&key);
+            drop(guard);
         }
     });
 }
@@ -1436,7 +1448,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         // spent computing it; steady-state (no writes) bodies are unchanged
         // and byte-identical, and the X-Stats-Cache header keeps Node's
         // answer for this instant ('miss' — Node had no entry either).
-        let slot = cache.slot(&key);
+        let (slot, guard) = crate::flight::slot_guarded(&cache, &key);
         let init_cache = Arc::clone(&cache);
         let init_pool = Arc::clone(&compute_pool);
         let init_key = key.clone();
@@ -1455,20 +1467,18 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
         };
         if let Some(stale) = cache.stale_for(user_id) {
             let bg_slot = Arc::clone(&slot);
-            let bg_cache = Arc::clone(&cache);
-            let bg_key = key.clone();
             tokio::spawn(async move {
                 match bg_slot.get_or_try_init(init).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => tracing::error!(error = %e, "stats background build failed"),
                     Err(e) => tracing::error!(error = %e, "stats background build failed"),
                 }
-                bg_cache.finish(&bg_key);
+                drop(guard);
             });
             return Ok((false, stale));
         }
         let res: Result<&Result<Arc<StatsEntry>, String>, String> = slot.get_or_try_init(init).await;
-        cache.finish(&key);
+        drop(guard);
         // get_or_try_init nests: outer Err carries a clone of the init error
         // (E: Clone), outer Ok wraps the stored Result<Arc<StatsEntry>, String>.
         let entry = match res {
