@@ -806,7 +806,7 @@ pub async fn route_export(State(st): State<AppState>, req: Request) -> Response 
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
@@ -900,7 +900,7 @@ pub async fn route_export_post(State(st): State<AppState>, req: Request) -> Resp
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
@@ -1044,7 +1044,7 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();

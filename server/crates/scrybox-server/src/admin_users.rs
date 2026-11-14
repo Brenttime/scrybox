@@ -83,7 +83,7 @@ pub async fn route_users(State(st): State<AppState>, req: Request) -> Response {
     match req.method().clone() {
         axum::http::Method::GET => handle_get(State(st), req).await,
         axum::http::Method::POST => handle_post(State(st), req).await,
-        _ => crate::collection_writes::unowned(st, req, true).await,
+        _ => crate::collection_writes::unowned(st, req).await,
     }
 }
 
@@ -92,7 +92,7 @@ pub async fn route_user(State(st): State<AppState>, Path(id): Path<String>, req:
     match req.method().clone() {
         axum::http::Method::PUT => handle_put(State(st), id, req).await,
         axum::http::Method::DELETE => handle_delete(State(st), id, req).await,
-        _ => crate::collection_writes::unowned(st, req, true).await,
+        _ => crate::collection_writes::unowned(st, req).await,
     }
 }
 

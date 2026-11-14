@@ -228,7 +228,7 @@ pub async fn handle_oracle(State(st): State<AppState>, req: Request) -> Response
         return crate::proxy(State(st), req).await;
     }
     if req.method() != axum::http::Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -475,7 +475,7 @@ pub async fn handle_oracle_tags(State(st): State<AppState>, req: Request) -> Res
         return crate::proxy(State(st), req).await;
     }
     if req.method() != axum::http::Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -572,7 +572,7 @@ pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Respo
         return crate::proxy(State(st), req).await;
     }
     if req.method() != axum::http::Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;
@@ -775,7 +775,7 @@ pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Respo
         return crate::proxy(State(st), req).await;
     }
     if req.method() != axum::http::Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st.clone()), req).await;

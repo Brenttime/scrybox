@@ -424,7 +424,7 @@ pub async fn route_settings(State(st): State<AppState>, req: Request) -> Respons
             }
         }
         Method::PUT => handle_put(&st, pool, req).await,
-        _ => crate::collection_writes::unowned(st, req, false).await,
+        _ => crate::collection_writes::unowned(st, req).await,
     }
 }
 
@@ -436,7 +436,7 @@ pub async fn route_version(State(st): State<AppState>, req: Request) -> Response
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;

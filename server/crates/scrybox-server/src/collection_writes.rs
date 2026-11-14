@@ -585,14 +585,21 @@ pub(crate) fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
     }
 }
 
-/// Standalone (no Node upstream) answer for a method/path a native handler
-/// does not own — what Node does when no route matches: the global
-/// `normalJson` parser (pre-auth; skipped for the large-body paths, whose
-/// parser runs AFTER auth), the auth gate (`/api` authenticateToken, or the
-/// admin router's `authenticateToken, requireAdmin` when `admin`), then
-/// finalhandler's `Cannot METHOD /path` 404. Parser failures land in the
-/// generic error handler (413 too-large / 500 `Internal server error`).
-pub(crate) async fn standalone_unmatched(st: &AppState, req: Request, admin: bool) -> Response {
+/// THE standalone (no Node upstream) answer for any request no native
+/// handler serves — the router fallback (`crate::proxy`) and every native
+/// handler's unowned method/shape land here. Mirrors server.js order for a
+/// request no Express route matches: the global `normalJson` parser (pre-auth,
+/// for EVERY path; skipped only for the large-body paths, whose matcher is
+/// the custom middleware's case-sensitive `req.path` test), then for `/api`
+/// (Express mounts are case-insensitive) the admin router's
+/// `authenticateToken, requireAdmin` under `/api/admin`, else the global
+/// `authenticateToken` gate, then the post-auth bigJson parsers (mounted, so
+/// case-insensitive; a body already parsed by normalJson is skipped), then
+/// finalhandler's `Cannot METHOD /path` 404 — METHOD/path being the ORIGINAL
+/// request's (HEAD stays HEAD, `/API/Foo/` stays as typed). Parser failures
+/// land in the generic error handler (413 too-large / 500 `Internal server
+/// error`).
+pub(crate) async fn standalone_unmatched(st: &AppState, req: Request) -> Response {
     const LARGE: &[(&str, usize)] = &[
         ("/api/import", BODY_BIG),
         ("/api/scan-match", BODY_BIG),
@@ -600,13 +607,24 @@ pub(crate) async fn standalone_unmatched(st: &AppState, req: Request, admin: boo
         ("/api/cardscan", BODY_BIG),
         ("/api/manabox-sync", BODY_MANABOX),
     ];
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let large = LARGE
-        .iter()
-        .find(|(p, _)| path == *p || path.starts_with(&format!("{p}/")))
-        .map(|(_, cap)| *cap);
-    let (parts, bytes, oversize) = read_parts(req, large.unwrap_or(BODY_NORMAL)).await;
+    let method = req
+        .extensions()
+        .get::<crate::OrigMethod>()
+        .map(|m| m.0.clone())
+        .unwrap_or_else(|| req.method().clone());
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let lower = path.to_ascii_lowercase();
+    let under = |base: &str, p: &str| p == base || p.starts_with(&format!("{base}/"));
+    // server.js largeJsonPaths middleware: exact-case req.path test.
+    let skip_normal = LARGE.iter().any(|(p, _)| under(p, &path));
+    // app.use('/api/import', bigJson) etc.: case-insensitive mounts.
+    let big = LARGE.iter().find(|(p, _)| under(p, &lower)).map(|(_, cap)| *cap);
+    let read_cap = if skip_normal { big.unwrap_or(BODY_NORMAL) } else { BODY_NORMAL };
+    let (parts, bytes, oversize) = read_parts(req, read_cap).await;
     let parse = |cap: usize| -> Option<Response> {
         if !is_json_ct(&parts.headers) {
             return None;
@@ -622,31 +640,35 @@ pub(crate) async fn standalone_unmatched(st: &AppState, req: Request, admin: boo
             _ => Some(internal_error()),
         }
     };
-    if large.is_none() {
+    if !skip_normal {
         if let Some(r) = parse(BODY_NORMAL) {
             return r;
         }
     }
-    if let Some(pool) = st.db.as_ref() {
-        let is_get = method == Method::GET;
-        if admin {
-            let user = match crate::settings::authenticate(pool, &parts.headers, is_get) {
-                Ok(u) => u,
-                Err(r) => return r,
-            };
-            if let Some(r) = crate::settings::admin_gate(&user) {
-                return r;
-            }
-        } else {
-            let token = bearer_token(&parts.headers).map(|s| s.to_string());
-            if let Err(r) = crate::auth::authenticate_async(pool, token.as_deref(), is_get).await {
-                return r;
+    if under("/api", &lower) {
+        if let Some(pool) = st.db.as_ref() {
+            let is_get = method == Method::GET;
+            if under("/api/admin", &lower) {
+                let user = match crate::settings::authenticate(pool, &parts.headers, is_get) {
+                    Ok(u) => u,
+                    Err(r) => return r,
+                };
+                if let Some(r) = crate::settings::admin_gate(&user) {
+                    return r;
+                }
+            } else {
+                let token = bearer_token(&parts.headers).map(|s| s.to_string());
+                if let Err(r) = crate::auth::authenticate_async(pool, token.as_deref(), is_get).await {
+                    return r;
+                }
             }
         }
-    }
-    if let Some(cap) = large {
-        if let Some(r) = parse(cap) {
-            return r;
+        if skip_normal {
+            if let Some(cap) = big {
+                if let Some(r) = parse(cap) {
+                    return r;
+                }
+            }
         }
     }
     crate::static_assets::express_default_404(&method, &path)
@@ -654,9 +676,9 @@ pub(crate) async fn standalone_unmatched(st: &AppState, req: Request, admin: boo
 
 /// Unowned method on a native route: hybrid forwards to Node; standalone
 /// answers Node's no-route arms natively (see `standalone_unmatched`).
-pub(crate) async fn unowned(st: AppState, req: Request, admin: bool) -> Response {
+pub(crate) async fn unowned(st: AppState, req: Request) -> Response {
     if st.cfg.node_upstream.is_empty() {
-        return standalone_unmatched(&st, req, admin).await;
+        return standalone_unmatched(&st, req).await;
     }
     crate::proxy(State(st), req).await
 }
@@ -717,7 +739,7 @@ pub async fn handle_cardlist(State(st): State<AppState>, req: Request) -> Respon
         if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
             return handle_entry(Path("cardlist".to_string()), State(st), req).await;
         }
-        return unowned(st, req, false).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -854,7 +876,7 @@ fn cardlist(pool: &DbPool, user_id: i64, uri: &Uri, headers: &HeaderMap) -> Resu
 pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     if method != Method::PUT && method != Method::DELETE {
-        return unowned(st, req, false).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -918,7 +940,7 @@ pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
         if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
             return handle_entry(Path("bulk".to_string()), State(st), req).await;
         }
-        return unowned(st, req, false).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
@@ -2171,7 +2193,7 @@ pub(crate) async fn plan_add_standalone(
 /// `POST /collection` — routes/collection.js route 3.
 pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST {
-        return unowned(st, req, false).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;
@@ -2286,7 +2308,7 @@ pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Respon
         if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
             return handle_entry(Path("bulk-add".to_string()), State(st), req).await;
         }
-        return unowned(st, req, false).await;
+        return unowned(st, req).await;
     }
     let Some(pool) = st.db.clone() else {
         return crate::proxy(State(st), req).await;

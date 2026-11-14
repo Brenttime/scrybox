@@ -1220,7 +1220,7 @@ pub async fn handle_preview(State(st): State<AppState>, req: Request) -> Respons
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
@@ -1276,7 +1276,7 @@ pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response 
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::POST {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
@@ -1431,7 +1431,7 @@ pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
@@ -1489,7 +1489,7 @@ pub async fn handle_report(State(st): State<AppState>, Path(id): Path<String>, r
         return crate::proxy(State(st), req).await;
     }
     if req.method() != Method::GET {
-        return crate::collection_writes::unowned(st, req, false).await;
+        return crate::collection_writes::unowned(st, req).await;
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
