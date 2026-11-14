@@ -331,7 +331,8 @@ async fn bulk_add_all_failed_500() {
         .await;
     // false is falsy -> skipped (not failed); only 111 fails, added 0 -> 500.
     assert_eq!(s, 500);
-    assert_eq!(body["error"], "Failed to add cards to list");
+    // Node: res.status(500).json({ added, failed }) — counts body, key order kept.
+    assert_eq!(serde_json::to_string(&body).unwrap(), r#"{"added":0,"failed":[111]}"#);
 }
 
 // ---------------------------------------------------------------------------

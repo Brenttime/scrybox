@@ -343,6 +343,7 @@ pub async fn handle_card(
 /// are on (one axum route per path): GET -> decks_reads list, POST -> create,
 /// anything else -> Node (never 405; Express falls through to its JSON 404).
 pub async fn route_collection(State(st): State<AppState>, req: Request) -> Response {
+    let req = crate::decks_reads::head_as_get(&st, req);
     if req.method() == Method::GET && st.owns("decks_reads") {
         crate::decks_reads::handle_list(State(st), req).await
     } else if req.method() == Method::POST && st.owns("decks_writes") {
@@ -550,13 +551,26 @@ pub async fn handle_add_card(Path(id): Path<String>, State(st): State<AppState>,
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    match add_card(&pool, &id, user.id, &body) {
+    match add_card(&pool, &id, user.id, &body, false) {
         AddCard::Response(res) => res,
-        AddCard::Forward => crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        AddCard::Forward if !crate::lists_body_writes::standalone(&st) => {
+            crate::proxy(State(st), rebuild(parts, &bytes)).await
+        }
+        // Node-free: getCardById fetch leg natively; null -> route 404.
+        AddCard::Forward => {
+            let cid = crate::collection_writes::js_to_string(body.get("card_id"));
+            if !crate::lists_body_writes::standalone_fetch(&st, &cid).await {
+                return crate::lists_body_writes::not_on_provider(&cid);
+            }
+            match add_card(&pool, &id, user.id, &body, true) {
+                AddCard::Response(res) => res,
+                AddCard::Forward => crate::lists_body_writes::not_on_provider(&cid),
+            }
+        }
     }
 }
 
-fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddCard {
+fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value, fetched: bool) -> AddCard {
     const FAILED: &str = "Failed to add card to deck";
     let fail = |e: &dyn std::fmt::Debug| {
         tracing::error!("decks add-card: {e:?}");
@@ -601,7 +615,7 @@ fn add_card(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddCard {
         Ok(c) => c,
         Err(e) => return AddCard::Response(fail(&e)),
     };
-    if cached.is_none() {
+    if cached.is_none() && !fetched {
         if !matches!(card_id_v, Some(Value::String(_))) {
             // Node reaches cardApi.getCardById, whose `cardId.startsWith`
             // throws TypeError on a non-string -> the route's generic 500.
