@@ -364,7 +364,11 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     };
 
     let token = crate::auth::bearer_token(&headers).map(str::to_string);
-    let user = match crate::auth::authenticate(&pool, token.as_deref(), method == Method::GET) {
+    // M5 class (iter-70): the auth gate and the RMW below must not park the
+    // runtime worker on the DbPool live-cap Condvar — under the bench's
+    // 16-way mixed load that park deadlocked the whole runtime behind
+    // user_lock (ALL_mixed stall, iter-78/81 note). Same SQL either way.
+    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), method == Method::GET).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -376,9 +380,15 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     }
 
     let result: Result<Value, (&'static str, String)> = match method {
-        Method::GET => load(&pool, user_id)
-            .map(|list| view(&list))
-            .map_err(|e| ("Failed to load search history", e)),
+        Method::GET => {
+            // Off-worker (M5 class): pool.get() may park on the live cap.
+            let lpool = pool.clone();
+            match tokio::task::spawn_blocking(move || load(&lpool, user_id)).await {
+                Ok(Ok(list)) => Ok(view(&list)),
+                Ok(Err(e)) => Err(("Failed to load search history", e)),
+                Err(e) => Err(("Failed to load search history", e.to_string())),
+            }
+        }
         Method::POST => {
             let now = crate::stats::now_ms()
                 .div_euclid(1000);
@@ -399,28 +409,47 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                 return json_error(StatusCode::BAD_REQUEST, "q is required");
             }
             let guard = user_lock(user_id).lock_owned().await;
-            let res = (|| -> Result<Value, String> {
-                let cur = load(&pool, user_id)?;
-                let list = merge_lists(cur, add.clone());
-                save(&pool, user_id, &list)?;
+            // Off-worker (M5 class, iter-70): load/save run pool.get(), which
+            // may park on the live-cap Condvar — on the blocking pool that
+            // park is harmless, inline on the worker it deadlocked the whole
+            // runtime behind user_lock (bench ALL_mixed stall, iter-78/81).
+            // Guard stays held across the hop: Node's promise-chain RMW
+            // serialisation is unchanged.
+            let wpool = pool.clone();
+            let res = match tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                let cur = load(&wpool, user_id)?;
+                let list = merge_lists(cur, add);
+                save(&wpool, user_id, &list)?;
                 Ok(view(&list))
-            })();
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            };
             drop(guard);
             res.map_err(|e| ("Failed to save search history", e))
         }
         Method::DELETE => {
             let q = clean_query(body.get("q"));
             let guard = user_lock(user_id).lock_owned().await;
-            let res = (|| -> Result<Value, String> {
-                let cur = load(&pool, user_id)?;
+            // Off-worker RMW — see POST arm.
+            let wpool = pool.clone();
+            let res = match tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                let cur = load(&wpool, user_id)?;
                 let list = if q.is_empty() {
                     Vec::new()
                 } else {
                     cur.into_iter().filter(|(x, _)| *x != q).collect()
                 };
-                save(&pool, user_id, &list)?;
+                save(&wpool, user_id, &list)?;
                 Ok(view(&list))
-            })();
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            };
             drop(guard);
             res.map_err(|e| ("Failed to update search history", e))
         }
