@@ -38,6 +38,7 @@ use rusqlite::{types::Value as SqlValue, Connection, Row};
 use serde_json::{Map, Value};
 use tokio::sync::{OnceCell, Semaphore};
 
+use crate::poison::LockExt;
 use crate::collection::{
     body_etag, etag_matches, gzip_bytes, json_num, resolve_card_price, sqlite_value, truthy,
     wants_encoding,
@@ -183,13 +184,13 @@ impl StatsCache {
 
     /// The coalescing slot for a key (created on first miss).
     fn slot(&self, key: &str) -> Arc<ComputeSlot> {
-        self.inner.lock().unwrap().inflight.entry(key.to_string()).or_default().clone()
+        self.inner.guard().inflight.entry(key.to_string()).or_default().clone()
     }
 
     /// Drop a finished slot so the NEXT miss starts a fresh computation
     /// (the completed entry now lives in the store).
     fn finish(&self, key: &str) {
-        self.inner.lock().unwrap().inflight.remove(key);
+        self.inner.guard().inflight.remove(key);
     }
 
     /// Observability for the single-flight test and ops dashboards.
@@ -211,7 +212,7 @@ impl StatsCache {
 
     /// statsCache.bump(userId) — invalidate everything computed for a user.
     pub fn bump(&self, user_id: i64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         *inner.gens.entry(user_id).or_insert(0) += 1;
     }
 
@@ -232,7 +233,7 @@ impl StatsCache {
     /// refresher pre-builds the `/stats` body only; a /stats/history request
     /// must not enroll a user in that background work).
     pub(crate) fn gen_of(&self, user_id: i64) -> u64 {
-        *self.inner.lock().unwrap().gens.get(&user_id).unwrap_or(&0)
+        *self.inner.guard().gens.get(&user_id).unwrap_or(&0)
     }
 
     /// statsCache.set for a NON-stats name: same store (Node's cache is one
@@ -240,7 +241,7 @@ impl StatsCache {
     /// stale-while-revalidate `latest` slot — that slot backs the `/stats`
     /// SWR path only; a sub-route body must never be served for `/stats`.
     pub(crate) fn set_named(&self, user_id: i64, key: String, entry: Arc<StatsEntry>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         if !inner.store.contains_key(&key) && inner.store.len() >= MAX_ENTRIES {
             let oldest = inner.store.values().min_by_key(|e| e.seq).map(|e| e.seq);
             if let Some(seq) = oldest {
@@ -282,7 +283,7 @@ impl StatsCache {
     /// user "active" for the refresher — mirrors Node doing work only for
     /// users who asked.)
     fn touch(&self, user_id: i64) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         inner.seen.insert(user_id, Instant::now());
         inner.gens.get(&user_id).copied().unwrap_or(0)
     }
@@ -291,8 +292,7 @@ impl StatsCache {
     fn active_users(&self, window: Duration) -> Vec<i64> {
         let now = Instant::now();
         self.inner
-            .lock()
-            .unwrap()
+            .guard()
             .seen
             .iter()
             .filter(|(_, at)| now.duration_since(**at) <= window)
@@ -307,7 +307,7 @@ impl StatsCache {
     /// follows a write immediately still sees `miss` (Node answers `miss`
     /// in that window too) and edit+revert pairs do not fan out builds.
     fn refresh_due(&self, user_id: i64, rev: Option<&str>) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         if inner
             .cooldown
             .get(&user_id)
@@ -354,12 +354,12 @@ impl StatsCache {
     }
 
     fn refresh_failed(&self, user_id: i64) {
-        self.inner.lock().unwrap().cooldown.insert(user_id, Instant::now());
+        self.inner.guard().cooldown.insert(user_id, Instant::now());
     }
 
     /// statsCache.get: TTL-bound hit, expired entries dropped on probe.
     fn get(&self, key: &str) -> Option<Arc<StatsEntry>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         let hit = inner.store.get(key)?;
         if Instant::now().duration_since(hit.at) > TTL {
             inner.store.remove(key);
@@ -373,7 +373,7 @@ impl StatsCache {
     /// the stored `seq` preserves. Also records the entry as the user's
     /// newest computed body for the stale-while-revalidate path.
     fn set(&self, user_id: i64, key: String, entry: Arc<StatsEntry>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.guard();
         if !inner.store.contains_key(&key) && inner.store.len() >= MAX_ENTRIES {
             let oldest = inner.store.values().min_by_key(|e| e.seq).map(|e| e.seq);
             if let Some(seq) = oldest {
@@ -394,7 +394,7 @@ impl StatsCache {
     /// background rebuild of the current key is in flight, so writes never
     /// put the ~0.6 s aggregate on a request's critical path.
     pub(crate) fn stale_for(&self, user_id: i64) -> Option<Arc<StatsEntry>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.guard();
         let (entry, at) = inner.latest.get(&user_id)?;
         (at.elapsed() <= STALE_GRACE).then(|| entry.clone())
     }
@@ -1782,7 +1782,7 @@ mod js_number_tests {
         assert!(cache.stale_for(2).is_some());
         // Age the newest body past the grace window: stale is no longer
         // servable (Node would never be staler than its own rebuild).
-        cache.inner.lock().unwrap().latest.insert(
+        cache.inner.guard().latest.insert(
             2,
             (entry("b1"), Instant::now() - STALE_GRACE - Duration::from_secs(1)),
         );
@@ -1804,5 +1804,35 @@ mod js_number_tests {
         // serves (it is the newest COMPUTED body, matching the DB at its
         // compute time); the point is it is Some, not None.
         assert!(cache.stale_for(2).is_some());
+    }
+}
+
+#[cfg(test)]
+mod poison_m2 {
+    //! REVIEW-errors-maint M2 (lane-A remainder): the stats cache's store
+    //! (gens/seen/inflight/cooldown maps) locks through `crate::poison::LockExt`;
+    //! a poisoning panic must not take down cache-gen bumping for every user.
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn poisoned_store_still_bumps_touches_and_reads() {
+        let c = StatsCache::new();
+        c.bump(7);
+        assert_eq!(c.gen_of(7), 1, "baseline gen before poisoning");
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _g = c.inner.lock().unwrap();
+                    panic!("simulated panic under the stats store guard");
+                });
+            });
+        }));
+        assert!(poisoned.is_err(), "precondition: the poisoning thread must panic");
+        // Pre-fix (`.lock().unwrap()`) ALL of these panicked with "mutex is poisoned".
+        c.bump(7);
+        assert_eq!(c.gen_of(7), 2, "bump must survive a poisoned store");
+        assert_eq!(c.touch(7), 2, "touch must survive a poisoned store");
+        assert_eq!(c.active_users(Duration::from_secs(60)), vec![7], "active set survives");
     }
 }

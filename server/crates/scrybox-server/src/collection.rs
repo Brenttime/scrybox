@@ -32,6 +32,7 @@ use bytes::Bytes;
 use rusqlite::{types::ValueRef, Row};
 use serde_json::{Map, Number, Value};
 
+use crate::poison::LockExt;
 use crate::{auth, db::DbPool, AppState};
 
 /// Process boot id, formatted the way Node's `Date.now().toString(36)`.
@@ -679,7 +680,7 @@ static CHUNK_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// smallest pooled buffer that fits (best fit) so the big full-build buffers
 /// stay reserved for full-build shapes.
 fn take_chunk(desired: usize) -> Vec<u8> {
-    let mut pool = CHUNK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = CHUNK_POOL.guard();
     let mut best: Option<usize> = None;
     for (i, b) in pool.iter().enumerate() {
         if b.capacity() >= desired && best.map_or(true, |j| b.capacity() < pool[j].capacity()) {
@@ -710,7 +711,7 @@ fn give_chunk(mut buf: Vec<u8>) {
         return;
     }
     buf.clear();
-    let mut pool = CHUNK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = CHUNK_POOL.guard();
     if pool.len() >= CHUNK_POOL_MAX_BUFFERS {
         drop(pool);
         CHUNK_POOL_BYTES.fetch_sub(cap as u64, Ordering::Relaxed);
@@ -721,7 +722,7 @@ fn give_chunk(mut buf: Vec<u8>) {
 
 #[cfg(test)]
 fn chunk_pool_len() -> usize {
-    CHUNK_POOL.lock().unwrap().len()
+    CHUNK_POOL.guard().len()
 }
 
 /// Step the main SELECT, returning the raw (unshaped) column values per row.
@@ -1088,7 +1089,7 @@ impl CollectionCache {
     }
     fn get(&self, key: &str, rev: impl Into<RevPair>) -> Option<Arc<CacheEntry>> {
         let rp = rev.into();
-        let e = self.inner.lock().unwrap();
+        let e = self.inner.guard();
         let hit = e
             .entries
             .get(key)
@@ -1129,7 +1130,7 @@ impl CollectionCache {
     /// re-run eviction once it lands to keep raw+gz inside `max_bytes`.
     fn account_encoded(&self) {
         let freed = {
-            let mut e = self.inner.lock().unwrap();
+            let mut e = self.inner.guard();
             self.evict_over_budget(&mut e)
         };
         if freed >= self.trim_dirty_bytes.load(Ordering::Relaxed) && freed > 0 {
@@ -1189,7 +1190,7 @@ impl CollectionCache {
         let live_rev = self.max_rev.load(Ordering::Relaxed);
         let mut freed: u64 = 0;
         {
-            let mut e = self.inner.lock().unwrap();
+            let mut e = self.inner.guard();
             if e.entries.len() > 64 {
                 freed += e.entries.values().map(|v| v.bytes()).sum::<u64>();
                 e.entries.clear();
@@ -1218,16 +1219,16 @@ impl CollectionCache {
     }
     /// The coalescing slot for a key (created on first miss).
     fn slot(&self, key: &str) -> Arc<ComputeSlot> {
-        self.inner.lock().unwrap().inflight.entry(key.to_string()).or_default().clone()
+        self.inner.guard().inflight.entry(key.to_string()).or_default().clone()
     }
     /// Drop a finished slot so the NEXT miss starts a fresh computation.
     fn finish(&self, key: &str) {
-        self.inner.lock().unwrap().inflight.remove(key);
+        self.inner.guard().inflight.remove(key);
     }
     /// Record a request for this params shape (refresher candidate).
     fn touch(&self, p: &CollectionParams) {
         let key = p.cache_key();
-        let mut e = self.inner.lock().unwrap();
+        let mut e = self.inner.guard();
         if e.recent.len() > RECENT_MAX && !e.recent.contains_key(&key) {
             e.recent.retain(|_, (_, seen)| seen.elapsed() < RECENT_WINDOW);
             e.cooldown.retain(|_, t| t.elapsed() < REFRESH_COOLDOWN);
@@ -1244,7 +1245,7 @@ impl CollectionCache {
     /// excluded — the request path pays their first build and records the
     /// cost for a later generation.
     fn prewarm_keys(&self, window: Duration, min_cost_ms: u64, budget_ms: u64) -> Vec<(String, CollectionParams)> {
-        let e = self.inner.lock().unwrap();
+        let e = self.inner.guard();
         let mut v: Vec<_> = e
             .recent
             .iter()
@@ -1269,7 +1270,7 @@ impl CollectionCache {
     /// True when the stored entry for `key` already carries the current rev.
     fn is_current(&self, key: &str, rev: impl Into<RevPair>) -> bool {
         let rp = rev.into();
-        let e = self.inner.lock().unwrap();
+        let e = self.inner.guard();
         e.entries
             .get(key)
             .map_or(false, |e| e.rev == rp.coll && e.deck_rev == rp.deck)
@@ -1277,17 +1278,17 @@ impl CollectionCache {
     /// A build already in flight for this key (request-path or refresher) —
     /// the poller skips it this tick; the slot's owner will land the body.
     fn inflight_contains(&self, key: &str) -> bool {
-        self.inner.lock().unwrap().inflight.contains_key(key)
+        self.inner.guard().inflight.contains_key(key)
     }
     fn on_cooldown(&self, key: &str) -> bool {
-        let e = self.inner.lock().unwrap();
+        let e = self.inner.guard();
         match e.cooldown.get(key) {
             Some(t) => t.elapsed() < REFRESH_COOLDOWN,
             None => false,
         }
     }
     fn refresh_failed(&self, key: &str) {
-        self.inner.lock().unwrap().cooldown.insert(key.to_string(), Instant::now());
+        self.inner.guard().cooldown.insert(key.to_string(), Instant::now());
     }
     /// Observability for the single-flight test and ops dashboards.
     pub fn computes(&self) -> u64 {
@@ -1986,11 +1987,11 @@ mod store_budget {
         // Two bodies from generation 1.
         cache.put(params(0).cache_key(), 1, vec![1u8; 1000], None, Duration::from_millis(50));
         cache.put(params(100).cache_key(), 1, vec![2u8; 1000], None, Duration::from_millis(50));
-        assert_eq!(cache.inner.lock().unwrap().entries.len(), 2);
+        assert_eq!(cache.inner.guard().entries.len(), 2);
         // A generation-2 body lands: the generation-1 bodies are dead weight
         // (get filters by exact rev) and must be dropped, not just shadowed.
         cache.put(params(200).cache_key(), 2, vec![3u8; 32], None, Duration::from_millis(50));
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.guard();
         assert_eq!(inner.entries.len(), 1, "superseded-generation bodies must be dropped");
         assert_eq!(inner.entries.values().next().unwrap().rev, 2);
     }
@@ -2005,7 +2006,7 @@ mod store_budget {
         let stale =
             cache.put(params(100).cache_key(), 1, vec![2u8; 1000], None, Duration::from_millis(50));
         assert_eq!(stale.rev, 1, "the caller still gets its own body");
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.guard();
         assert_eq!(inner.entries.len(), 1);
         assert_eq!(inner.entries.values().next().unwrap().rev, 2);
     }
@@ -2024,7 +2025,7 @@ mod store_budget {
         // even though it was inserted first.
         assert!(cache.get(&params(0).cache_key(), 1).is_some());
         cache.put(params(300).cache_key(), 1, body, None, Duration::from_millis(50));
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.guard();
         let stored: usize = inner
             .entries
             .values()
@@ -2063,7 +2064,7 @@ mod store_budget {
         // gz for offset-0 lands after put (as in the serve path): 2000 + 800 > 2500.
         a.gz.set(Bytes::from(vec![0u8; 800])).unwrap();
         cache.account_encoded();
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.guard();
         let stored: u64 = inner.entries.values().map(|e| e.bytes()).sum();
         assert!(stored <= 2500, "raw+gz must fit the budget: {stored}");
     }
@@ -2073,7 +2074,7 @@ mod store_budget {
         let cache = CollectionCache::new();
         cache.max_bytes.store(500, Ordering::Relaxed);
         cache.put(params(0).cache_key(), 1, vec![3u8; 4000], None, Duration::from_millis(50));
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.guard();
         assert!(
             inner.entries.contains_key(&params(0).cache_key()),
             "the only entry survives even over budget (hot full shape)"
@@ -2284,5 +2285,56 @@ mod single_encoding {
         let (a, b) = (a.unwrap(), b.unwrap());
         assert!(a.as_ptr() == b.as_ptr() && a.len() == b.len(), "concurrent first gzip hits coalesce on the OnceCell");
         assert_eq!(gunzip_bytes(&a).unwrap(), body);
+    }
+}
+
+#[cfg(test)]
+mod poison_m2 {
+    //! REVIEW-errors-maint M2 (lane-A remainder): every path through the
+    //! collection store's std Mutex locks via `crate::poison::LockExt`, so
+    //! a panic unwinding under the guard recovers the data instead of
+    //! turning one bug into a permanent cache outage (the pre-conversion
+    //! `inner.lock().unwrap()` panicked for EVERY later get/put).
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn params(offset: i64) -> CollectionParams {
+        CollectionParams {
+            user_id: 1,
+            is_trade: None,
+            card_id: None,
+            paginated: true,
+            limit: 100,
+            offset,
+            alloc: false,
+            count_zero: false,
+            qs: String::new(),
+        }
+    }
+
+    #[test]
+    fn poisoned_store_still_serves_and_stores() {
+        let cache = CollectionCache::new();
+        let key = params(0).cache_key();
+        cache.put(key.clone(), 1, vec![7u8; 64], None, Duration::from_millis(50));
+        // Poison the store WHILE HELD, without mutating: the panic unwinds
+        // through the guard and the mutex is poisoned from then on.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _g = cache.inner.lock().unwrap();
+                    panic!("simulated panic under the collection store guard");
+                });
+            });
+        }));
+        assert!(poisoned.is_err(), "precondition: the poisoning thread must panic");
+        // Pre-fix (`.lock().unwrap()`) BOTH of these panicked with "mutex is poisoned".
+        assert!(cache.get(&key, 1).is_some(), "reads must survive a poisoned store");
+        let k2 = params(100).cache_key();
+        cache.put(k2.clone(), 1, vec![8u8; 64], None, Duration::from_millis(50));
+        assert!(
+            cache.inner.guard().entries.contains_key(&k2),
+            "writes must survive a poisoned store"
+        );
     }
 }

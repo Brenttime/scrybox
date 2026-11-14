@@ -60,6 +60,7 @@ use hyper_util::rt::TokioExecutor;
 use regex::Regex;
 use serde_json::{Map, Value};
 
+use crate::poison::LockExt;
 use crate::auth::{authenticate, bearer_token};
 use crate::collection::{body_etag, etag_matches};
 use crate::decks_reads::root_collator;
@@ -554,7 +555,7 @@ fn read_cache(path: &Path) -> Option<Value> {
 /// try/catch). On failure with a good copy: `{...mem, stale: err.message}`.
 pub async fn get_rules(st: &AppState, force: bool) -> Result<Value, String> {
     {
-        let mut mem = st.rules_mem.lock().unwrap();
+        let mut mem = st.rules_mem.guard();
         if mem.is_none() {
             *mem = read_cache(&st.rules_cache_path);
         }
@@ -574,7 +575,7 @@ pub async fn get_rules(st: &AppState, force: bool) -> Result<Value, String> {
     // has cleared.
     let _g = st.rules_build.lock().await;
     if !force {
-        let mem = st.rules_mem.lock().unwrap();
+        let mem = st.rules_mem.guard();
         if let Some(m) = mem.as_ref() {
             if fresh(m) {
                 return Ok(m.clone());
@@ -583,12 +584,12 @@ pub async fn get_rules(st: &AppState, force: bool) -> Result<Value, String> {
     }
     match build(st).await {
         Ok(built) => {
-            *st.rules_mem.lock().unwrap() = Some(built.clone());
+            *st.rules_mem.guard() = Some(built.clone());
             let _ = std::fs::write(&st.rules_cache_path, serde_json::to_vec(&built).unwrap_or_default());
             Ok(built)
         }
         Err(msg) => {
-            let mem = st.rules_mem.lock().unwrap().clone();
+            let mem = st.rules_mem.guard().clone();
             match mem {
                 Some(m) => {
                     let mut map = m.as_object().cloned().unwrap_or_default();
@@ -897,16 +898,16 @@ pub async fn route_keywords(State(st): State<AppState>, req: Request) -> Respons
         ),
     };
     let need = {
-        let kw = st.kw_mem.lock().unwrap();
+        let kw = st.kw_mem.guard();
         !force
             && kw.as_ref().map(|k| k.get("fetched") == data.get("fetched")).unwrap_or(false)
     };
     let kw = if need {
-        st.kw_mem.lock().unwrap().clone().unwrap()
+        st.kw_mem.guard().clone().unwrap()
     } else {
         match build_keywords(&st, &data) {
             Ok(k) => {
-                *st.kw_mem.lock().unwrap() = Some(k.clone());
+                *st.kw_mem.guard() = Some(k.clone());
                 k
             }
             // buildKeywords threw AFTER res.set — the 502 carries the header.
