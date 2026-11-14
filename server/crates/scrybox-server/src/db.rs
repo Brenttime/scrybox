@@ -28,10 +28,11 @@ use crate::poison::LockExt;
 /// PRAGMA cache_size semantics). The pool applies a GLOBAL budget
 /// (`SCRYBOX_DB_CACHE_BUDGET_MB`, default 64 MB — Node's single-connection
 /// size) divided across `max` connections, so 16 pooled readers no longer
-/// each get their own 64 MB cache. `mmap_kb` (default 32 MB, was a fixed
-/// 256 MB) is the per-connection mmap window; the DB copy is 256 MB and
-/// the hot working set is far smaller, so a smaller window caps how much
-/// file-backed page cache can be faulted in per reader.
+/// each get their own 64 MB cache. `mmap_kb` (default 4 MB, was 256 MB then
+/// 32 MB) is the per-connection mmap window; the DB copy is 256 MB and
+/// the hot working set is far smaller, so a small window caps how much
+/// file-backed page cache can be faulted in per reader. 0 disables mmap
+/// entirely (SCRYBOX_DB_MMAP_MB=0 is honoured, not filtered to the default).
 #[derive(Clone, Copy, Debug)]
 pub struct PoolConfig {
     pub max: usize,
@@ -59,7 +60,19 @@ impl PoolConfig {
         let max = env_i64("SCRYBOX_DB_POOL_MAX").unwrap_or(default_max as i64).max(1) as usize;
         let budget_mb = env_i64("SCRYBOX_DB_CACHE_BUDGET_MB").unwrap_or(64);
         let cache_kb = (budget_mb * 1024 / max as i64).max(2048); // never below 2 MB/conn
-        let mmap_kb = env_i64("SCRYBOX_DB_MMAP_MB").unwrap_or(32) * 1024;
+        // SCRYBOX_DB_MMAP_MB accepts 0 (mmap OFF). The shared env_i64 above
+        // filters `> 0`, which silently turned `0` into the default — a
+        // deliberate "disable mmap" setting was a no-op (review/MEMORY.md #3).
+        // 0 is a legal value here only: each pooled connection maps its own
+        // window of the same file, so N × 32 MB windows dominated RssFile
+        // (111 MB measured); MMAP_MB=1 cut it to 17 MB with no measured
+        // speed loss. Default 4 MB (owner-ruling bound 0-4 MB).
+        let mmap_mb = std::env::var("SCRYBOX_DB_MMAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(4);
+        let mmap_kb = mmap_mb * 1024;
         let live_max = env_i64("SCRYBOX_DB_LIVE_MAX")
             .unwrap_or(max as i64 * 2)
             .max(max as i64)
@@ -479,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn from_env_splits_budget_and_floors_per_conn_cache() {
+    fn from_env_splits_budget_floors_cache_and_honours_mmap_zero() {
         std::env::set_var("SCRYBOX_DB_POOL_MAX", "8");
         std::env::set_var("SCRYBOX_DB_CACHE_BUDGET_MB", "64");
         std::env::set_var("SCRYBOX_DB_MMAP_MB", "16");
@@ -503,11 +516,42 @@ mod tests {
         for k in ["SCRYBOX_DB_POOL_MAX", "SCRYBOX_DB_CACHE_BUDGET_MB", "SCRYBOX_DB_MMAP_MB", "SCRYBOX_DB_LIVE_MAX"] {
             std::env::remove_var(k);
         }
-        // Defaults: budget 64 MB, mmap 32 MB, caller's max.
+        // Defaults: budget 64 MB, mmap 4 MB (Gate-D memory fix), caller's max.
         let c = PoolConfig::from_env(6);
         assert_eq!(c.max, 6);
         assert_eq!(c.cache_kb, 64 * 1024 / 6);
-        assert_eq!(c.mmap_kb, 32 * 1024);
+        assert_eq!(c.mmap_kb, 4 * 1024);
+        // MEMORY.md #3: SCRYBOX_DB_MMAP_MB=0 must mean "mmap OFF". The old
+        // shared env_i64 filtered `> 0`, so 0 silently became the default
+        // (a deliberate disable was a no-op).
+        std::env::set_var("SCRYBOX_DB_MMAP_MB", "0");
+        let c = PoolConfig::from_env(4);
+        assert_eq!(c.mmap_kb, 0, "MMAP_MB=0 must produce mmap_kb 0, not the default");
+        // The PRAGMA actually lands at 0 on a real pooled connection.
+        let p = temp_db("mmap0");
+        let pool = DbPool::open_with(&p, c).unwrap();
+        let conn = pool.get().unwrap();
+        assert_eq!(pragmas(&conn, "mmap_size"), 0);
+        drop(conn);
+        drop(pool);
+        // restart-rust.sh passes an EMPTY string for unset knobs: empty and
+        // garbage must fall back to the 4 MB default, not panic or 0-out.
+        std::env::set_var("SCRYBOX_DB_MMAP_MB", "");
+        assert_eq!(PoolConfig::from_env(4).mmap_kb, 4 * 1024);
+        std::env::set_var("SCRYBOX_DB_MMAP_MB", "abc");
+        assert_eq!(PoolConfig::from_env(4).mmap_kb, 4 * 1024);
+        std::env::set_var("SCRYBOX_DB_MMAP_MB", "-1");
+        assert_eq!(PoolConfig::from_env(4).mmap_kb, 4 * 1024);
+        // Other knobs keep rejecting 0 via the shared filter (0 is nonsense
+        // for a pool size / budget / live cap).
+        std::env::set_var("SCRYBOX_DB_POOL_MAX", "0");
+        std::env::set_var("SCRYBOX_DB_CACHE_BUDGET_MB", "0");
+        let c = PoolConfig::from_env(5);
+        assert_eq!(c.max, 5);
+        assert_eq!(c.cache_kb, 64 * 1024 / 5);
+        std::env::remove_var("SCRYBOX_DB_MMAP_MB");
+        std::env::remove_var("SCRYBOX_DB_POOL_MAX");
+        std::env::remove_var("SCRYBOX_DB_CACHE_BUDGET_MB");
     }
 
     // ---- H3/M3: LIVE connection cap (REVIEW-concurrency H3, REVIEW-writes M3) ----

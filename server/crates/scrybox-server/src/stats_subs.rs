@@ -30,6 +30,7 @@ use axum::{
 use bytes::Bytes;
 use serde_json::{Map, Value};
 
+use crate::poison::LockExt;
 use crate::collection::{etag_matches, sqlite_value, truthy, wants_encoding};
 use crate::db::DbPool;
 use crate::stats::{js_fixed_parsed, js_math_round, js_to_num, iso_utc_ms, StatsCache, StatsEntry};
@@ -351,7 +352,7 @@ fn history_cards(
 ) -> Result<Arc<Vec<HistCard>>, String> {
     let rev = StatsCache::revision(pool);
     if allow_cache {
-        if let (Some(rev), Some(hit)) = (rev.as_ref(), hist_store().lock().unwrap().get(&user_id)) {
+        if let (Some(rev), Some(hit)) = (rev.as_ref(), hist_store().guard().get(&user_id)) {
             if &hit.0 == rev {
                 return Ok(Arc::clone(&hit.1));
             }
@@ -363,7 +364,7 @@ fn history_cards(
     if allow_cache {
         if let (Some(rev), Some(after)) = (rev.as_ref(), StatsCache::revision(pool)) {
             if after == *rev {
-                hist_store().lock().unwrap().insert(user_id, (rev.clone(), Arc::clone(&cards)));
+                hist_store().guard().insert(user_id, (rev.clone(), Arc::clone(&cards)));
             }
         }
     }

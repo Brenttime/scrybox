@@ -41,6 +41,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
+use crate::poison::LockExt;
 use crate::auth::{bearer_token, AuthUser};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, json_num, sqlite_value, wants_encoding};
 use crate::collection_writes::{
@@ -1078,7 +1079,7 @@ fn build_deck_list_cached_with(
     // Node: `const revision = await currentRevision(conn);` before build().
     let revision = if cache_enabled() { current_revision(conn)? } else { None };
     if let Some(revision) = revision {
-        if let Some(hit) = store.lock().unwrap().get(&user_id) {
+        if let Some(hit) = store.guard().get(&user_id) {
             if hit.0 == revision {
                 return Ok((hit.1.clone(), true));
             }
@@ -1090,7 +1091,7 @@ fn build_deck_list_cached_with(
     // currentRevision(conn)) === revision`), so a mid-build bump drops the body.
     if let Some(revision) = revision {
         if current_revision(conn)? == Some(revision) {
-            store.lock().unwrap().insert(user_id, (revision, body.clone()));
+            store.guard().insert(user_id, (revision, body.clone()));
         }
     }
     Ok((body, false))
@@ -1577,7 +1578,7 @@ mod tests {
         let (b1, hit1) = build_deck_list_cached_with(&conn, 1, &store, quiet).unwrap();
         assert!(!hit1 && b1 == b"body-A");
         let rev1 = current_revision(&conn).unwrap().unwrap();
-        assert_eq!(store.lock().unwrap().get(&1), Some(&(rev1, b"body-A".to_vec())));
+        assert_eq!(store.guard().get(&1), Some(&(rev1, b"body-A".to_vec())));
         let (b2, hit2) =
             build_deck_list_cached_with(&conn, 1, &store, |_: &Connection| -> Result<Vec<u8>, rusqlite::Error> {
                 unreachable!()
@@ -1600,7 +1601,7 @@ mod tests {
         let after = current_revision(&conn).unwrap().unwrap();
         assert!(after > rev1, "builder must have bumped the revision");
         assert!(
-            !store.lock().unwrap().contains_key(&2),
+            !store.guard().contains_key(&2),
             "H1/H2: body built while the revision moved must NOT be cached (would serve stale until the next bump)"
         );
 
@@ -1608,7 +1609,7 @@ mod tests {
         let (b4, hit4) =
             build_deck_list_cached_with(&conn, 2, &store, |_: &Connection| Ok(b"body-C".to_vec())).unwrap();
         assert!(!hit4 && b4 == b"body-C");
-        assert_eq!(store.lock().unwrap().get(&2), Some(&(after, b"body-C".to_vec())));
+        assert_eq!(store.guard().get(&2), Some(&(after, b"body-C".to_vec())));
     }
 
     #[test]
@@ -1648,5 +1649,47 @@ mod tests {
         assert_eq!(js_or(Some(&json!(0)), &name), &name);
         assert_eq!(js_or(Some(&json!("P")), &name), &json!("P"));
         assert_eq!(js_or(None, &name), &name);
+    }
+}
+
+#[cfg(test)]
+mod poison_m2 {
+    //! REVIEW-errors-maint M2 (lane-A remainder): the deck-list body store
+    //! locks through `crate::poison::LockExt`; one panic under the guard
+    //! must not turn every later deck-list read into a permanent 500.
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn deck_list_store_survives_a_poisoning_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("m2.db")).unwrap();
+        conn.execute_batch(include_str!("../tests/schema_fixture.sql")).unwrap();
+        conn.execute_batch("INSERT OR IGNORE INTO deck_list_revision (id, revision) VALUES (1, 0);")
+            .unwrap();
+        let store: std::sync::Mutex<HashMap<i64, (i64, Vec<u8>)>> =
+            std::sync::Mutex::new(HashMap::new());
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _g = store.lock().unwrap();
+                    panic!("simulated panic under the deck-list store guard");
+                });
+            });
+        }));
+        assert!(poisoned.is_err(), "precondition: the poisoning thread must panic");
+        // Pre-fix (`.lock().unwrap()`) this panicked with "mutex is poisoned".
+        let (body, hit) = build_deck_list_cached_with(&conn, 1, &store, |_: &Connection| {
+            Ok(b"body-M2".to_vec())
+        })
+        .unwrap();
+        assert!(!hit && body == b"body-M2", "cold build must survive poisoning");
+        let rev = current_revision(&conn).unwrap().unwrap();
+        assert_eq!(store.guard().get(&1), Some(&(rev, b"body-M2".to_vec())), "store write survives");
+        let (_, hit2) = build_deck_list_cached_with(&conn, 1, &store, |_: &Connection| -> Result<Vec<u8>, rusqlite::Error> {
+            unreachable!("second call must hit the poisoned-but-recovered store")
+        })
+        .unwrap();
+        assert!(hit2, "cache hit must survive a poisoned store");
     }
 }

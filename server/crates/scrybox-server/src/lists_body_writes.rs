@@ -242,6 +242,12 @@ fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddOne {
     if js_falsy(card_id_v) {
         return AddOne::Response(json_error(StatusCode::BAD_REQUEST, "card_id is required"));
     }
+    // js_falsy(None) is true — the 400 above already ran, so binding by
+    // let-else removes the two checked-then-unwrapped sites below
+    // (errors-maint L1).
+    let Some(card_id) = card_id_v else {
+        return AddOne::Response(json_error(StatusCode::BAD_REQUEST, "card_id is required"));
+    };
     // `const { quantity = 1 } = req.body` — destructuring default.
     let quantity = body.get("quantity").cloned().unwrap_or(Value::from(1));
     let qty = qty_or_one(Some(&quantity));
@@ -256,7 +262,7 @@ fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddOne {
     if !exists {
         return AddOne::Response(json_error(StatusCode::NOT_FOUND, "List not found or unauthorized"));
     }
-    let probe = js_bind(card_id_v.unwrap());
+    let probe = js_bind(card_id);
     let cached = match get_row_map(&conn, "SELECT id FROM card_cache WHERE id = ?1", std::slice::from_ref(&probe)) {
         Ok(c) => c,
         Err(e) => return AddOne::Response(fail(&e)),
@@ -269,7 +275,7 @@ fn add_one(pool: &DbPool, id: &str, user_id: i64, body: &Value) -> AddOne {
         }
         return AddOne::Forward;
     }
-    match set_fold(&conn, id, &probe, card_id_v.unwrap(), qty) {
+    match set_fold(&conn, id, &probe, card_id, qty) {
         Ok(()) => AddOne::Response(json_response(StatusCode::OK, &json!({ "message": "Card added to list" }))),
         Err(e) => AddOne::Response(fail(&e)),
     }
@@ -351,7 +357,9 @@ fn bulk_add(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<
             pre.push(Pre::Skip);
             continue;
         }
-        match get_row_map(&conn, "SELECT id FROM card_cache WHERE id = ?1", &[js_bind(card_id.unwrap())]) {
+        // js_falsy(None) is true — the continue above already ran (L1).
+        let Some(cid) = card_id else { continue };
+        match get_row_map(&conn, "SELECT id FROM card_cache WHERE id = ?1", &[js_bind(cid)]) {
             Ok(Some(_)) => pre.push(Pre::Cached),
             Ok(None) => {
                 pre.push(if matches!(card_id, Some(Value::String(_))) {
@@ -378,7 +386,9 @@ fn bulk_add(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Result<
             Pre::Cached => {}
             Pre::Hydrate => unreachable!("forwarded above"),
         }
-        let card_id = entry.get("card_id").unwrap();
+        // Pre::Cached/Hydrate/Failed only exist for a truthy card_id, so the
+        // pre-pass guarantees Some here; let-else drops the unwrap (L1).
+        let Some(card_id) = entry.get("card_id") else { continue };
         let qty = qty_or_one(entry.get("quantity"));
         let probe = js_bind(card_id);
         match inc_fold(&conn, id, &probe, qty) {
@@ -459,7 +469,8 @@ fn bulk_remove(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Resu
         if js_falsy(card_id) {
             continue;
         }
-        let card_id = card_id.unwrap();
+        // js_falsy(None) is true — the continue above already ran (L1).
+        let Some(card_id) = card_id else { continue };
         let probe = js_bind(card_id);
         // Cards whose printing is unknown to the cache never match the
         // target_cc join — Node skips them silently, as we do.
@@ -468,7 +479,10 @@ fn bulk_remove(pool: &DbPool, id: &str, user_id: i64, entries: &[Value]) -> Resu
         };
         let qty = qty_or_one(entry.get("quantity"));
         let have = js_num_opt(row.get("quantity"));
-        let row_id = json_to_sql_value(row.get("card_id").unwrap());
+        // The SELECT projects lc.card_id, so the key is always present;
+        // let-else drops the unwrap (L1).
+        let Some(row_card_id) = row.get("card_id") else { continue };
+        let row_id = json_to_sql_value(row_card_id);
         let id_sql = SqlValue::Text(id.to_string());
         match have {
             Some(h) if h > qty as f64 => {
