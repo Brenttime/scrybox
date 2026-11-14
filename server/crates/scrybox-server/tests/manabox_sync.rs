@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use mock_scryfall::{raw_card, scry_for, spawn_mock};
 use scrybox_server::{
     app,
-    backup::{backup_dir, create_backup, keep_last, list_backups},
+    backup::{backup_dir, create_backup, keep_last, list_backups, spawn_auto_backup},
     manabox::{
         identity_mismatch, js_number_pub, parse_csv, parse_manabox_export, plan_collection,
         plan_lists, CardRow, CollRow, Expectation, ExistingList, OwnedRow,
@@ -1016,6 +1016,70 @@ async fn backup_create_list_prune_and_vacuum_determinism() {
     // Route half runs HERE (not as its own test) so no other test can read
     // BACKUP_KEEP_LAST while this one mutates it.
     backup_routes_body().await;
+
+    // Timer half also runs HERE: the tick's create_backup reads
+    // BACKUP_KEEP_LAST, so it must not overlap this test's mutations.
+    backup_timer_body().await;
+}
+
+async fn backup_timer_body() {
+    // startAutoBackup() twin proof: setInterval semantics — NO fire at
+    // boot; the first fire lands after one full interval; disabled arms
+    // (0/NaN/negative) spawn nothing; the missing-db arm declines.
+    let fx = seeded_db("backup_timer.db");
+    let st = state_for(&fx, None);
+    let dir = backup_dir(&fx.path);
+
+    std::env::set_var("BACKUP_KEEP_LAST", "5");
+    // 0.001 h = 3.6 s — parseFloat accepts the fraction, Node-identical.
+    std::env::set_var("BACKUP_INTERVAL_HOURS", "0.001");
+    assert!(spawn_auto_backup(&st), "0.001h must arm the timer");
+    // Boot silence: nothing exists at t=0 (setInterval never fires inline).
+    assert!(
+        list_backups(&dir).is_empty(),
+        "timer fired at boot: {:?}",
+        list_backups(&dir)
+    );
+    // First fire at ~3.6 s; poll to 20 s (pool + VACUUM are local).
+    let mut fired = None;
+    for _ in 0..200 {
+        let l = list_backups(&dir);
+        if !l.is_empty() {
+            fired = Some(l);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let fired = fired.expect("auto-backup timer never created a snapshot");
+    assert_eq!(fired.len(), 1, "exactly one timer fire expected so far");
+    assert!(fired[0].file.starts_with("backup_timer.") && fired[0].file.ends_with(".bak"));
+    // The snapshot is a real, queryable copy of the live DB.
+    let snap = Connection::open(dir.join(&fired[0].file)).unwrap();
+    let n: i64 = snap
+        .query_row("SELECT COUNT(*) FROM card_cache WHERE id = ?1", rusqlite::params![format!("mtg-{UUID_A}")], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "timer snapshot must contain live rows");
+    drop(snap);
+
+    // Disabled arms: 0, NaN and negative never arm a task.
+    for off in ["0", "abc", "-2", ""] {
+        std::env::set_var("BACKUP_INTERVAL_HOURS", off);
+        assert!(!spawn_auto_backup(&st), "{off:?} must disable the timer");
+    }
+    // Missing-db arm: enabled interval but no DB declines (warns, no task).
+    std::env::set_var("BACKUP_INTERVAL_HOURS", "0.001");
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        node_upstream: "http://127.0.0.1:1".to_string(),
+        static_dir: None,
+        rust_routes: ["manabox_backup".to_string()].into_iter().collect(),
+        db_path: None,
+        sidecar_url: None,
+    };
+    let st_nodb = AppState::new(cfg);
+    assert!(!spawn_auto_backup(&st_nodb), "no-db arm must decline");
+    std::env::remove_var("BACKUP_INTERVAL_HOURS");
+    std::env::remove_var("BACKUP_KEEP_LAST");
 }
 
 async fn backup_routes_body() {

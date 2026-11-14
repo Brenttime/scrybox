@@ -893,13 +893,13 @@ pub fn app(state: AppState) -> Router {
     // scheduler + boot catch-up ride the same gate (Node's twin is disabled
     // with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER, server.js).
     let router = if state.owns("moxfield") {
-        // Scheduler twin of Node's server.js kill switch: the harness runs
-        // the test instance with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=1 (and
-        // the Node container's flag file marks its tick off) so the shared
-        // DB copy stays quiescent for parity — the tick/boot-catch-up
-        // semantics are proven by cargo tests, like the sets/price jobs are
-        // by the jobs binary + DB-diff. Flip this env off (and remove the
-        // container flag file) to hand the live tick to Rust.
+        // Scheduler twin of Node's server.js kill switch. Lane-B iter-49
+        // cutover: the live tick is Rust-owned — restart-rust-b.sh defaults
+        // SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=0 and the Node container boots
+        // with the /app/moxfield.disabled flag file (docker-cp overlay on
+        // server.js) so exactly one side ticks. Set the env to 1 (e.g.
+        // SCRYBOX_DISABLE_MOXFIELD_SCHEDULER_B=1) to quiesce this instance;
+        // tick/boot-catch-up semantics are also proven by cargo tests.
         let sched_off = std::env::var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -920,9 +920,11 @@ pub fn app(state: AppState) -> Router {
         router
     };
     // Lane B unit 3b: ManaBox sync + backup job, both under
-    // RUST_ROUTES=manabox_backup. Node's twin auto-backup timer is switched
-    // off with SCRYBOX_DISABLE_AUTO_BACKUP (server.js); the parity harness
-    // sets it on both instances so the shared DB copy stays quiescent.
+    // RUST_ROUTES=manabox_backup. iter-49 cutover: the live 24h timer is
+    // Rust-owned — restart-rust-b.sh defaults SCRYBOX_DISABLE_AUTO_BACKUP=0
+    // and the Node container boots with /app/auto-backup.disabled
+    // (docker-cp overlay on server.js). Set the env to 1 to quiesce this
+    // instance for a quiesced-DB run.
     let router = if state.owns("manabox_backup") {
         let backup_off = std::env::var("SCRYBOX_DISABLE_AUTO_BACKUP")
             .map(|v| v == "true" || v == "1")
