@@ -199,6 +199,19 @@ pub fn handle(method: &str, path: &str, headers: &[(String, String)], body: &[u8
         // measured; bounded by STATUS_LOAD_WAIT) instead of answering a 503
         // placeholder that rendered "Fast scan service is offline".
         if ENGINE.get().is_none() {
+            // LANE-B iter-68 (REVIEW LANE-A iter-25 probe): unconfigured
+            // deploy (SCRYBOX_CARDSCAN_DATA unset). spawn_warm() early-returns
+            // for this shape WITHOUT ever setting ENGINE, so the wait loop
+            // below spun the full STATUS_LOAD_WAIT (20 s, measured on the
+            // blocking pool) on EVERY probe and then answered the "loading"
+            // placeholder. Node's twin has no sidecar to dial in this state:
+            // axios ECONNREFUSED/ENOTFOUND -> immediate 503 'Scanner service
+            // is not running'. Return None here — and crucially do NOT call
+            // engine(), so the permanent 'SCRYBOX_CARDSCAN_DATA unset'
+            // Err-cache stays free for the real-dir shape (env-flip tests).
+            if scan_ocr::data_dir().is_none() {
+                return None;
+            }
             spawn_warm();
             let deadline = Instant::now() + STATUS_LOAD_WAIT;
             while ENGINE.get().is_none() && Instant::now() < deadline {
