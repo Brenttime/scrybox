@@ -871,13 +871,23 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
     shared.insert("language".into(), language);
     shared.insert("stackable".into(), Value::Bool(true));
 
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "secret-lair add: cannot open write connection");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
-        }
-    };
+    // M5 (REVIEW, iter-19 flag; marketplace iter-83/84 one-hop shape): the
+    // checkout + plan-reads leg (pass 1) and the checkout + write-loop leg
+    // (pass 2) move off the runtime worker onto the blocking pool, each as
+    // ONE hop. Pass 1's only await is the standalone-hydration branch, which
+    // cannot live inside a blocking hop: the hop returns a `Deferred`
+    // resume marker at the first hydration-needing entry, plan_add_standalone
+    // runs BETWEEN hops holding NO connection (pre-fold, the single conn was
+    // held across that branch's scryfall fetches; rusqlite autocommit already
+    // opens a fresh read snapshot per statement, so drop-and-re-checkout is
+    // observationally identical, and Node takes its own connection per
+    // helper call). The upstream Forward/FetchCard arm becomes a `Replay`
+    // sentinel: the conn drops BEFORE replay_post — pass 1 wrote nothing, so
+    // the 'nothing local has been written yet' replay guarantee is
+    // unchanged. Checkout errors and JoinError fold into the SAME
+    // pool-error body (documented per arm, settings/precons precedent).
+    // Queries, order, binds and every fold arm are byte-unchanged.
+    let standalone = st.cfg.node_upstream.is_empty();
 
     // Pass 1 — pure reads over BOTH groups before any write (the same shape
     // handle_bulk_add pinned): Node answers per-card failures INSIDE
@@ -888,82 +898,173 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
         Ready(AddPlan),
         Reject(String),
     }
-    let groups: [&Vec<Map<String, Value>>; 2] = [&normal, &holo];
+    enum Pass1 {
+        Done(Vec<(usize, Map<String, Value>, Planned)>),
+        /// Upstream Forward/FetchCard: replay the whole request to Node.
+        Replay,
+        /// Standalone Forward/FetchCard at (group, index): hydrate between
+        /// hops, then resume at (group, index + 1).
+        Deferred {
+            planned: Vec<(usize, Map<String, Value>, Planned)>,
+            group: usize,
+            index: usize,
+            entry: Map<String, Value>,
+            merged: Map<String, Value>,
+        },
+    }
+
+    let normal = std::sync::Arc::new(normal);
+    let holo = std::sync::Arc::new(holo);
     let mut planned: Vec<(usize, Map<String, Value>, Planned)> = Vec::new();
-    for group in groups {
-        for (index, entry) in group.iter().enumerate() {
-            let mut merged = shared.clone();
-            // perCard overrides (bulkAddToCollection): quantity/printing ride
-            // when neither null nor ''.
-            for k in ["quantity", "printing"] {
-                if let Some(v) = entry.get(k) {
-                    if !v.is_null() && js_to_string(Some(v)) != "" {
-                        merged.insert(k.into(), v.clone());
+    let mut resume = (0usize, 0usize);
+    loop {
+        let pool1 = std::sync::Arc::clone(&pool);
+        let normal1 = std::sync::Arc::clone(&normal);
+        let holo1 = std::sync::Arc::clone(&holo);
+        let shared1 = shared.clone();
+        let planned_in = std::mem::take(&mut planned);
+        let (g0, i0) = resume;
+        let hop = tokio::task::spawn_blocking(move || -> Result<Pass1, ()> {
+            let conn = match pool1.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "secret-lair add: cannot open write connection");
+                    return Err(());
+                }
+            };
+            let groups: [&[Map<String, Value>]; 2] = [normal1.as_slice(), holo1.as_slice()];
+            let mut planned = planned_in;
+            for (gi, group) in groups.iter().enumerate() {
+                if gi < g0 {
+                    continue;
+                }
+                let start = if gi == g0 { i0 } else { 0 };
+                for (index, entry) in group.iter().enumerate().skip(start) {
+                    let mut merged = shared1.clone();
+                    // perCard overrides (bulkAddToCollection): quantity/printing ride
+                    // when neither null nor ''.
+                    for k in ["quantity", "printing"] {
+                        if let Some(v) = entry.get(k) {
+                            if !v.is_null() && js_to_string(Some(v)) != "" {
+                                merged.insert(k.into(), v.clone());
+                            }
+                        }
+                    }
+                    merged.insert("card_id".into(), entry.get("card_id").cloned().unwrap_or(Value::Null));
+                    match plan_add(&conn, &merged) {
+                        Ok(p @ AddPlan::Ready { .. }) => {
+                            planned.push((index, entry.clone(), Planned::Ready(p)));
+                        }
+                        Ok(AddPlan::Reject(msg)) => {
+                            planned.push((index, entry.clone(), Planned::Reject(msg)));
+                        }
+                        Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if standalone => {
+                            // Node-free: addCardToCollection's own hydration legs
+                            // (getCardById / getPrintingInLang) run natively —
+                            // still before any write, so pass 1 stays read-only.
+                            // The await cannot run inside the hop: stop here,
+                            // hydrate between hops, resume after this entry.
+                            return Ok(Pass1::Deferred {
+                                planned,
+                                group: gi,
+                                index,
+                                entry: entry.clone(),
+                                merged,
+                            });
+                        }
+                        Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
+                            tracing::debug!("secret-lair add: hydration-needing card, forwarding to Node");
+                            return Ok(Pass1::Replay);
+                        }
+                        // Non-AddCardError: Node console.errors and reports the
+                        // generic per-card message.
+                        Err(e) => {
+                            tracing::error!(error = ?e, "secret-lair add: plan failed");
+                            planned.push((index, entry.clone(), Planned::Reject("Failed to add card".into())));
+                        }
                     }
                 }
             }
-            merged.insert("card_id".into(), entry.get("card_id").cloned().unwrap_or(Value::Null));
-            match plan_add(&conn, &merged) {
-                Ok(p @ AddPlan::Ready { .. }) => {
-                    planned.push((index, entry.clone(), Planned::Ready(p)));
-                }
-                Ok(AddPlan::Reject(msg)) => {
-                    planned.push((index, entry.clone(), Planned::Reject(msg)));
-                }
-                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) if st.cfg.node_upstream.is_empty() => {
-                    // Node-free: addCardToCollection's own hydration legs
-                    // (getCardById / getPrintingInLang) run natively —
-                    // still before any write, so pass 1 stays read-only.
-                    use crate::collection_writes::{plan_add_standalone, StandalonePlan};
-                    let p = match plan_add_standalone(&st, &pool, &merged).await {
-                        Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
-                        Ok(StandalonePlan::Plan(p)) => Planned::Ready(p),
-                        Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
-                        Err(e) => {
-                            tracing::error!(error = ?e, "secret-lair add: plan failed");
-                            Planned::Reject("Failed to add card".into())
-                        }
-                    };
-                    planned.push((index, entry.clone(), p));
-                }
-                Ok(AddPlan::Forward) | Ok(AddPlan::FetchCard(_)) => {
-                    tracing::debug!("secret-lair add: hydration-needing card, forwarding to Node");
-                    return replay_post(st, &headers, "/api/secret-lair/add", &body_req).await;
-                }
-                // Non-AddCardError: Node console.errors and reports the
-                // generic per-card message.
-                Err(e) => {
-                    tracing::error!(error = ?e, "secret-lair add: plan failed");
-                    planned.push((index, entry.clone(), Planned::Reject("Failed to add card".into())));
-                }
+            Ok(Pass1::Done(planned))
+        })
+        .await;
+        match hop {
+            Ok(Ok(Pass1::Done(p))) => {
+                planned = p;
+                break;
+            }
+            Ok(Ok(Pass1::Replay)) => {
+                return replay_post(st, &headers, "/api/secret-lair/add", &body_req).await;
+            }
+            Ok(Ok(Pass1::Deferred { planned: p, group, index, entry, merged })) => {
+                planned = p;
+                use crate::collection_writes::{plan_add_standalone, StandalonePlan};
+                let p = match plan_add_standalone(&st, &pool, &merged).await {
+                    Ok(StandalonePlan::Plan(AddPlan::Reject(msg))) => Planned::Reject(msg),
+                    Ok(StandalonePlan::Plan(p)) => Planned::Ready(p),
+                    Ok(StandalonePlan::NotFound(cid)) => Planned::Reject(format!("Card ID {cid} not found.")),
+                    Err(e) => {
+                        tracing::error!(error = ?e, "secret-lair add: plan failed");
+                        Planned::Reject("Failed to add card".into())
+                    }
+                };
+                planned.push((index, entry, p));
+                resume = (group, index + 1);
+            }
+            // Checkout failure and JoinError fold into the SAME pool-error
+            // body (documented arms).
+            Ok(Err(())) | Err(_) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
             }
         }
     }
 
     // Pass 2 — sequential writes in group order (Normal, then Holofoil);
     // `index` restarts per bulkAddToCollection call, exactly like Node.
-    let mut added_count: i64 = 0;
-    let mut failed: Vec<Value> = Vec::new();
-    for (index, entry, plan) in planned {
-        let card_id = entry.get("card_id").cloned().unwrap_or(Value::Null);
-        let fail = |error: String, failed: &mut Vec<Value>| {
-            let mut m = Map::new();
-            m.insert("card_id".into(), card_id.clone());
-            m.insert("error".into(), Value::String(error));
-            m.insert("index".into(), Value::from(index as i64));
-            failed.push(Value::Object(m));
-        };
-        match plan {
-            Planned::Ready(p) => match execute_add(&conn, user.id, &p) {
-                Ok(_) => added_count += 1,
+    // ONE hop: the loop is await-free; its checkout folds like pass 1's.
+    let pass2 = {
+        let pool2 = std::sync::Arc::clone(&pool);
+        tokio::task::spawn_blocking(move || -> Result<(i64, Vec<Value>), ()> {
+            let conn = match pool2.get() {
+                Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(error = ?e, "secret-lair add: card failed");
-                    fail("Failed to add card".into(), &mut failed);
+                    tracing::error!(error = %e, "secret-lair add: cannot open write connection");
+                    return Err(());
                 }
-            },
-            Planned::Reject(msg) => fail(msg, &mut failed),
+            };
+            let mut added_count: i64 = 0;
+            let mut failed: Vec<Value> = Vec::new();
+            for (index, entry, plan) in planned {
+                let card_id = entry.get("card_id").cloned().unwrap_or(Value::Null);
+                let fail = |error: String, failed: &mut Vec<Value>| {
+                    let mut m = Map::new();
+                    m.insert("card_id".into(), card_id.clone());
+                    m.insert("error".into(), Value::String(error));
+                    m.insert("index".into(), Value::from(index as i64));
+                    failed.push(Value::Object(m));
+                };
+                match plan {
+                    Planned::Ready(p) => match execute_add(&conn, user.id, &p) {
+                        Ok(_) => added_count += 1,
+                        Err(e) => {
+                            tracing::error!(error = ?e, "secret-lair add: card failed");
+                            fail("Failed to add card".into(), &mut failed);
+                        }
+                    },
+                    Planned::Reject(msg) => fail(msg, &mut failed),
+                }
+            }
+            Ok((added_count, failed))
+        })
+        .await
+    };
+    let (added_count, failed) = match pass2 {
+        // Checkout failure and JoinError fold into the SAME pool-error body.
+        Ok(Ok(v)) => v,
+        Ok(Err(())) | Err(_) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
         }
-    }
+    };
 
     let mut out = Map::new();
     out.insert("added".into(), Value::from(added_count));

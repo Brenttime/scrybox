@@ -20,11 +20,11 @@
 //! immediately, no timeout race. get_async's checkout runs on the blocking
 //! pool via get_conn and never fires the tripwire.
 //!
-//! Hermetic folds only: none of these routes touch the network. The
-//! precons-import write leg and the secret-lair preview/add legs sit
-//! behind scryfall fetches (no mock exists in this harness) — their park
-//! pins are flagged for the next tick together with the remaining
-//! secret_lair add leg.
+//! Hermetic folds below the header run with no network at all. The
+//! networked legs (precons-import write hop, secret-lair preview/add) run in
+//! parked_probe_net against mock_scryfall + scripted MTGJSON/fake-Node
+//! servers on EXTERNAL runtime threads — the "no mock exists" limitation
+//! this file opened with is closed as of iter-20.
 
 use std::sync::{mpsc, Arc};
 
@@ -406,4 +406,430 @@ fn rules_keywords_never_parks_a_runtime_worker() {
     let j = parse(&bytes);
     assert_eq!(j["keywords"], json!([]));
     assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+// ---------------------------------------------------------------------------
+// iter-20: secret_lair add (pass-1 plan leg + pass-2 write leg) and the
+// precons-import write hop. Closes the harness gap flagged by the file header
+// and iter-19 ("no mock exists in this harness"): mock_scryfall plus a
+// scripted MTGJSON v5 stand-in and a fake-Node echo run on EXTERNAL runtime
+// threads, so the network fetches BEFORE the DB legs complete without ever
+// needing the parked worker — the request then actually reaches the folded
+// hops. The checkout tripwire (armed on the named worker for the whole
+// request) is what makes these true pins: any leg neutered back to an inline
+// pool.get() dies on CHECKOUT-ON-RUNTIME-WORKER before the response lands.
+// ---------------------------------------------------------------------------
+
+mod mock_scryfall;
+
+use axum::{response::IntoResponse, routing::{any, get}, Router};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+/// Scripted MTGJSON v5 stand-in (same body contract as tests/precons.rs):
+/// a Null deck body answers 500, so a route that unexpectedly fetches fails
+/// LOUD instead of silently resolving.
+struct MtgState {
+    deck: std::sync::Mutex<Value>,
+}
+
+fn mtg_router(s: Arc<MtgState>) -> Router {
+    let d = s.clone();
+    let deck = get(move || {
+        let d = d.clone();
+        async move {
+            let v = d.deck.lock().unwrap().clone();
+            if v.is_null() {
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            axum::Json(v).into_response()
+        }
+    });
+    let empty = get(|| async { axum::Json(json!({"data": []})).into_response() });
+    Router::new()
+        .route("/api/v5/DeckList.json", get(|| async { axum::Json(json!({"data": []})).into_response() }))
+        .route("/api/v5/SetList.json", empty)
+        .route("/api/v5/decks/{name}", deck)
+}
+
+/// Fake Node: same echo contract as tests/secret_lair.rs (x-node: 1 +
+/// {method, pq, body}), so the Replay arm asserts distinctly from a native 200.
+fn node_router() -> Router {
+    let echo = any(|req: axum::extract::Request| async move {
+        let (parts, body) = req.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let mut out = axum::http::HeaderMap::new();
+        out.insert(
+            axum::http::HeaderName::from_static("x-node"),
+            axum::http::HeaderValue::from_static("1"),
+        );
+        (
+            axum::http::StatusCode::OK,
+            out,
+            axum::Json(json!({
+                "method": parts.method.as_str(),
+                "pq": parts.uri.path_and_query().unwrap().as_str(),
+                "body": String::from_utf8_lossy(&body),
+            })),
+        )
+            .into_response()
+    });
+    let health = get(|| async {
+        (axum::http::StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response()
+    });
+    Router::new().route("/api/health", health).fallback(echo)
+}
+
+/// Serve a router on its OWN runtime thread: the mock can never be starved by
+/// (nor mask a park of) the parked worker thread.
+fn spawn_serve_thread(router: Router) -> SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            axum::serve(l, router).await.unwrap();
+        });
+    });
+    rx.recv().unwrap()
+}
+
+/// mock_scryfall's accept loop on its own runtime thread (spawn_mock drives
+/// axum::serve via tokio::spawn; the current_thread block_on keeps polling
+/// spawned tasks while the thread parks on the pending future).
+fn spawn_scry_mock() -> (SocketAddr, Arc<mock_scryfall::MockState>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let (addr, st) = mock_scryfall::spawn_mock().await;
+            tx.send((addr, st)).unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    rx.recv().unwrap()
+}
+
+struct NetRun {
+    status: u16,
+    headers: axum::http::HeaderMap,
+    body: Vec<u8>,
+    live_after: usize,
+    scry: Arc<mock_scryfall::MockState>,
+    db_path: std::path::PathBuf,
+}
+
+/// parked_probe shape (two-permit hold + release + checkout tripwire on the
+/// named worker) with the network mocks mounted on external threads and
+/// caller-scripted MTGJSON deck + Scryfall batch bodies.
+#[allow(clippy::too_many_arguments)]
+fn parked_probe_net(
+    group: &'static str,
+    uri: &'static str,
+    token: &'static str,
+    body: &'static str,
+    node_free: bool,
+    mtg_deck: Value,
+    scry_batches: Vec<Value>,
+) -> NetRun {
+    let dir = std::env::temp_dir().join(format!(
+        "scrybox-legspark-net-{}",
+        scrybox_server::auth_support::uuid_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = seed(&dir);
+    let index_path = dir.join("precons-mirror.json");
+
+    let mtg = Arc::new(MtgState { deck: std::sync::Mutex::new(mtg_deck) });
+    let mtg_addr = spawn_serve_thread(mtg_router(mtg.clone()));
+    let node_addr = spawn_serve_thread(node_router());
+    let (scry_addr, scry) = spawn_scry_mock();
+    *scry.collection_batches.lock().unwrap() = scry_batches;
+
+    let pool = Arc::new(
+        scrybox_server::db::DbPool::open_with(
+            &db_path,
+            scrybox_server::db::PoolConfig { max: 0, cache_kb: 1024, mmap_kb: 0, live_max: 2 },
+        )
+        .unwrap(),
+    );
+    pool.warm(3);
+
+    let (tx, rx) = mpsc::channel::<(u16, axum::http::HeaderMap, Vec<u8>)>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let pool_for_rt = pool.clone();
+    let db_for_rt = db_path.clone();
+
+    std::thread::Builder::new()
+        .name("parked-runtime-worker".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let cfg = Config {
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    node_upstream: if node_free {
+                        String::new()
+                    } else {
+                        format!("http://{node_addr}")
+                    },
+                    static_dir: None,
+                    rust_routes: [group.to_string()].into_iter().collect(),
+                    db_path: Some(db_for_rt),
+                    sidecar_url: None,
+                };
+                let mut st = AppState::new(cfg);
+                st.db = Some(pool_for_rt.clone());
+                st.scry = Arc::new(mock_scryfall::scry_for(scry_addr, 0.0));
+                st.mtgjson_base = format!("http://{mtg_addr}/api/v5");
+                st.precons_index_path = index_path;
+                let r = app(st);
+
+                // Two-permit hold protocol — byte-same as parked_probe.
+                let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+                {
+                    let pool2 = pool_for_rt.clone();
+                    tokio::spawn(async move {
+                        let h1 = pool2.get().unwrap_or_else(|e| panic!("HELD-CHECKOUT-FAIL {e:?}"));
+                        let h2 = pool2.get().unwrap_or_else(|e| panic!("HELD-CHECKOUT-FAIL {e:?}"));
+                        let _ = held_tx.send(());
+                        let _ = release_rx.await;
+                        drop((h1, h2));
+                    });
+                }
+                held_rx.await.unwrap();
+
+                pool_for_rt.set_after_checkout_hook(Some(std::sync::Arc::new(|| {
+                    if std::thread::current().name() == Some("parked-runtime-worker") {
+                        panic!(
+                            "CHECKOUT-ON-RUNTIME-WORKER: sync pool.get() ran inline \
+                             on the parked runtime worker (M5 regression)"
+                        );
+                    }
+                })));
+
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .extension(axum::extract::ConnectInfo(
+                        std::net::SocketAddr::from(([127, 0, 0, 1], 54321)),
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap();
+                let resp = r.oneshot(req).await.unwrap();
+                let status = resp.status().as_u16();
+                let headers = resp.headers().clone();
+                let bytes =
+                    axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+                pool_for_rt.set_after_checkout_hook(None);
+                let _ = tx.send((status, headers, bytes));
+            });
+        })
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = release_tx.send(());
+
+    let (status, headers, bytes) = rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            match e {
+                std::sync::mpsc::RecvTimeoutError::Disconnected => panic!(
+                    "POST {uri}: the parked-worker thread died mid-request — with the \
+                     checkout tripwire armed this means an inline sync pool.get() ran on the \
+                     runtime worker (see CHECKOUT-ON-RUNTIME-WORKER panic above)"
+                ),
+                std::sync::mpsc::RecvTimeoutError::Timeout => panic!(
+                    "POST {uri} never completed: the handler parked the runtime worker on the \
+                     DbPool live cap (synchronous pool.get() inline on the worker)"
+                ),
+            }
+        });
+    let t0 = Instant::now();
+    while pool.live_count() > 0 && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    NetRun { status, headers, body: bytes, live_after: pool.live_count(), scry, db_path }
+}
+
+fn sl_deck_body() -> Value {
+    json!({"data": {
+        "name": "Test Drop", "code": "sl1", "type": "Secret Lair Drop",
+        "releaseDate": "2024-05-01",
+        "mainBoard": [
+            {"setCode":"10E","number":"1","count":4,"identifiers":{"scryfallId":"aaa"}},
+            {"setCode":"M19","number":"9","count":"x","identifiers":{"scryfallId":"ccc"}}
+        ],
+        "commander": []
+    }})
+}
+
+fn sl_batches() -> Vec<Value> {
+    vec![json!({
+        "data": [
+            mock_scryfall::raw_card("aaa", "Card A", "10e", "1", Some(1.0)),
+            mock_scryfall::raw_card("ccc", "Card C", "m19", "9", Some(3.0)),
+        ],
+        "not_found": []
+    })]
+}
+
+fn collection_rows(db: &std::path::Path) -> Vec<(String, i64, String)> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let rows = conn
+        .prepare("SELECT card_id, quantity, language FROM collection ORDER BY card_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    rows
+}
+
+/// The add happy path: preview (cacheCards + ownCollection hops, iter-19),
+/// pass 1 (checkout + plan reads in ONE hop) and pass 2 (checkout + write
+/// loop in ONE hop) all run on the blocking pool with both permits held.
+#[test]
+fn sl_add_never_parks_a_runtime_worker() {
+    let r = parked_probe_net(
+        "secret_lair",
+        "/api/secret-lair/add",
+        "sess-admin",
+        r#"{"fileName":"test_drop_SL1.json","copies":"2x","condition":"Near Mint"}"#,
+        false,
+        sl_deck_body(),
+        sl_batches(),
+    );
+    assert_eq!(r.status, 200, "body={}", String::from_utf8_lossy(&r.body));
+    let j: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["added"], json!(2), "{j}");
+    assert_eq!(j["failed"].as_array().unwrap().len(), 0, "{j}");
+    // Node's parseInt trap, pinned: '2x' doubles NOTHING (4+1 rows).
+    assert_eq!(
+        collection_rows(&r.db_path),
+        vec![
+            ("mtg-aaa".to_string(), 4, "English".to_string()),
+            ("mtg-ccc".to_string(), 1, "English".to_string()),
+        ]
+    );
+    assert_eq!(r.live_after, 0, "every checkout must be returned to the pool");
+}
+
+/// The Replay sentinel arm: upstream mode, language Japanese — no Japanese
+/// printing exists in the mock, plan_add answers FetchCard and the WHOLE
+/// request replays to Node while the (already-dropped) connection wrote
+/// nothing.
+#[test]
+fn sl_add_replay_arm_never_parks_a_runtime_worker() {
+    let r = parked_probe_net(
+        "secret_lair",
+        "/api/secret-lair/add",
+        "sess-admin",
+        r#"{"fileName":"test_drop_SL1.json","language":"Japanese"}"#,
+        false,
+        sl_deck_body(),
+        sl_batches(),
+    );
+    assert_eq!(r.status, 200, "body={}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.headers.get("x-node").map(|v| v.to_str().unwrap().to_string()),
+        Some("1".to_string()),
+        "must have replayed to Node; body={}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let j: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["pq"], "/api/secret-lair/add");
+    assert_eq!(
+        collection_rows(&r.db_path),
+        Vec::<(String, i64, String)>::new(),
+        "pass 1 must have written nothing before the replay"
+    );
+    assert_eq!(r.live_after, 0, "every checkout must be returned to the pool");
+}
+
+/// The Deferred arm (Node-free): language Japanese — pass 1 stops at each
+/// hydration-needing entry, plan_add_standalone runs BETWEEN hops (get_async
+/// + getPrintingInLang fetch, mock 404 → English rows kept, filed Japanese),
+/// the hop RESUMES after it, and pass 2 writes. The most leg-dense shape in
+/// the route, entirely under the tripwire.
+#[test]
+fn sl_add_standalone_localized_never_parks_a_runtime_worker() {
+    let r = parked_probe_net(
+        "secret_lair",
+        "/api/secret-lair/add",
+        "sess-admin",
+        r#"{"fileName":"test_drop_SL1.json","language":"Japanese"}"#,
+        true,
+        sl_deck_body(),
+        sl_batches(),
+    );
+    assert_eq!(r.status, 200, "body={}", String::from_utf8_lossy(&r.body));
+    let j: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["added"], json!(2), "{j}");
+    assert_eq!(
+        collection_rows(&r.db_path),
+        vec![
+            ("mtg-aaa".to_string(), 4, "Japanese".to_string()),
+            ("mtg-ccc".to_string(), 1, "Japanese".to_string()),
+        ]
+    );
+    assert!(
+        !r.scry.hits_for("GET /cards/10e/1/ja").is_empty(),
+        "the between-hops printing-in-language leg must have run (Deferred arm exercised)"
+    );
+    assert_eq!(r.live_after, 0, "every checkout must be returned to the pool");
+}
+
+/// precons import (folded iter-19; the pin flagged then): the whole write
+/// region — checkout, cacheCards leg, deck INSERT, deck_cards INSERT loop —
+/// is ONE blocking-pool hop behind the mtgjson deck fetch + Scryfall bulk
+/// resolve.
+#[test]
+fn precons_import_never_parks_a_runtime_worker() {
+    let deck = json!({"data": {
+        "name": "Test Commander Deck", "code": "tcd", "type": "Commander Deck",
+        "releaseDate": "2024-05-01",
+        "mainBoard": [
+            {"setCode":"10E","number":"1","count":4,"name":"Card A","identifiers":{"scryfallId":"aaa"}},
+            {"setCode":"10e","number":"1","count":2,"name":"Card A dup"},
+            {"setCode":"M19","number":"9","count":"x","name":"Card C"}
+        ],
+        "commander": [
+            {"setCode":"M19","number":"1","count":1,"name":"Card B","identifiers":{"scryfallId":"bbb"}}
+        ],
+        "sideboard": []
+    }});
+    let batches = vec![json!({
+        "data": [
+            mock_scryfall::raw_card("aaa", "Card A", "10e", "1", Some(1.0)),
+            mock_scryfall::raw_card("bbb", "Card B", "m19", "1", Some(2.0)),
+            mock_scryfall::raw_card("ccc", "Card C", "m19", "9", Some(3.0)),
+        ],
+        "not_found": []
+    })];
+    let r = parked_probe_net(
+        "precons",
+        "/api/precons/import",
+        "sess-admin",
+        r#"{"fileName":"tcd_Deck"}"#,
+        false,
+        deck,
+        batches,
+    );
+    assert_eq!(r.status, 201, "body={}", String::from_utf8_lossy(&r.body));
+    let j: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["message"], "Precon imported: 3 card types in the deck");
+    assert_eq!(j["cards"], json!(3));
+    let conn = rusqlite::Connection::open(&r.db_path).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM deck_cards WHERE deck_id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3, "the INSERT loop ran inside the hop");
+    assert_eq!(r.live_after, 0, "every checkout must be returned to the pool");
 }
