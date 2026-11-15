@@ -1143,8 +1143,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// CURRENT/LAST are process-globals shared by every test in this
+    /// binary. `state_and_stop_when_idle` calls `reset_for_test()` (clears
+    /// LAST) and could land between JobGuard::drop writing LAST and the
+    /// assert reading it — the m1 flake (`LAST.as_ref().unwrap()` on None).
+    /// Every test that touches the job globals holds this lock.
+    static JOB_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_job_globals() -> std::sync::MutexGuard<'static, ()> {
+        JOB_GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn m1_panicking_job_clears_current() {
+        let _globals = lock_job_globals();
         *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Job {
             game: "mtg".into(),
             lang: "English".into(),
@@ -1301,6 +1313,7 @@ mod tests {
 
     #[test]
     fn state_and_stop_when_idle() {
+        let _globals = lock_job_globals();
         reset_for_test();
         assert_eq!(state(), Value::Null);
         assert_eq!(last_result(), Value::Null);
