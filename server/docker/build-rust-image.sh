@@ -38,3 +38,8 @@ else
 fi
 docker image inspect "$IMG" \
   --format 'IMAGE SIZE: {{.Size}} bytes (Gate D ceiling 150 MB = 157286400)'
+# Container smoke (/tmp 1777 + uid-1000 writable, server uid, health):
+# SCRYBOX_SMOKE=1 runs it right after the build.
+if [ "${SCRYBOX_SMOKE:-0}" = 1 ]; then
+  "$ROOT/server/docker/smoke-rust-image.sh" "$IMG"
+fi

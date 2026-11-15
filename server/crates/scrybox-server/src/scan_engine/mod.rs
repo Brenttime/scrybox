@@ -35,6 +35,10 @@ pub struct Engine {
 static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
 /// Explicit `CARDSCAN_URL` keeps the HTTP sidecar path.
+/// Longest a status probe waits for the lazy engine load (cardscan.rs sets
+/// its in-process status timeout just above this).
+pub const STATUS_LOAD_WAIT: Duration = Duration::from_secs(20);
+
 pub fn http_mode() -> bool {
     std::env::var("CARDSCAN_URL").ok().is_some_and(|s| !s.is_empty())
 }
@@ -77,7 +81,10 @@ pub fn spawn_warm() {
 
 /// Boot hook (main.rs): build missing indexes in the volume, and warm the
 /// engine only when SCRYBOX_CARDSCAN_WARM=1 (owner ruling: heavy assets load
-/// lazily; the first scan or status probe triggers the load).
+/// lazily; the first scan or status probe triggers the load). Default stays
+/// lazy: warm costs ~230 MB idle RSS for a feature used occasionally, and the
+/// load is ~2-4 s (≤ 9 s under CPU contention), which the first status probe
+/// now absorbs (see `handle`, cutfix BUG-2) — so lazy never shows "offline".
 pub fn boot() {
     if http_mode() {
         return;
@@ -129,13 +136,22 @@ pub fn handle(method: &str, path: &str, headers: &[(String, String)], body: &[u8
         return None;
     }
     if method == "GET" && path == "/api/health" {
-        // Never block the 2.5 s status probe on the index load: answer like
-        // the sidecar before `init_ocr` finished and load in the background.
-        match ENGINE.get() {
-            None => {
-                spawn_warm();
-                return Some((503, json!({"ok": false, "ocr_backend": "uninitialized", "physical_printings": 0})));
+        // cutfix BUG-2: the sidecar loaded its models before it listened, so
+        // its health probe never saw a half-loaded engine, and FastScanner
+        // reads one status probe on mount (`setService(r.ok)`). With the
+        // lazy load (default: ~230 MB stays unallocated until someone scans)
+        // the probe itself triggers the load and waits for it (~2-4 s
+        // measured; bounded by STATUS_LOAD_WAIT) instead of answering a 503
+        // placeholder that rendered "Fast scan service is offline".
+        if ENGINE.get().is_none() {
+            spawn_warm();
+            let deadline = Instant::now() + STATUS_LOAD_WAIT;
+            while ENGINE.get().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
             }
+        }
+        match ENGINE.get() {
+            None => return Some((503, json!({"ok": false, "ocr_backend": "loading", "physical_printings": 0}))),
             Some(Err(_)) => return None,
             Some(Ok(_)) => {}
         }

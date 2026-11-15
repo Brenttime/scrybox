@@ -225,6 +225,7 @@ RUN set -eu; \
     done; \
     mkdir -p /staging/opt/ort/lib /staging/opt/lib /staging/usr/local/bin /staging/bin \
              /staging/etc/ssl/certs /staging/etc/ssl/private /staging/tmp; \
+    chmod 1777 /staging/tmp; \
     cp -p /payload/bin/scrybox-server /staging/usr/local/bin/scrybox-server; \
     cp -p /payload/ort/libonnxruntime.so.1 /staging/opt/ort/lib/libonnxruntime.so.1; \
     cp -p /payload/lib/libscryjpeg.so /staging/opt/lib/libscryjpeg.so; \
@@ -246,6 +247,11 @@ FROM scratch
 # Rootfs subset (loader, glibc + libstdc++/libgcc closure, NSS, static gosu
 # and busybox, CA roots, /etc/passwd|group, the three payload binaries).
 COPY --from=pkgroot /staging/ /
+# cutfix BUG-1: /tmp must be world-writable+sticky (1777). The server runs as
+# uid 1000 (gosu) and SQLite spills temp b-trees (big GROUP BY / ORDER BY,
+# e.g. GET /api/admin/catalogs) to /tmp; a root 0755 /tmp made those fail
+# with "disk I/O error". Build-time assertion so a regression fails the build.
+RUN ["/bin/busybox", "sh", "-c", "[ \"$(/bin/busybox stat -c %a /tmp)\" = 1777 ] || { echo '/tmp must be 1777' >&2; exit 1; }"]
 # Layout mirrors the Node image so an existing named volume at /app/database
 # (bindarr.db, models/, ssl/, card-art/) drops in unchanged.
 WORKDIR /app

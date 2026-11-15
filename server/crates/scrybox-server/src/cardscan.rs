@@ -826,7 +826,13 @@ pub async fn handle_status(State(st): State<AppState>, req: Request) -> Response
     if let Err(res) = authed(&st, &parts.headers, true).await {
         return node_exact(res).await;
     }
-    match call_get("/api/health", Duration::from_millis(2500)).await {
+    // In-process: the probe may wait out the lazy engine load (BUG-2).
+    let probe = if crate::scan_engine::http_mode() {
+        Duration::from_millis(2500)
+    } else {
+        crate::scan_engine::STATUS_LOAD_WAIT + Duration::from_secs(2)
+    };
+    match call_get("/api/health", probe).await {
         Up::Resp { status, json, .. } => {
             let mut body = Map::new();
             body.insert("ok".into(), Value::Bool(status == 200));
