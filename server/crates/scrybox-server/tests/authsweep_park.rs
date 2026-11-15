@@ -123,10 +123,22 @@ fn parked_probe(
         });
     });
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Event-driven release (LANE-B iter-65, same shape as legs_park
+    // iter-22 / authsweep_park_laneb iter-64): hold the slot until the
+    // request has actually attempted its checkout — every probe below
+    // authenticates, and authenticate_async's get_async idle-miss
+    // increments blocking_fallbacks BEFORE it waits on the live cap. The
+    // old blind sleep(300 ms) could release before the worker reached its
+    // first idle-miss under load: the holder's returned conn got popped
+    // from idle and the pin passed WITHOUT EVER PARKING (vacuous green —
+    // the live_count assert below cannot see that). RED arms intact: a
+    // synchronous get() build never registers the counter, falls through
+    // at the 5 s cap, the worker stays parked (it owns the worker), and
+    // recv_timeout below expires exactly as before.
+    let hop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pool.blocking_fallbacks() == 0 && std::time::Instant::now() < hop_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let _ = release_tx.send(());
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
@@ -136,6 +148,12 @@ fn parked_probe(
         )
     });
     assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "{method} {uri} answered {status} without EVER hopping to the blocking pool — \
+         with the only live slot held by a runtime task that means the request never took \
+         its get_async checkout (pin vacuous), not that it was safe"
+    );
     (status, bytes, pool)
 }
 

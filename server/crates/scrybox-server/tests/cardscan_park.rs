@@ -201,10 +201,20 @@ fn parked_probe(
         });
     });
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Event-driven release (LANE-B iter-65, same shape as legs_park
+    // iter-22 / authsweep_park_laneb iter-64): every probe sends Bearer
+    // sess-1, so authenticate_async's get_async idle-miss increments
+    // blocking_fallbacks BEFORE the live-cap wait — hold the slot until
+    // that registers instead of the old blind sleep(300 ms), which could
+    // release before the worker reached its first idle-miss under load
+    // (the pin then passed without ever parking: vacuous green). RED arms
+    // intact: a synchronous get()/inline-hydrate build never registers
+    // the counter, falls through at the 5 s cap, the parked worker owns
+    // the runtime, and recv_timeout below expires as before.
+    let hop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pool.blocking_fallbacks() == 0 && std::time::Instant::now() < hop_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let _ = release_tx.send(());
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
@@ -214,6 +224,12 @@ fn parked_probe(
         )
     });
     assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "{method} {uri} answered {status} without EVER hopping to the blocking pool — \
+         with the only live slot held by a runtime task that means the request never took \
+         its get_async checkout (pin vacuous), not that it was safe"
+    );
     (status, bytes, pool)
 }
 
