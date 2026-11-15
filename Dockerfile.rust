@@ -48,7 +48,10 @@ RUN npm run build
 # =========================================
 # Stage 2: package donor (discarded — only /staging is COPY'd out)
 # =========================================
-FROM debian:12-slim AS pkgroot
+FROM debian:13-slim AS pkgroot
+# Debian 13 (glibc 2.41): the static OpenCV 4.10 linked into scrybox-server
+# is built on the Debian 13 build host and needs GLIBC_2.38 / CXXABI_1.3.15,
+# which bookworm's libc/libstdc++ lack. Only the ldd closure is copied out.
 # glibc Debian, same distro family the Node image runs (issue #19): the ONNX
 # Runtime dylib and libscryjpeg are glibc-linked and the server binary is
 # built against Debian glibc. Nothing apt installs here survives into the
