@@ -1,0 +1,210 @@
+{
+ "names": [
+  "Syr Gwyn, Hero of Ashvale",
+  "Relic Axe",
+  "Cryogen Relic",
+  "Nazgûl",
+  "Fling",
+  "Sentinel",
+  "Tri-Sentinel",
+  "Mole Man",
+  "Troop of Ponies",
+  "Panther Idol",
+  "Bone Shard",
+  "Squall",
+  "Glóin, Dwarf Emissary",
+  "Hunter's Insight",
+  "Hamletback Goliath",
+  "Bolt Bend",
+  "Cindervines",
+  "Pako, Arcane Retriever",
+  "Lightning Bolt",
+  "Lightning Axe",
+  "Lightning Helix",
+  "Shock",
+  "Shocker",
+  "A-Fling",
+  "Arcane Signet",
+  "Sol Ring",
+  "Solemn Simulacrum",
+  "Llanowar Elves",
+  "Elvish Mystic",
+  "Counterspell"
+ ],
+ "excluded": [
+  "goblin token"
+ ],
+ "cases": [
+  [
+   "Syr Gwyn, Hero of Ashvaie",
+   "Syr Gwyn, Hero of Ashvale",
+   "0.9583333333333335"
+  ],
+  [
+   "SyrGwyn Hero of Ashva1e",
+   "Syr Gwyn, Hero of Ashvale",
+   "0.9361702127659575"
+  ],
+  [
+   "Relic Axe",
+   "Relic Axe",
+   "1.0"
+  ],
+  [
+   "ix Cryogen Relic",
+   "Cryogen Relic",
+   "0.99"
+  ],
+  [
+   "Nazgul",
+   "Nazgûl",
+   "1.0"
+  ],
+  [
+   "Flinq",
+   null,
+   "0.8"
+  ],
+  [
+   "Fling",
+   "Fling",
+   "1.0"
+  ],
+  [
+   "Sentine1",
+   null,
+   "0.875"
+  ],
+  [
+   "Tri-Sentine",
+   "Tri-Sentinel",
+   "0.9565217391304348"
+  ],
+  [
+   "Mole Man",
+   "Mole Man",
+   "1.0"
+  ],
+  [
+   "Troop of Ponles",
+   "Troop of Ponies",
+   "0.9333333333333333"
+  ],
+  [
+   "Panther ldol",
+   "Panther Idol",
+   "0.9166666666666666"
+  ],
+  [
+   "Bone Shad",
+   "Bone Shard",
+   "0.9473684210526316"
+  ],
+  [
+   "Squa11",
+   null,
+   "0.6666666666666667"
+  ],
+  [
+   "Gloin, Dwarf Emissary",
+   "Glóin, Dwarf Emissary",
+   "1.0"
+  ],
+  [
+   "Hunter’s Insight",
+   "Hunter's Insight",
+   "1.0"
+  ],
+  [
+   "Hamletback Gol1ath",
+   "Hamletback Goliath",
+   "0.9444444444444444"
+  ],
+  [
+   "Bolt Bnd",
+   "Bolt Bend",
+   "0.9411764705882353"
+  ],
+  [
+   "Cindervine",
+   "Cindervines",
+   "0.9523809523809523"
+  ],
+  [
+   "Pako Arcane Retriever",
+   "Pako, Arcane Retriever",
+   "1.0"
+  ],
+  [
+   "Lightning Bol",
+   "Lightning Bolt",
+   "0.962962962962963"
+  ],
+  [
+   "Lightning",
+   null,
+   "0.8181818181818181"
+  ],
+  [
+   "Shock",
+   "Shock",
+   "1.0"
+  ],
+  [
+   "Shoker",
+   "Shocker",
+   "0.9230769230769231"
+  ],
+  [
+   "Goblin Token",
+   null,
+   "0.0"
+  ],
+  [
+   "",
+   null,
+   "0.0"
+  ],
+  [
+   "x",
+   null,
+   "0.0"
+  ],
+  [
+   "ab cd Sol Ring",
+   "Sol Ring",
+   "0.99"
+  ],
+  [
+   "Solemn Simulacrun",
+   "Solemn Simulacrum",
+   "0.9411764705882353"
+  ],
+  [
+   "Llanowar Elfs",
+   "Llanowar Elves",
+   "0.8888888888888888"
+  ],
+  [
+   "Elvish Mystc",
+   "Elvish Mystic",
+   "0.96"
+  ],
+  [
+   "Counterspel",
+   "Counterspell",
+   "0.9565217391304348"
+  ],
+  [
+   "Arcane Sign",
+   "Arcane Signet",
+   "0.9166666666666666"
+  ],
+  [
+   "zzzzzzzz",
+   null,
+   "0.0"
+  ]
+ ],
+ "note": "scores are Python repr() strings (exact float64); serde_json without float_roundtrip mis-parses some by 1 ULP"
+}

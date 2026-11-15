@@ -26,6 +26,7 @@ libc.workspace = true
 icu_collator.workspace = true
 icu_locale.workspace = true
 regex.workspace = true
+unicode-normalization = "0.1"
 ort.workspace = true
 image.workspace = true
 local-scryfall = { path = "../local-scryfall" }

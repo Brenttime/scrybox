@@ -31,8 +31,21 @@ ORT=${ORT_DYLIB_PATH:-/home/brenttime/projects/bindarr/backend/node_modules/onnx
 JPEG=${SCRYBOX_JPEG_LIB:-$ROOT/../data/lib/libscryjpeg.so}
 [ -f "$JPEG" ] || { echo "scryjpeg shim not found: $JPEG (set SCRYBOX_JPEG_LIB)"; exit 1; }
 
-rm -rf "$STAGE/bin" "$STAGE/lib"
-mkdir -p "$STAGE/bin" "$STAGE/lib"
+rm -rf "$STAGE/bin" "$STAGE/lib" "$STAGE/ocr"
+mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/ocr"
+# TOTORO mono scan: in-process cardscan OCR assets. SCRYBOX_OCR_SRC is a dir
+# holding the sidecar's PP-OCRv6_rec_small.onnx (rapidocr 3.9.2, sha256
+# 6f327246...) plus its data/oracle_titles.json + oracle_index.meta.json.
+# Unset = ship nothing (the scan routes keep proxying to CARDSCAN_URL).
+if [ -n "${SCRYBOX_OCR_SRC:-}" ]; then
+  for f in PP-OCRv6_rec_small.onnx oracle_titles.json oracle_index.meta.json; do
+    [ -f "$SCRYBOX_OCR_SRC/$f" ] || { echo "OCR asset missing: $SCRYBOX_OCR_SRC/$f"; exit 1; }
+    cp "$SCRYBOX_OCR_SRC/$f" "$STAGE/ocr/$f"
+  done
+  echo 6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884"  $STAGE/ocr/PP-OCRv6_rec_small.onnx" | sha256sum -c - >/dev/null \
+    || { echo "PP-OCRv6_rec_small.onnx sha256 mismatch (must be the sidecar's file)"; exit 1; }
+fi
+touch "$STAGE/ocr/.keep"
 cp "$BIN" "$STAGE/bin/scrybox-server"
 cp "$ORT" "$STAGE/lib/libonnxruntime.so.1"
 cp "$JPEG" "$STAGE/lib/libscryjpeg.so"

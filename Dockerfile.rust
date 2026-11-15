@@ -157,6 +157,8 @@ COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
 # the bulk files live in the volume (see SCRYBOX_LSF_DATA_DIR below).
 COPY --chown=1000:1000 local-scryfall/static/ /app/scryfall/static/
 COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-meta.json local-scryfall/data/land_cycles.json /app/scryfall/data/
+# In-process cardscan OCR assets (empty unless SCRYBOX_OCR_SRC was staged).
+COPY server/docker/ocr/ /opt/ocr/
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -167,6 +169,8 @@ ENV PORT=3001 \
     CV_MODEL_DIR=/app/database/models \
     ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
     SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
+    SCRYBOX_OCR_MODEL_DIR=/opt/ocr \
+    SCRYBOX_CARDSCAN_DATA=/opt/ocr \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \
     RUST_MIGRATIONS=true \

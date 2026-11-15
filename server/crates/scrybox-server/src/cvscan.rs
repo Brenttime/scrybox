@@ -156,7 +156,7 @@ struct Models {
 static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 static MODELS: Mutex<Option<Result<Arc<Models>, String>>> = Mutex::new(None);
 
-fn ort_env() -> Result<&'static ort::environment::Environment, String> {
+pub(crate) fn ort_env() -> Result<&'static ort::environment::Environment, String> {
     ENV.get_or_init(|| match std::env::var("ORT_DYLIB_PATH") {
         Ok(p) if !p.is_empty() => ort::init_from(&p)
             .map_err(|e| format!("ort load: {e}"))
