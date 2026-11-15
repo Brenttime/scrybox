@@ -22,6 +22,11 @@
 //! PUT so route_card falls through to auth_then_404). The bogus token
 //! misses the sessions/api-key lookups and the fold answers the
 //! authenticateToken 401 — no upstream network, no other table touched.
+//!
+//! iter-61 adds post-auth body pins (parked_probe canaries + REAL
+//! contended_probe parking pins for the moxfield legs). iter-62 adds the
+//! seed_cards close-out pair on the legs_park.rs tripwire shape
+//! (after_checkout_hook) — see the iter-62 section at the bottom.
 
 use std::sync::{mpsc, Arc};
 
@@ -630,6 +635,242 @@ fn moxfield_sync_decklist_checkout_does_not_park_the_runtime_worker() {
     assert!(
         pool.blocking_fallbacks() >= 2,
         "post-auth checkout never hopped (blocking_fallbacks={}): the grabber never engaged — vacuous pin",
+        pool.blocking_fallbacks()
+    );
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+// ===========================================================================
+// LANE-B iter-62 (M5 close-out): the last request-path sync pool.get()
+// sites in Lane-B modules — seed_cards' getCardsBySet cacheCards checkout
+// and handle_post's fallback_conn checkout — moved to get_async(). Both
+// ran INLINE on the runtime worker inside async fns, right after real
+// await points (the Scryfall fetch legs). The scry_jobs timer set
+// (set sync / price sweep / oracle maintenance / sessions purge) runs on
+// a DEDICATED OS thread with its own rusqlite Connections (scry_jobs.rs
+// start_job_timers_with) — never the DbPool — and is the sanctioned
+// blocking-thread shape, not an M5 site; spawn_blocking-internal
+// checkouts (backup auto-timer, heavy folds, manabox apply_plan, cvscan
+// legs) stay sync by the same ruling.
+//
+// These pins take the legs_park.rs tripwire shape (stronger than the
+// contended_probe grabber for a single-threaded runtime): the live slot
+// is held by a runtime task, and DbPool's debug after_checkout_hook
+// panics if ANY get() checkout executes on the named runtime worker
+// thread mid-request. get_async never fires it (its idle-pop never
+// calls get(); its hop runs get_conn on the blocking pool). RED-BEFORE-
+// GREEN is per-site and deterministic: revert either converted site to
+// pool.get() and that pin dies with CHECKOUT-ON-RUNTIME-WORKER; the
+// sibling pin stays green.
+// ===========================================================================
+
+/// Scripted Scryfall stand-in for the seed pins: GET /cards/search
+/// answers `search_body`, everything else 404. Dedicated thread +
+/// runtime (spawn_mfx_mock shape).
+fn spawn_scry_mock(search_body: Value) -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel::<std::net::SocketAddr>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let body = search_body.to_string();
+            let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+                let body = body.clone();
+                async move {
+                    let path = req.uri().path().to_string();
+                    let json = |status: axum::http::StatusCode, b: String| -> axum::http::Response<axum::body::Body> {
+                        axum::http::Response::builder()
+                            .status(status)
+                            .header(axum::http::header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    };
+                    if path == "/cards/search" {
+                        json(axum::http::StatusCode::OK, body)
+                    } else {
+                        json(
+                            axum::http::StatusCode::NOT_FOUND,
+                            json!({"status_code": 404, "mock": path}).to_string(),
+                        )
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let _ = tx.send(listener.local_addr().unwrap());
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    rx.recv().unwrap()
+}
+
+/// POST /api/admin/seed-cards with a valid admin session, live_max=1,
+/// the only slot held by a runtime task, and the checkout tripwire armed
+/// for the request's duration. The 500 ms×2 Scryfall courtesy sleeps in
+/// handle_post run AFTER auth, so both converted sites (site ~159 cache
+/// checkout per set, site ~207 fallback_conn) execute post-release while
+/// the tripwire is still armed — a sync get() there fires the hook
+/// regardless of whether the pop would have succeeded.
+fn tripwire_probe_seed(search: Value, expected: u16) -> (u16, Vec<u8>, Arc<scrybox_server::db::DbPool>) {
+    let dir = std::env::temp_dir().join(format!(
+        "scrybox-authsweep-seedb-{}",
+        scrybox_server::auth_support::uuid_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = seed(&dir);
+    let mock = spawn_scry_mock(search);
+
+    let pool = Arc::new(
+        scrybox_server::db::DbPool::open_with(
+            &db_path,
+            scrybox_server::db::PoolConfig { max: 1, cache_kb: 1024, mmap_kb: 0, live_max: 1 },
+        )
+        .unwrap(),
+    );
+    assert_eq!(pool.open_count(), 0, "no pool connection before the first request");
+
+    let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let pool_for_rt = pool.clone();
+    let db_for_rt = db_path.clone();
+
+    std::thread::Builder::new()
+        .name("parked-seed-worker".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let cfg = Config {
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    node_upstream: String::new(),
+                    static_dir: None,
+                    rust_routes: ["seed_cards".to_string()].into_iter().collect(),
+                    db_path: Some(db_for_rt),
+                    sidecar_url: None,
+                };
+                let mut st = AppState::new(cfg);
+                st.db = Some(pool_for_rt.clone());
+                st.scry = Arc::new(scrybox_server::scryfall::Scry::new(
+                    scrybox_server::scryfall::ScryEnv {
+                        local: false,
+                        local_url: String::new(),
+                        base_url: format!("http://{mock}"),
+                        gap_scale: 0.0,
+                    },
+                ));
+                let r = app(st);
+
+                let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+                {
+                    let p = pool_for_rt.clone();
+                    tokio::spawn(async move {
+                        let h = p.get().unwrap_or_else(|e| panic!("HELD-CHECKOUT-FAIL {e:?}"));
+                        let _ = held_tx.send(());
+                        let _ = release_rx.await;
+                        drop(h);
+                    });
+                }
+                held_rx.await.unwrap();
+
+                pool_for_rt.set_after_checkout_hook(Some(Arc::new(|| {
+                    if std::thread::current().name() == Some("parked-seed-worker") {
+                        panic!(
+                            "CHECKOUT-ON-RUNTIME-WORKER: sync pool.get() ran inline \
+                             on the parked runtime worker (M5 regression)"
+                        );
+                    }
+                })));
+
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/seed-cards")
+                    .extension(axum::extract::ConnectInfo(
+                        std::net::SocketAddr::from(([127, 0, 0, 1], 54321)),
+                    ))
+                    .header("authorization", "Bearer sess-2")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                let resp = r.oneshot(req).await.unwrap();
+                let status = resp.status().as_u16();
+                let bytes =
+                    axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+                let _ = tx.send((status, bytes));
+            });
+        })
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = release_tx.send(());
+
+    let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|e| {
+        match e {
+            std::sync::mpsc::RecvTimeoutError::Disconnected => panic!(
+                "POST /api/admin/seed-cards: the parked-worker thread died mid-request — with \
+                 the checkout tripwire armed this means an inline sync pool.get() ran on the \
+                 runtime worker (see CHECKOUT-ON-RUNTIME-WORKER panic above)"
+            ),
+            std::sync::mpsc::RecvTimeoutError::Timeout => panic!(
+                "POST /api/admin/seed-cards never completed: a handler leg parked the runtime \
+                 worker on the DbPool live cap (synchronous pool.get() inline on the worker)"
+            ),
+        }
+    });
+    assert_eq!(
+        status, expected,
+        "POST /api/admin/seed-cards answered {status}, expected {expected}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    (status, bytes, pool)
+}
+
+// Site ~159 (getCardsBySet cacheCards): non-empty /cards/search answer →
+// the per-set cache checkout runs. 200 with the Node "… cards for admin
+// user." tail. RED-BEFORE-GREEN (measured): revert ONLY this site →
+// this pin dies with the tripwire panic and the 502 fallback pin stays
+// green (empty data never reaches site 159). Reverting site 207
+// (fallback_conn, unconditional) dies BOTH pins — the E1 asymmetry is
+// what localises the checkout to this site.
+#[test]
+fn seed_cards_cache_cards_checkout_does_not_park_the_runtime_worker() {
+    std::env::set_var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER", "1");
+    let (_s, bytes, pool) = tripwire_probe_seed(
+        json!({"data": [
+            {"id": "a1", "set": "lea", "name": "Alpha Card", "lang": "en",
+             "prices": {"usd": "1.50", "usd_foil": "3.00"}}
+        ], "has_more": false}),
+        200,
+    );
+    let b = String::from_utf8_lossy(&bytes);
+    assert!(b.contains(" cards for admin user."), "seed body: {b}");
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "the auth hop never reached the blocking pool (blocking_fallbacks={}): vacuous pin",
+        pool.blocking_fallbacks()
+    );
+    assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
+}
+
+// Site ~207 (handle_post fallback_conn): empty /cards/search answers →
+// both sets yield [] → mock_pool empty → fallback_conn is the FIRST
+// (and only) body checkout, used for the card_cache LIMIT 500 fallback
+// read; cache empty → Node's 502. RED-BEFORE-GREEN (measured): revert
+// ONLY this site and this pin dies with the tripwire panic (so does the
+// 200 pin — site 207 is unconditional; only site 159's revert spares
+// this one, localising the two sites).
+#[test]
+fn seed_cards_fallback_conn_checkout_does_not_park_the_runtime_worker() {
+    std::env::set_var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER", "1");
+    let (_s, bytes, pool) = tripwire_probe_seed(json!({"data": []}), 502);
+    let v = parse(&bytes);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Could not fetch seed card data"),
+        "fallback body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "the auth hop never reached the blocking pool (blocking_fallbacks={}): vacuous pin",
         pool.blocking_fallbacks()
     );
     assert_eq!(pool.live_count(), 0, "every checkout must be returned to the pool");
