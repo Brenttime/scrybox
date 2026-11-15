@@ -1907,6 +1907,9 @@ fn collq_walk_base_operator_battery() {
         ("is:basic-land", "t:\"basic land\""),
         ("is:Foo", "is:Foo"),
         ("is:land t:creature", "t:land t:creature"),
+        // parseAnd consumes `and and` between two terms; Node walks the
+        // serialised AST (local-scryfall's parser decides, not a scanner).
+        ("t:a and and t:c", "t:a t:c"),
     ];
     const REJECT: &[&str] = &[
         // Node's parser THROWS on these → sidecar mode walks the raw string
@@ -1917,7 +1920,6 @@ fn collq_walk_base_operator_battery() {
         "and",
         "and t:creature",
         "t:creature and",
-        "t:a and and t:c", // Node elides both — proxy is the safe subset
         // Grammar structures outside the subset.
         "or",
         "sol ring or plains",

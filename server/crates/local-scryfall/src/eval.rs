@@ -377,6 +377,8 @@ fn eval_node(node: &Node, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
         Node::TextKw(word) => eval_text_kw(word, ix),
         Node::Phrase(phrase) => eval_phrase(phrase, ix),
         Node::Filter(f) => eval_filter(f, ix, w),
+        // surface atoms only exist in parse_syntax output (never searched)
+        Node::Atom(_) => RoaringBitmap::new(),
     }
 }
 
