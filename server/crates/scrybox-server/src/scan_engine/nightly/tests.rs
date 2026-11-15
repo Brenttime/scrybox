@@ -277,3 +277,17 @@ fn client_index_columns_and_flags() {
     assert_eq!(v["printings"][1], json!(["id1", "pm19", "2", 20190712, 1 | 2 | 4 | 8]));
     assert_eq!(v["byTitle"]["card 0"], json!([0]));
 }
+
+#[test]
+fn gzip_matches_cpython_zlib_bytes() {
+    // sha256(gzip.compress(raw, 9, mtime=0)) from CPython 3.12.15 / zlib
+    // 1.3.1 (cardscan:local-scanspeed). zlib-rs (flate2's default backend)
+    // produced a different stream for the real index — this pins stock zlib.
+    let mut raw = Vec::new();
+    for i in 0..20000u64 {
+        raw.extend(format!("card {} scan-index é ", i * 7919 % 1000).as_bytes());
+    }
+    let h = Sha256::digest(gzip_py(&raw));
+    let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, "71d751e624fd4bee6083563e0e834b9c06f4b31e5dabd4de1e93997cb309652e");
+}

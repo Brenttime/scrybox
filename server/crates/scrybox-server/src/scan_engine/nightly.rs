@@ -311,17 +311,66 @@ pub fn build_index_json(oracle: &Oracle, printings: &Printings, meta: &CardMeta)
     Ok((o.into_bytes(), names.len(), rows.len()))
 }
 
-/// CPython 3.12 `gzip.compress(raw, 9, mtime=0)` (= `zlib.compress(raw, 9,
-/// wbits=31)`): zlib's gzip wrapper, header `1f8b 08 00 00000000 02 03`.
+/// CPython 3.12 `gzip.compress(raw, 9, mtime=0)` = `zlib.compress(raw, 9,
+/// wbits=31)` on stock zlib (header `1f8b 08 00 00000000 02 03`). zlib-rs
+/// (flate2's backend) emits a different, valid deflate stream, so this goes
+/// through libz-sys' bundled stock zlib to stay byte-identical.
 pub fn gzip_py(raw: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 3];
-    let mut enc = flate2::write::DeflateEncoder::new(Vec::with_capacity(raw.len() / 4), flate2::Compression::new(9));
-    enc.write_all(raw).expect("deflate");
-    out.extend(enc.finish().expect("deflate"));
-    let mut crc = flate2::Crc::new();
-    crc.update(raw);
-    out.extend(crc.sum().to_le_bytes());
-    out.extend((raw.len() as u32).to_le_bytes());
+    use libz_sys as z;
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len() / 3 + 1024);
+    unsafe {
+        extern "C" fn zalloc(_: z::voidpf, items: z::uInt, size: z::uInt) -> z::voidpf {
+            unsafe { libc::calloc(items as usize, size as usize) }
+        }
+        extern "C" fn zfree(_: z::voidpf, p: z::voidpf) {
+            unsafe { libc::free(p) }
+        }
+        let mut s = z::z_stream {
+            next_in: std::ptr::null_mut(),
+            avail_in: 0,
+            total_in: 0,
+            next_out: std::ptr::null_mut(),
+            avail_out: 0,
+            total_out: 0,
+            msg: std::ptr::null_mut(),
+            state: std::ptr::null_mut(),
+            zalloc,
+            zfree,
+            opaque: std::ptr::null_mut(),
+            data_type: 0,
+            adler: 0,
+            reserved: 0,
+        };
+        let rc = z::deflateInit2_(
+            &mut s,
+            9,
+            z::Z_DEFLATED,
+            31,
+            8,
+            z::Z_DEFAULT_STRATEGY,
+            z::zlibVersion(),
+            std::mem::size_of::<z::z_stream>() as i32,
+        );
+        assert_eq!(rc, z::Z_OK, "deflateInit2");
+        s.next_in = raw.as_ptr() as *mut u8;
+        s.avail_in = raw.len() as u32;
+        loop {
+            if out.capacity() - out.len() < 64 * 1024 {
+                out.reserve(1 << 20);
+            }
+            let spare = out.capacity() - out.len();
+            s.next_out = out.as_mut_ptr().add(out.len());
+            s.avail_out = spare as u32;
+            let rc = z::deflate(&mut s, z::Z_FINISH);
+            let produced = spare - s.avail_out as usize;
+            out.set_len(out.len() + produced);
+            if rc == z::Z_STREAM_END {
+                break;
+            }
+            assert!(rc == z::Z_OK || rc == z::Z_BUF_ERROR, "deflate rc {rc}");
+        }
+        z::deflateEnd(&mut s);
+    }
     out
 }
 
@@ -760,8 +809,10 @@ fn install_live(oracle: Oracle, printings: Printings) -> Result<bool, String> {
         // Lazy engine never loaded: the next load reads the new files.
         return Ok(false);
     }
+    let (t, n) = (oracle.norm_list.len(), printings.len());
     let e = super::Engine::from_parts(oracle, printings)?;
     super::install_engine(e);
+    tracing::info!("scan-index refresh: scan engine hot-swapped ({t} titles, {n} printings; no restart)");
     Ok(true)
 }
 
