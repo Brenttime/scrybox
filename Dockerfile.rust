@@ -21,7 +21,8 @@
 # gosu, busybox-static and the CA roots — and scratch receives just those
 # files, with payload ownership baked in via COPY --chown (never chown -R).
 #
-# Payload budget (uncompressed): server 17.6 + ORT 38 + scryjpeg 0.2 +
+# Payload budget (uncompressed): server 17.6 (+~2 MB: linked local-scryfall
+# engine) + scryfall portal/meta 0.7 + ORT 38 + scryjpeg 0.2 +
 # curl-impersonate 4.9 (stripped: the published binary carries full debug
 # symbols, 30.8 -> 4.9 MB, same behaviour) + dist 22.5 + shared 0.2 +
 # glibc/libstdc++/libgcc closure ~11 + static gosu 2.9 + busybox 2.5 +
@@ -149,6 +150,13 @@ COPY --chown=1000:1000 --from=frontend-builder /app/frontend/dist /app/frontend/
 # entrypoint-rust.sh is LF in-tree (verified); --chmod bakes the exec bit
 # (scratch has no RUN shell for sed/chmod).
 COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
+# TOTORO mono: the local Scryfall engine is linked INTO scrybox-server (no
+# scryfall-local sidecar). Its static portal (~256 KB) and the vendored set
+# metadata (~430 KB: blocks.json, sets-meta.json, land_cycles.json — the
+# copies the live sidecar actually serves from) ship read-only in the image;
+# the bulk files live in the volume (see SCRYBOX_LSF_DATA_DIR below).
+COPY --chown=1000:1000 local-scryfall/static/ /app/scryfall/static/
+COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-meta.json local-scryfall/data/land_cycles.json /app/scryfall/data/
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -162,12 +170,26 @@ ENV PORT=3001 \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \
     RUST_MIGRATIONS=true \
-    RUST_JOBS=scryfall
+    RUST_JOBS=scryfall \
+    SCRYBOX_LSF_DATA_DIR=/app/database/scryfall-data \
+    SCRYBOX_LSF_STATIC_DIR=/app/scryfall/static \
+    SCRYBOX_LSF_VENDORED_DIR=/app/scryfall/data \
+    LOCAL_SCRYFALL_ENABLED=true \
+    LOCAL_WEB_PORTAL_ENABLED=true
 # The two ONNX models are NOT in the image (AGPL-3.0 vs MIT — operator
 # fetches them into the volume, same policy as the Node image).
-# LOCAL_SCRYFALL_* / SCRYBOX_SIDECAR_URL / SCRYBOX_NODE_UPSTREAM stay unset:
-# the Node-free image has no Node to forward to; unset legs answer their
-# documented no-sidecar arms.
+# TOTORO mono (local Scryfall engine in-process):
+#   SCRYBOX_LSF_DATA_DIR   bulk data dir (default-cards / oracle-tags are
+#                          fetched there on first boot and refreshed daily at
+#                          05:00, SCRYBOX_LSF_REFRESH_AT; an existing sidecar
+#                          /data dir — incl. all-cards.jsonl.gz and
+#                          lang_map_full.json.gz, which are never downloaded —
+#                          can be mounted here as-is).
+#   LOCAL_SCRYFALL_ENABLED / LOCAL_WEB_PORTAL_ENABLED = true, matching the
+#   production Node container's env, but LOCAL_SCRYFALL_URL and
+#   SCRYBOX_SIDECAR_URL stay UNSET: unset = in-process engine; setting either
+#   re-enables the HTTP path to an external engine (fallback only).
+#   SCRYBOX_NODE_UPSTREAM stays empty: the Node-free image has no Node.
 # NOTE: no USER directive on purpose — the container starts as root so
 # entrypoint-rust.sh can adopt a foreign-owned /app/database volume, then
 # gosu drops to uid 1000 (matching the Node image's `node` user) for the

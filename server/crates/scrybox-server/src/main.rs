@@ -345,6 +345,10 @@ async fn run() {
     // SCRYBOX_DISABLE_PRICE_SWEEP when this is on). Off unless set.
     // Built before AppState so the weekly tick shares AppState.scryfall_sets
     // (REVIEW concurrency-jobs L4: no fresh per-tick memo).
+    // TOTORO mono: the local Scryfall engine runs in-process (own runtime,
+    // background index build + daily bulk refresh). No-op unless
+    // SCRYBOX_LSF_DATA_DIR / SCRYFALL_DATA_DIR is set.
+    scrybox_server::lsf::start_from_env();
     let state = scrybox_server::AppState::new(cfg.clone());
     let jobs = scrybox_server::scry_jobs::JobSet::parse(
         &std::env::var("RUST_JOBS").unwrap_or_default(),

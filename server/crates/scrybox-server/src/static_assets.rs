@@ -402,10 +402,7 @@ fn scan_dir(st: &AppState) -> PathBuf {
 const PORTAL_PREFIX: &str = "/scryfall-portal";
 
 fn portal_upstream_base() -> String {
-    std::env::var("LOCAL_SCRYFALL_URL")
-        .unwrap_or_else(|_| "http://scryfall-local:8420".into())
-        .trim_end_matches('/')
-        .to_string()
+    crate::lsf::local_scryfall_url()
 }
 
 /// server.js rewriteText's two regexes as byte scans (the patterns are pure
@@ -538,7 +535,7 @@ pub async fn handle_portal(State(st): State<AppState>, req: Request) -> Response
     // Node's fetch AbortSignal.timeout(10000) covers header arrival; body
     // streaming itself stays untimed on both sides (honest approximation).
     let upstream = match upstream_req {
-        Ok(r) => match tokio::time::timeout(Duration::from_secs(10), st.client.request(r)).await {
+        Ok(r) => match tokio::time::timeout(Duration::from_secs(10), crate::lsf::send(&st.client, r)).await {
             Ok(Ok(r)) => r,
             _ => {
                 tracing::warn!(target = %target, "scryfall-portal: upstream unreachable");

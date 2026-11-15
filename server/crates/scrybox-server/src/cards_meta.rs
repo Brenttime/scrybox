@@ -214,7 +214,7 @@ async fn scry_page(
             .header("accept", "application/json")
             .body(Body::empty())
             .map_err(|_| WinErr::Transport)?;
-        let res = match tokio::time::timeout(PAGE_TIMEOUT, st.client.request(req)).await {
+        let res = match tokio::time::timeout(PAGE_TIMEOUT, crate::lsf::send(&st.client, req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) | Err(_) => {
                 // Transport/timeout: Node does NOT retry these, but a
@@ -1347,7 +1347,7 @@ pub async fn handle_suggest(State(st): State<AppState>, req: Request) -> Respons
     };
     // 2500 ms AbortController: any timeout/transport/non-2xx/parse failure
     // lands on the same {suggestions: []}.
-    let res = match tokio::time::timeout(std::time::Duration::from_millis(2500), st.client.request(hreq)).await {
+    let res = match tokio::time::timeout(std::time::Duration::from_millis(2500), crate::lsf::send(&st.client, hreq)).await {
         Ok(Ok(r)) => r,
         _ => return empty(),
     };
