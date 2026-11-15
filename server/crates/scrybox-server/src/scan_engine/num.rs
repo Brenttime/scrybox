@@ -47,7 +47,9 @@ pub fn percentile_hist(hist: &[u64; 256], n: u64, q: f64) -> f64 {
     }
     let qq = q / 100.0;
     let nf = n as f64;
-    let virt = nf * qq + (1.0 + qq * (1.0 - 1.0 - 1.0)) - 1.0;
+    // numpy linear-method virtual index q*(n-1), written exactly as
+    // percentile_f64 below does: nf*qq + (1-qq) - 1 (bit-identical ops).
+    let virt = nf * qq + (1.0 - qq) - 1.0;
     let virt = virt.clamp(0.0, nf - 1.0);
     let prev = virt.floor();
     let gamma = virt - prev;
