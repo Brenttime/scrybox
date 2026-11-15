@@ -2464,10 +2464,11 @@ mod tests {
     // -----------------------------------------------------------------------
     // Recognition parity vs Node ground truth (unit-6b readiness criterion:
     // "at least as good as Node" on the eval corpus). node-truth.json is the
-    // frozen :3312 capture of POST /api/scan-match over server/bench/
-    // scan-eval/corpus (regenerable with mkcorpus.py + mkvariants.py +
-    // node-scan-match.mjs); the corpus itself lives in the lane's data dir
-    // (../../data/scan-eval-corpus, CORPUS_DIR overrides). Requires the lane
+    // frozen :3312 capture of POST /api/scan-match over the lane eval corpus
+    // (the lane data dir ../../data/scan-eval-corpus, CORPUS_DIR overrides;
+    // regenerable with mkcorpus.py + mkvariants.py + node-scan-match.mjs,
+    // which write that same dir — the old bench/scan-eval/corpus copy was
+    // retired in iter-58). Requires the lane
     // artifacts (ORT dylib + models) — skipped, never failed, when absent.
     // -----------------------------------------------------------------------
 

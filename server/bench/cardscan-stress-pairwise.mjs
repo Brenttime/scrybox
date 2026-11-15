@@ -18,7 +18,8 @@
 // documented saturation set, every 429 a verbatim busy envelope, every 502/
 // 503 the front's own error envelope. Histograms/percentiles are evidence.
 //
-// Env: AB_TOKEN (required), CORPUS_DIR (default bench/scan-eval/corpus),
+// Env: AB_TOKEN (required), CORPUS_DIR (default ../data/scan-eval-corpus — lane-B
+//      iter-58: the retired bench/scan-eval/corpus copy is gone; one corpus dir),
 //      CONC (default 16), ROUNDS (default 3), PIDS="rust:PID,node:PID".
 const NODE = 'http://127.0.0.1:3312';
 const RUST = 'http://127.0.0.1:3320';
@@ -31,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 const TOK = process.env.AB_TOKEN;
 if (!TOK) { console.error('AB_TOKEN required'); process.exit(2); }
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CORPUS = process.env.CORPUS_DIR || path.join(HERE, 'scan-eval', 'corpus');
+const CORPUS = process.env.CORPUS_DIR || path.join(HERE, '..', '..', '..', 'data', 'scan-eval-corpus');
 const CONC = parseInt(process.env.CONC || '16', 10);
 const ROUNDS = parseInt(process.env.ROUNDS || '3', 10);
 
