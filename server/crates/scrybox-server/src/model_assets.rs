@@ -24,7 +24,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::cards_tags::json_response;
 use crate::collection_writes::node_exact;
 use crate::cvscan;
@@ -474,7 +474,7 @@ pub async fn handle_models(State(st): State<AppState>, mut req: Request) -> Resp
     let pool = st.db.clone().unwrap();
     let headers = req.headers().clone();
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), is_get) {
+    let user = match authenticate_async(&pool, token.as_deref(), is_get).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

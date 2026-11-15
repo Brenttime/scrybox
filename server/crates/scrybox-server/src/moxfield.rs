@@ -26,7 +26,7 @@ use rusqlite::types::{ToSqlOutput, Value as SqlValue};
 use rusqlite::{Connection, ToSql};
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_cache::{cache_normalized_cards, card_key_sql};
 use crate::card_norm::{normalize_card, scryfall_uuid};
 use crate::collection_writes::{alloc_lock, node_exact, parse_body, BodyOutcome, Tx};
@@ -2023,7 +2023,7 @@ fn is_not_found(msg: &str) -> bool {
 async fn auth_gate(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64, Response> {
     let pool = st.db.as_ref().unwrap();
     let token = bearer_token(headers).map(|s| s.to_string());
-    let auth = authenticate(pool, token.as_deref(), is_get).map_err(|res| res)?;
+    let auth = authenticate_async(pool, token.as_deref(), is_get).await.map_err(|res| res)?;
     // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
     // user's stats gen before the handler body (REVIEW-writes L1).
     if !is_get {
@@ -2042,7 +2042,7 @@ pub async fn handle_status(State(st): State<AppState>, req: Request) -> Response
         Err(res) => return node_exact(res).await,
     };
     let authors = {
-        let conn = match st.db.as_ref().unwrap().get() {
+        let conn = match st.db.as_ref().unwrap().get_async().await {
             Ok(c) => c,
             Err(_) => return json_response(StatusCode::INTERNAL_SERVER_ERROR, &err_body("Failed to load Moxfield sync status")),
         };
@@ -2054,7 +2054,7 @@ pub async fn handle_status(State(st): State<AppState>, req: Request) -> Response
     // Raw app_settings column values, no coercion: NULL columns answer null,
     // and 60/1 default ONLY when the row itself is missing (routes/moxfield.js:19-27).
     let settings = {
-        let conn = st.db.as_ref().unwrap().get().ok();
+        let conn = st.db.as_ref().unwrap().get_async().await.ok();
         conn.and_then(|c| {
             query_one(
                 &c,

@@ -29,7 +29,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_cache::cache_normalized_cards;
 use crate::card_norm::{normalize_card, scryfall_uuid};
 use crate::collection_writes::{node_exact, Tx};
@@ -1164,10 +1164,10 @@ fn js_number(v: &Value) -> f64 {
 /// The router mounts only the global authenticateToken (server.js
 /// `app.use('/api', authenticateToken)`) — /api/manabox-sync has NO
 /// requireAdmin: any logged-in session may sync their own collection.
-fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<crate::auth::AuthUser, Response> {
+async fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<crate::auth::AuthUser, Response> {
     let pool = st.db.as_ref().ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
     let token = bearer_token(headers).map(|s| s.to_string());
-    let user = authenticate(pool, token.as_deref(), is_get).map_err(|res| res)?;
+    let user = authenticate_async(pool, token.as_deref(), is_get).await.map_err(|res| res)?;
     // statsCache.invalidateOnWrite twin: authenticated non-GET bumps the
     // user's stats gen before the handler body (REVIEW-writes L1).
     if !is_get {
@@ -1224,7 +1224,7 @@ pub async fn handle_preview(State(st): State<AppState>, req: Request) -> Respons
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
-    let user = match authed(&st, &headers, false) {
+    let user = match authed(&st, &headers, false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -1280,7 +1280,7 @@ pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response 
     }
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_MANABOX).await;
     let headers = parts.headers.clone();
-    let user = match authed(&st, &headers, false) {
+    let user = match authed(&st, &headers, false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -1435,7 +1435,7 @@ pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
-    let user = match authed(&st, &headers, true) {
+    let user = match authed(&st, &headers, true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -1493,7 +1493,7 @@ pub async fn handle_report(State(st): State<AppState>, Path(id): Path<String>, r
     }
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
-    let user = match authed(&st, &headers, true) {
+    let user = match authed(&st, &headers, true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
