@@ -380,7 +380,7 @@ pub async fn handle_backups_collection(State(st): State<AppState>, req: Request)
         return json_response(StatusCode::OK, &serde_json::Value::Object(body));
     }
     // POST createBackup
-    let conn = match st.db.as_ref().unwrap().get() {
+    let conn = match st.db.as_ref().unwrap().get_async().await {
         Ok(c) => c,
         Err(_) => {
             tracing::error!("BACKUP ERROR: pool exhaustion");

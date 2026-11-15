@@ -460,7 +460,7 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
         return crate::collection_writes::json_error(StatusCode::BAD_REQUEST, "Invalid card id");
     }
     // Known-card gate (cardArt.js:47) — DB failures ride the route catch.
-    let known = match pool.get() {
+    let known = match pool.get_async().await {
         Ok(conn) => crate::collection_writes::get_row_map(
             &conn,
             "SELECT id FROM card_cache WHERE id = ?",

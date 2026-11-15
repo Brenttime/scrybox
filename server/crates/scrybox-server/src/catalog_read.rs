@@ -275,8 +275,16 @@ pub async fn handle_catalog_languages(State(st): State<AppState>, req: Request) 
         None => return crate::proxy(State(st.clone()), req).await,
     };
 
+    // M5: get_async keeps the checkout off the runtime worker; the
+    // immediately-invoked block below borrows the conn and drops it with it.
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "catalog languages listing failed");
+            return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Could not list languages");
+        }
+    };
     let result: Result<Vec<Value>, String> = (|| -> Result<Vec<Value>, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
         // catalog.listLanguages / list share this aggregate.
         let mut stmt = conn
             .prepare_cached(
@@ -371,8 +379,16 @@ pub async fn handle_scan_sets(State(st): State<AppState>, req: Request) -> Respo
 
     let lang = to_name(&langs, query_param(query.as_deref(), "lang").as_deref());
 
+    // M5: get_async keeps the checkout off the runtime worker; the
+    // immediately-invoked block below borrows the conn and drops it with it.
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "scan-sets failed");
+            return json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Could not read catalog set counts");
+        }
+    };
     let result: Result<Value, String> = (|| -> Result<Value, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
         // catalog.setCounts — one pass over card_cache, counts keyed by the
         // lowercased set code (what the scan filter matches on), insertion
         // order = row order (same unindexed scan Node performs).
