@@ -158,7 +158,13 @@ pub struct DbPool {
     /// tests hold legs at the cap deterministically instead of racing
     /// query durations. Same shape as the search_history park-test's
     /// release-on-notify hold.
-    #[cfg(test)]
+    ///
+    /// iter-19: gate widened from cfg(test) to cfg(any(test,
+    /// debug_assertions)) so INTEGRATION test binaries (tests/legs_park.rs)
+    /// can install it — cfg(test) is not set when building the lib for
+    /// integration tests. Debug builds only; zero cost in release
+    /// (serving/parity binaries).
+    #[cfg(any(test, debug_assertions))]
     after_checkout_hook: std::sync::RwLock<
         Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     >,
@@ -205,7 +211,7 @@ impl DbPool {
             build_gate: Mutex::new(0),
             build_gate_cv: std::sync::Condvar::new(),
             build_gate_capacity,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             after_checkout_hook: std::sync::RwLock::new(None),
         })
     }
@@ -245,7 +251,7 @@ impl DbPool {
     /// `connect()`, so the wait adds no new class of blocking.
     pub fn get(&self) -> rusqlite::Result<PooledConn<'_>> {
         let conn = self.get_conn()?;
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         if let Some(hook) = &*self.after_checkout_hook.read().unwrap() {
             hook();
         }
@@ -253,8 +259,8 @@ impl DbPool {
     }
 
     /// Install (or clear with `None`) the test-only post-checkout hook; see
-    /// the `after_checkout_hook` field. Test binaries only.
-    #[cfg(test)]
+    /// the `after_checkout_hook` field. Debug builds (tests) only.
+    #[cfg(any(test, debug_assertions))]
     pub fn set_after_checkout_hook(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
