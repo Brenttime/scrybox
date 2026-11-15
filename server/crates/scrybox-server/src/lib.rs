@@ -826,6 +826,8 @@ pub fn app(state: AppState) -> Router {
             .rroute("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
             .rroute("/api/admin/models", any(model_assets::handle_models))
             .rroute("/api/admin/models/download", any(model_assets::handle_models))
+            .rroute("/api/admin/models/scan-index", any(model_assets::handle_models))
+            .rroute("/api/admin/models/scan-index/refresh", any(model_assets::handle_models))
     } else {
         router
     };

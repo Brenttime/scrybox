@@ -13,6 +13,7 @@
 
 pub mod detect;
 pub mod jobs;
+pub mod nightly;
 pub mod num;
 pub mod printings;
 pub mod scene;
@@ -20,7 +21,7 @@ pub mod scene;
 use crate::scan_ocr::{self, names::Oracle, rec};
 use printings::Printings;
 use serde_json::{json, Map, Value};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub struct Engine {
@@ -32,7 +33,12 @@ pub struct Engine {
     scan: Mutex<scene::IdentityCache>,
 }
 
-static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+/// The live engine. TOTORO nightly: a hot-swappable slot instead of a
+/// OnceLock, so the daily index refresh installs a freshly built engine
+/// without a restart (in-flight scans keep their `Arc` to the old one).
+static ENGINE: HotSlot<Engine> = HotSlot::new();
+/// Serialises the lazy first load (the OnceLock's init exclusivity).
+static LOAD: Mutex<()> = Mutex::new(());
 
 /// Explicit `CARDSCAN_URL` keeps the HTTP sidecar path.
 /// Longest a status probe waits for the lazy engine load (cardscan.rs sets
@@ -43,26 +49,97 @@ pub fn http_mode() -> bool {
     std::env::var("CARDSCAN_URL").ok().is_some_and(|s| !s.is_empty())
 }
 
-pub fn engine() -> Result<&'static Engine, String> {
-    ENGINE
-        .get_or_init(|| {
-            let t0 = Instant::now();
-            let dir = scan_ocr::data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?;
-            let mut oracle = Oracle::load(&dir)?;
-            let printings = Printings::load(&dir, &mut oracle)?;
-            let rec = rec::engine()?;
-            // `init_ocr` warm-up: pay graph setup before scan one.
-            let _ = rec.recognize(&[scan_ocr::pil::Rgb { w: 512, h: 64, px: vec![255; 512 * 64 * 3] }]);
-            tracing::info!(
-                "cardscan in-process: {} oracle titles, {} printings in {:.1}s",
-                oracle.norm_list.len(),
-                printings.len(),
-                t0.elapsed().as_secs_f64()
-            );
-            Ok(Engine { oracle, printings, rec, history: Mutex::new(Default::default()), scan: Mutex::new(Default::default()) })
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+/// A value that is either unset, failed to load, or live; `install`
+/// replaces it atomically (readers holding the old `Arc` are unaffected).
+pub struct HotSlot<T> {
+    inner: RwLock<Option<Result<Arc<T>, String>>>,
+}
+
+impl<T> Default for HotSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> HotSlot<T> {
+    pub const fn new() -> Self {
+        HotSlot { inner: RwLock::new(None) }
+    }
+    /// `None` until a load was attempted; then the live value or its error.
+    pub fn get(&self) -> Option<Result<Arc<T>, String>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub fn live(&self) -> Option<Arc<T>> {
+        self.get().and_then(|r| r.ok())
+    }
+    /// Swap in a new value; returns the previous live one.
+    pub fn install(&self, v: T) -> Option<Arc<T>> {
+        let prev = self.inner.write().unwrap_or_else(|e| e.into_inner()).replace(Ok(Arc::new(v)));
+        prev.and_then(|r| r.ok())
+    }
+    /// First-load result (only when nothing was attempted yet).
+    pub fn init_with(&self, f: impl FnOnce() -> Result<T, String>) -> Result<Arc<T>, String> {
+        if let Some(r) = self.get() {
+            return r;
+        }
+        let r = f().map(Arc::new);
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = g.as_ref() {
+            return existing.clone();
+        }
+        *g = Some(r.clone());
+        r
+    }
+}
+
+impl Engine {
+    /// Engine over the given (already loaded) indexes and the shared
+    /// recogniser.
+    pub fn from_parts(oracle: Oracle, printings: Printings) -> Result<Engine, String> {
+        let rec = rec::engine()?;
+        Ok(Engine { oracle, printings, rec, history: Mutex::new(Default::default()), scan: Mutex::new(Default::default()) })
+    }
+}
+
+/// `load_oracle()` + `load_printings()` over one data dir.
+pub fn load_indexes(dir: &std::path::Path) -> Result<(Oracle, Printings), String> {
+    let mut oracle = Oracle::load(dir)?;
+    let printings = Printings::load(dir, &mut oracle)?;
+    Ok((oracle, printings))
+}
+
+pub fn engine() -> Result<Arc<Engine>, String> {
+    if let Some(r) = ENGINE.get() {
+        return r;
+    }
+    let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    ENGINE.init_with(|| {
+        let t0 = Instant::now();
+        let dir = scan_ocr::data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?;
+        let (oracle, printings) = load_indexes(&dir)?;
+        let rec = rec::engine()?;
+        // `init_ocr` warm-up: pay graph setup before scan one.
+        let _ = rec.recognize(&[scan_ocr::pil::Rgb { w: 512, h: 64, px: vec![255; 512 * 64 * 3] }]);
+        tracing::info!(
+            "cardscan in-process: {} oracle titles, {} printings in {:.1}s",
+            oracle.norm_list.len(),
+            printings.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        Engine::from_parts(oracle, printings)
+    })
+}
+
+/// The engine if it is loaded (no lazy load).
+pub fn loaded_engine() -> Option<Arc<Engine>> {
+    ENGINE.live()
+}
+
+/// Hot-swap a new engine in (nightly refresh). Clears an earlier load
+/// failure too (auto-recovery once good indexes land).
+pub fn install_engine(e: Engine) {
+    let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    ENGINE.install(e);
 }
 
 /// Load the indexes + model in the background at boot (the sidecar loads
@@ -93,6 +170,8 @@ pub fn boot() {
     let warm = std::env::var("SCRYBOX_CARDSCAN_WARM").is_ok_and(|v| v == "1");
     tokio::spawn(async move {
         jobs::ensure_indexes(dir).await;
+        // TOTORO nightly: daily cardscan + client-scan index refresh.
+        nightly::spawn_scheduler();
         if warm {
             spawn_warm();
         }

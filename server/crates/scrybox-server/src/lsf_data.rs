@@ -311,7 +311,7 @@ pub async fn refresh_pass(eng: &Arc<InProcessEngine>) -> bool {
 }
 
 /// Seconds until the next local HH:MM (default 05:00 — the host cron's slot).
-fn secs_until(hh: u32, mm: u32) -> u64 {
+pub(crate) fn secs_until(hh: u32, mm: u32) -> u64 {
     use chrono::{Local, Timelike};
     let now = Local::now();
     let now_s = now.num_seconds_from_midnight() as i64;
@@ -337,7 +337,11 @@ pub async fn refresh_loop(eng: Arc<InProcessEngine>) {
         let until = Duration::from_secs(secs_until(hh, mm));
         if until <= poll {
             tokio::time::sleep(until).await;
-            refresh_pass(&eng).await;
+            if refresh_pass(&eng).await {
+                // TOTORO nightly: fresh bulk → cardscan indexes + the phone
+                // client-scan index (replaces the host scan-index-refresh timer).
+                crate::scan_engine::nightly::after_lsf_refresh();
+            }
             tokio::time::sleep(Duration::from_secs(61)).await;
         } else {
             tokio::time::sleep(poll).await;

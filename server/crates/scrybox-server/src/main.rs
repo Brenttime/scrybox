@@ -259,6 +259,20 @@ fn main() {
 }
 
 async fn run() {
+    // TOTORO nightly one-shots (ops + the Python differential):
+    //   scrybox-server build-client-index OUT_DIR [--model PATH]
+    //   scrybox-server scan-index-refresh [--force]
+    let argv: Vec<String> = std::env::args().collect();
+    if matches!(argv.get(1).map(String::as_str), Some("build-client-index" | "scan-index-refresh")) {
+        tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "scrybox_server=info".into())).init();
+        std::process::exit(match one_shot(&argv).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        });
+    }
     tracing_subscriber::fmt()
         // App-target default, NOT bare "info": the bare default also enables
         // tower_http's per-request INFO span events, which meant every API
@@ -582,4 +596,30 @@ mod jemalloc_cap_tests {
             "order in the operator string does not matter"
         );
     }
+}
+
+async fn one_shot(argv: &[String]) -> Result<(), String> {
+    use scrybox_server::scan_engine::{self, nightly};
+    if argv[1] == "scan-index-refresh" {
+        let r = nightly::run_now(argv.iter().any(|a| a == "--force"), "cli").await?;
+        println!("{}", nightly::status_json());
+        let _ = r;
+        return Ok(());
+    }
+    let out = std::path::PathBuf::from(argv.get(2).ok_or("usage: build-client-index OUT_DIR [--model PATH]")?);
+    let dir = scrybox_server::scan_ocr::data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?;
+    let model = match argv.iter().position(|a| a == "--model") {
+        Some(i) => std::path::PathBuf::from(argv.get(i + 1).ok_or("--model PATH")?),
+        None => scrybox_server::scan_ocr::rec::model_dir().ok_or("no OCR model dir")?.join(scrybox_server::scan_ocr::rec::REC_MODEL_FILE),
+    };
+    let (oracle, printings) = scan_engine::load_indexes(&dir)?;
+    let meta_path = std::env::var("CARDSCAN_DEFAULT_CARDS").ok().filter(|s| !s.is_empty()).map(std::path::PathBuf::from).unwrap_or_else(|| dir.join("default-cards.jsonl.gz"));
+    let meta = nightly::load_card_meta(&meta_path)?;
+    let idx = nightly::build_client_index(&oracle, &printings, &meta)?;
+    let rec = nightly::RecAssets::new(&model, &scrybox_server::scan_ocr::rec::model_character(&model)?)?;
+    let stem = model.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let m = nightly::write_out_dir(&out, &idx, &rec, &stem)?;
+    let v: serde_json::Value = serde_json::from_str(&m).map_err(|e| e.to_string())?;
+    println!("{v}");
+    Ok(())
 }

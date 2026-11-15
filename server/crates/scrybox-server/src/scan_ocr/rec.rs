@@ -57,6 +57,18 @@ pub fn py_splitlines(s: &str) -> Vec<String> {
     out
 }
 
+/// The recogniser model's raw `character` metadata (the CTC dictionary
+/// build_client_index.py ships as `rec-dict.<hash>.txt`).
+pub fn model_character(path: &std::path::Path) -> Result<String, String> {
+    let env = crate::cvscan::ort_env()?;
+    let mut b = ort::session::Session::builder(env).map_err(|e| e.to_string())?;
+    b = b.with_intra_threads(1).map_err(|e| e.to_string())?;
+    let s = b.commit_from_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = s.metadata().map_err(|e| e.to_string())?;
+    let raw = meta.custom("character").ok_or("rec model has no character metadata")?;
+    Ok(raw.to_string())
+}
+
 pub fn engine() -> Result<&'static RecEngine, String> {
     ENGINE
         .get_or_init(|| {

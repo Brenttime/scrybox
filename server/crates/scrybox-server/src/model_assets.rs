@@ -501,6 +501,20 @@ pub async fn handle_models(State(st): State<AppState>, mut req: Request) -> Resp
     };
     match (method, path.as_str()) {
         (axum::http::Method::GET, "/api/admin/models") => json_response(StatusCode::OK, &status(st.model_dir.as_ref())),
+        // TOTORO nightly: scan-index refresh status + manual pass.
+        (axum::http::Method::GET, "/api/admin/models/scan-index") => {
+            json_response(StatusCode::OK, &crate::scan_engine::nightly::status_json())
+        }
+        (axum::http::Method::POST, "/api/admin/models/scan-index/refresh") => {
+            let force = body_val.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            if crate::scan_ocr::data_dir().is_none() {
+                return json_error(StatusCode::CONFLICT, "SCRYBOX_CARDSCAN_DATA unset");
+            }
+            tokio::spawn(async move {
+                let _ = crate::scan_engine::nightly::run_now(force, "admin").await;
+            });
+            json_response(StatusCode::ACCEPTED, &crate::scan_engine::nightly::status_json())
+        }
         (axum::http::Method::POST, "/api/admin/models/download") => {
             let what = body_val
                 .get("what")

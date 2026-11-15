@@ -42,7 +42,9 @@ pub struct Printings {
     pub list: Vec<Printing>,
     pub by_title: IndexMap<String, Vec<Pid>>,
     pub by_title_physical: HashMap<(String, String, String), Vec<Pid>>,
-    pub unique_aliases: HashMap<String, Vec<(String, Pid)>>,
+    /// Insertion-ordered like Python's defaultdict (build_client_index.py
+    /// serialises it in that order).
+    pub unique_aliases: IndexMap<String, Vec<(String, Pid)>>,
     pub set_codes: Vec<String>,
     pub set_lookup: HashSet<String>,
     pub set_lengths: Vec<usize>,
