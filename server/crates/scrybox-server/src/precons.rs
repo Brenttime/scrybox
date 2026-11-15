@@ -955,6 +955,14 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
         );
     }
 
+    // M5 (REVIEW, iter-18, marketplace iter-83/84 shape): the whole write
+    // region — checkout, cacheCards leg, deck INSERT, deck_cards INSERT loop —
+    // is await-free, so it moves to the blocking pool as ONE hop. Queries,
+    // order, binds and every fold arm are byte-unchanged; JoinError folds
+    // into the checkout arm (same log context, same import_failed shape —
+    // e.to_string() reads identically for a dead-pool checkout and the
+    // cancellation/panic string).
+    let hop = tokio::task::spawn_blocking(move || -> Response {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -1049,6 +1057,15 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     out.insert("cards".into(), Value::from(by_name.len()));
     out.insert("notFound".into(), num_out(bulk.not_found as f64));
     json_response(StatusCode::CREATED, &out)
+    })
+    .await;
+    match hop {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "precons: cannot open write connection");
+            import_failed(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), Value::from(0))
+        }
+    }
 }
 
 fn import_failed(status: StatusCode, message: &str, not_found: Value) -> Response {

@@ -415,8 +415,16 @@ pub async fn route_settings(State(st): State<AppState>, req: Request) -> Respons
             if let Err(res) = authenticate_async(&pool, &headers, true).await {
                 return res;
             }
-            match get_effective_settings(&pool, &env) {
-                Ok(map) => json_response(StatusCode::OK, &map),
+            // M5 (REVIEW, iter-18): get_effective_settings' pool.get() +
+            // SELECT run on the blocking pool (marketplace iter-83/84 one-hop
+            // shape); the error fold (log context + 500 body) is unchanged.
+            let hop_pool = pool.clone();
+            match tokio::task::spawn_blocking(move || get_effective_settings(&hop_pool, &env)).await {
+                Ok(Ok(map)) => json_response(StatusCode::OK, &map),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "settings: failed to retrieve settings");
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve settings")
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "settings: failed to retrieve settings");
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve settings")
@@ -531,6 +539,14 @@ async fn handle_put(st: &crate::AppState, pool: Arc<DbPool>, req: Request) -> Re
     // 400 EARLY from the price/moxfield/base-url gates — earlier writes stay
     // committed. No transaction here: wrapping it would roll back on a 400
     // what Node leaves behind.
+    // M5 (REVIEW, iter-18): the whole write region (checkout + every arm +
+    // the after-update read) runs on the blocking pool — ONE hop; the arms
+    // contain no awaits, so the fold is byte-identical (same early-400
+    // order, same committed-prefix semantics). JoinError folds into the
+    // write-pool arm (same generic 500 body via internal_error).
+    let hop_body = body.clone();
+    let resp = tokio::task::spawn_blocking(move || -> Response {
+    let body = &hop_body;
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => return internal_error("settings: write pool", e),
@@ -628,12 +644,24 @@ async fn handle_put(st: &crate::AppState, pool: Arc<DbPool>, req: Request) -> Re
             return internal_error("settings: public_base_url update", e);
         }
     }
+    // Re-read on a FRESH checkout: drop the write conn first so a (rare)
+    // live_max==1 pool can never nest two checkouts on one thread. Node's
+    // better-sqlite3 is a single sync handle here (prepare_cached reuses the
+    // prepared EFFECTIVE_SQL statement on the same handle either way) —
+    // same query, same order, same fold arms.
+    drop(conn);
     match get_effective_settings(&pool, &env) {
         Ok(map) => json_response(StatusCode::OK, &map),
         Err(e) => {
             tracing::error!(error = %e, "settings: failed to load after update");
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update settings")
         }
+    }
+    })
+    .await;
+    match resp {
+        Ok(r) => r,
+        Err(e) => internal_error("settings: write pool", e),
     }
 }
 

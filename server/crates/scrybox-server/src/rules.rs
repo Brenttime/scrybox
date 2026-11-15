@@ -900,17 +900,41 @@ pub async fn route_keywords(State(st): State<AppState>, req: Request) -> Respons
     let kw = if need {
         st.kw_mem.guard().clone().unwrap()
     } else {
-        match build_keywords(&st, &data) {
-            Ok(k) => {
+        // M5 (REVIEW, iter-18, marketplace iter-83/84 shape): build_keywords
+        // runs the mine_reminders card_cache scan with an INLINE pool.get()
+        // (the iter-82/83 parked-worker class) plus heavy regex/collator CPU —
+        // the whole call moves to the blocking pool (one hop; AppState is a
+        // cheap Clone, data is an owned clone). Both fold arms are byte-
+        // identical: Ok arms cache+serve, any Err (mine_reminders String or
+        // the JoinError) takes the same 502-with-header 'Could not load
+        // keywords' arm.
+        let hop_st = st.clone();
+        let hop_data = data.clone();
+        let built = tokio::task::spawn_blocking(move || build_keywords(&hop_st, &hop_data)).await;
+        match built {
+            Ok(Ok(k)) => {
                 *st.kw_mem.guard() = Some(k.clone());
                 k
             }
             // buildKeywords threw AFTER res.set — the 502 carries the header.
-            Err(msg) => return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("Could not load keywords: {msg}"),
-                true,
-            ),
+            // The JoinError arm folds into the SAME 502 body shape (a panic
+            // string where Node's throw message would sit; unreachable in
+            // practice — build_keywords is panic-free by construction).
+            Ok(Err(msg)) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Could not load keywords: {msg}"),
+                    true,
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Could not load keywords: {msg}"),
+                    true,
+                );
+            }
         }
     };
     let inm = inm_header(&headers).filter(|_| !force && fresh_allows_304(&headers));

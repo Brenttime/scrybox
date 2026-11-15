@@ -357,20 +357,33 @@ async fn preview_secret_lair_drop(
     };
 
     let pool = st.db.clone().ok_or_else(|| PreviewFail::Forward("database unavailable".into()))?;
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
-            return Err(PreviewFail::Forward(e.to_string()));
-        }
-    };
-
+    // M5 (REVIEW, iter-18, marketplace iter-83/84 shape): the two DB legs
+    // (cacheCards, ownedCountForCards) each get ONE blocking-pool hop; the
+    // resolved fold between them is pure CPU and stays inline. Checkout and
+    // query errors fold byte-identically (same log lines, same
+    // PreviewFail::Forward(e.to_string())); JoinError folds into the
+    // checkout arm of its own leg.
     if !bulk.cards.is_empty() {
         let fresh: Vec<Map<String, Value>> =
             bulk.cards.iter().filter_map(|c| c.as_object().cloned()).collect();
-        if let Err(e) = cache_normalized_cards(&conn, &fresh) {
-            tracing::error!("secret-lair preview: cacheCards failed: {e}; forwarding to Node");
-            return Err(PreviewFail::Forward(e.to_string()));
+        let cache_pool = pool.clone();
+        let cache_res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = match cache_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
+                    return Err(e.to_string());
+                }
+            };
+            cache_normalized_cards(&conn, &fresh).map_err(|e| e.to_string())
+        })
+        .await;
+        if let Err(msg) = cache_res.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
+            Err(e.to_string())
+        }) {
+            tracing::error!("secret-lair preview: cacheCards failed: {msg}; forwarding to Node");
+            return Err(PreviewFail::Forward(msg));
         }
     }
 
@@ -432,11 +445,28 @@ async fn preview_secret_lair_drop(
         );
         let mut params: Vec<SqlValue> = vec![SqlValue::Integer(user_id)];
         params.extend(card_ids.iter().map(|s| SqlValue::Text(s.clone())));
-        let rows = match rows_map(&conn, &sql, &params) {
+        let own_pool = pool.clone();
+        let own_sql = sql.clone();
+        let own_params = params.clone();
+        let rows_res = tokio::task::spawn_blocking(move || -> Result<Vec<Map<String, Value>>, String> {
+            let conn = match own_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
+                    return Err(e.to_string());
+                }
+            };
+            rows_map(&conn, &own_sql, &own_params).map_err(|e| e.to_string())
+        })
+        .await;
+        let rows = match rows_res.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "secret-lair preview: cannot open read connection");
+            Err(e.to_string())
+        }) {
             Ok(rows) => rows,
-            Err(e) => {
-                tracing::error!("secret-lair preview: owned-count query failed: {e}; forwarding to Node");
-                return Err(PreviewFail::Forward(e.to_string()));
+            Err(msg) => {
+                tracing::error!("secret-lair preview: owned-count query failed: {msg}; forwarding to Node");
+                return Err(PreviewFail::Forward(msg));
             }
         };
         let mut owned_lower: HashMap<String, f64> = HashMap::new();

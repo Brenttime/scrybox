@@ -118,25 +118,52 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
     if let Some(Value::String(t)) = body.get("list_text") {
         let lines = parse_list_text(t);
         if !lines.is_empty() {
-            if let Ok(conn) = pool.get() {
+            // M5 (REVIEW, iter-18): the probe checkout runs on the blocking
+            // pool — DbPool::get parks on the live-cap Condvar and a parked
+            // worker starves the runtime (marketplace iter-83/84 shape). The
+            // checkout-error swallow-to-skip is preserved exactly.
+            let probe_pool = pool.clone();
+            let probe_names: Vec<String> = lines.iter().map(|l| l.name.clone()).collect();
+            let probe = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+                let conn = probe_pool.get().ok()?;
                 let mut missing: Vec<String> = Vec::new();
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for l in &lines {
-                    if find_cached_card(&conn, &l.name).ok().flatten().is_none()
-                        && seen.insert(l.name.to_lowercase())
+                for n in &probe_names {
+                    if find_cached_card(&conn, n).ok().flatten().is_none()
+                        && seen.insert(n.to_lowercase())
                     {
-                        missing.push(l.name.clone());
+                        missing.push(n.clone());
                     }
                 }
                 drop(conn);
+                Some(missing)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(missing) = probe {
                 if !missing.is_empty() {
                     bulk_resolve_names(&st, &missing).await;
                 }
             }
         }
     }
-    match create_list(&pool, user.id, &body) {
-        CreateOutcome::Response(res) => res,
+    // M5 (REVIEW, iter-18): create_list's pool.get() + INSERT/SELECT legs
+    // move to the blocking pool (one hop; body/id/user_id are owned clones).
+    let create_pool = pool.clone();
+    let create_body = body.clone();
+    let create_uid = user.id;
+    match tokio::task::spawn_blocking(move || create_list(&create_pool, create_uid, &create_body)).await {
+        Ok(CreateOutcome::Response(res)) => res,
+        Err(e) => {
+            // JoinError folds into create_list's pool-error arm (fail(&e)):
+            // same log shape, same 500 body the inline checkout error produced.
+            tracing::error!("lists create: {e:?}");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create list",
+            )
+        }
     }
 }
 
@@ -171,7 +198,19 @@ pub async fn handle_order(State(st): State<AppState>, req: Request) -> Response 
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    reorder_lists(&pool, user.id, &body)
+    // M5 (REVIEW, iter-18): reorder_lists' pool.get()/TX legs move to the
+    // blocking pool (marketplace iter-83/84 one-hop shape). JoinError folds
+    // into reorder_lists' pool-error arm (fail(&e)) — same log/body shape.
+    let hop_pool = pool.clone();
+    let hop_body = body.clone();
+    let hop_uid = user.id;
+    match tokio::task::spawn_blocking(move || reorder_lists(&hop_pool, hop_uid, &hop_body)).await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("lists order: {e:?}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to reorder lists")
+        }
+    }
 }
 
 /// PUT /api/lists/:id (routes/lists.js:379).
@@ -197,7 +236,19 @@ pub async fn handle_update(Path(id): Path<String>, State(st): State<AppState>, r
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    update_list(&pool, &id, user.id, &body)
+    // M5 (REVIEW, iter-18): update_list's pool.get()/UPDATE legs move to the
+    // blocking pool; JoinError folds into its pool-error arm (fail(&e)).
+    let hop_pool = pool.clone();
+    let hop_body = body.clone();
+    let hop_uid = user.id;
+    let hop_id = id.clone();
+    match tokio::task::spawn_blocking(move || update_list(&hop_pool, &hop_id, hop_uid, &hop_body)).await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("lists update: {e:?}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update list")
+        }
+    }
 }
 
 /// DELETE /api/lists/:id (routes/lists.js:410). express.json still runs
@@ -225,7 +276,18 @@ pub async fn handle_delete(Path(id): Path<String>, State(st): State<AppState>, r
     // statsCache.invalidateOnWrite twin: Node bumps the user's stats gen
     // after auth, before the handler body (REVIEW-writes L1).
     crate::stats::on_native_write(&st, user.id);
-    delete_list(&pool, &id, user.id)
+    // M5 (REVIEW, iter-18): delete_list's pool.get()/TX legs move to the
+    // blocking pool; JoinError folds into its pool-error arm (fail(&e)).
+    let hop_pool = pool.clone();
+    let hop_uid = user.id;
+    let hop_id = id.clone();
+    match tokio::task::spawn_blocking(move || delete_list(&hop_pool, &hop_id, hop_uid)).await {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("lists delete: {e:?}");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete list")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

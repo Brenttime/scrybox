@@ -181,6 +181,11 @@ async fn handle_get(State(st): State<AppState>, req: Request) -> Response {
         Err(res) => return res,
     };
     let _ = &user; // GET does not branch on identity beyond the gate
+    // M5 (REVIEW, iter-18): the whole read region (checkout + USERS_SQL +
+    // per-user STATS_SQL) runs on the blocking pool — one hop (marketplace
+    // iter-83/84 shape). JoinError folds into the pool-error arm: same log
+    // context, same 500 body.
+    let hop = tokio::task::spawn_blocking(move || -> Response {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -222,6 +227,15 @@ async fn handle_get(State(st): State<AppState>, req: Request) -> Response {
         out.push(Value::Object(m));
     }
     json_response(StatusCode::OK, &Value::Array(out))
+    })
+    .await;
+    match hop {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "admin_users GET pool");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve users list")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,21 +292,44 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
                 Some(Value::String(r)) if r == "member" || r == "admin" => r.as_str(),
                 _ => return json_error(StatusCode::BAD_REQUEST, "Invalid role specification"),
             };
-            let conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "admin_users POST pool");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user");
-                }
-            };
+            // M5 (REVIEW, iter-18, marketplace iter-83/84 shape): ONE
+            // spawn_blocking hop per DB leg. The hash (already a hop) sits
+            // between the SELECT and the INSERT; the checkout that used to
+            // straddle it splits into two checkouts — same query order, same
+            // folds (pool->'POST pool', lookup->'POST lookup',
+            // insert->'POST insert'; JoinError folds into the pool arm).
             // --- route try { } catch → 'Failed to create user' ---
-            match get_row_map(&conn, "SELECT id FROM users WHERE username = ?", &[SqlValue::Text(clean_username.clone())]) {
-                Ok(Some(_)) => return json_error(StatusCode::BAD_REQUEST, "Username is already taken"),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(error = ?e, "admin_users POST lookup");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user");
+            let look_pool = pool.clone();
+            let look_name = clean_username.clone();
+            let taken = tokio::task::spawn_blocking(move || -> Result<bool, (String, Option<Response>)> {
+                let conn = match look_pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "admin_users POST pool");
+                        return Err(("pool".into(), Some(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user"))));
+                    }
+                };
+                match get_row_map(&conn, "SELECT id FROM users WHERE username = ?", &[SqlValue::Text(look_name)]) {
+                    Ok(Some(_)) => Ok(true),
+                    Ok(None) => Ok(false),
+                    Err(e) => {
+                        tracing::error!(error = ?e, "admin_users POST lookup");
+                        Err(("lookup".into(), Some(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user"))))
+                    }
                 }
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "admin_users POST pool");
+                Err(("pool".into(), Some(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user"))))
+            });
+            let taken = match taken {
+                Ok(t) => t,
+                Err((_, Some(res))) => return res,
+                Err(_) => unreachable!(),
+            };
+            if taken {
+                return json_error(StatusCode::BAD_REQUEST, "Username is already taken");
             }
             let pass_for_hash = raw_pass.to_string();
             let hashed = match tokio::task::spawn_blocking(move || hash_password(&pass_for_hash)).await {
@@ -303,13 +340,31 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
                 }
             };
             let share_token = random_hex(16);
-            match conn.execute(
-                "INSERT INTO users (username, password_hash, role, share_token, share_enabled) VALUES (?, ?, ?, ?, ?)",
-                rusqlite::params![clean_username, hashed, role_val, share_token, 0],
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(error = %e, "admin_users POST insert");
+            let ins_pool = pool.clone();
+            let ins_user = (clean_username.clone(), hashed, role_val.to_string(), share_token.clone());
+            match tokio::task::spawn_blocking(move || -> Result<(), ()> {
+                let conn = match ins_pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "admin_users POST pool");
+                        return Err(());
+                    }
+                };
+                match conn.execute(
+                    "INSERT INTO users (username, password_hash, role, share_token, share_enabled) VALUES (?, ?, ?, ?, ?)",
+                    rusqlite::params![ins_user.0, ins_user.1, ins_user.2, ins_user.3, 0],
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        tracing::error!(error = %e, "admin_users POST insert");
+                        Err(())
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(())) | Err(_) => {
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create user");
                 }
             }
@@ -345,69 +400,130 @@ async fn handle_put(State(st): State<AppState>, id: String, req: Request) -> Res
                 Ok(u) => u,
                 Err(res) => return res,
             };
-            let conn = match pool.get() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "admin_users PUT pool");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
-                }
-            };
-            // --- route try { } catch → 'Failed to update user' ---
-            let target = match get_row_map(
-                &conn,
-                "SELECT id, username, role FROM users WHERE id = ?",
-                &[SqlValue::Text(id.clone())],
-            ) {
-                Ok(Some(t)) => t,
-                Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
-                Err(e) => {
-                    tracing::error!(error = ?e, "admin_users PUT lookup");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
-                }
-            };
-            let _ = &target; // Node reads it only for the 404 gate
-            // password !== undefined gate: an explicit null RUNS the arm.
-            if let Some(pw) = body.get("password") {
-                let Some(pw) = pw.as_str() else {
-                    // null.length TypeError / number→pbkdf2Sync throw: both
-                    // land in Node's route catch.
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
+            // M5 (REVIEW, iter-18, one hop per leg): checkout + target
+            // SELECT hop; the (already hopped) hash sits between it and the
+            // UPDATE hop. Same query order, same folds ('PUT pool'/'PUT
+            // lookup' JoinError folds; 404/500 bodies byte-identical).
+            let look_pool = pool.clone();
+            let look_id = id.clone();
+            let lookup = tokio::task::spawn_blocking(move || -> Result<Option<()>, Response> {
+                let conn = match look_pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "admin_users PUT pool");
+                        return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user"));
+                    }
                 };
-                if js_len(pw) < 8 {
-                    return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
+                match get_row_map(
+                    &conn,
+                    "SELECT id, username, role FROM users WHERE id = ?",
+                    &[SqlValue::Text(look_id)],
+                ) {
+                    Ok(Some(_)) => Ok(Some(())),
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        tracing::error!(error = ?e, "admin_users PUT lookup");
+                        Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user"))
+                    }
                 }
-                let pw_owned = pw.to_string();
-                let hashed = match tokio::task::spawn_blocking(move || hash_password(&pw_owned)).await {
-                    Ok(h) => h,
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "admin_users PUT pool");
+                Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user"))
+            });
+            match lookup {
+                Ok(Some(())) => {}
+                Ok(None) => return json_error(StatusCode::NOT_FOUND, "User not found"),
+                Err(res) => return res,
+            };
+            let _ = &id; // target value itself is read only for the 404 gate
+            // password !== undefined gate: an explicit null RUNS the arm.
+            let pw_owned = match body.get("password") {
+                None => None,
+                Some(pw) => {
+                    let Some(pw) = pw.as_str() else {
+                        // null.length TypeError / number→pbkdf2Sync throw: both
+                        // land in Node's route catch.
+                        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
+                    };
+                    if js_len(pw) < 8 {
+                        return json_error(StatusCode::BAD_REQUEST, "Password must be at least 8 characters");
+                    }
+                    Some(pw.to_string())
+                }
+            };
+            // role gate: Node runs it AFTER the password arm has COMMITTED
+            // its UPDATE (pin put_password_commits_before_bad_role_400) —
+            // so the gate lives inside the write hop below, between the
+            // password UPDATE and the role UPDATE, not here.
+            let upd_pool = pool.clone();
+            let upd_id = id.clone();
+            let upd_self_id = user.id;
+            let upd_role_provided = body.get("role").is_some();
+            let upd_role_json = body.get("role").cloned();
+            let hashed = match pw_owned {
+                None => None,
+                Some(pw_owned) => match tokio::task::spawn_blocking(move || hash_password(&pw_owned)).await {
+                    Ok(h) => Some(h),
                     Err(e) => {
                         tracing::error!(error = %e, "admin_users PUT hash");
                         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
                     }
+                },
+            };
+            let upd_pw = hashed;
+            let upd = tokio::task::spawn_blocking(move || -> Result<Result<(), Response>, ()> {
+                let conn = match upd_pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "admin_users PUT pool");
+                        return Err(());
+                    }
                 };
-                if let Err(e) = conn.execute(
-                    "UPDATE users SET password_hash = ? WHERE id = ?",
-                    rusqlite::params![hashed, id],
-                ) {
-                    tracing::error!(error = %e, "admin_users PUT password");
-                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
+                if let Some(hashed) = &upd_pw {
+                    if let Err(e) = conn.execute(
+                        "UPDATE users SET password_hash = ? WHERE id = ?",
+                        rusqlite::params![hashed, upd_id],
+                    ) {
+                        tracing::error!(error = %e, "admin_users PUT password");
+                        return Err(());
+                    }
                 }
-            }
-            if body.get("role").is_some() {
-                let role = match body.get("role") {
-                    Some(Value::String(r)) if r == "member" || r == "admin" => r.as_str(),
-                    _ => return json_error(StatusCode::BAD_REQUEST, "Invalid role"),
-                };
-                if js_parse_int_v(Some(&Value::String(id.clone()))) == Some(user.id) && role != "admin" {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "You cannot demote yourself from Administrator role.",
-                    );
+                if upd_role_provided {
+                    // 'Invalid role' 400 (after the committed password arm).
+                    let role = match &upd_role_json {
+                        Some(Value::String(r)) if r == "member" || r == "admin" => r.clone(),
+                        _ => {
+                            return Ok(Err(json_error(StatusCode::BAD_REQUEST, "Invalid role")));
+                        }
+                    };
+                    if js_parse_int_v(Some(&Value::String(upd_id.clone()))) == Some(upd_self_id)
+                        && role != "admin"
+                    {
+                        return Ok(Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "You cannot demote yourself from Administrator role.",
+                        )));
+                    }
+                    if let Err(e) = conn.execute(
+                        "UPDATE users SET role = ? WHERE id = ?",
+                        rusqlite::params![role, upd_id],
+                    ) {
+                        tracing::error!(error = %e, "admin_users PUT role");
+                        return Err(());
+                    }
                 }
-                if let Err(e) = conn.execute(
-                    "UPDATE users SET role = ? WHERE id = ?",
-                    rusqlite::params![role, id],
-                ) {
-                    tracing::error!(error = %e, "admin_users PUT role");
+                Ok(Ok(()))
+            })
+            .await;
+            match upd {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(res))) => return res,
+                // Ok(Err(())) = pool/password/role fold ('PUT pool'/
+                // 'PUT password'/'PUT role' logged in the hop); Err(_) =
+                // JoinError — both take the same 500 the pool arm produced.
+                Ok(Err(())) | Err(_) => {
                     return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update user");
                 }
             }
@@ -441,6 +557,12 @@ async fn handle_delete(State(st): State<AppState>, id: String, req: Request) -> 
     }
     const FAILED: &str = "Failed to delete user";
     let _guard = alloc_lock().lock().await;
+    // M5 (REVIEW, iter-18): the whole transaction region (checkout, pragma,
+    // BEGIN IMMEDIATE tx, rollback/restore) runs on the blocking pool — one
+    // hop; the alloc_lock guard stays held across it (taken before, dropped
+    // after the await, same critical section). JoinError folds into the
+    // pool arm: same log context, same 500 body.
+    let hop = tokio::task::spawn_blocking(move || -> Response {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -552,5 +674,14 @@ async fn handle_delete(State(st): State<AppState>, id: String, req: Request) -> 
                 json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED)
             }
         },
+    }
+    })
+    .await;
+    match hop {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "admin_users DELETE pool");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, FAILED)
+        }
     }
 }
