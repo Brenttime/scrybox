@@ -53,19 +53,42 @@ const dbConnection = new sqlite3.Database(dbPath, (err) => {
     console.error('Error opening database:', err.message);
   } else {
     console.log('Database connection established successfully.');
-    dbConnection.run('PRAGMA foreign_keys = ON');
-    dbConnection.run('PRAGMA journal_mode = WAL');
-    dbConnection.run('PRAGMA busy_timeout = 5000');
+    // e2e-boot hardening (LANE-B iter-70): these run() calls used to have no
+    // callback. On contention node-sqlite3 emits an unhandled 'error' event on
+    // the Statement and the process dies with SQLITE_BUSY (observed when the
+    // Rust test server held its boot migration write txn on the same DB file;
+    // REVIEW.md LANE-A iter-26 flake report). busy_timeout is queued BEFORE
+    // journal_mode: statements run in queue order, and with the busy handler
+    // still at 0 the WAL upgrade hit an immediate SQLITE_BUSY. The WAL upgrade
+    // is the one PRAGMA busy_timeout cannot save — upgrading rollback->WAL
+    // takes the exclusive write lock, which SQLite never busy-waits for — so
+    // it retries with a backoff. Same final PRAGMA state either way.
+    const pragmaLogged = (name) => (error) => {
+      if (error) console.error(`PRAGMA ${name} failed: ${error.message}`);
+    };
+    dbConnection.run('PRAGMA foreign_keys = ON', pragmaLogged('foreign_keys'));
+    dbConnection.run('PRAGMA busy_timeout = 5000', pragmaLogged('busy_timeout'));
+    const setWalMode = (attempt) => {
+      dbConnection.run('PRAGMA journal_mode = WAL', (error) => {
+        if (!error) return;
+        if (attempt >= 40) {
+          console.error(`PRAGMA journal_mode = WAL failed: ${error.message}`);
+          return;
+        }
+        setTimeout(() => setWalMode(attempt + 1), 250);
+      });
+    };
+    setWalMode(0);
     // Perf (audit A): WAL makes synchronous=NORMAL durable against app crashes
     // (only an OS crash can lose the last commits); a 64 MB page cache and
     // 256 MB mmap keep the hot collection/card_cache pages out of read() calls.
-    dbConnection.run('PRAGMA synchronous = NORMAL');
-    dbConnection.run('PRAGMA cache_size = -65536');
-    dbConnection.run('PRAGMA mmap_size = 268435456');
-    dbConnection.run('PRAGMA temp_store = MEMORY');
+    dbConnection.run('PRAGMA synchronous = NORMAL', pragmaLogged('synchronous'));
+    dbConnection.run('PRAGMA cache_size = -65536', pragmaLogged('cache_size'));
+    dbConnection.run('PRAGMA mmap_size = 268435456', pragmaLogged('mmap_size'));
+    dbConnection.run('PRAGMA temp_store = MEMORY', pragmaLogged('temp_store'));
     // Build planner stats on open (the DB had never been analyzed); cheap with a limit.
-    dbConnection.run('PRAGMA analysis_limit = 1000');
-    dbConnection.run('PRAGMA optimize = 0x10002');
+    dbConnection.run('PRAGMA analysis_limit = 1000', pragmaLogged('analysis_limit'));
+    dbConnection.run('PRAGMA optimize = 0x10002', pragmaLogged('optimize'));
   }
 });
 
