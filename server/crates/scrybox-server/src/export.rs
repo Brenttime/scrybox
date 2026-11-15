@@ -173,7 +173,7 @@ fn js_parse_float(v: &str) -> Option<f64> {
             end = dot;
         }
     }
-    if end == d0 && (end == d0) {
+    if end == d0 {
         // no digits after optional sign
         return None;
     }

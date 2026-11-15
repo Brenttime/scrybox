@@ -666,7 +666,7 @@ pub async fn handle_card_decks(State(st): State<AppState>, Path(id): Path<String
             let (did, name, qty) = row?;
             // Number(d.quantity) || 0
             let qty = match qty {
-                Some(f) if f != 0.0 && f == f => json_num(f),
+                Some(f) if f != 0.0 && !f.is_nan() => json_num(f),
                 _ => json_num(0.0),
             };
             decks.push(obj(&[("id", did), ("name", name), ("quantity", qty)]));
@@ -1184,7 +1184,7 @@ pub async fn handle_cotd(State(st): State<AppState>, req: Request) -> Response {
         Err(_) => return err_json(StatusCode::BAD_GATEWAY, "Commander of the day unavailable"),
     };
     let total = match first.total {
-        Some(t) if t != 0.0 && t == t => t,
+        Some(t) if t != 0.0 && !t.is_nan() => t,
         _ => return err_json(StatusCode::SERVICE_UNAVAILABLE, "No commanders available"),
     };
     let idx = (day_hash(&format!("cotd:{day}")) as f64) % total;
