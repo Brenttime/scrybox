@@ -209,6 +209,41 @@ pub enum Node {
     TextKw(String),
     Phrase(String),
     Filter(Filter),
+    /// Surface atom — produced ONLY by [`parse_syntax`] (the Scrybox
+    /// dialect), never by the search parse. Carries the term exactly as
+    /// typed (operator / comparator / value split) so callers can run their
+    /// own AST transforms instead of re-parsing the query text.
+    Atom(Atom),
+}
+
+/// Surface grammar dialect. `Scryfall` is the engine's own lenient search
+/// grammar (unchanged behaviour); `Scrybox` is the strict front-end grammar
+/// Scrybox exposes to users (JS whitespace, `\"` escapes, `/regex/`
+/// literals, quotes only at term starts, hard syntax errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Scryfall,
+    Scrybox,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxError(pub String);
+
+/// One surface term of the Scrybox dialect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Atom {
+    /// leading `-`
+    pub neg: bool,
+    /// `!name` exact-name term
+    pub exact: bool,
+    /// lowercased operator keyword (`t`, `otag`, …); None = bare name term
+    pub key: Option<String>,
+    /// comparator (`:`, `=`, `!=`, `<`, `<=`, `>`, `>=`); empty for names
+    pub cmp: String,
+    /// value: quotes stripped + `\"` unescaped; regex body without slashes
+    pub value: String,
+    pub quoted: bool,
+    pub regex: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,43 +261,123 @@ enum Tok {
 }
 
 fn tokenize(input: &str) -> Vec<Tok> {
+    tokenize_dialect(input, Dialect::Scryfall).map(|(t, _)| t).unwrap_or_default()
+}
+
+/// JS `\s` (and the `String#trim` set) — the Scrybox dialect's whitespace.
+pub fn is_js_ws(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+/// `^-?!?` or `^-?[A-Za-z_]+(!=|<=|>=|:|=|<|>)$` — a word prefix after
+/// which a quote / regex literal may open (Scrybox dialect).
+fn literal_may_open(cur: &str, quote: bool) -> bool {
+    let t = cur.strip_prefix('-').unwrap_or(cur);
+    // `!` (exact name) takes a quoted phrase, never a regex literal
+    if t.is_empty() || (quote && t == "!") {
+        return true;
+    }
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+        i += 1;
+    }
+    i > 0 && matches!(&t[i..], "!=" | "<=" | ">=" | ":" | "=" | "<" | ">")
+}
+
+/// The single tokenizer. Returns tokens + byte spans (start, end) per token.
+/// The Scryfall dialect never errors (unterminated quotes run to the end).
+fn tokenize_dialect(input: &str, dialect: Dialect) -> Result<(Vec<Tok>, Vec<(usize, usize)>), SyntaxError> {
+    let strict = dialect == Dialect::Scrybox;
     let mut toks = Vec::new();
+    let mut spans = Vec::new();
     let mut cur = String::new();
     let mut first_quoted = false;
     let mut started = false;
     let mut in_quote = false;
-    for c in input.chars() {
+    let mut in_regex = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    macro_rules! flush_at {
+        ($end:expr) => {{
+            if started {
+                spans.push((start, $end));
+            }
+            flush(&mut toks, &mut cur, &mut started, &mut first_quoted);
+        }};
+    }
+    for (i, c) in input.char_indices() {
+        if strict && (in_quote || in_regex) {
+            cur.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                // `\"` inside quotes, `\x` pairs inside regex
+                escaped = in_regex || input[i + 1..].starts_with('"');
+            } else if in_quote && c == '"' {
+                in_quote = false;
+                // a closed quote ends the term (Node readQuoted)
+                flush_at!(i + 1);
+            } else if in_regex && c == '/' {
+                in_regex = false;
+                flush_at!(i + 1);
+            }
+            continue;
+        }
+        let ws = if strict { is_js_ws(c) } else { c.is_whitespace() };
         match c {
+            '"' if strict && !literal_may_open(&cur, true) => {
+                cur.push(c);
+            }
             '"' => {
                 if !started {
                     first_quoted = true;
+                    start = i;
                 }
                 started = true;
                 cur.push(c);
                 in_quote = !in_quote;
             }
+            '/' if strict && literal_may_open(&cur, false) => {
+                if !started {
+                    start = i;
+                }
+                started = true;
+                cur.push(c);
+                in_regex = true;
+            }
             '(' if !in_quote => {
-                flush(&mut toks, &mut cur, &mut started, &mut first_quoted);
+                flush_at!(i);
                 toks.push(Tok::LParen);
+                spans.push((i, i + 1));
             }
             ')' if !in_quote => {
-                flush(&mut toks, &mut cur, &mut started, &mut first_quoted);
+                flush_at!(i);
                 toks.push(Tok::RParen);
+                spans.push((i, i + 1));
             }
-            c if c.is_whitespace() && !in_quote => {
-                flush(&mut toks, &mut cur, &mut started, &mut first_quoted);
+            _ if ws && !in_quote => {
+                flush_at!(i);
             }
             c => {
                 if !started {
                     first_quoted = false;
+                    start = i;
                 }
                 started = true;
                 cur.push(c);
             }
         }
     }
-    flush(&mut toks, &mut cur, &mut started, &mut first_quoted);
-    toks
+    if strict && in_quote {
+        return Err(SyntaxError("Unterminated quoted phrase — close it with \"".into()));
+    }
+    if strict && in_regex {
+        return Err(SyntaxError("Unterminated regular expression — close it with /".into()));
+    }
+    flush_at!(input.len());
+    Ok((toks, spans))
 }
 
 fn flush(toks: &mut Vec<Tok>, cur: &mut String, started: &mut bool, first_quoted: &mut bool) {
@@ -579,6 +694,12 @@ struct Parser {
     /// None = offline/test parse(): keyword values fall through to the legacy
     /// eval-side heuristics instead of parse-time drop semantics.
     kwenum: Option<std::collections::HashSet<String>>,
+    /// Scrybox dialect: strict grammar, atoms instead of filters.
+    strict: bool,
+    /// token byte spans (adjacency of `-` and `(` in the strict dialect)
+    spans: Vec<(usize, usize)>,
+    /// first strict-dialect syntax error
+    error: Option<SyntaxError>,
 }
 
 impl Parser {
@@ -599,6 +720,13 @@ impl Parser {
         }
     }
 
+    fn fail(&mut self, msg: &str) -> Node {
+        if self.error.is_none() {
+            self.error = Some(SyntaxError(msg.to_string()));
+        }
+        Node::All
+    }
+
     fn parse_or(&mut self) -> Node {
         let mut parts = vec![self.parse_and()];
         loop {
@@ -611,6 +739,14 @@ impl Parser {
             }
             self.next();
             parts.push(self.parse_and());
+        }
+        // strict dialect: a leading group that is itself an OR absorbs the
+        // following `or` terms (`(a or b) or c` == `a or b or c`).
+        if self.strict && parts.len() > 1 && matches!(parts[0], Node::Or(_)) {
+            if let Node::Or(mut first) = parts.remove(0) {
+                first.extend(parts);
+                return Node::Or(first);
+            }
         }
         if parts.len() == 1 {
             parts.pop().unwrap()
@@ -630,14 +766,31 @@ impl Parser {
                     }
                     if w.text.eq_ignore_ascii_case("and") {
                         self.next();
+                        if self.strict {
+                            let dangling = match self.peek() {
+                                None | Some(Tok::RParen) => true,
+                                Some(Tok::Word(n)) => !n.first_quoted && n.text.eq_ignore_ascii_case("or"),
+                                _ => false,
+                            };
+                            if parts.is_empty() || dangling {
+                                return self.fail("\"and\" needs a term on both sides");
+                            }
+                        }
                         continue;
                     }
                 }
                 _ => {}
             }
+            if self.strict {
+                parts.push(self.parse_unary_strict());
+                continue;
+            }
             parts.push(self.parse_unary());
         }
         if parts.is_empty() {
+            if self.strict {
+                return self.fail("Empty query or empty parenthesis group");
+            }
             Node::All
         } else if parts.len() == 1 {
             parts.pop().unwrap()
@@ -748,6 +901,40 @@ impl Parser {
             Some(Tok::RParen) => Node::All,
             Some(Tok::Word(w)) => self.atom_to_node(w.text, w.first_quoted, kw_res),
             None => Node::All,
+        }
+    }
+
+    /// Scrybox-dialect unary: `( … )`, glued `-( … )`, or a surface atom.
+    fn parse_unary_strict(&mut self) -> Node {
+        let at = self.pos;
+        match self.next() {
+            Some(Tok::LParen) => {
+                let inner = self.parse_or();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    return self.fail("Unbalanced parenthesis");
+                }
+                self.next();
+                inner
+            }
+            Some(Tok::Word(w)) => {
+                let glued_group = w.text == "-"
+                    && matches!(self.peek(), Some(Tok::LParen))
+                    && self.spans.get(at).map(|s| s.1) == self.spans.get(at + 1).map(|s| s.0);
+                if glued_group {
+                    self.next();
+                    let inner = self.parse_or();
+                    if !matches!(self.peek(), Some(Tok::RParen)) {
+                        return self.fail("Unbalanced parenthesis");
+                    }
+                    self.next();
+                    return Node::Not(Box::new(inner));
+                }
+                match split_atom(&w.text) {
+                    Ok(a) => Node::Atom(a),
+                    Err(e) => self.fail(&e.0),
+                }
+            }
+            _ => self.fail("Unbalanced parenthesis"),
         }
     }
 
@@ -2033,6 +2220,9 @@ pub fn parse_with(
         warnings: Vec::new(),
         kw_residual: false,
         kwenum: kw_enum.cloned(),
+        strict: false,
+        spans: Vec::new(),
+        error: None,
     };
     let mut nodes = Vec::new();
     while p.peek().is_some() {
@@ -2099,3 +2289,194 @@ fn prune_ignored(n: Node) -> Option<Node> {
     }
 }
 
+
+/// Strict (Scrybox-dialect) parse into the surface AST: `And`/`Or`/`Not`
+/// over [`Node::Atom`] leaves, with hard syntax errors. Same tokenizer and
+/// boolean grammar as [`parse`]; only the unary/atom level and the error
+/// policy differ. `q` should already be trimmed (empty → error).
+pub fn parse_syntax(q: &str) -> Result<Node, SyntaxError> {
+    let q = q.trim_matches(is_js_ws);
+    if q.is_empty() {
+        return Err(SyntaxError("Empty query".into()));
+    }
+    let (toks, spans) = tokenize_dialect(q, Dialect::Scrybox)?;
+    let mut p = Parser { toks, pos: 0, warnings: Vec::new(), kw_residual: false, kwenum: None, strict: true, spans, error: None };
+    let ast = p.parse_or();
+    if p.error.is_none() && p.pos < p.toks.len() {
+        p.fail("Unbalanced parenthesis");
+    }
+    match p.error {
+        Some(e) => Err(e),
+        None => Ok(ast),
+    }
+}
+
+/// `^([a-z_]+)(!=|<=|>=|:|=|<|>)` (ASCII, case-insensitive) at s[i..].
+fn op_match(s: &[char], i: usize) -> Option<(String, String, usize)> {
+    let mut j = i;
+    while j < s.len() && (s[j].is_ascii_alphabetic() || s[j] == '_') {
+        j += 1;
+    }
+    if j == i {
+        return None;
+    }
+    let two = |a: char, b: char| s.get(j) == Some(&a) && s.get(j + 1) == Some(&b);
+    let cmp = if two('!', '=') {
+        "!="
+    } else if two('<', '=') {
+        "<="
+    } else if two('>', '=') {
+        ">="
+    } else {
+        match s.get(j) {
+            Some(':') => ":",
+            Some('=') => "=",
+            Some('<') => "<",
+            Some('>') => ">",
+            _ => return None,
+        }
+    };
+    let kw: String = s[i..j].iter().collect::<String>().to_ascii_lowercase();
+    Some((kw, cmp.to_string(), j + cmp.len()))
+}
+
+/// Body of a `"…"` literal starting at s[i] (tokenizer guarantees closure).
+fn unquote(s: &[char], i: usize) -> String {
+    let mut j = i + 1;
+    let mut val = String::new();
+    while j < s.len() && s[j] != '"' {
+        if s[j] == '\\' && s.get(j + 1) == Some(&'"') {
+            val.push('"');
+            j += 2;
+            continue;
+        }
+        val.push(s[j]);
+        j += 1;
+    }
+    val
+}
+
+/// Body of a `/…/` literal starting at s[i] (escapes kept verbatim).
+fn unregex(s: &[char], i: usize) -> String {
+    let mut j = i + 1;
+    let mut val = String::new();
+    while j < s.len() && s[j] != '/' {
+        if s[j] == '\\' && j + 1 < s.len() {
+            val.push(s[j]);
+            val.push(s[j + 1]);
+            j += 2;
+            continue;
+        }
+        val.push(s[j]);
+        j += 1;
+    }
+    val
+}
+
+/// Split one Scrybox-dialect word token into its surface atom.
+pub fn split_atom(text: &str) -> Result<Atom, SyntaxError> {
+    let s: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut a = Atom { neg: false, exact: false, key: None, cmp: String::new(), value: String::new(), quoted: false, regex: false };
+    if s.first() == Some(&'-') {
+        a.neg = true;
+        i = 1;
+        if i >= s.len() {
+            return Err(SyntaxError("\"-\" must negate a term".into()));
+        }
+    }
+    if s[i] == '!' && s.get(i + 1) != Some(&'=') {
+        i += 1;
+        a.exact = true;
+        a.quoted = s.get(i) == Some(&'"');
+        a.value = if a.quoted { unquote(&s, i) } else { s[i..].iter().collect() };
+        if a.value.is_empty() {
+            return Err(SyntaxError("\"!\" needs a card name".into()));
+        }
+        return Ok(a);
+    }
+    if s[i] == '"' {
+        a.quoted = true;
+        a.value = unquote(&s, i);
+        return Ok(a);
+    }
+    if let Some((key, cmp, end)) = op_match(&s, i) {
+        match s.get(end) {
+            Some('"') => {
+                a.quoted = true;
+                a.value = unquote(&s, end);
+            }
+            Some('/') => {
+                a.regex = true;
+                a.value = unregex(&s, end);
+            }
+            _ => a.value = s[end..].iter().collect(),
+        }
+        if a.value.is_empty() && !a.quoted {
+            return Err(SyntaxError(format!("Operator \"{key}{cmp}\" needs a value")));
+        }
+        a.key = Some(key);
+        a.cmp = cmp;
+        return Ok(a);
+    }
+    if s[i] == '/' {
+        a.key = Some("name".into());
+        a.cmp = ":".into();
+        a.regex = true;
+        a.value = unregex(&s, i);
+        return Ok(a);
+    }
+    a.value = s[i..].iter().collect();
+    let wl = a.value.to_ascii_lowercase();
+    if a.neg && (wl == "or" || wl == "and") {
+        return Err(SyntaxError(format!("Cannot negate \"{wl}\"")));
+    }
+    Ok(a)
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    fn atom(q: &str) -> Atom {
+        match parse_syntax(q).unwrap() {
+            Node::Atom(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_syntax_atoms() {
+        let a = atom("T:\"basic land\"");
+        assert_eq!((a.key.as_deref(), a.cmp.as_str(), a.value.as_str(), a.quoted), (Some("t"), ":", "basic land", true));
+        let a = atom("-!\"Fire // Ice\"");
+        assert!(a.neg && a.exact && a.quoted && a.value == "Fire // Ice");
+        let a = atom("name:/(a|b) c/");
+        assert!(a.regex && a.value == "(a|b) c");
+        let a = atom("!=foo");
+        assert!(a.key.is_none() && !a.exact && a.value == "!=foo");
+        assert_eq!(atom("kodama\"s").value, "kodama\"s");
+        assert_eq!(atom("\"a\\\"b\"").value, "a\"b");
+    }
+
+    #[test]
+    fn parse_syntax_structure_and_errors() {
+        assert!(matches!(parse_syntax("-(a or b)"), Ok(Node::Not(_))));
+        assert!(matches!(parse_syntax("(a or b) or c"), Ok(Node::Or(v)) if v.len() == 3));
+        assert!(matches!(parse_syntax("a and and b"), Ok(Node::And(v)) if v.len() == 2));
+        for bad in ["", "(a", "a)", "()", "a and", "and a", "a or", "OR", "-", "- a", "-or", "!", "!\"\"", "t:", "\"x", "/x", "- (a)"] {
+            assert!(parse_syntax(bad).is_err(), "{bad:?} must be a syntax error");
+        }
+    }
+
+    #[test]
+    fn scryfall_dialect_tokens_unchanged() {
+        // the search grammar keeps its lenient tokenizer: quotes toggle
+        // anywhere, `\` is literal, `/` never opens a literal, no errors.
+        let (toks, spans) = tokenize_dialect("a\"b c\" /x y/ \"open", Dialect::Scryfall).unwrap();
+        let words: Vec<String> = toks.iter().map(|t| match t { Tok::Word(w) => w.text.clone(), _ => "?".into() }).collect();
+        assert_eq!(words, vec!["a\"b c\"", "/x", "y/", "\"open"]);
+        assert_eq!(spans.len(), 4);
+        assert_eq!(parse("(a").0.len(), 1);
+    }
+}

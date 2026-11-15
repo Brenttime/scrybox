@@ -465,31 +465,10 @@ pub fn safe_free_text(q: &str) -> bool {
     })
 }
 
-/// The QuerySyntaxError message for the tokenizer-provable rejects
-/// (collq::definitely_invalid's subset): an unterminated quote throws in
-/// readQuoted during tokenization — before any paren is balanced — so it
-/// wins; otherwise unbalanced parens are the parser's 'Unbalanced
-/// parenthesis'. None = not provably invalid (the engine decides).
-pub fn provable_syntax_error(q: &str) -> Option<&'static str> {
-    if !crate::collq::definitely_invalid(q) {
-        return None;
-    }
-    let mut in_q = false;
-    let mut esc = false;
-    for c in q.chars() {
-        if in_q {
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_q = false;
-            }
-        } else if c == '"' {
-            in_q = true;
-        }
-    }
-    Some(if in_q { "Unterminated quoted phrase — close it with \"" } else { "Unbalanced parenthesis" })
+/// analyze(q)'s QuerySyntaxError message, from local-scryfall's parser
+/// (via scryq). None = the query parses (the engine decides).
+pub fn provable_syntax_error(q: &str) -> Option<String> {
+    crate::collq::syntax_reject(q)
 }
 
 /// stats.js `exact`: `!"${n.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`.
@@ -572,13 +551,11 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
 
     // analyze(q) validation gate: bare words provably never throw; anything
     // else is Node's grammar to judge (raw replay before any engine call).
-    // Node-free: no parser twin to reproduce analyze()'s QuerySyntaxError
-    // text, so a non-bare query goes straight to the engine (valid queries
-    // answer identically; the tokenizer-provable rejects get Node's 400
-    // status with a generic message — see collq::definitely_invalid).
+    // Node-free: local-scryfall's parser (scryq) judges the query and a
+    // syntax error answers 400 with the parser's message.
     if st.cfg.node_upstream.is_empty() && !safe_free_text(&q) {
         if let Some(msg) = provable_syntax_error(&q) {
-            return err_json(StatusCode::BAD_REQUEST, msg);
+            return err_json(StatusCode::BAD_REQUEST, &msg);
         }
     }
     if (!safe_free_text(&q) && !st.cfg.node_upstream.is_empty()) || local_base(&st).is_none() {

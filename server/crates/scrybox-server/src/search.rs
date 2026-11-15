@@ -637,7 +637,7 @@ pub fn plan_post(
 }
 
 /// Node-free planner: identical to [`plan`] except that a collection-scope
-/// `q` is classified by the FULL Scryfall-syntax parser port (scryq — the
+/// `q` is classified by local-scryfall's parser via scryq (the
 /// Scrybox normalization layer in front of local-scryfall), so every q
 /// answers natively instead of falling back to a Node proxy:
 ///  * parse error → 400 INVALID_QUERY (upstream mode) / verbatim walk
@@ -675,14 +675,13 @@ pub fn plan_standalone(user_id: i64, raw_query: Option<&str>, local_scrayfall: b
     let expected_snapshot = if dup("snapshot") { None } else { first("snapshot") };
     let local_q = |ast: &crate::scryq::Node, tag_leg: bool| collq::LocalQ {
         user_id,
-        leaves: Vec::new(),
         tag_leg,
         has_window,
         page,
         limit,
         include_total,
         expected_snapshot: expected_snapshot.clone(),
-        ast: Some(ast.clone()),
+        ast: ast.clone(),
         outage_fallback: false,
     };
     if let Some(a) = &parsed {
@@ -1720,7 +1719,7 @@ async fn fetch_window(
 /// Add Cards search box. In hybrid mode this leg proxies to Node (its
 /// parser, shared/scryfallQuery.js, is not ported); with Node gone the
 /// proxy answered 502 for every Add Cards search. Served here:
-///   * upstream query: collq::walk_base's exact toScryfall twin when the
+///   * upstream query: collq::walk_base's exact toScryfall subset when the
 ///     query is in its accepted subset, else the trimmed query VERBATIM —
 ///     Node's own sidecar-mode behaviour for queries its parser rejects
 ///     (Scryfall is the grammar authority). Known divergence: the Scrybox
@@ -1768,19 +1767,10 @@ pub fn standalone_raw_q_plan(user_id: i64, raw_query: Option<&str>) -> Option<Ra
     Some(RawQ { user_id, q, internet: scope == "internet", lang: first("lang"), page, limit })
 }
 
-/// Upstream query string for the raw leg (see RawQ).
-pub fn raw_q_upstream(q: &str, scry_code: &str) -> String {
-    // Outside walk_base's exact toScryfall subset the query rides verbatim
-    // except for the Scrybox `is:<type>` extension, which toScryfall
-    // rewrites to `t:` (Scryfall does not know it).
-    let upstream = crate::collq::walk_base(q).unwrap_or_else(|| crate::collq::rewrite_is_types(q));
-    if scry_code == "en" { upstream } else { format!("({upstream})") }
-}
-
 async fn serve_raw_q_standalone(st: &AppState, pool: &Arc<DbPool>, rq: RawQ) -> Response {
     let lang_name = to_name(rq.lang.as_deref());
     // Upstream mode: a query the parser rejects is INVALID_QUERY without a
-    // request (only the tokenizer-provable rejects are modelled).
+    // request (local-scryfall's parser via scryq decides).
     // analyze(cleanRaw): a QuerySyntaxError is INVALID_QUERY in upstream
     // mode; in sidecar mode the query rides verbatim (parsed = null).
     let parsed = match crate::scryq::analyze(&rq.q) {
@@ -3623,14 +3613,13 @@ async fn standalone_walk_failed(
         tracing::error!("sidecar collection walk failed; answering from local SQL");
         let lq = collq::LocalQ {
             user_id: cq.user_id,
-            leaves: Vec::new(),
             tag_leg: false,
             has_window: cq.has_window,
             page: cq.page,
             limit: cq.limit,
             include_total: cq.include_total,
             expected_snapshot: cq.expected_snapshot.clone(),
-            ast: Some(ast),
+            ast,
             outage_fallback: true,
         };
         let _ = &st;
