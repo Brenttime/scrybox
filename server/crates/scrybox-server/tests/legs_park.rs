@@ -216,10 +216,25 @@ fn parked_probe(
     })
     .unwrap();
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Counter-observed release (iter-22): free the holders only once the
+    // request has REGISTERED a cap wait — the first get_async idle-miss
+    // (blocking_fallbacks >= 1) — with a 5 s timeout fallback for shapes
+    // whose legs never miss idle. The old blind 300 ms sleep raced a loaded
+    // scheduler: if the request had not reached its get_async by t=300 ms
+    // (observed as the cvscan prefetch pin's RED under the full-suite
+    // battery, brain-local), the holders dropped, max=0 CLOSED the returned
+    // conns, and the body leg then opened a FRESH conn below the cap — the
+    // pin went vacuously green with zero cap pressure proven. Waiting on the
+    // counter makes the hold real by construction: at the instant we release,
+    // a hop is demonstrably parked at the cap. Pre-fix regressions are
+    // unaffected: an inline sync leg never registers the counter, the
+    // tripwire/timeout arms below still redden it.
+    {
+        let start = std::time::Instant::now();
+        while pool.blocking_fallbacks() == 0 && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     let _ = release_tx.send(());
 
     let (status, bytes) = rx
@@ -633,7 +648,16 @@ fn parked_probe_net(
         })
         .unwrap();
 
-    std::thread::sleep(Duration::from_millis(300));
+    // Counter-observed release (iter-22) — same fix as parked_probe: release
+    // when the first get_async idle-miss registers (cap wait demonstrably
+    // started) instead of a blind 300 ms sleep that a loaded scheduler can
+    // beat, turning the hold vacuous. 5 s fallback for never-miss shapes.
+    {
+        let start = std::time::Instant::now();
+        while pool.blocking_fallbacks() == 0 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
     let _ = release_tx.send(());
 
     let (status, headers, bytes) = rx
