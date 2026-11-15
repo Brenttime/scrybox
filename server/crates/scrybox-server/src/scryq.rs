@@ -1,6 +1,11 @@
-//! Full port of `shared/scryfallQuery.js` (tokenizer, parser, `analyze`,
-//! `toScryfall`, `stripDirectives`) and `backend/src/utils/rawQuerySql.js`
-//! (`compileWhere` → one SQLite predicate over `card_cache cc`).
+//! Scrybox query semantics over local-scryfall's parser. There is NO
+//! tokenizer/parser here: `parse` calls `local_scryfall::query::parse_syntax`
+//! (the engine's own tokenizer + boolean grammar, Scrybox dialect) and lowers
+//! its surface AST by transform. On top of that tree: `analyze` (mode /
+//! printing classification), `toScryfall`, `stripDirectives`, the otag gate,
+//! and `backend/src/utils/rawQuerySql.js`'s SQL compiler (`compileWhere` →
+//! one SQLite predicate over `card_cache cc`, kept for card_cache/collection
+//! rows that the card index does not model: printed_name, cached language).
 //!
 //! The SQL text and the parameter list are emitted byte-for-byte the way
 //! Node builds them (same expressions, same parenthesisation, same bind
@@ -23,11 +28,9 @@ use rusqlite::types::Value as Sql;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxError(pub String);
 
-/// JS `\s` (and the `String#trim` set).
-pub fn is_js_ws(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}'
-        | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
-}
+/// JS `\s` (and the `String#trim` set) — local-scryfall's Scrybox dialect.
+pub use local_scryfall::query::is_js_ws;
+use local_scryfall::query as lsq;
 
 pub fn js_trim(s: &str) -> &str {
     s.trim_matches(is_js_ws)
@@ -304,188 +307,6 @@ pub struct OpLeaf {
     pub color: Option<Color>,
 }
 
-#[derive(Debug, Clone)]
-enum Tok {
-    Open { neg: bool },
-    Close,
-    Or,
-    And,
-    Term { neg: bool, op: Option<String>, cmp: String, value: String, exact: bool, quoted: bool, regex: bool },
-}
-
-fn read_quoted(s: &[char], i: usize) -> Result<(String, usize), SyntaxError> {
-    let mut j = i + 1;
-    let mut val = String::new();
-    while j < s.len() && s[j] != '"' {
-        if s[j] == '\\' && s.get(j + 1) == Some(&'"') {
-            val.push('"');
-            j += 2;
-            continue;
-        }
-        val.push(s[j]);
-        j += 1;
-    }
-    if j >= s.len() {
-        return Err(SyntaxError("Unterminated quoted phrase — close it with \"".into()));
-    }
-    Ok((val, j + 1))
-}
-
-fn read_regex(s: &[char], i: usize) -> Result<(String, usize), SyntaxError> {
-    let mut j = i + 1;
-    let mut val = String::new();
-    while j < s.len() && s[j] != '/' {
-        if s[j] == '\\' && j + 1 < s.len() {
-            val.push(s[j]);
-            val.push(s[j + 1]);
-            j += 2;
-            continue;
-        }
-        val.push(s[j]);
-        j += 1;
-    }
-    if j >= s.len() {
-        return Err(SyntaxError("Unterminated regular expression — close it with /".into()));
-    }
-    Ok((val, j + 1))
-}
-
-fn read_bare(s: &[char], i: usize) -> (String, usize) {
-    let mut j = i;
-    while j < s.len() && !is_js_ws(s[j]) && s[j] != '(' && s[j] != ')' {
-        j += 1;
-    }
-    (s[i..j].iter().collect(), j)
-}
-
-/// `^([a-z_]+)(!=|<=|>=|:|=|<|>)` (ASCII, case-insensitive) at s[i..].
-fn op_match(s: &[char], i: usize) -> Option<(String, String, usize)> {
-    let mut j = i;
-    while j < s.len() && (s[j].is_ascii_alphabetic() || s[j] == '_') {
-        j += 1;
-    }
-    if j == i {
-        return None;
-    }
-    let two = |a: char, b: char| s.get(j) == Some(&a) && s.get(j + 1) == Some(&b);
-    let cmp = if two('!', '=') {
-        "!="
-    } else if two('<', '=') {
-        "<="
-    } else if two('>', '=') {
-        ">="
-    } else {
-        match s.get(j) {
-            Some(':') => ":",
-            Some('=') => "=",
-            Some('<') => "<",
-            Some('>') => ">",
-            _ => return None,
-        }
-    };
-    let kw: String = s[i..j].iter().collect::<String>().to_ascii_lowercase();
-    Some((kw, cmp.to_string(), j + cmp.len()))
-}
-
-fn tokenize(query: &str) -> Result<Vec<Tok>, SyntaxError> {
-    let s: Vec<char> = query.chars().collect();
-    let mut toks = Vec::new();
-    let mut i = 0;
-    while i < s.len() {
-        let ch = s[i];
-        if is_js_ws(ch) {
-            i += 1;
-            continue;
-        }
-        if ch == '(' {
-            toks.push(Tok::Open { neg: false });
-            i += 1;
-            continue;
-        }
-        if ch == ')' {
-            toks.push(Tok::Close);
-            i += 1;
-            continue;
-        }
-        let mut neg = false;
-        if ch == '-' {
-            if s.get(i + 1) == Some(&'(') {
-                toks.push(Tok::Open { neg: true });
-                i += 2;
-                continue;
-            }
-            neg = true;
-            i += 1;
-            if i >= s.len() || is_js_ws(s[i]) || s[i] == ')' {
-                return Err(SyntaxError("\"-\" must negate a term".into()));
-            }
-        }
-        if s[i] == '!' && s.get(i + 1) != Some(&'=') {
-            i += 1;
-            let quoted = s.get(i) == Some(&'"');
-            let (value, end) = if quoted { read_quoted(&s, i)? } else { read_bare(&s, i) };
-            if value.is_empty() {
-                return Err(SyntaxError("\"!\" needs a card name".into()));
-            }
-            toks.push(Tok::Term { neg, op: None, cmp: String::new(), value, exact: true, quoted, regex: false });
-            i = end;
-            continue;
-        }
-        if s[i] == '"' {
-            let (value, end) = read_quoted(&s, i)?;
-            toks.push(Tok::Term { neg, op: None, cmp: String::new(), value, exact: false, quoted: true, regex: false });
-            i = end;
-            continue;
-        }
-        if let Some((op, cmp, end)) = op_match(&s, i) {
-            i = end;
-            let (value, quoted, regex);
-            if s.get(i) == Some(&'"') {
-                let (v, e) = read_quoted(&s, i)?;
-                value = v;
-                quoted = true;
-                regex = false;
-                i = e;
-            } else if s.get(i) == Some(&'/') {
-                let (v, e) = read_regex(&s, i)?;
-                value = v;
-                quoted = false;
-                regex = true;
-                i = e;
-            } else {
-                let (v, e) = read_bare(&s, i);
-                value = v;
-                quoted = false;
-                regex = false;
-                i = e;
-            }
-            if value.is_empty() && !quoted {
-                return Err(SyntaxError(format!("Operator \"{op}{cmp}\" needs a value")));
-            }
-            toks.push(Tok::Term { neg, op: Some(op), cmp, value, exact: false, quoted, regex });
-            continue;
-        }
-        if s[i] == '/' {
-            let (value, end) = read_regex(&s, i)?;
-            toks.push(Tok::Term { neg, op: Some("name".into()), cmp: ":".into(), value, exact: false, quoted: false, regex: true });
-            i = end;
-            continue;
-        }
-        let (word, end) = read_bare(&s, i);
-        i = end;
-        let wl = word.to_ascii_lowercase();
-        if (wl == "or" || wl == "and") && word.len() == wl.len() {
-            if neg {
-                return Err(SyntaxError(format!("Cannot negate \"{wl}\"")));
-            }
-            toks.push(if wl == "or" { Tok::Or } else { Tok::And });
-            continue;
-        }
-        toks.push(Tok::Term { neg, op: None, cmp: String::new(), value: word, exact: false, quoted: false, regex: false });
-    }
-    Ok(toks)
-}
-
 fn make_leaf(op: Option<&str>, cmp: &str, value: &str, exact: bool, quoted: bool, regex: bool) -> Result<Node, SyntaxError> {
     let Some(raw) = op else {
         if !exact && !quoted && value.eq_ignore_ascii_case("colorless") && value.len() == 9 {
@@ -545,83 +366,31 @@ fn make_leaf(op: Option<&str>, cmp: &str, value: &str, exact: bool, quoted: bool
     Ok(Node::Op(leaf))
 }
 
-struct Parser {
-    toks: Vec<Tok>,
-    pos: usize,
-}
-
-impl Parser {
-    fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.pos)
-    }
-    fn parse_or(&mut self) -> Result<Node, SyntaxError> {
-        let mut left = self.parse_and()?;
-        while matches!(self.peek(), Some(Tok::Or)) {
-            self.pos += 1;
-            let right = self.parse_and()?;
-            left = match left {
-                Node::Or(mut terms) => {
-                    terms.push(right);
-                    Node::Or(terms)
-                }
-                l => Node::Or(vec![l, right]),
-            };
-        }
-        Ok(left)
-    }
-    fn parse_and(&mut self) -> Result<Node, SyntaxError> {
-        let mut terms = Vec::new();
-        loop {
-            let Some(t) = self.peek().cloned() else { break };
-            if matches!(t, Tok::Or | Tok::Close) {
-                break;
-            }
-            self.pos += 1;
-            if matches!(t, Tok::And) {
-                if terms.is_empty() || matches!(self.peek(), None | Some(Tok::Or) | Some(Tok::Close)) {
-                    return Err(SyntaxError("\"and\" needs a term on both sides".into()));
-                }
-                continue;
-            }
-            terms.push(self.parse_term(t)?);
-        }
-        if terms.is_empty() {
-            return Err(SyntaxError("Empty query or empty parenthesis group".into()));
-        }
-        Ok(if terms.len() == 1 { terms.pop().unwrap() } else { Node::And(terms) })
-    }
-    fn parse_term(&mut self, t: Tok) -> Result<Node, SyntaxError> {
-        match t {
-            Tok::Open { neg } => {
-                let inner = self.parse_or()?;
-                if !matches!(self.peek(), Some(Tok::Close)) {
-                    return Err(SyntaxError("Unbalanced parenthesis".into()));
-                }
-                self.pos += 1;
-                Ok(if neg { Node::Not(Box::new(inner)) } else { inner })
-            }
-            Tok::Term { neg, op, cmp, value, exact, quoted, regex } => {
-                let leaf = make_leaf(op.as_deref(), &cmp, &value, exact, quoted, regex)?;
-                Ok(if neg { Node::Not(Box::new(leaf)) } else { leaf })
-            }
-            // `and` at a term position is consumed in parse_and; `or`/`close`
-            // never reach here (parse_and breaks first).
-            _ => Err(SyntaxError("Unbalanced parenthesis".into())),
-        }
-    }
-}
-
+/// Parse with local-scryfall's parser (the ONE Scryfall-syntax parser —
+/// `local_scryfall::query::parse_syntax`, Scrybox dialect) and lower its
+/// surface AST into the Scrybox-annotated tree by AST transform:
+/// operator aliases, `is:`/`not:<type>` → type leaves, bare `colorless` →
+/// `c:c`, lowercased names, color/mv/comparator validation.
 pub fn parse(query: &str) -> Result<Node, SyntaxError> {
     let trimmed = js_trim(query);
     if trimmed.is_empty() {
         return Err(SyntaxError("Empty query".into()));
     }
-    let mut p = Parser { toks: tokenize(trimmed)?, pos: 0 };
-    let ast = p.parse_or()?;
-    if p.pos < p.toks.len() {
-        return Err(SyntaxError("Unbalanced parenthesis".into()));
-    }
-    Ok(ast)
+    let ast = lsq::parse_syntax(trimmed).map_err(|e| SyntaxError(e.0))?;
+    lower(ast)
+}
+
+fn lower(n: lsq::Node) -> Result<Node, SyntaxError> {
+    Ok(match n {
+        lsq::Node::And(ts) => Node::And(ts.into_iter().map(lower).collect::<Result<_, _>>()?),
+        lsq::Node::Or(ts) => Node::Or(ts.into_iter().map(lower).collect::<Result<_, _>>()?),
+        lsq::Node::Not(t) => Node::Not(Box::new(lower(*t)?)),
+        lsq::Node::Atom(a) => {
+            let leaf = make_leaf(a.key.as_deref(), &a.cmp, &a.value, a.exact, a.quoted, a.regex)?;
+            if a.neg { Node::Not(Box::new(leaf)) } else { leaf }
+        }
+        other => return Err(SyntaxError(format!("unexpected parse node {other:?}"))),
+    })
 }
 
 #[derive(Debug, Clone)]

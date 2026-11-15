@@ -42,8 +42,16 @@ jobs:
 
   # One leg per architecture, each on a runner of that architecture. QEMU
   # emulation was the alternative and it is far slower here: the image compiles
-  # sqlite3 from source (see Dockerfile), which under emulation dominates the
-  # build. Native runners are free on public repos, so each leg builds at full
+  # static OpenCV 4.10 and scrybox-server (cargo --release) from source (see
+  # Dockerfile.rust), which under emulation dominates the build.
+  #
+  # Dockerfile.rust is self-contained: ONNX Runtime, OpenCV, the mozjpeg
+  # shim and the OCR model are fetched sha256-pinned or built inside builder
+  # stages, so a plain checkout + buildx is all a runner needs. Its cargo
+  # step uses BuildKit cache mounts (not exported by type=gha), so the gha
+  # cache below covers the OpenCV/ORT/mozjpeg layers and cargo recompiles
+  # from a warm registry-less state each run (~10-15 min on 4 cores). The
+  # arm64 leg builds OpenCV without IPP-ICV (x86-only). Native runners are free on public repos, so each leg builds at full
   # speed and the two run in parallel.
   #
   # Each leg pushes an untagged image and reports its digest; the `merge` job
@@ -100,7 +108,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.rust
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # Per-arch cache scopes. A shared scope would have the two legs

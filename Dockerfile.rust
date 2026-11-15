@@ -1,34 +1,146 @@
+# syntax=docker/dockerfile:1.7
 # =========================================
-# Scrybox — Node-free Rust image (LANE B unit 7)
+# Scrybox — Node-free Rust image (LANE B unit 7; TOTORO mono build)
 #
 # Single binary, glibc Debian. No Node runtime anywhere in the final image
-# (Gate D: "the single-binary Docker image (no Node)"). The Node image stays
-# the parity oracle; this one is what the Rust lane ships.
+# (Gate D: "the single-binary Docker image (no Node)").
 #
-# Build via server/docker/build-rust-image.sh — it stages the binary
-# (cargo build --release, offloaded to brain via tools/remote-cargo), the
-# ONNX Runtime dylib and the scryjpeg shim into server/docker/{bin,lib}/
-# first. The frontend bundle is still built in Stage 1 with node:alpine —
-# a build-time tool, gone from the final layers.
+# Reproducible from a clean checkout — every native input is built or
+# fetched (sha256-pinned) inside builder stages, nothing is read from the
+# host:
 #
-# Size design (lane-B iter-50; Gate D ceiling: image < 150 MB uncompressed,
-# the `docker image inspect -f '{{.Size}}'` number build-rust-image.sh
-# prints). debian:12-slim alone is 116 MB, and a root `chown -R` over the
-# payload re-commits every byte it touches (the old final stage carried a
-# 61 MB ghost layer of duplicated ORT + dist bytes). So the final stage is
-# FROM scratch: stage 2 is a debian:12-slim *package donor* whose only
+#   docker build -f Dockerfile.rust -t scrybox-rust:local .
+#
+#   ort        ONNX Runtime 1.27.0 release tarball (sha256-pinned per arch).
+#              ort 2.0.0-rc.15 (load-dynamic, no api-* features) needs
+#              ORT_API_VERSION >= its base; 1.27.0 is the version the Node
+#              image's onnxruntime-node ships, so both lanes run the same ORT.
+#   opencv     static OpenCV 4.10.0 core+imgproc (+IPP-ICV on x86_64) — the
+#              exact BUILD_LIST/flags of brain:~/ocv/build4. Own stage so the
+#              ~5 min build is cached independently of any source change.
+#   scryjpeg   server/native/build.sh over sha-pinned mozjpeg 4.1.5 (no nasm:
+#              the shipped shim was built WITHOUT SIMD — keep the decoder
+#              bit-identical).
+#   ocr        PP-OCRv6_rec_small.onnx, rapidocr 3.9.2's file (sha256-pinned).
+#   rust-build cargo build --release inside docker; BuildKit cache mounts for
+#              the registry + target dir keep rebuilds incremental.
+#
+# server/docker/build-rust-image.sh is a thin wrapper around this command.
+#
+# Size design (Gate D ceiling: image < 150 MB uncompressed). debian slim
+# alone is 116 MB and a root `chown -R` re-commits every byte, so the final
+# stage is FROM scratch: stage `pkgroot` is a *package donor* whose only
 # export is /staging — the ldd closure of every exec'd/dlopen'd binary plus
 # gosu, busybox-static and the CA roots — and scratch receives just those
 # files, with payload ownership baked in via COPY --chown (never chown -R).
-#
-# Payload budget (uncompressed): server 17.6 + ORT 38 + scryjpeg 0.2 +
-# curl-impersonate 4.9 (stripped: the published binary carries full debug
-# symbols, 30.8 -> 4.9 MB, same behaviour) + dist 22.5 + shared 0.2 +
-# glibc/libstdc++/libgcc closure ~11 + static gosu 2.9 + busybox 2.5 +
-# CA roots ~1.3 ≈ 101 MB.
-#
-#   docker build -f Dockerfile.rust -t scrybox-rust:local .
 # =========================================
+
+ARG DEBIAN_IMAGE=debian:13-slim
+ARG RUST_IMAGE=rust:1.99-trixie
+
+# =========================================
+# Native build base (cmake/ninja/gcc; Debian 13 = the runtime glibc 2.41)
+# =========================================
+FROM ${DEBIAN_IMAGE} AS native-base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# =========================================
+# ONNX Runtime 1.27.0 (release dylib, sha256-pinned)
+# =========================================
+FROM native-base AS ort
+ARG TARGETARCH
+ARG ORT_VERSION=1.27.0
+ARG ORT_SHA256_AMD64=547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f
+ARG ORT_SHA256_ARM64=3e4d83ac06924a32a07b6d7f91ce6f852876153fc0bbdf931bf517a140bfbe48
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) a=x64; sha=$ORT_SHA256_AMD64 ;; \
+      arm64) a=aarch64; sha=$ORT_SHA256_ARM64 ;; \
+      *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${a}-${ORT_VERSION}.tgz"; \
+    echo "$sha  /tmp/ort.tgz" | sha256sum -c -; \
+    mkdir -p /out; \
+    tar xzf /tmp/ort.tgz -C /tmp; \
+    cp "/tmp/onnxruntime-linux-${a}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /out/libonnxruntime.so.1; \
+    rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-*
+
+# =========================================
+# Static OpenCV 4.10.0 — core + imgproc only (what scan_engine links)
+# =========================================
+FROM native-base AS opencv
+ARG TARGETARCH
+ARG OPENCV_VERSION=4.10.0
+ARG OPENCV_SHA256=b2171af5be6b26f7a06b1229948bbb2bdaa74fcf5cd097e0af6378fce50a6eb9
+RUN set -eu; \
+    curl -fsSL -o /tmp/ocv.tgz "https://github.com/opencv/opencv/archive/refs/tags/${OPENCV_VERSION}.tar.gz"; \
+    echo "$OPENCV_SHA256  /tmp/ocv.tgz" | sha256sum -c -; \
+    tar xzf /tmp/ocv.tgz -C /tmp; rm /tmp/ocv.tgz; \
+    if [ "${TARGETARCH:-amd64}" = amd64 ]; then ipp=ON; else ipp=OFF; fi; \
+    cmake -S /tmp/opencv-${OPENCV_VERSION} -B /tmp/ocvb -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/opencv \
+      -DBUILD_LIST=core,imgproc -DBUILD_SHARED_LIBS=OFF -DENABLE_PIC=ON \
+      -DWITH_IPP=$ipp -DBUILD_IPP_IW=$ipp -DBUILD_ZLIB=ON \
+      -DWITH_OPENCL=OFF -DWITH_ITT=OFF -DWITH_TBB=OFF -DWITH_OPENMP=OFF \
+      -DWITH_EIGEN=OFF -DWITH_LAPACK=OFF -DWITH_ZLIB_NG=OFF \
+      -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+      -DBUILD_opencv_apps=OFF -DBUILD_JAVA=OFF -DBUILD_opencv_python3=OFF \
+      -DOPENCV_GENERATE_PKGCONFIG=OFF -DENABLE_CCACHE=OFF; \
+    cmake --build /tmp/ocvb; cmake --install /tmp/ocvb; \
+    rm -rf /tmp/ocvb /tmp/opencv-${OPENCV_VERSION}; \
+    ls /opt/opencv/lib /opt/opencv/lib/opencv4/3rdparty
+
+# =========================================
+# libscryjpeg.so — server/native/build.sh over pinned mozjpeg 4.1.5
+# =========================================
+FROM native-base AS scryjpeg
+ARG MOZJPEG_SHA256=9fcbb7171f6ac383f5b391175d6fb3acde5e64c4c4727274eade84ed0998fcc1
+RUN set -eu; \
+    curl -fsSL -o /tmp/moz.tgz https://github.com/mozilla/mozjpeg/archive/refs/tags/v4.1.5.tar.gz; \
+    echo "$MOZJPEG_SHA256  /tmp/moz.tgz" | sha256sum -c -; \
+    tar xzf /tmp/moz.tgz -C /tmp; rm /tmp/moz.tgz
+COPY server/native/ /src/native/
+# No nasm installed => mozjpeg's CMake builds WITHOUT SIMD, matching the
+# shim the lane has always shipped (no jsimd_*avx2/sse2 symbols).
+RUN cd /src/native && sh ./build.sh /tmp/mozjpeg-4.1.5 /out && rm -rf /tmp/mozjpeg-4.1.5
+
+# =========================================
+# OCR recogniser (rapidocr 3.9.2 PP-OCRv6_rec_small, sha256-pinned)
+# =========================================
+FROM native-base AS ocr
+ARG OCR_URL=https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
+ARG OCR_SHA256=6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884
+RUN mkdir -p /out && curl -fsSL -o /out/PP-OCRv6_rec_small.onnx "$OCR_URL" \
+  && echo "$OCR_SHA256  /out/PP-OCRv6_rec_small.onnx" | sha256sum -c -
+
+# =========================================
+# scrybox-server (cargo --release inside docker)
+# =========================================
+FROM ${RUST_IMAGE} AS rust-build
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends clang libclang-dev \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=opencv /opt/opencv /opt/opencv
+ENV OPENCV_INCLUDE_PATHS=/opt/opencv/include/opencv4 \
+    OPENCV_LINK_PATHS=/opt/opencv/lib,/opt/opencv/lib/opencv4/3rdparty
+WORKDIR /src
+# include_str! reaches ../shared; server/ holds both workspace crates.
+COPY shared/ /src/shared/
+COPY server/ /src/server/
+WORKDIR /src/server
+RUN --mount=type=cache,id=scrybox-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=scrybox-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=scrybox-target-${TARGETARCH},target=/src/server/target \
+    set -eu; \
+    if [ "${TARGETARCH:-amd64}" = amd64 ]; then \
+      export OPENCV_LINK_LIBS=static=opencv_imgproc,static=opencv_core,static=ippiw,static=ippicv,static=zlib; \
+    else \
+      export OPENCV_LINK_LIBS=static=opencv_imgproc,static=opencv_core,static=zlib; \
+    fi; \
+    cargo build --release --locked -p scrybox-server; \
+    mkdir -p /out; cp target/release/scrybox-server /out/scrybox-server
 
 # =========================================
 # Stage 1: Build Frontend Assets (build-time Node only)
@@ -47,7 +159,10 @@ RUN npm run build
 # =========================================
 # Stage 2: package donor (discarded — only /staging is COPY'd out)
 # =========================================
-FROM debian:12-slim AS pkgroot
+FROM ${DEBIAN_IMAGE} AS pkgroot
+# Debian 13 (glibc 2.41): the static OpenCV 4.10 linked into scrybox-server
+# is built on the Debian 13 build host and needs GLIBC_2.38 / CXXABI_1.3.15,
+# which bookworm's libc/libstdc++ lack. Only the ldd closure is copied out.
 # glibc Debian, same distro family the Node image runs (issue #19): the ONNX
 # Runtime dylib and libscryjpeg are glibc-linked and the server binary is
 # built against Debian glibc. Nothing apt installs here survives into the
@@ -74,17 +189,10 @@ RUN wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/release
   && rm -f /tmp/ci.tgz \
   && /usr/local/bin/curl-impersonate --version | head -1
 
-# Staged inputs (see server/docker/build-rust-image.sh):
-#   bin/scrybox-server        — cargo --release, strip=true, ~17 MB
-#   lib/libonnxruntime.so.1   — MIT-licensed ORT dylib the Node image carries
-#                               inside onnxruntime-node; Rust dlopens it via
-#                               ORT_DYLIB_PATH (ort "load-dynamic"). Already
-#                               symbol-stripped upstream (38 MB is real).
-#   lib/libscryjpeg.so        — mozjpeg-4.1.5 static shim (bit-identical JPEG
-#                               decode for the scan tensor path), SCRYBOX_JPEG_LIB.
-COPY server/docker/bin/scrybox-server /payload/bin/scrybox-server
-COPY server/docker/lib/libonnxruntime.so.1 /payload/ort/libonnxruntime.so.1
-COPY server/docker/lib/libscryjpeg.so /payload/lib/libscryjpeg.so
+# Payload from the builder stages above (nothing from the host).
+COPY --from=rust-build /out/scrybox-server /payload/bin/scrybox-server
+COPY --from=ort /out/libonnxruntime.so.1 /payload/ort/libonnxruntime.so.1
+COPY --from=scryjpeg /out/libscryjpeg.so /payload/lib/libscryjpeg.so
 
 # Build the final rootfs subset: every binary the runtime exec's or dlopen's
 # plus its FULL ldd closure (paths preserved so PT_INTERP and the loader's
@@ -117,6 +225,7 @@ RUN set -eu; \
     done; \
     mkdir -p /staging/opt/ort/lib /staging/opt/lib /staging/usr/local/bin /staging/bin \
              /staging/etc/ssl/certs /staging/etc/ssl/private /staging/tmp; \
+    chmod 1777 /staging/tmp; \
     cp -p /payload/bin/scrybox-server /staging/usr/local/bin/scrybox-server; \
     cp -p /payload/ort/libonnxruntime.so.1 /staging/opt/ort/lib/libonnxruntime.so.1; \
     cp -p /payload/lib/libscryjpeg.so /staging/opt/lib/libscryjpeg.so; \
@@ -138,6 +247,11 @@ FROM scratch
 # Rootfs subset (loader, glibc + libstdc++/libgcc closure, NSS, static gosu
 # and busybox, CA roots, /etc/passwd|group, the three payload binaries).
 COPY --from=pkgroot /staging/ /
+# cutfix BUG-1: /tmp must be world-writable+sticky (1777). The server runs as
+# uid 1000 (gosu) and SQLite spills temp b-trees (big GROUP BY / ORDER BY,
+# e.g. GET /api/admin/catalogs) to /tmp; a root 0755 /tmp made those fail
+# with "disk I/O error". Build-time assertion so a regression fails the build.
+RUN ["/bin/busybox", "sh", "-c", "[ \"$(/bin/busybox stat -c %a /tmp)\" = 1777 ] || { echo '/tmp must be 1777' >&2; exit 1; }"]
 # Layout mirrors the Node image so an existing named volume at /app/database
 # (bindarr.db, models/, ssl/, card-art/) drops in unchanged.
 WORKDIR /app
@@ -149,6 +263,23 @@ COPY --chown=1000:1000 --from=frontend-builder /app/frontend/dist /app/frontend/
 # entrypoint-rust.sh is LF in-tree (verified); --chmod bakes the exec bit
 # (scratch has no RUN shell for sed/chmod).
 COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
+# TOTORO mono: the local Scryfall engine is linked INTO scrybox-server (no
+# scryfall-local sidecar). Its static portal (~256 KB) and the vendored set
+# metadata (~430 KB: blocks.json, sets-meta.json, land_cycles.json — the
+# copies the live sidecar actually serves from) ship read-only in the image;
+# the bulk files live in the volume (see SCRYBOX_LSF_DATA_DIR below).
+COPY --chown=1000:1000 local-scryfall/static/ /app/scryfall/static/
+COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-meta.json local-scryfall/data/land_cycles.json /app/scryfall/data/
+# In-process cardscan (TOTORO mono scan2): only the PP-OCRv6 recogniser ships
+# here (fetched + sha-checked in the `ocr` stage). OpenCV (core+imgproc,
+# 4.10 + IPP-ICV) is linked STATICALLY into scrybox-server, so no libopencv
+# joins the ldd closure. The indexes live in the volume at
+# SCRYBOX_CARDSCAN_DATA (a sidecar data/ dir can be mounted as-is); missing
+# ones are built at boot (printing index from the in-process Scryfall
+# engine's default-cards bulk, oracle titles from Scryfall oracle-cards).
+# CARDSCAN_URL unset = in-process; set it to keep proxying to a sidecar.
+# (static OpenCV + OPENCV_* env: see the `opencv` / `rust-build` stages).
+COPY --from=ocr /out/ /opt/ocr/
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -159,15 +290,34 @@ ENV PORT=3001 \
     CV_MODEL_DIR=/app/database/models \
     ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
     SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
+    SCRYBOX_OCR_MODEL_DIR=/opt/ocr \
+    SCRYBOX_CARDSCAN_DATA=/app/database/cardscan-data \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \
     RUST_MIGRATIONS=true \
-    RUST_JOBS=scryfall
+    RUST_JOBS=scryfall \
+    SCRYBOX_LSF_DATA_DIR=/app/database/scryfall-data \
+    SCRYBOX_LSF_STATIC_DIR=/app/scryfall/static \
+    SCRYBOX_LSF_VENDORED_DIR=/app/scryfall/data \
+    LOCAL_SCRYFALL_ENABLED=true \
+    LOCAL_WEB_PORTAL_ENABLED=true \
+    CARDSCAN_KEEP_CAPTURES=0 \
+    CARDSCAN_SCENE_FALLBACK=0 \
+    CARDSCAN_TITLE_ROTATE=0
 # The two ONNX models are NOT in the image (AGPL-3.0 vs MIT — operator
 # fetches them into the volume, same policy as the Node image).
-# LOCAL_SCRYFALL_* / SCRYBOX_SIDECAR_URL / SCRYBOX_NODE_UPSTREAM stay unset:
-# the Node-free image has no Node to forward to; unset legs answer their
-# documented no-sidecar arms.
+# TOTORO mono (local Scryfall engine in-process):
+#   SCRYBOX_LSF_DATA_DIR   bulk data dir (default-cards / oracle-tags are
+#                          fetched there on first boot and refreshed daily at
+#                          05:00, SCRYBOX_LSF_REFRESH_AT; an existing sidecar
+#                          /data dir — incl. all-cards.jsonl.gz and
+#                          lang_map_full.json.gz, which are never downloaded —
+#                          can be mounted here as-is).
+#   LOCAL_SCRYFALL_ENABLED / LOCAL_WEB_PORTAL_ENABLED = true, matching the
+#   production Node container's env, but LOCAL_SCRYFALL_URL and
+#   SCRYBOX_SIDECAR_URL stay UNSET: unset = in-process engine; setting either
+#   re-enables the HTTP path to an external engine (fallback only).
+#   SCRYBOX_NODE_UPSTREAM stays empty: the Node-free image has no Node.
 # NOTE: no USER directive on purpose — the container starts as root so
 # entrypoint-rust.sh can adopt a foreign-owned /app/database volume, then
 # gosu drops to uid 1000 (matching the Node image's `node` user) for the
