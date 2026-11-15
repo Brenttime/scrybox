@@ -201,19 +201,24 @@ fn parked_probe(
         });
     });
 
-    // Event-driven release (LANE-B iter-65, same shape as legs_park
-    // iter-22 / authsweep_park_laneb iter-64): every probe sends Bearer
-    // sess-1, so authenticate_async's get_async idle-miss increments
-    // blocking_fallbacks BEFORE the live-cap wait — hold the slot until
-    // that registers instead of the old blind sleep(300 ms), which could
-    // release before the worker reached its first idle-miss under load
-    // (the pin then passed without ever parking: vacuous green). RED arms
-    // intact: a synchronous get()/inline-hydrate build never registers
-    // the counter, falls through at the 5 s cap, the parked worker owns
-    // the runtime, and recv_timeout below expires as before.
-    let hop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while pool.blocking_fallbacks() == 0 && std::time::Instant::now() < hop_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    // Counter-observed release (LANE-A iter-24, legs_park iter-22 shape):
+    // free the holder when the FIRST get_async idle-miss registers (the
+    // blocking-pool hop — hence the live-cap wait — has demonstrably
+    // started) instead of a blind 300 ms sleep that a loaded scheduler can
+    // beat. If the release lands before the handler reaches its checkout,
+    // the holder's conn is popped back from idle inline: the pin goes
+    // false-RED (no hop ever happened) or vacuously GREEN on pools that
+    // close returned conns — both closed by the assert below. 5 s fallback
+    // for shapes that legitimately never miss. Pre-fix park still reddens:
+    // a worker parked on the Condvar can never run the releasing task, so
+    // the counter never fires, the fallback expires, recv_timeout panics.
+    {
+        let start = std::time::Instant::now();
+        while pool.blocking_fallbacks() == 0
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
     let _ = release_tx.send(());
 
@@ -223,13 +228,12 @@ fn parked_probe(
              (synchronous authenticate/pool.get()/hydrate inline on the worker)"
         )
     });
-    assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
     assert!(
         pool.blocking_fallbacks() >= 1,
-        "{method} {uri} answered {status} without EVER hopping to the blocking pool — \
-         with the only live slot held by a runtime task that means the request never took \
-         its get_async checkout (pin vacuous), not that it was safe"
+        "{method} {uri}: pin never observed a get_async blocking-pool hop before the \
+         release — the hold was vacuous (the handler popped the returned idle conn inline)"
     );
+    assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
     (status, bytes, pool)
 }
 

@@ -1170,7 +1170,7 @@ fn parked_probe_scoped(
 
     let (tx, rx) = mpsc::channel::<(u16, Vec<u8>)>();
     // oneshot (not Notify): notify_waiters() stores no permit, so a held
-    // task that registered after the parent's 300 ms timer lost the release
+    // task that registered after the parent's release lost the wakeup
     // under parallel load — the slot never freed and the handler sat on the
     // live cap until the 10 s recv timeout (which mis-labelled the lost
     // wakeup as a parking regression; same class as cardscan_park, iter-15).
@@ -1238,15 +1238,35 @@ fn parked_probe_scoped(
         });
     });
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Counter-observed release (LANE-A iter-24, legs_park iter-22 shape):
+    // free the holder when the FIRST get_async idle-miss registers (the
+    // blocking-pool hop — hence the live-cap wait — has demonstrably
+    // started) instead of a blind 300 ms sleep that a loaded scheduler can
+    // beat. If the release lands before the handler reaches its checkout,
+    // the holder's conn is popped back from idle inline: the pin goes
+    // false-RED (no hop ever happened) or vacuously GREEN on pools that
+    // close returned conns — both closed by the assert below. 5 s fallback
+    // for shapes that legitimately never miss. Pre-fix park still reddens:
+    // a worker parked on the Condvar can never run the releasing task, so
+    // the counter never fires, the fallback expires, recv_timeout panics.
+    {
+        let start = std::time::Instant::now();
+        while pool.blocking_fallbacks() == 0
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     let _ = release_tx.send(());
 
     let (status, bytes) = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap_or_else(|_| panic!("{method} {uri} never completed: the handler parked the runtime worker on the DbPool live cap (synchronous pool.get()/authenticate inline on the worker)"));
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "{method} {uri}: pin never observed a get_async blocking-pool hop before the \
+         release — the hold was vacuous (the handler popped the returned idle conn inline)"
+    );
     assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
     (status, bytes, pool)
 }

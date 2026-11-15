@@ -116,10 +116,25 @@ fn parked_probe(uri: &str, token: Option<&'static str>, tree: bool, expected: u1
         });
     });
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Counter-observed release (LANE-A iter-24, legs_park iter-22 shape):
+    // free the holder when the FIRST get_async idle-miss registers (the
+    // blocking-pool hop — hence the live-cap wait — has demonstrably
+    // started) instead of a blind 300 ms sleep that a loaded scheduler can
+    // beat. If the release lands before the handler reaches its checkout,
+    // the holder's conn is popped back from idle inline: the pin goes
+    // false-RED (no hop ever happened) or vacuously GREEN on pools that
+    // close returned conns — both closed by the assert below. 5 s fallback
+    // for shapes that legitimately never miss. Pre-fix park still reddens:
+    // a worker parked on the Condvar can never run the releasing task, so
+    // the counter never fires, the fallback expires, recv_timeout panics.
+    {
+        let start = std::time::Instant::now();
+        while pool.blocking_fallbacks() == 0
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     let _ = release_tx.send(());
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
@@ -128,6 +143,11 @@ fn parked_probe(uri: &str, token: Option<&'static str>, tree: bool, expected: u1
              (synchronous authenticate/pool.get() inline on the worker)"
         )
     });
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "GET {uri}: pin never observed a get_async blocking-pool hop before the \
+         release — the hold was vacuous (the handler popped the returned idle conn inline)"
+    );
     assert_eq!(status, expected, "GET {uri} answered {status}, expected {expected}");
     (status, bytes, pool)
 }
