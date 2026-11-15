@@ -8,14 +8,12 @@
 # copied so the server boots offline.
 
 FROM rust:1-slim-bookworm AS builder
+# The engine is now the `local-scryfall` lib+bin crate inside the server
+# workspace (server/crates/local-scryfall); build context is the REPO ROOT.
 WORKDIR /build
-# Dependencies compile first and stay cached unless Cargo.* changes.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release && rm -rf src target/release/scryfall-api* \
-    && rm -rf target/release/.fingerprint/scryfall-api-*
-COPY src/ src/
-RUN cargo build --release && strip target/release/scryfall-api
+COPY server/ /build/server/
+RUN cd server && cargo build --release -p local-scryfall --bin scryfall-api \
+    && strip target/release/scryfall-api && cp target/release/scryfall-api /build/scryfall-api
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -24,10 +22,10 @@ RUN apt-get update \
 # Unprivileged: nothing here binds <1024 or writes outside /data.
 RUN useradd -r -u 10001 -m scryfall
 WORKDIR /app
-COPY --from=builder /build/target/release/scryfall-api /app/scryfall-api
-COPY static/ /app/static/
-COPY data/ /app/data/
-COPY fetch-data.sh /app/fetch-data.sh
+COPY --from=builder /build/scryfall-api /app/scryfall-api
+COPY local-scryfall/static/ /app/static/
+COPY local-scryfall/data/ /app/data/
+COPY local-scryfall/fetch-data.sh /app/fetch-data.sh
 RUN chmod +x /app/fetch-data.sh && chown -R scryfall:scryfall /app
 VOLUME /data
 ENV SCRYFALL_DATA_DIR=/data \

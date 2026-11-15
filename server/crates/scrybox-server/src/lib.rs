@@ -41,6 +41,8 @@ pub mod catalog_read;
 pub mod collq;
 pub mod scryq;
 pub mod cvscan;
+pub mod scan_ocr;
+pub mod scan_engine;
 pub mod ip_limit;
 pub mod oidc;
 pub mod oracle_tags;
@@ -55,6 +57,8 @@ pub mod flight;
 pub mod npz;
 pub mod settings;
 pub mod limited;
+pub mod lsf;
+pub mod lsf_data;
 pub mod lists_body_writes;
 pub mod lists_reads;
 pub mod lists_writes;
@@ -142,7 +146,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from), sidecar_url: std::env::var("SCRYBOX_SIDECAR_URL").ok().map(|s| s.trim_end_matches('/').to_string()).filter(|s| !s.is_empty()) })
+        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from), sidecar_url: lsf::resolve_sidecar_url(std::env::var("SCRYBOX_SIDECAR_URL").ok().map(|s| s.trim_end_matches('/').to_string()).filter(|s| !s.is_empty())) })
     }
 }
 

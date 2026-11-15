@@ -22,19 +22,28 @@ Card data & images © Scryfall (https://scryfall.com). This indexes Scryfall's
 public bulk data for a single self-hosted install; it is not a redistribution
 service, and the compose stack gives it no published ports.
 
+## Layout (TOTORO mono)
+
+The engine source now lives in the server workspace as the `local-scryfall`
+crate (`server/crates/local-scryfall`: library + thin `scryfall-api` bin).
+scrybox-server links the library and serves the same router in-process, so
+the single Scrybox image needs no sidecar. This directory keeps the
+standalone assets: `static/` (portal), `data/` (vendored set meta),
+`fetch-data.sh`, `tests.sh` and the standalone Dockerfile.
+
 ## Run standalone
 
 ```sh
 SCRYFALL_DATA_DIR=./data ./fetch-data.sh   # first time: pulls bulk files (~86 MB)
-cargo build --release
-./target/release/scryfall-api              # binds 0.0.0.0:8420
+(cd ../server && cargo build --release -p local-scryfall)
+../server/target/release/scryfall-api              # binds 0.0.0.0:8420
 ./tests.sh http://127.0.0.1:8420           # regression suite, server must be up
 ```
 
 ## Run in Docker
 
 ```sh
-docker build -t scryfall-local local-scryfall/
+docker build -f local-scryfall/Dockerfile -t scryfall-local .
 docker run -d --name scryfall-local -v scryfall-data:/data -p 8420:8420 scryfall-local
 ```
 

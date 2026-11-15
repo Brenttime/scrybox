@@ -1,7 +1,7 @@
 //! Node-free (SCRYBOX_NODE_UPSTREAM empty): collection-scope `q` searches
 //! outside the old name/t:/c: subset used to return Plan::Proxy and answer
 //! 502 "Upstream unavailable" with no Node. They are now classified by the
-//! full Scryfall-syntax port (scryq.rs) and answered natively through
+//! local-scryfall parser (via scryq.rs) and answered natively through
 //! Node's own legs: answerLocally (upstream mode), the local-scryfall walk
 //! (sidecar mode, by printing id for printing-level terms), and the
 //! engine-outage local-fallback / 503.

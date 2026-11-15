@@ -1,4 +1,4 @@
-//! Differential test: the Rust Scryfall-syntax port (scryq.rs) against
+//! Differential test: local-scryfall's parser + scryq's AST transforms against
 //! NODE's own parser + SQL compiler (shared/scryfallQuery.js,
 //! backend/src/utils/rawQuerySql.js). Expectations come from running Node
 //! over the same fixture DB (`node tests/fixtures/scryq_gen.js`); this test

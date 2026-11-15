@@ -64,10 +64,9 @@ impl ScryEnv {
     pub fn from_env() -> Self {
         Self {
             local: std::env::var("LOCAL_SCRYFALL_ENABLED").as_deref() == Ok("true"),
-            local_url: std::env::var("LOCAL_SCRYFALL_URL")
-                .unwrap_or_else(|_| "http://scryfall-local:8420".into())
-                .trim_end_matches('/')
-                .to_string(),
+            // TOTORO mono: explicit URL = external engine over HTTP; unset
+            // with the in-process engine configured = the in-process sentinel.
+            local_url: crate::lsf::local_scryfall_url(),
             base_url: std::env::var("SCRYFALL_BASE_URL")
                 .unwrap_or_else(|_| UPSTREAM_BASE.to_string())
                 .trim_end_matches('/')
@@ -496,10 +495,23 @@ impl Scry {
         }
         .map_err(|e| ScryError::transport(format!("request build: {e}")))?;
 
-        let res = tokio::time::timeout(REQUEST_TIMEOUT, self.inner.client.request(req))
-            .await
-            .map_err(|_| ScryError::transport(format!("{abs}: timeout")))?
-            .map_err(|e| ScryError::transport(format!("{abs}: {e}")))?;
+        // TOTORO mono: the in-process engine sentinel never touches a socket —
+        // same request, same handler bytes, via the ScryfallEngine seam.
+        let res: hyper::Response<axum::body::Body> = if crate::lsf::is_inproc_url(abs) {
+            let (parts, body) = req.into_parts();
+            let req = Request::from_parts(parts, axum::body::Body::from(body));
+            let eng = crate::lsf::inproc().ok_or_else(|| ScryError::transport(format!("{abs}: local scryfall engine not ready")))?;
+            tokio::time::timeout(REQUEST_TIMEOUT, crate::lsf::ScryfallEngine::call(eng.as_ref(), req))
+                .await
+                .map_err(|_| ScryError::transport(format!("{abs}: timeout")))?
+                .map_err(|e| ScryError::transport(format!("{abs}: {e}")))?
+        } else {
+            tokio::time::timeout(REQUEST_TIMEOUT, self.inner.client.request(req))
+                .await
+                .map_err(|_| ScryError::transport(format!("{abs}: timeout")))?
+                .map_err(|e| ScryError::transport(format!("{abs}: {e}")))?
+                .map(axum::body::Body::new)
+        };
 
         let status = res.status().as_u16();
         let retry_after_secs = if status == 429 {

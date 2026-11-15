@@ -5,7 +5,7 @@ use crate::eval::eval;
 use crate::index::prefix_edit_dist;
 use crate::index::Index;
 use crate::query::parse;
-use axum::extract::{Json, Path, Query, State};
+use axum::extract::{Json, Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
@@ -92,28 +92,82 @@ fn urlencode(s: &str) -> String {
 /// request's Host so links point back at whichever origin reached us (direct
 /// or through the Scrybox /scryfall-portal proxy). Callers that follow
 /// pagination links (cardSets.js fetchMtgSet) then work unchanged.
-fn page_link(headers: &HeaderMap, p: &HashMap<String, String>, next_key: &str, next_val: usize) -> String {
+fn page_link(
+    headers: &HeaderMap,
+    p: &HashMap<String, String>,
+    order: &[String],
+    next_key: &str,
+    next_val: usize,
+) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost:8420");
     let mut parts: Vec<String> = Vec::new();
-    for (k, v) in p {
+    for k in order {
         if k == "page" || k == "offset" || k == next_key {
             continue;
         }
-        parts.push(format!("{}={}", urlencode(k), urlencode(v)));
+        if let Some(v) = p.get(k) {
+            parts.push(format!("{}={}", urlencode(k), urlencode(v)));
+        }
     }
     parts.push(format!("{next_key}={next_val}"));
     format!("http://{host}/cards/search?{}", parts.join("&"))
 }
 
+/// Decode one form-urlencoded query component ('+' = space, %XX bytes).
+fn form_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The request's param keys in their ORIGINAL order (first occurrence wins;
+/// values still come from the parsed map, last-wins like `Query`). Echoing
+/// the HashMap's iteration order made self/next_page links differ between
+/// otherwise identical requests. Keys absent from the raw query (none in
+/// practice) are appended sorted, so the order is always deterministic.
+fn param_order(raw: Option<&str>, p: &HashMap<String, String>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for pair in raw.unwrap_or("").split('&').filter(|s| !s.is_empty()) {
+        let k = form_decode(pair.split_once('=').map(|(k, _)| k).unwrap_or(pair));
+        if p.contains_key(&k) && !order.contains(&k) {
+            order.push(k);
+        }
+    }
+    let mut rest: Vec<String> = p.keys().filter(|k| !order.contains(k)).cloned().collect();
+    rest.sort();
+    order.extend(rest);
+    order
+}
+
 pub async fn search(
     State(st): State<SharedState>,
     headers: HeaderMap,
+    RawQuery(raw_q): RawQuery,
     Query(p): Query<HashMap<String, String>>,
 ) -> Response {
     let t0 = Instant::now();
+    let param_keys = param_order(raw_q.as_deref(), &p);
     let q = p.get("q").cloned().unwrap_or_default();
     let per: usize = p
         .get("limit")
@@ -250,13 +304,13 @@ pub async fn search(
     // request's own paging style: offset in, offset out; otherwise page+1.
     let (self_link, next_link) = if p.contains_key("offset") {
         (
-            page_link(&headers, &p, "offset", offset),
-            has_more.then(|| page_link(&headers, &p, "offset", offset + ids.len())),
+            page_link(&headers, &p, &param_keys, "offset", offset),
+            has_more.then(|| page_link(&headers, &p, &param_keys, "offset", offset + ids.len())),
         )
     } else {
         (
-            page_link(&headers, &p, "page", page as usize),
-            has_more.then(|| page_link(&headers, &p, "page", page as usize + 1)),
+            page_link(&headers, &p, &param_keys, "page", page as usize),
+            has_more.then(|| page_link(&headers, &p, &param_keys, "page", page as usize + 1)),
         )
     };
 

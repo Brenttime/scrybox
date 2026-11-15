@@ -475,7 +475,7 @@ async fn scry_page(st: &crate::AppState, base: &str, q: &str, page: i64) -> Resu
         .header("user-agent", "Scrybox/1.0")
         .body(axum::body::Body::empty())
         .map_err(|_| PageErr::Failed)?;
-    let res = tokio::time::timeout(PAGE_TIMEOUT, st.client.request(req))
+    let res = tokio::time::timeout(PAGE_TIMEOUT, crate::lsf::send(&st.client, req))
         .await
         .map_err(|_| PageErr::Failed)?
         .map_err(|_| PageErr::Failed)?;
@@ -598,7 +598,7 @@ async fn names_page(st: &crate::AppState, base: &str, q: &str, page: i64, multil
         .header("user-agent", "Scrybox/1.0")
         .body(axum::body::Body::empty())
         .map_err(|_| NamesWalkErr::Transport)?;
-    let res = tokio::time::timeout(PAGE_TIMEOUT, st.client.request(req))
+    let res = tokio::time::timeout(PAGE_TIMEOUT, crate::lsf::send(&st.client, req))
         .await
         .map_err(|_| NamesWalkErr::Transport)?
         .map_err(|_| NamesWalkErr::Transport)?;
