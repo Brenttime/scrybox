@@ -31,7 +31,7 @@ use serde_json::{json, Map, Value};
 
 use crate::collection_writes::{json_response, read_parts};
 use crate::scryfall::ScryOpts;
-use crate::settings::authenticate;
+use crate::settings::authenticate_async;
 use crate::AppState;
 
 /// express.json({limit:'1mb'}) — normalJson (server.js:205). npm `mb` = 1024^2.
@@ -503,7 +503,7 @@ pub async fn handle(
     };
 
     // (2) authenticateToken — POST kills the API-key leg (is_get=false).
-    if let Err(res) = authenticate(&pool, &headers, false) {
+    if let Err(res) = authenticate_async(&pool, &headers, false).await {
         return res;
     }
     // (3) invalidateOnWrite: every authenticated non-GET bumps the user's

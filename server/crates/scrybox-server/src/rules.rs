@@ -61,7 +61,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::poison::LockExt;
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection::{body_etag, etag_matches};
 use crate::decks_reads::root_collator;
 use crate::lists_reads::{qs_get, QsVal};
@@ -853,7 +853,7 @@ pub async fn route_rules(State(st): State<AppState>, req: Request) -> Response {
     let headers = req.headers().clone();
     let query = req.uri().query().map(str::to_string);
     let token = bearer_token(&headers).map(str::to_string);
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return res;
     }
     let force = has_refresh(query.as_deref());
@@ -879,7 +879,7 @@ pub async fn route_keywords(State(st): State<AppState>, req: Request) -> Respons
     let headers = req.headers().clone();
     let query = req.uri().query().map(str::to_string);
     let token = bearer_token(&headers).map(str::to_string);
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return res;
     }
     let force = has_refresh(query.as_deref());

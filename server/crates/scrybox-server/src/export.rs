@@ -63,7 +63,7 @@ use axum::{
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_cache::cache_normalized_cards;
 use crate::collection::{body_etag, etag_matches, gzip_bytes, truthy, wants_encoding};
 use crate::collection_writes::json_to_sql_value;
@@ -811,7 +811,7 @@ pub async fn route_export(State(st): State<AppState>, req: Request) -> Response 
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -910,7 +910,7 @@ pub async fn route_export_post(State(st): State<AppState>, req: Request) -> Resp
         return res;
     }
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -1049,7 +1049,7 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };

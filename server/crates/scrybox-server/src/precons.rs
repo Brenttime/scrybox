@@ -54,7 +54,7 @@ use hyper_util::rt::TokioExecutor;
 use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_cache::cache_normalized_cards;
 use crate::card_norm::normalize_card;
 use crate::collection::truthy;
@@ -756,7 +756,7 @@ pub async fn route_precons(State(st): State<AppState>, req: Request) -> Response
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
     let token = bearer_token(&headers).map(str::to_string);
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return res;
     }
     let q = js_trim(&crate::lists_reads::qs_string(req.uri().query(), "q")).to_string();
@@ -809,7 +809,7 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
         return res;
     }
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };

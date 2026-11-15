@@ -412,7 +412,7 @@ pub async fn route_settings(State(st): State<AppState>, req: Request) -> Respons
         Method::GET => {
             let env = SettingsEnv::from_env();
             let headers = req.headers().clone();
-            if let Err(res) = authenticate(&pool, &headers, true) {
+            if let Err(res) = authenticate_async(&pool, &headers, true).await {
                 return res;
             }
             match get_effective_settings(&pool, &env) {
@@ -443,7 +443,7 @@ pub async fn route_version(State(st): State<AppState>, req: Request) -> Response
     };
     let env = SettingsEnv::from_env();
     let headers = req.headers().clone();
-    if let Err(res) = authenticate(&pool, &headers, true) {
+    if let Err(res) = authenticate_async(&pool, &headers, true).await {
         return res;
     }
     let query = req.uri().query().map(str::to_string);
@@ -475,6 +475,18 @@ pub(crate) fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> 
     auth::authenticate(pool, token.as_deref(), is_get)
 }
 
+/// M5 twin of [`authenticate`]: checks out through `DbPool::get_async`
+/// (see auth::authenticate_async), so a pool stall cannot freeze the
+/// runtime worker. Same token extraction, same SQL, same bodies.
+pub(crate) async fn authenticate_async(
+    pool: &std::sync::Arc<DbPool>,
+    headers: &HeaderMap,
+    is_get: bool,
+) -> Result<auth::AuthUser, Response> {
+    let token = auth::bearer_token(headers).map(str::to_string);
+    auth::authenticate_async(pool, token.as_deref(), is_get).await
+}
+
 /// middleware/auth.js requireAdmin (API keys are never admin credentials).
 /// Shared with admin_users (iter-40).
 pub(crate) fn admin_gate(user: &auth::AuthUser) -> Option<Response> {
@@ -503,7 +515,7 @@ async fn handle_put(st: &crate::AppState, pool: Arc<DbPool>, req: Request) -> Re
         Ok(b) => b,
         Err(res) => return res,
     };
-    let user = match authenticate(&pool, &headers, false) {
+    let user = match authenticate_async(&pool, &headers, false).await {
         Ok(u) => u,
         Err(res) => return res,
     };

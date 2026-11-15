@@ -60,7 +60,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection_writes::{
     get_row_map, internal_error, js_falsy, js_to_string, json_error, json_response,
     json_to_sql_value, node_exact, parse_body, read_parts, too_large, BodyOutcome, Tx,
@@ -103,7 +103,7 @@ pub async fn handle_create(State(st): State<AppState>, req: Request) -> Response
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -164,7 +164,7 @@ pub async fn handle_order(State(st): State<AppState>, req: Request) -> Response 
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -190,7 +190,7 @@ pub async fn handle_update(Path(id): Path<String>, State(st): State<AppState>, r
         BodyOutcome::Parsed(b) => b,
     };
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -218,7 +218,7 @@ pub async fn handle_delete(Path(id): Path<String>, State(st): State<AppState>, r
         BodyOutcome::Parsed(_) => {} // route ignores the body; parse only mirrors error order
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

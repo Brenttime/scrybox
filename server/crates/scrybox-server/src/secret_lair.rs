@@ -59,7 +59,7 @@ use axum::{
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_cache::cache_normalized_cards;
 use crate::collection::truthy;
 use crate::collection_writes::{execute_add, js_to_string, plan_add, AddPlan};
@@ -489,7 +489,7 @@ pub async fn route_search(State(st): State<AppState>, req: Request) -> Response 
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
     let token = bearer_token(&headers).map(str::to_string);
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return res;
     }
     let query = req.uri().query().map(str::to_string);
@@ -645,7 +645,7 @@ pub async fn route_preview(State(st): State<AppState>, req: Request) -> Response
     let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
     let headers: HeaderMap = req.headers().clone();
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return res,
     };
@@ -705,7 +705,7 @@ pub async fn route_add(State(st): State<AppState>, req: Request) -> Response {
         return res;
     }
     let token = bearer_token(&headers).map(str::to_string);
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return res,
     };

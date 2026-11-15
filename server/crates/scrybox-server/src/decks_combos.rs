@@ -53,7 +53,7 @@ use axum::response::Response;
 use axum::extract::Request;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection_writes::{
     internal_error, json_error, node_exact, parse_body, read_parts, too_large, BodyOutcome,
 };
@@ -173,7 +173,7 @@ async fn guard(st: &AppState, req: Request, group: &str) -> Result<Ctx, Response
         BodyOutcome::Parsed(_) => {}
     }
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return Err(node_exact(res).await),
     };
