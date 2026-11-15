@@ -2,10 +2,14 @@
 //! (`_footer_numbers`, `_footer_codes`, `_resolve_footer_group`,
 //! `_strong_conflict`, `retro_line_number`, ...), ported from server.py.
 //!
-//! Printings keep their raw JSON object text (RawValue, ~84 MB for the
-//! full index) and only the fields the resolver needs are parsed into the
-//! struct; `card_json` re-materialises the Python `dict(printing)` (key order
-//! preserved, `_phys` appended exactly where `load_printings` added it).
+//! Printings keep only the fields the resolver needs parsed into the
+//! struct; the raw JSON object text of each printing (~84 MB for the full
+//! index) is NOT held on the heap (TOTORO mem): the struct records its byte
+//! span in `printing_index.json` and `raw()` reads it back from the file
+//! handle opened at load (`pread`, page-cache served). The handle pins the
+//! loaded inode, so the nightly refresh's rename-over never changes what an
+//! engine reads. `dict()` re-materialises the Python `dict(printing)` (key
+//! order preserved, `_phys` appended exactly where `load_printings` added it).
 
 use crate::scan_ocr::names::{norm_name, Oracle};
 use indexmap::{IndexMap, IndexSet};
@@ -17,7 +21,9 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 pub struct Printing {
-    pub raw: Box<RawValue>,
+    /// Byte span of this printing's JSON object in the loaded index file.
+    raw_off: u64,
+    raw_len: u32,
     pub id: Option<String>,
     pub name: Option<String>,
     pub set: Option<String>,
@@ -37,8 +43,12 @@ pub struct FaceNames {
 
 type Pid = u32;
 
+/// The loaded `printing_index.json` (open handle; see module docs).
+pub struct RawSrc(std::fs::File);
+
 #[derive(Default)]
 pub struct Printings {
+    raw_src: Option<std::sync::Arc<RawSrc>>,
     pub list: Vec<Printing>,
     pub by_title: IndexMap<String, Vec<Pid>>,
     pub by_title_physical: HashMap<(String, String, String), Vec<Pid>>,
@@ -88,13 +98,20 @@ impl Printings {
     /// unambiguous printed/flavor aliases exactly like the Python globals.
     pub fn load(dir: &Path, oracle: &mut Oracle) -> Result<Printings, String> {
         let path = dir.join("printing_index.json");
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let raw: IndexMap<String, Box<RawValue>> = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        drop(bytes);
+        // One handle for both the parse and every later `raw()` read, so the
+        // spans always index the same inode even if the file is replaced.
+        let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        let base = bytes.as_ptr() as usize;
+        let raw: IndexMap<String, &RawValue> = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let mut list = Vec::with_capacity(raw.len());
         let mut keys_sets = Vec::with_capacity(raw.len());
         for (key, rv) in raw {
-            let v: Map<String, Value> = serde_json::from_str(rv.get()).map_err(|e| e.to_string())?;
+            let text = rv.get();
+            let raw_off = (text.as_ptr() as usize - base) as u64;
+            let raw_len = u32::try_from(text.len()).map_err(|_| "printing object over 4 GiB".to_string())?;
+            let v: Map<String, Value> = serde_json::from_str(text).map_err(|e| e.to_string())?;
             let aliases = v.get("aliases").and_then(|a| a.as_array()).map(|a| a.iter().map(|x| s_opt(Some(x))).collect());
             let faces = v
                 .get("faces")
@@ -122,10 +139,13 @@ impl Printings {
                 aliases,
                 faces,
                 phys: None,
-                raw: rv,
+                raw_off,
+                raw_len,
             });
         }
-        let mut p = Printings { list, ..Default::default() };
+        drop(bytes);
+        list.shrink_to_fit();
+        let mut p = Printings { list, raw_src: Some(std::sync::Arc::new(RawSrc(file))), ..Default::default() };
 
         if std::env::var("CARDSCAN_PAPER_TITLES").unwrap_or_else(|_| "1".into()) != "0" {
             for pr in &p.list {
@@ -239,6 +259,23 @@ impl Printings {
         self.list.len()
     }
 
+    /// The printing's raw JSON object text, read back from the loaded index
+    /// file. An I/O failure yields "" (callers parse with `unwrap_or_default`
+    /// / propagate the parse error), and is logged.
+    pub fn raw(&self, id: Pid) -> String {
+        use std::os::unix::fs::FileExt;
+        let pr = &self.list[id as usize];
+        let Some(src) = &self.raw_src else { return String::new() };
+        let mut buf = vec![0u8; pr.raw_len as usize];
+        match src.0.read_exact_at(&mut buf, pr.raw_off).map_err(|e| e.to_string()).and_then(|_| String::from_utf8(buf).map_err(|e| e.to_string())) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("cardscan: printing {id} raw read failed: {e}");
+                String::new()
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
@@ -249,14 +286,14 @@ impl Printings {
     }
 
     pub fn field(&self, id: Pid, key: &str) -> Value {
-        let m: Map<String, Value> = serde_json::from_str(self.list[id as usize].raw.get()).unwrap_or_default();
+        let m: Map<String, Value> = serde_json::from_str(&self.raw(id)).unwrap_or_default();
         m.get(key).cloned().unwrap_or(Value::Null)
     }
 
     /// `dict(printing)` including the `_phys` tuple load_printings added.
     pub fn dict(&self, id: Pid) -> Map<String, Value> {
         let pr = &self.list[id as usize];
-        let mut m: Map<String, Value> = serde_json::from_str(pr.raw.get()).unwrap_or_default();
+        let mut m: Map<String, Value> = serde_json::from_str(&self.raw(id)).unwrap_or_default();
         if let Some((s, n)) = &pr.phys {
             m.insert("_phys".into(), Value::Array(vec![Value::String(s.clone()), Value::String(n.clone())]));
         }
@@ -739,5 +776,40 @@ mod tests {
         assert!(strong_numbers(&v(&["50/249"])).contains("50"));
         assert!(strong_numbers(&v(&["U 0298", "0298 FRA"])).contains("298"));
         assert!(!strong_numbers(&v(&["2021", "2021"])).contains("2021"));
+    }
+
+    /// TOTORO mem: raw printing text is read back from the file by span,
+    /// byte-for-byte equal to the object text in the index (escapes, key
+    /// order, unicode), keeps working after the file is replaced on disk
+    /// (rename-over, like the nightly swap), and `dict` adds `_phys`.
+    #[test]
+    fn raw_spans_read_back_exact_and_survive_rename_over() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("oracle_titles.json"), r#"["Lightning Bolt","Fire // Ice"]"#).unwrap();
+        let objs = [
+            r#"{"id":"a1","name":"Lightning Bolt","set":"lea","num":"161","zeta":1,"alpha":"é\u00e9\"q"}"#,
+            r#"{"id":"b2","name":"Fire // Ice","set":"apc","num":128,"faces":[{"name":"Fire"},{"name":"Ice","printed_name":"Eis"}]}"#,
+            r#"{ "id" : "c3", "name":"Lightning Bolt","set":"m10","num":null }"#,
+        ];
+        let idx = format!(r#"{{"lea:161":{},"apc:128" : {} , "m10:x":{}}}"#, objs[0], objs[1], objs[2]);
+        std::fs::write(d.path().join("printing_index.json"), &idx).unwrap();
+        let mut oracle = Oracle::load(d.path()).unwrap();
+        let p = Printings::load(d.path(), &mut oracle).unwrap();
+        assert_eq!(p.len(), 3);
+        for (i, o) in objs.iter().enumerate() {
+            assert_eq!(p.raw(i as Pid), *o, "printing {i}");
+        }
+        // Replace the file the way the nightly swap does; the loaded engine
+        // keeps reading the inode it parsed.
+        let tmp = d.path().join("printing_index.json.tmp");
+        std::fs::write(&tmp, "{}").unwrap();
+        std::fs::rename(&tmp, d.path().join("printing_index.json")).unwrap();
+        assert_eq!(p.raw(1), objs[1]);
+        let dict = p.dict(0);
+        let keys: Vec<&str> = dict.keys().map(|k| k.as_str()).collect();
+        assert_eq!(&keys[..6], &["id", "name", "set", "num", "zeta", "alpha"], "key order kept");
+        assert_eq!(dict["alpha"], Value::String("éé\"q".into()));
+        assert_eq!(p.field(1, "num"), Value::from(128));
+        assert_eq!(p.list[1].num.as_deref(), Some("128"));
     }
 }

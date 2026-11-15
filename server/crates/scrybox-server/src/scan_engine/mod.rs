@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 pub struct Engine {
     pub oracle: Oracle,
     pub printings: Printings,
-    pub rec: &'static rec::RecEngine,
+    pub rec: Arc<rec::RecEngine>,
     history: Mutex<scene::History>,
     /// `_SCAN_LOCK` + the per-session identity cache it guards.
     scan: Mutex<scene::IdentityCache>,
@@ -77,6 +77,15 @@ impl<T> HotSlot<T> {
         let prev = self.inner.write().unwrap_or_else(|e| e.into_inner()).replace(Ok(Arc::new(v)));
         prev.and_then(|r| r.ok())
     }
+    /// Drop the live value (idle unload); returns it. An error stays.
+    pub fn take_live(&self) -> Option<Arc<T>> {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if matches!(g.as_ref(), Some(Ok(_))) {
+            g.take().and_then(|r| r.ok())
+        } else {
+            None
+        }
+    }
     /// First-load result (only when nothing was attempted yet).
     pub fn init_with(&self, f: impl FnOnce() -> Result<T, String>) -> Result<Arc<T>, String> {
         if let Some(r) = self.get() {
@@ -109,25 +118,105 @@ pub fn load_indexes(dir: &std::path::Path) -> Result<(Oracle, Printings), String
 }
 
 pub fn engine() -> Result<Arc<Engine>, String> {
+    touch_use();
     if let Some(r) = ENGINE.get() {
         return r;
     }
     let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
-    ENGINE.init_with(|| {
+    let r = ENGINE.init_with(|| {
         let t0 = Instant::now();
+        let rss0 = rss_mb();
         let dir = scan_ocr::data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?;
-        let (oracle, printings) = load_indexes(&dir)?;
+        let mut oracle = scan_ocr::names::Oracle::load(&dir)?;
+        let rss_oracle = rss_mb();
+        let printings = printings::Printings::load(&dir, &mut oracle)?;
+        let rss_print = rss_mb();
         let rec = rec::engine()?;
         // `init_ocr` warm-up: pay graph setup before scan one.
         let _ = rec.recognize(&[scan_ocr::pil::Rgb { w: 512, h: 64, px: vec![255; 512 * 64 * 3] }]);
+        let rss_rec = rss_mb();
         tracing::info!(
-            "cardscan in-process: {} oracle titles, {} printings in {:.1}s",
+            "cardscan in-process: {} oracle titles, {} printings in {:.1}s (rss MB: start {rss0}, +oracle {}, +printings {}, +ocr {})",
             oracle.norm_list.len(),
             printings.len(),
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            rss_oracle - rss0,
+            rss_print - rss_oracle,
+            rss_rec - rss_print,
         );
         Engine::from_parts(oracle, printings)
-    })
+    });
+    if r.is_ok() {
+        spawn_janitor();
+    }
+    r
+}
+
+/// Resident set in MB (/proc/self/statm), for the load attribution log.
+fn rss_mb() -> i64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<i64>().ok()))
+        .map(|pages| pages * 4096 / (1 << 20))
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Idle unload (TOTORO mem). The loaded engine (oracle titles, printing
+// resolver tables, ORT recogniser) is ~230 MB resident for a feature used in
+// bursts. After `CARDSCAN_IDLE_SECS` (default 900 = 15 min; 0 = never) with
+// no cardscan request, a janitor drops the engine + recogniser and trims the
+// heap; the next request reloads the same files (~2 s, the existing lazy
+// first-load path, which the status probe already waits out). Mirrors
+// cvscan's CV_SCAN_IDLE_SECS janitor for the scan-match catalog.
+// ---------------------------------------------------------------------------
+
+static LAST_USE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn touch_use() {
+    LAST_USE_MS.store(crate::util::now_ms_u64(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn idle_ttl_ms() -> u64 {
+    match std::env::var("CARDSCAN_IDLE_SECS") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse::<u64>().unwrap_or(900).saturating_mul(1000),
+        _ => 900_000,
+    }
+}
+
+/// One janitor decision: unload when loaded, enabled and idle past the TTL.
+pub fn idle_due(now_ms: u64, last_ms: u64, ttl_ms: u64, loaded: bool) -> bool {
+    loaded && ttl_ms > 0 && now_ms.saturating_sub(last_ms) >= ttl_ms
+}
+
+/// Drop the live engine + recogniser if idle (or `force`). Returns true when
+/// something was unloaded. Serialised with loads and nightly installs.
+pub fn unload_if_idle(force: bool) -> bool {
+    let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::util::now_ms_u64();
+    let last = LAST_USE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if !force && !idle_due(now, last, idle_ttl_ms(), ENGINE.live().is_some()) {
+        return false;
+    }
+    let dropped = ENGINE.take_live().is_some();
+    let rec_dropped = rec::unload();
+    if dropped || rec_dropped {
+        crate::collection::trim_heap();
+        tracing::info!("cardscan in-process: engine unloaded after idle (reloads on next scan)");
+    }
+    dropped || rec_dropped
+}
+
+fn spawn_janitor() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if idle_ttl_ms() == 0 || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let tick = Duration::from_millis((idle_ttl_ms() / 15).clamp(1_000, 60_000));
+    let _ = std::thread::Builder::new().name("cardscan-idle".into()).spawn(move || loop {
+        std::thread::sleep(tick);
+        unload_if_idle(false);
+    });
 }
 
 /// The engine if it is loaded (no lazy load).
@@ -145,14 +234,17 @@ pub fn install_engine(e: Engine) {
 /// Load the indexes + model in the background at boot (the sidecar loads
 /// them before serving), so scan one does not pay ~3 s of JSON parsing.
 pub fn spawn_warm() {
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if http_mode() || scan_ocr::data_dir().is_none() || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    // One warm-up thread at a time; re-armed when it finishes so a status
+    // probe after an idle unload can trigger the reload again.
+    static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if http_mode() || scan_ocr::data_dir().is_none() || WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(|| {
         if let Err(e) = engine() {
             tracing::warn!("cardscan in-process engine unavailable: {e}");
         }
+        WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -214,6 +306,7 @@ pub fn handle(method: &str, path: &str, headers: &[(String, String)], body: &[u8
     if http_mode() {
         return None;
     }
+    touch_use();
     if method == "GET" && path == "/api/health" {
         // cutfix BUG-2: the sidecar loaded its models before it listened, so
         // its health probe never saw a half-loaded engine, and FastScanner
@@ -319,4 +412,19 @@ pub fn handle(method: &str, path: &str, headers: &[(String, String)], body: &[u8
         }
         _ => (404, json!({"error": "not found"})),
     })
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::idle_due;
+
+    #[test]
+    fn idle_unload_decision() {
+        let ttl = 900_000;
+        assert!(!idle_due(1_000_000, 500_000, ttl, true), "used 500 s ago: keep");
+        assert!(idle_due(1_400_000, 500_000, ttl, true), "idle exactly the TTL: unload");
+        assert!(!idle_due(9_000_000, 0, ttl, false), "nothing loaded: nothing to do");
+        assert!(!idle_due(9_000_000, 0, 0, true), "CARDSCAN_IDLE_SECS=0 disables");
+        assert!(!idle_due(0, 5, ttl, true), "clock skew never underflows");
+    }
 }

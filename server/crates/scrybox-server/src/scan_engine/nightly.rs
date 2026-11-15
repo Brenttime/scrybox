@@ -209,7 +209,7 @@ pub fn build_index_json(oracle: &Oracle, printings: &Printings, meta: &CardMeta)
         if let Some(&n) = pid.get(&p.id) {
             return Ok(n);
         }
-        let cols = PrintingCols::parse(p.raw.get())?;
+        let cols = PrintingCols::parse(&printings.raw(i))?;
         let mut r = String::with_capacity(96);
         r.push('[');
         js_opt(&mut r, &p.id);

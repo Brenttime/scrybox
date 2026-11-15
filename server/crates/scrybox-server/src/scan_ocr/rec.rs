@@ -6,7 +6,7 @@
 use super::cvresize::resize_linear;
 use super::pil::Rgb;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub const REC_MODEL_FILE: &str = "PP-OCRv6_rec_small.onnx";
 const IMG_H: usize = 48;
@@ -20,7 +20,10 @@ pub struct RecEngine {
     input: String,
 }
 
-static ENGINE: OnceLock<Result<RecEngine, String>> = OnceLock::new();
+/// The shared recogniser. TOTORO mem: droppable (`unload`) so an idle
+/// scanner returns the ORT session; the next `engine()` reloads it from the
+/// same model file. A load error stays cached like the old OnceLock did.
+static ENGINE: Mutex<Option<Result<Arc<RecEngine>, String>>> = Mutex::new(None);
 
 /// Model dir: SCRYBOX_OCR_MODEL_DIR, else `<CV_MODEL_DIR>/ocr`.
 pub fn model_dir() -> Option<PathBuf> {
@@ -69,33 +72,50 @@ pub fn model_character(path: &std::path::Path) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
-pub fn engine() -> Result<&'static RecEngine, String> {
-    ENGINE
-        .get_or_init(|| {
-            let dir = model_dir().ok_or("no OCR model dir")?;
-            let env = crate::cvscan::ort_env()?;
-            let threads: usize = std::env::var("CARDSCAN_OCR_THREADS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8));
-            let eps = [ort::ep::CPU::default().with_arena_allocator(false).build()];
-            let mut b = ort::session::Session::builder(env).map_err(|e| e.to_string())?;
-            b = b.with_intra_threads(threads).map_err(|e| e.to_string())?;
-            b = b.with_inter_threads(1).map_err(|e| e.to_string())?;
-            b = b.with_execution_providers(&eps).map_err(|e| e.to_string())?;
-            let s = b.commit_from_file(dir.join(REC_MODEL_FILE)).map_err(|e| e.to_string())?;
-            let meta = s.metadata().map_err(|e| e.to_string())?;
-            let raw = meta.custom("character").ok_or("rec model has no character metadata")?;
-            let mut chars = py_splitlines(&raw);
-            chars.push(" ".into());
-            chars.insert(0, "blank".into());
-            let input = s.inputs()[0].name().to_string();
-            let output = s.outputs()[0].name().to_string();
-            drop(meta);
-            Ok(RecEngine { session: Mutex::new(s), chars, output, input })
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+pub fn engine() -> Result<Arc<RecEngine>, String> {
+    let mut g = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = g.as_ref() {
+        return r.clone();
+    }
+    let r = load().map(Arc::new);
+    *g = Some(r.clone());
+    r
+}
+
+/// Drop the cached recogniser (idle unload). In-flight users keep their
+/// `Arc`; a cached load error is kept (nothing to free, same answer).
+pub fn unload() -> bool {
+    let mut g = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(g.as_ref(), Some(Ok(_))) {
+        *g = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn load() -> Result<RecEngine, String> {
+    let dir = model_dir().ok_or("no OCR model dir")?;
+    let env = crate::cvscan::ort_env()?;
+    let threads: usize = std::env::var("CARDSCAN_OCR_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8));
+    let eps = [ort::ep::CPU::default().with_arena_allocator(false).build()];
+    let mut b = ort::session::Session::builder(env).map_err(|e| e.to_string())?;
+    b = b.with_intra_threads(threads).map_err(|e| e.to_string())?;
+    b = b.with_inter_threads(1).map_err(|e| e.to_string())?;
+    b = b.with_execution_providers(&eps).map_err(|e| e.to_string())?;
+    let s = b.commit_from_file(dir.join(REC_MODEL_FILE)).map_err(|e| e.to_string())?;
+    let meta = s.metadata().map_err(|e| e.to_string())?;
+    let raw = meta.custom("character").ok_or("rec model has no character metadata")?;
+    let mut chars = py_splitlines(&raw);
+    chars.push(" ".into());
+    chars.insert(0, "blank".into());
+    let input = s.inputs()[0].name().to_string();
+    let output = s.outputs()[0].name().to_string();
+    drop(meta);
+    Ok(RecEngine { session: Mutex::new(s), chars, output, input })
 }
 
 /// numpy pairwise_sum (float64) as used by `np.mean`.
