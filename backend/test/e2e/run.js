@@ -78,7 +78,19 @@ async function runTestFile(file) {
       }
     });
     
-    child.on('close', (code) => {
+    // LANE-A iter-26: 'close' waits for ALL stdio consumers, so a suite
+    // that crashes while a stdio-inheriting grandchild (the per-boot
+    // rust-e2e-mock-server.js, or any fixture server the suite spawns) is
+    // still alive pins the event forever — the runner sat 15+ min at one
+    // suite. Resolve on 'exit' with a short drain grace: the normal path
+    // still gets 'close' (full output flushed); the crash path forces the
+    // streams shut after the grace window instead of hanging.
+    let settled = false;
+    let graceTimer = null;
+    const settle = (code) => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer) clearTimeout(graceTimer);
       if (code === 0) {
         console.log(`PASS: ${file} executed successfully.`);
         passedSuites++;
@@ -89,12 +101,24 @@ async function runTestFile(file) {
           fileFailed = 1;
         }
       }
-      
+
       totalPassed += filePassed;
       totalFailed += fileFailed;
-      
+
       resolve();
+    };
+    child.once('exit', (code) => {
+      graceTimer = setTimeout(() => {
+        console.error(`WARN: ${file} exited (code ${code}) but its stdio is still held open by a surviving child — forcing the streams shut.`);
+        if (child.stdout) child.stdout.destroy();
+        if (child.stderr) child.stderr.destroy();
+        settle(code);
+      }, 2000);
+      // deliberately NOT unref'd: this timer is the only thing standing
+      // between a crashed suite and the runner skipping the remaining
+      // suites — it must always get to fire.
     });
+    child.on('close', (code) => settle(code));
   });
 }
 

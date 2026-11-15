@@ -122,12 +122,23 @@ cp.spawn = function (cmd, args, opts) {
     const mp = nextMockPort++;
     // Fixture server per server-boot (matches Node semantics: one mock state
     // per server process, incl. per-boot MOCK_SCRYFALL_ERROR/DELAY flags).
-    // stdio ignore + unref: never keeps the suite alive; ppid watchdog in the
-    // mock child reaps orphans if a suite forgets process.exit().
+    // stdio ignore (ALL THREE — LANE-A iter-26: stderr 'inherit' made the
+    // mock a stdio consumer of the SUITE's pipes, so a suite that crashed
+    // with the mock alive pinned run.js's 'close' event forever) + unref;
+    // ppid watchdog in the mock child reaps orphans if a suite forgets
+    // process.exit(), and the suite-exit kill below covers a stuck watchdog.
     const mock = realSpawn(process.execPath, [MOCK, String(mp)], {
-      stdio: ['ignore', 'ignore', 'inherit'], env: { ...env },
+      stdio: 'ignore', env: { ...env },
     });
     if (typeof mock.unref === 'function') mock.unref();
+    // Replace the diagnostics stderr 'inherit' used to give, without
+    // re-inheriting the pipe: surface a dying fixture server loudly.
+    mock.once('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        console.error(`[rust-e2e] fixture mock (port ${mp}) exited with code ${code}`);
+      }
+    });
+    rustChildren.push(mock);
     env.SCRYBOX_BIND = `127.0.0.1:${port}`;
     if (env.DB_PATH) env.SCRYBOX_DB_PATH = env.DB_PATH;
     env.SCRYBOX_NODE_UPSTREAM = '';
