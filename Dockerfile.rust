@@ -149,6 +149,8 @@ COPY --chown=1000:1000 --from=frontend-builder /app/frontend/dist /app/frontend/
 # entrypoint-rust.sh is LF in-tree (verified); --chmod bakes the exec bit
 # (scratch has no RUN shell for sed/chmod).
 COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
+# In-process cardscan OCR assets (empty unless SCRYBOX_OCR_SRC was staged).
+COPY server/docker/ocr/ /opt/ocr/
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -159,6 +161,8 @@ ENV PORT=3001 \
     CV_MODEL_DIR=/app/database/models \
     ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
     SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
+    SCRYBOX_OCR_MODEL_DIR=/opt/ocr \
+    SCRYBOX_CARDSCAN_DATA=/opt/ocr \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \
     RUST_MIGRATIONS=true \

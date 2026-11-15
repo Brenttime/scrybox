@@ -41,6 +41,7 @@ pub mod catalog_read;
 pub mod collq;
 pub mod scryq;
 pub mod cvscan;
+pub mod scan_ocr;
 pub mod ip_limit;
 pub mod oidc;
 pub mod oracle_tags;

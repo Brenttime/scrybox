@@ -2,3 +2,4 @@
 # commit the ~55 MB of binaries.
 bin/
 lib/
+ocr/
