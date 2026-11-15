@@ -21,7 +21,13 @@
 #   scryjpeg   server/native/build.sh over sha-pinned mozjpeg 4.1.5 (no nasm:
 #              the shipped shim was built WITHOUT SIMD — keep the decoder
 #              bit-identical).
-#   ocr        PP-OCRv6_rec_small.onnx, rapidocr 3.9.2's file (sha256-pinned).
+#   ocr        REFERENCE-ONLY pin stage for PP-OCRv6_rec_small.onnx (rapidocr
+#              3.9.2, sha256-pinned). Since lane-B iter-64 the recogniser is
+#              OPERATOR-FETCHED by the server into ${CV_MODEL_DIR}/ocr at
+#              first use (no longer a shipped layer — `docker images` SIZE
+#              gate); the stage stays as the pin's canonical source, mirrored
+#              by scan_ocr::rec::{REC_MODEL_URL,REC_MODEL_SHA256} (a cargo
+#              pin test fails if they drift).
 #   rust-build cargo build --release inside docker; BuildKit cache mounts for
 #              the registry + target dir keep rebuilds incremental.
 #
@@ -107,7 +113,11 @@ COPY server/native/ /src/native/
 RUN cd /src/native && sh ./build.sh /tmp/mozjpeg-4.1.5 /out && rm -rf /tmp/mozjpeg-4.1.5
 
 # =========================================
-# OCR recogniser (rapidocr 3.9.2 PP-OCRv6_rec_small, sha256-pinned)
+# OCR recogniser (rapidocr 3.9.2 PP-OCRv6_rec_small, sha256-pinned).
+# REFERENCE-ONLY since lane-B iter-64: nothing COPYs from this stage (the
+# server operator-fetches the file at runtime with the SAME pin — see
+# scan_ocr::rec::REC_MODEL_URL/SHA256, kept in sync by a cargo test), so
+# BuildKit never builds it. Re-shipping the model starts here.
 # =========================================
 FROM native-base AS ocr
 ARG OCR_URL=https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx
@@ -270,8 +280,15 @@ COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
 # the bulk files live in the volume (see SCRYBOX_LSF_DATA_DIR below).
 COPY --chown=1000:1000 local-scryfall/static/ /app/scryfall/static/
 COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-meta.json local-scryfall/data/land_cycles.json /app/scryfall/data/
-# In-process cardscan (TOTORO mono scan2): only the PP-OCRv6 recogniser ships
-# here (fetched + sha-checked in the `ocr` stage). OpenCV (core+imgproc,
+# In-process cardscan (TOTORO mono scan2): the PP-OCRv6 recogniser does NOT
+# ship here since lane-B iter-64 — it is operator-fetched, sha256-verified
+# and atomically installed into ${CV_MODEL_DIR}/ocr by the server itself
+# (prefetched at boot; lazily re-attempted on first scan/status; disable with
+# SCRYBOX_OCR_MODEL_FETCH=0). Same policy the two AGPL card models follow,
+# and the reason `docker images` SIZE fits the 150 MB gate. To ship it again:
+# copy the `ocr` stage's /out/ into an image dir and re-point
+# SCRYBOX_OCR_MODEL_DIR at it (see scan_ocr::rec for the pin constants).
+# OpenCV (core+imgproc,
 # 4.10 + IPP-ICV) is linked STATICALLY into scrybox-server, so no libopencv
 # joins the ldd closure. The indexes live in the volume at
 # SCRYBOX_CARDSCAN_DATA (a sidecar data/ dir can be mounted as-is); missing
@@ -279,7 +296,6 @@ COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-
 # engine's default-cards bulk, oracle titles from Scryfall oracle-cards).
 # CARDSCAN_URL unset = in-process; set it to keep proxying to a sidecar.
 # (static OpenCV + OPENCV_* env: see the `opencv` / `rust-build` stages).
-COPY --from=ocr /out/ /opt/ocr/
 
 ENV PORT=3001 \
     SCRYBOX_BIND=0.0.0.0:3001 \
@@ -290,7 +306,6 @@ ENV PORT=3001 \
     CV_MODEL_DIR=/app/database/models \
     ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
     SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
-    SCRYBOX_OCR_MODEL_DIR=/opt/ocr \
     SCRYBOX_CARDSCAN_DATA=/app/database/cardscan-data \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \

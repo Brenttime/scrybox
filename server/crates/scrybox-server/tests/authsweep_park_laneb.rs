@@ -80,6 +80,23 @@ fn seed(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// REVIEW lane-B (Lane-A iter-22 find): event-driven release for the
+/// parking pins. The blind `sleep(300ms); release` reddened (or went
+/// vacuously green) under full-suite load when the worker was slow to
+/// reach its first get_async idle-miss: the holder dropped the conn first
+/// and the next checkout legitimately idle-popped. Hold the conn(s) until
+/// the pool's counter shows the request actually attempted its hop(s); a
+/// reverted (inline sync get()) build never registers the counter, so we
+/// fall back after 5 s and the original RED arms (parked worker ->
+/// recv_timeout; tripwire panic; thread-death) still fire unchanged.
+fn release_after_hops(pool: &scrybox_server::db::DbPool, release_tx: tokio::sync::oneshot::Sender<()>, expect: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pool.blocking_fallbacks() < expect && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let _ = release_tx.send(());
+}
+
 /// Shared harness (authsweep_park.rs parked_probe shape). STANDALONE
 /// (empty node_upstream). rust_routes pins exactly the group under
 /// test. Returns (status, body, pool).
@@ -164,11 +181,12 @@ fn parked_probe(
         });
     });
 
-    // Give the request task time to reach its cap wait, then free the pool.
-    // Pre-fix this never helps: the worker parked on the Condvar cannot run
-    // the releasing task either, so recv_timeout below expires.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let _ = release_tx.send(());
+    // Give the request task time to reach its cap wait, then free the pool
+    // (event-driven: wait for the auth-checkout hop counter, see
+    // release_after_hops). Pre-fix this never helps: the worker parked on
+    // the Condvar cannot run the releasing task either, so recv_timeout
+    // below expires.
+    release_after_hops(&pool, release_tx, 1);
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
         panic!(
@@ -565,12 +583,13 @@ fn contended_probe(
         });
     });
 
-    // Free the grabber once the contended checkout has had time to occur
-    // (mock leg is 20 ms + curl spawn margin). Pre-fix the worker itself
-    // is parked on the cap, so this release can never run and the pin
-    // dies at the recv_timeout below.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let _ = release_tx.send(());
+    // Free the grabber once the contended checkout has actually occurred
+    // (event-driven: wait for BOTH hops — auth checkout + post-yield body
+    // checkout — see release_after_hops; the old blind 300 ms sleep could
+    // land before the grabber engaged under load -> vacuous green or false
+    // RED). Pre-fix the worker itself is parked on the cap, so this
+    // release can never run and the pin dies at the recv_timeout below.
+    release_after_hops(&pool, release_tx, 2);
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
         panic!(
@@ -797,8 +816,11 @@ fn tripwire_probe_seed(search: Value, expected: u16) -> (u16, Vec<u8>, Arc<scryb
         })
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let _ = release_tx.send(());
+    // Event-driven (REVIEW lane-B): the request's auth checkout must have
+    // registered its hop before the holder drops; body sites 159/207 run
+    // post-release inside the 500 ms x2 courtesy sleeps with the tripwire
+    // still armed (see release_after_hops for why the blind sleep flaked).
+    release_after_hops(&pool, release_tx, 1);
 
     let (status, bytes) = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|e| {
         match e {

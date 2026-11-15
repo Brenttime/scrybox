@@ -44,25 +44,50 @@ pub fn http_mode() -> bool {
 }
 
 pub fn engine() -> Result<&'static Engine, String> {
-    ENGINE
-        .get_or_init(|| {
-            let t0 = Instant::now();
-            let dir = scan_ocr::data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?;
-            let mut oracle = Oracle::load(&dir)?;
-            let printings = Printings::load(&dir, &mut oracle)?;
-            let rec = rec::engine()?;
-            // `init_ocr` warm-up: pay graph setup before scan one.
-            let _ = rec.recognize(&[scan_ocr::pil::Rgb { w: 512, h: 64, px: vec![255; 512 * 64 * 3] }]);
-            tracing::info!(
-                "cardscan in-process: {} oracle titles, {} printings in {:.1}s",
-                oracle.norm_list.len(),
-                printings.len(),
-                t0.elapsed().as_secs_f64()
-            );
-            Ok(Engine { oracle, printings, rec, history: Mutex::new(Default::default()), scan: Mutex::new(Default::default()) })
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+    if let Some(r) = ENGINE.get() {
+        return r.as_ref().map_err(|e| e.clone());
+    }
+    // get_or_init blocks duplicate inits; replicate that with an explicit
+    // lock so a RETRYABLE init failure (iter-64: OCR recogniser fetch over a
+    // flaky network) can be returned WITHOUT caching — OnceLock would poison
+    // cardscan permanently offline for a transient error.
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+    let _g = INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(r) = ENGINE.get() {
+        return r.as_ref().map_err(|e| e.clone());
+    }
+    match init_engine() {
+        Ok(eng) => {
+            let _ = ENGINE.set(Ok(eng));
+        }
+        Err((m, true)) => return Err(m), // transient: not cached, next probe/scan retries.
+        Err((m, false)) => {
+            let _ = ENGINE.set(Err(m.clone()));
+            return Err(m);
+        }
+    }
+    ENGINE.get().unwrap().as_ref().map_err(|e| e.clone())
+}
+
+fn init_engine() -> Result<Engine, (String, bool)> {
+    let t0 = Instant::now();
+    let dir = scan_ocr::data_dir().ok_or_else(|| ("SCRYBOX_CARDSCAN_DATA unset".to_string(), false))?;
+    let mut oracle = Oracle::load(&dir).map_err(|e| (e, false))?;
+    let printings = Printings::load(&dir, &mut oracle).map_err(|e| (e, false))?;
+    // Operator fetch policy (iter-64): the recogniser is no longer baked into
+    // the image; if missing, fetch the sha256-pinned file into the model
+    // volume (see scan_ocr::rec). Network-shaped failures are retryable.
+    rec::ensure_model_present().map_err(|e| (format!("ocr recogniser: {e}"), e.retryable))?;
+    let rec = rec::engine().map_err(|e| (e, false))?;
+    // `init_ocr` warm-up: pay graph setup before scan one.
+    let _ = rec.recognize(&[scan_ocr::pil::Rgb { w: 512, h: 64, px: vec![255; 512 * 64 * 3] }]);
+    tracing::info!(
+        "cardscan in-process: {} oracle titles, {} printings in {:.1}s",
+        oracle.norm_list.len(),
+        printings.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(Engine { oracle, printings, rec, history: Mutex::new(Default::default()), scan: Mutex::new(Default::default()) })
 }
 
 /// Load the indexes + model in the background at boot (the sidecar loads
@@ -73,9 +98,27 @@ pub fn spawn_warm() {
         return;
     }
     std::thread::spawn(|| {
-        if let Err(e) = engine() {
-            tracing::warn!("cardscan in-process engine unavailable: {e}");
+        // iter-64: retryable failures (OCR fetch network/CDN) are not cached
+        // by engine(), so retry here with a short backoff; a permanent
+        // failure is cached on the first attempt and ends the loop.
+        for attempt in 0..3u32 {
+            match engine() {
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!("cardscan in-process engine unavailable: {e}");
+                    if ENGINE.get().is_some() {
+                        return; // permanent (cached) — retrying cannot help.
+                    }
+                    if attempt + 1 < 3 {
+                        std::thread::sleep(Duration::from_secs(2 << attempt));
+                    }
+                }
+            }
         }
+        // Transient failure with the retries spent: release the gate so the
+        // next status probe respawns the warm thread instead of hanging in
+        // "loading" forever.
+        STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -92,6 +135,18 @@ pub fn boot() {
     let Some(dir) = scan_ocr::data_dir() else { return };
     let warm = std::env::var("SCRYBOX_CARDSCAN_WARM").is_ok_and(|v| v == "1");
     tokio::spawn(async move {
+        // iter-64: prefetch the operator-fetched OCR recogniser into the
+        // model volume at boot, so scan/status #1 does not pay the ~20 MB
+        // download inside the STATUS_LOAD_WAIT window. Best effort: a
+        // transient failure just leaves the lazy fetch to retry on first use.
+        // spawn_blocking: ensure_model_present drives its own hyper hop on a
+        // throwaway runtime — never block a worker with it.
+        let hop = tokio::task::spawn_blocking(rec::ensure_model_present).await;
+        match hop {
+            Ok(Err(e)) => tracing::warn!("cardscan OCR prefetch: {e}"),
+            Err(e) => tracing::warn!("cardscan OCR prefetch: join error {e}"),
+            Ok(Ok(())) => {}
+        }
         jobs::ensure_indexes(dir).await;
         if warm {
             spawn_warm();

@@ -5,10 +5,195 @@
 
 use super::cvresize::resize_linear;
 use super::pil::Rgb;
+use http_body_util::BodyExt as _;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const REC_MODEL_FILE: &str = "PP-OCRv6_rec_small.onnx";
+
+// ---------------------------------------------------------------------------
+// Operator fetch policy (lane-B iter-64)
+// ---------------------------------------------------------------------------
+//
+// PP-OCRv6_rec_small.onnx no longer ships in the Node-free image
+// (Dockerfile.rust `docker images` SIZE gate). It follows the SAME policy as
+// the two card models in model_assets: missing from the model dir -> fetch
+// on demand, verify against the pinned sha256, install atomically into the
+// model volume (${CV_MODEL_DIR}/ocr persists across container recreations).
+// The pins mirror the `ocr` builder stage of Dockerfile.rust (ModelScope
+// RapidAI/RapidOCR v3.9.2 — Apache-2.0, so shipping it is allowed too; this
+// is purely a size call, unlike the AGPL card models).
+//
+// Env knobs:
+//   SCRYBOX_OCR_MODEL_FETCH=0  never fetch (offline hosts). A missing file
+//                              then behaves exactly like the pre-iter-64
+//                              permanent "offline" arm.
+//   SCRYBOX_OCR_MODEL_BASE     base-URL override (private mirror; tests).
+//   SCRYBOX_OCR_MODEL_SHA256   re-pin the checksum (empty = skip verify —
+//                              same test convention as model_assets).
+// The status probe stays non-poisoning: engine init treats a `retryable`
+// fetch error as "try again", so a transient network failure never leaves
+// cardscan permanently offline (cutfix BUG-2's "never show offline" spirit).
+
+pub const REC_MODEL_URL: &str =
+    "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx";
+pub const REC_MODEL_SHA256: &str = "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884";
+
+#[derive(Debug)]
+pub struct OcrFetchError {
+    /// true = worth retrying on the next probe/scan (network, CDN, sha
+    /// mismatch on a corrupt response); false = permanent until the
+    /// environment changes (no model dir, fetch disabled).
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl OcrFetchError {
+    fn fatal(m: impl Into<String>) -> Self {
+        Self { retryable: false, message: m.into() }
+    }
+    fn retry(m: impl Into<String>) -> Self {
+        Self { retryable: true, message: m.into() }
+    }
+}
+
+impl std::fmt::Display for OcrFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn fetch_locks() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>> {
+    static TABLE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    TABLE.get_or_init(Default::default)
+}
+
+/// Single-flight: concurrent first scans/probes share one download per path.
+fn fetch_lock(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
+    let mut t = fetch_locks().lock().unwrap_or_else(|p| p.into_inner());
+    t.entry(path.to_string_lossy().into_owned())
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Ensure `REC_MODEL_FILE` exists in `model_dir()`. Ok = the recogniser is
+/// loadable (already present, or fetched + sha256-verified into place).
+pub fn ensure_model_present() -> Result<(), OcrFetchError> {
+    let dir = model_dir()
+        .ok_or_else(|| OcrFetchError::fatal("no OCR model dir (set SCRYBOX_OCR_MODEL_DIR or CV_MODEL_DIR)"))?;
+    ensure_model_in(&dir)
+}
+
+/// ensure_model_present over an explicit dir (test seam: env-pinned model
+/// dirs stay untouched).
+pub fn ensure_model_in(dir: &std::path::Path) -> Result<(), OcrFetchError> {
+    let path = dir.join(REC_MODEL_FILE);
+    if path.is_file() {
+        return Ok(());
+    }
+    if std::env::var("SCRYBOX_OCR_MODEL_FETCH").map(|v| v == "0").unwrap_or(false) {
+        return Err(OcrFetchError::fatal(format!(
+            "{REC_MODEL_FILE} not present in {} and SCRYBOX_OCR_MODEL_FETCH=0",
+            dir.display()
+        )));
+    }
+    let base = std::env::var("SCRYBOX_OCR_MODEL_BASE").unwrap_or_else(|_| REC_MODEL_URL.to_string());
+    if base.trim().is_empty() {
+        return Err(OcrFetchError::fatal("SCRYBOX_OCR_MODEL_BASE is empty"));
+    }
+    let sha = std::env::var("SCRYBOX_OCR_MODEL_SHA256").unwrap_or_else(|_| REC_MODEL_SHA256.to_string());
+    let lock = fetch_lock(&path);
+    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+    if path.is_file() {
+        return Ok(()); // another fetch won the race — fine.
+    }
+    std::fs::create_dir_all(dir).map_err(|e| OcrFetchError::fatal(format!("create {}: {e}", dir.display())))?;
+    // Runs on the dedicated warm thread or the blocking pool (cardscan.rs
+    // dispatches handle() through spawn_blocking), never on a runtime worker,
+    // so a throwaway current-thread runtime for the hyper hop is safe here.
+    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(fetch_to(&path, &base, &sha)),
+        Err(e) => Err(OcrFetchError::retry(format!("ocr fetch runtime: {e}"))),
+    }
+}
+
+/// Redirect-following GET (same 10-hop ladder as model_assets::fetch_asset),
+/// sha256 verify BEFORE install, `.tmp` + atomic rename, tmp removed on any
+/// failure — a failed fetch never truncates or half-installs the model.
+/// Builds its OWN hyper client (pool_idle_timeout=0): ensure_model_in runs
+/// the future on a throwaway current-thread runtime, and the shared
+/// model_assets dl_client would strand its keep-alive pool tasks there —
+/// dropping that runtime then blocks ~90 s per fetch waiting for them.
+async fn fetch_to(path: &std::path::Path, url: &str, sha: &str) -> Result<(), OcrFetchError> {
+    use axum::http::header;
+    let client: hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        String,
+    > = {
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|e| OcrFetchError::fatal(format!("native roots: {e}")))?
+            .https_or_http()
+            .enable_http1()
+            .build();
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .pool_idle_timeout(std::time::Duration::ZERO)
+            .build(https)
+    };
+    let tmp = format!("{}.tmp", path.to_string_lossy());
+    let body = 'redirects: {
+        let mut url = url.to_string();
+        for _ in 0..10 {
+            let uri = url.parse::<axum::http::Uri>().map_err(|e| OcrFetchError::retry(e.to_string()))?;
+            let req = hyper::Request::builder()
+                .method(hyper::Method::GET)
+                .uri(uri)
+                .header(header::USER_AGENT, axum::http::HeaderValue::from_static("curl/8.5.0"))
+                .body(String::new())
+                .map_err(|e| OcrFetchError::retry(e.to_string()))?;
+            let res = client
+                .request(req)
+                .await
+                .map_err(|e| OcrFetchError::retry(format!("GET {url}: {e}")))?;
+            let status = res.status();
+            if status.is_redirection() {
+                if let Some(loc) = res.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()) {
+                    url = crate::catalog_build::join_uri(&url, loc);
+                    continue;
+                }
+            }
+            if !status.is_success() {
+                return Err(OcrFetchError::retry(format!("HTTP {} fetching {REC_MODEL_FILE}", status.as_u16())));
+            }
+            break 'redirects res.into_body();
+        }
+        return Err(OcrFetchError::retry("too many redirects".to_string()));
+    };
+    let bytes = body.collect().await.map_err(|e| OcrFetchError::retry(format!("body: {e}")))?.to_bytes();
+    if !sha.is_empty() {
+        use sha2::Digest as _;
+        let got = format!("{:x}", sha2::Sha256::new().chain_update(&bytes).finalize());
+        if !got.eq_ignore_ascii_case(sha) {
+            // Retryable: CDN edges serve corrupt bodies sometimes; a genuinely
+            // wrong pin just retries (and logs) until the operator fixes it.
+            return Err(OcrFetchError::retry(format!(
+                "sha256 mismatch for {url}: expected {sha}, got {got} — refusing to install"
+            )));
+        }
+    }
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(OcrFetchError::fatal(format!("write {tmp}: {e}")));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(OcrFetchError::fatal(format!("rename {tmp} -> {}: {e}", path.display())));
+    }
+    tracing::info!("cardscan OCR recogniser fetched: {} bytes from {url}", bytes.len());
+    Ok(())
+}
+
 const IMG_H: usize = 48;
 const IMG_W: usize = 320;
 const BATCH: usize = 6;
