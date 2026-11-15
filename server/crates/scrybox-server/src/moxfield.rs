@@ -230,7 +230,7 @@ async fn backfill_missing_cards(st: &AppState, entries: &[BoardEntry]) -> Result
     let mut missing: Vec<(String, Value)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         for e in entries {
             let id = scrybox_card_id(&e.card);
             if seen.insert(id.clone()) {
@@ -284,14 +284,14 @@ async fn backfill_missing_cards(st: &AppState, entries: &[BoardEntry]) -> Result
         }
     }
     if !fresh.is_empty() {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         cache_normalized_cards(&conn, &fresh).map_err(|e| SyncError::plain(e.to_string()))?;
     }
     // Still missing means Scryfall itself has no record — synthesize from
     // the Moxfield card block (first entry per id, entry order).
     let mut synthesized: Vec<Map<String, Value>> = Vec::new();
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         for (id, card) in &missing {
             // Same TEXT-id caveat as the first existence check above:
             // get::<i64> on the TEXT id column always errors, which would
@@ -317,7 +317,7 @@ async fn backfill_missing_cards(st: &AppState, entries: &[BoardEntry]) -> Result
             synthesized.len(),
             names.join(", ")
         );
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         cache_normalized_cards(&conn, &synthesized).map_err(|e| SyncError::plain(e.to_string()))?;
     }
     Ok(())
@@ -457,7 +457,7 @@ async fn upsert_tracking_row(
     let author_id = row_i64(author, "id");
     let author_user_id = row_i64(author, "user_id");
     let _guard = alloc_lock().lock().await;
-    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
     let mut tx = Tx::begin(&conn).map_err(|e| SyncError::plain(format!("{e:?}")))?;
 
     // Discovery is remote work and may finish after the author was removed.
@@ -574,7 +574,7 @@ fn count_param(v: Option<&Value>) -> P {
 /// history).
 async fn retire_deck(st: &AppState, author_id: Option<i64>, public_id: &str) -> Result<bool, SyncError> {
     let _guard = alloc_lock().lock().await;
-    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
     let mut tx = Tx::begin(&conn).map_err(|e| SyncError::plain(format!("{e:?}")))?;
     let row = query_one(
         &conn,
@@ -622,7 +622,7 @@ async fn retire_deck(st: &AppState, author_id: Option<i64>, public_id: &str) -> 
 /// retire deleted ones, refresh the stamp on every tracked row.
 pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i64>) -> Result<Map<String, Value>, SyncError> {
     let author = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(&conn, "SELECT * FROM moxfield_authors WHERE id = ?", &params_of(vec![author_id.into()]))
             .map_err(SyncError::plain)?
     };
@@ -646,7 +646,7 @@ pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i
     let user_name_for_lookup = row_str(&author, "moxfield_user").unwrap_or_default();
     let user_info = api.get_user(&user_name_for_lookup).await.map_err(SyncError::from_mox)?;
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         exec(
             &conn,
             "UPDATE moxfield_authors SET display_name = ?, profile_image_url = ?, last_error = NULL WHERE id = ?",
@@ -674,7 +674,7 @@ pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i
         }
         let public_id = row_str_of(summary.get("publicId"));
         let was_tracked = {
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             query_one(
                 &conn,
                 "SELECT id FROM moxfield_decks WHERE author_id = ? AND public_id = ?",
@@ -712,7 +712,7 @@ pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i
                     name_for_log,
                     err.message
                 );
-                let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+                let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
                 exec(
                     &conn,
                     "UPDATE moxfield_decks SET last_error = ? WHERE author_id = ? AND public_id = ?",
@@ -730,7 +730,7 @@ pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i
     // Decks that vanished on Moxfield.
     let mut removed = 0i64;
     let tracked = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_rows(
             &conn,
             "SELECT public_id FROM moxfield_decks WHERE author_id = ?",
@@ -754,7 +754,7 @@ pub async fn sync_decklist(st: &AppState, author_id: Option<i64>, user: Option<i
     }
 
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         exec(
             &conn,
             "UPDATE moxfield_authors SET last_decklist_sync_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -789,7 +789,7 @@ fn row_str_of(v: Option<&Value>) -> String {
 /// vanished are retired.
 pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Option<i64>) -> Result<Map<String, Value>, SyncError> {
     let author = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(&conn, "SELECT * FROM moxfield_authors WHERE id = ?", &params_of(vec![author_id.into()]))
             .map_err(SyncError::plain)?
     };
@@ -808,7 +808,7 @@ pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Optio
     // No ENABLED tracked decks (author just added, decklist sync pending, or
     // every deck unchecked): nothing to check, and NO network call.
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         let have = query_one(
             &conn,
             "SELECT COUNT(*) AS c FROM moxfield_decks WHERE author_id = ? AND enabled = 1",
@@ -839,7 +839,7 @@ pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Optio
         }
     }
     let tracked = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_rows(
             &conn,
             "SELECT md.*, d.checked_out AS mirror_checked_out
@@ -890,7 +890,7 @@ pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Optio
         // stamp) but never pull contents or create a mirror. JS === 0 strict.
         if row.get("enabled") == Some(&Value::from(0)) {
             skipped += 1;
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             refresh(&conn, &stamp)?;
             continue;
         }
@@ -914,7 +914,7 @@ pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Optio
                             err.message
                         );
                     }
-                    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+                    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
                     exec(
                         &conn,
                         "UPDATE moxfield_decks SET last_error = ? WHERE id = ?",
@@ -926,13 +926,13 @@ pub async fn run_content_sync(st: &AppState, author_id: Option<i64>, user: Optio
         }
         // Refresh the stored stamp (and the summary fields) even when no pull
         // happened, so the decklist job's view stays in step.
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         refresh(&conn, &stamp)?;
     }
 
     // Mark that we did a check just now, whether or not anything moved.
     {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         exec(
             &conn,
             "UPDATE moxfield_authors SET last_content_check_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -964,7 +964,7 @@ pub async fn pull_deck_content(
     let mut row: Option<Map<String, Value>> = match known_row {
         Some(r) => Some(r),
         None => {
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             query_one(
                 &conn,
                 "SELECT * FROM moxfield_decks WHERE author_id = ? AND public_id = ?",
@@ -996,7 +996,7 @@ pub async fn pull_deck_content(
     backfill_missing_cards(st, &entries.iter().cloned().chain(maybe_entries.iter().cloned()).collect::<Vec<_>>()).await?;
 
     let _guard = alloc_lock().lock().await;
-    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
     let mut tx = Tx::begin(&conn).map_err(|e| SyncError::plain(format!("{e:?}")))?;
 
     // A content pull may spend seconds in remote/cache I/O. Re-read tracking
@@ -1330,7 +1330,7 @@ pub async fn pull_deck_content(
 /// imported.
 pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enabled: bool) -> Result<Map<String, Value>, SyncError> {
     let row = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(
             &conn,
             "SELECT md.*, a.moxfield_user AS author_user
@@ -1348,7 +1348,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
 
     if enabled {
         {
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             exec(
                 &conn,
                 "UPDATE moxfield_decks SET enabled = 1, last_error = NULL WHERE id = ?",
@@ -1367,7 +1367,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
             return Ok(m);
         }
         let author = {
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             query_one(
                 &conn,
                 "SELECT * FROM moxfield_authors WHERE id = ?",
@@ -1378,7 +1378,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
         match author {
             Some(author) => {
                 if let Err(err) = pull_deck_content(st, &author, public_id, Some(row.clone())).await {
-                    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+                    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
                     exec(
                         &conn,
                         "UPDATE moxfield_decks SET last_error = ? WHERE id = ?",
@@ -1390,7 +1390,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
             None => {
                 // Node would TypeError reading author.moxfield_user off
                 // undefined; the FK makes this unreachable in practice.
-                let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+                let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
                 exec(
                     &conn,
                     "UPDATE moxfield_decks SET last_error = ? WHERE id = ?",
@@ -1403,7 +1403,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
             }
         }
         let fresh = {
-            let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+            let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
             query_one(
                 &conn,
                 "SELECT bindarr_deck_id FROM moxfield_decks WHERE id = ?",
@@ -1419,7 +1419,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
     }
 
     let _guard = alloc_lock().lock().await;
-    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
     let mut tx = Tx::begin(&conn).map_err(|e| SyncError::plain(format!("{e:?}")))?;
     let current = query_one(
         &conn,
@@ -1473,7 +1473,7 @@ pub async fn set_deck_enabled(st: &AppState, user_id: i64, public_id: &str, enab
 /// one author on Moxfield, so this is unique once found).
 pub async fn pull_deck_content_by_public_id(st: &AppState, user_id: i64, public_id: &str) -> Result<Map<String, Value>, SyncError> {
     let row = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(
             &conn,
             "SELECT md.* FROM moxfield_decks md
@@ -1488,7 +1488,7 @@ pub async fn pull_deck_content_by_public_id(st: &AppState, user_id: i64, public_
         None => return Err(SyncError::plain("Moxfield deck not found for this user")),
     };
     let author = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(
             &conn,
             "SELECT * FROM moxfield_authors WHERE id = ?",
@@ -1527,7 +1527,7 @@ pub async fn add_author(st: &AppState, user_id: i64, username: &Value) -> Result
     // silently-broken row.
     let user_info = st.mfx.get_user(&clean).await.map_err(SyncError::from_mox)?;
     let existing = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         query_one(
             &conn,
             "SELECT id FROM moxfield_authors WHERE user_id = ? AND LOWER(moxfield_user) = LOWER(?)",
@@ -1547,7 +1547,7 @@ pub async fn add_author(st: &AppState, user_id: i64, username: &Value) -> Result
         return Ok(m);
     }
     let new_id = {
-        let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+        let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
         exec(
             &conn,
             "INSERT INTO moxfield_authors (user_id, moxfield_user, display_name, profile_image_url) VALUES (?, ?, ?, ?)",
@@ -1578,7 +1578,7 @@ pub async fn add_author(st: &AppState, user_id: i64, username: &Value) -> Result
 /// Stop tracking an author: remove every mirrored deck this account produced.
 pub async fn remove_author(st: &AppState, user_id: i64, author_id: Option<i64>) -> Result<Map<String, Value>, SyncError> {
     let _guard = alloc_lock().lock().await;
-    let conn = st.db.as_ref().unwrap().get().map_err(|e| SyncError::plain(e.to_string()))?;
+    let conn = st.db.as_ref().unwrap().get_async().await.map_err(|e| SyncError::plain(e.to_string()))?;
     let mut tx = Tx::begin(&conn).map_err(|e| SyncError::plain(format!("{e:?}")))?;
     let author = query_one(
         &conn,
@@ -1804,7 +1804,7 @@ fn read_intervals(conn: &Connection) -> (i64, i64) {
 pub async fn tick(st: &AppState) {
     let Some(pool) = st.db.as_ref() else { return };
     let authors = {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!("Moxfield scheduler: no DB connection ({err})");
@@ -1827,7 +1827,7 @@ pub async fn tick(st: &AppState) {
         return; // nobody tracks Moxfield — nothing to do
     }
     let (decklist_min, content_min) = {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!("Moxfield scheduler: no DB connection ({err})");
@@ -1898,7 +1898,7 @@ pub async fn tick(st: &AppState) {
             // Record it on the author row so the UI can show what went
             // wrong, and back off this tick only — the next due tick retries.
             tracing::warn!("Moxfield sync ({job}) for {muser} failed: {}", err.message);
-            if let Ok(conn) = pool.get() {
+            if let Ok(conn) = pool.get_async().await {
                 let _ = exec(
                     &conn,
                     "UPDATE moxfield_authors SET last_error = ? WHERE id = ?",
@@ -1916,7 +1916,7 @@ pub async fn tick(st: &AppState) {
 pub async fn boot_catch_up(st: AppState) {
     let Some(pool) = st.db.clone() else { return };
     let authors = {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!("Moxfield sync boot catch-up failed: {err}");
@@ -1937,7 +1937,7 @@ pub async fn boot_catch_up(st: AppState) {
         }
     };
     let decklist_min = {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!("Moxfield sync boot catch-up failed: {err}");

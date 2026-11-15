@@ -341,6 +341,15 @@ impl DbPool {
         }
     }
 
+    /// Idle-only `try_get`: pops a returned connection or returns `None` —
+    /// never opens one, never waits on the live cap (the `take_idle`
+    /// accounting is shared with the `get_async` fast path). For async-safe
+    /// probes and for parking-pin tests that must seize a connection the
+    /// instant a handler returns it.
+    pub fn try_get_idle(self: &Arc<Self>) -> Option<OwnedConn> {
+        self.take_idle().map(|c| OwnedConn { pool: self.clone(), conn: Some(c) })
+    }
+
     /// Owned twin of [`get`](Self::get) for callers that must move the
     /// checkout across threads (or into `spawn_blocking`): the borrowed
     /// [`PooledConn`] cannot outlive the pool reference.

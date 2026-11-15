@@ -251,14 +251,15 @@ pub async fn handle_oracle(State(st): State<AppState>, req: Request) -> Response
         return node_exact(res).await;
     }
     let scry = st.scry.clone();
-    // Phase 1: cached answer or fetch decision (conn dropped before await —
-    // rusqlite connections are not Send).
-    let cached = (|| -> Result<Option<Result<Value, ()>>, Response> {
-        let conn = pool.get().map_err(|_| {
+    // Phase 1: cached answer or fetch decision (M5: get_async — idle-only
+    // pop / blocking-pool hop, conn dropped at the block end).
+    let cached: Result<Option<Result<Value, ()>>, Response> = (async {
+        let conn = pool.get_async().await.map_err(|_| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
         })?;
         Ok(oracle_cached(&conn, &card_id))
-    })();
+    })
+    .await;
     let cached = match cached {
         Ok(c) => c,
         Err(res) => return res,
@@ -288,12 +289,13 @@ pub async fn handle_oracle(State(st): State<AppState>, req: Request) -> Response
         }
     };
     // Phase 3: normalize + rules-text-only backfill.
-    let out = (|| -> Result<Value, Response> {
-        let conn = pool.get().map_err(|_| {
+    let out: Result<Value, Response> = (async {
+        let conn = pool.get_async().await.map_err(|_| {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
         })?;
         Ok(oracle_after_fetch(&conn, &card_id, &data))
-    })();
+    })
+    .await;
     match out {
         Ok(v) => json_response(StatusCode::OK, &v),
         Err(res) => res,
@@ -498,10 +500,11 @@ pub async fn handle_oracle_tags(State(st): State<AppState>, req: Request) -> Res
         return node_exact(res).await;
     }
     let fallback = query_param(query.as_deref(), "oracle_id");
-    let result = (|| -> Result<Value, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+    let result: Result<Value, String> = (async {
+        let conn = pool.get_async().await.map_err(|e| format!("read pool: {e}"))?;
         oracle_tags_query(&conn, &card_id, fallback.as_deref())
-    })();
+    })
+    .await;
     match result {
         Ok(v) => json_response(StatusCode::OK, &v),
         Err(e) => {
@@ -616,10 +619,11 @@ pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Respo
             "ids (1-1000) and slugs (1-100) are required",
         );
     }
-    let result = (|| -> Result<Value, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+    let result: Result<Value, String> = (async {
+        let conn = pool.get_async().await.map_err(|e| format!("read pool: {e}"))?;
         role_tags(&conn, &ids, &slugs)
-    })();
+    })
+    .await;
     match result {
         Ok(v) => json_response(StatusCode::OK, &v),
         Err(e) => {
@@ -811,10 +815,11 @@ pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Respo
     if ids.is_empty() || ids.len() > 1000 {
         return json_error(StatusCode::BAD_REQUEST, "ids (1-1000) are required");
     }
-    let result = (|| -> Result<Value, String> {
-        let conn = pool.get().map_err(|e| format!("read pool: {e}"))?;
+    let result: Result<Value, String> = (async {
+        let conn = pool.get_async().await.map_err(|e| format!("read pool: {e}"))?;
         tag_stats(&conn, &ids)
-    })();
+    })
+    .await;
     match result {
         Ok(v) => json_response(StatusCode::OK, &v),
         Err(e) => {

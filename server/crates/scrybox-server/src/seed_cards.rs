@@ -118,7 +118,7 @@ fn js_random() -> f64 {
 /// `getCardsBySet(setCode)` — scryfallApi.js:887. Never Errs: every failure
 /// (fetch throw past the 429-only retry, cacheCards throw) lands in Node's
 /// catch which returns [] for that set.
-async fn get_cards_by_set(st: &AppState, pool: &DbPool, url: &str, set_code: &str) -> Vec<Value> {
+async fn get_cards_by_set(st: &AppState, pool: &std::sync::Arc<DbPool>, url: &str, set_code: &str) -> Vec<Value> {
     // fetchFromScryfall(q, undefined, retries=3): only 429 continues the
     // loop; any other throw exits with the error (Node rethrows → catch).
     let mut body: Option<Value> = None;
@@ -156,7 +156,11 @@ async fn get_cards_by_set(st: &AppState, pool: &DbPool, url: &str, set_code: &st
         // SAME catch as the fetch error, so the set yields [] even though
         // the cards were fetched (faithful: cards are lost).
         let maps: Vec<Map<String, Value>> = cards.iter().filter_map(Value::as_object).cloned().collect();
-        match pool.get() {
+        // M5 (iter-62): this checkout runs INLINE on the runtime worker
+        // (async fn, right after the Scryfall await) — get() parks on the
+        // live-cap Condvar, which starves the whole runtime. get_async
+        // pops idle on the worker, else hops to the blocking pool.
+        match pool.get_async().await {
             Ok(conn) => {
                 if let Err(e) = cache_normalized_cards(&conn, &maps) {
                     tracing::error!("Error fetching MTG set {set_code} from Scryfall: {e}");
@@ -204,7 +208,10 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    let fallback_conn = pool.get().map_err(|e| {
+    // M5 (iter-62): first post-auth body checkout (same class as the
+    // iter-61 sweeps — same SQL, same folds, only the checkout moves to
+    // the idle-only pop + blocking hop).
+    let fallback_conn = pool.get_async().await.map_err(|e| {
         tracing::error!(error = %e, "seed_cards pool");
     });
     let conn = match fallback_conn {

@@ -707,7 +707,7 @@ pub async fn cards_by_id(st: &AppState, ids: &[String]) -> Result<HashMap<String
     let mut out: HashMap<String, CardRow> = HashMap::new();
     let pool = st.db.as_ref().ok_or("no db")?;
     for chunk in list.chunks(CACHE_CHUNK) {
-        let conn = pool.get().map_err(|e| e.to_string())?;
+        let conn = pool.get_async().await.map_err(|e| e.to_string())?;
         let ph = vec!["?"; chunk.len()].join(",");
         let params: Vec<SqlValue> = chunk.iter().map(|s| SqlValue::Text(s.clone())).collect();
         let mut stmt = conn
@@ -757,7 +757,7 @@ pub async fn cards_by_id(st: &AppState, ids: &[String]) -> Result<HashMap<String
             }
         }
         if !fresh.is_empty() {
-            let conn = pool.get().map_err(|e| e.to_string())?;
+            let conn = pool.get_async().await.map_err(|e| e.to_string())?;
             cache_normalized_cards(&conn, &fresh).map_err(|e| e.to_string())?;
             for c in &fresh {
                 let id = text_of(c, "id").unwrap_or_default();
@@ -900,7 +900,7 @@ pub async fn build_plan(st: &AppState, user_id: i64, csv: Value, include_lists: 
         None => return BuildOutcome::ServerError("no db".into()),
     };
     let rows: Vec<CollRow> = {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(e) => return BuildOutcome::ServerError(e.to_string()),
         };
@@ -934,7 +934,7 @@ pub async fn build_plan(st: &AppState, user_id: i64, csv: Value, include_lists: 
     let coll = plan_collection(&rows, &owned);
 
     let lists_plan = if include_lists {
-        let conn = match pool.get() {
+        let conn = match pool.get_async().await {
             Ok(c) => c,
             Err(e) => return BuildOutcome::ServerError(e.to_string()),
         };
@@ -1439,7 +1439,7 @@ pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
-    let conn = match st.db.as_ref().unwrap().get() {
+    let conn = match st.db.as_ref().unwrap().get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
     };
@@ -1497,7 +1497,7 @@ pub async fn handle_report(State(st): State<AppState>, Path(id): Path<String>, r
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
-    let conn = match st.db.as_ref().unwrap().get() {
+    let conn = match st.db.as_ref().unwrap().get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
     };

@@ -2018,11 +2018,6 @@ pub(crate) async fn prefetch_missing(
         let Some(card_id) = cand.get("cardId").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
             continue;
         };
-        let lookup = |sql: &'static str, params: Vec<SqlValue>| -> Option<Map<String, Value>> {
-            let conn = pool.get().ok()?;
-            let row = crate::decks_reads::one_row(&conn, sql, &params).ok()??;
-            crate::decks_reads::parse_card_row(&row).ok()
-        };
         let card = fetch_card_by_id(scry, pool, card_id).await;
         let Some(card) = card else { continue };
         if scry_code == "en" {
@@ -2039,12 +2034,23 @@ pub(crate) async fn prefetch_missing(
             continue;
         }
         let name = crate::search::to_name(Some(&scry_code));
-        if lookup(
-            "SELECT * FROM card_cache WHERE set_id = ?1 AND number = ?2 AND language = ?3 LIMIT 1",
-            vec![SqlValue::Text(set.clone()), SqlValue::Text(number.clone()), SqlValue::Text(name.clone())],
-        )
-        .is_some()
-        {
+        // M5 (iter-62): the getPrintingInLang twin's cache lookup ran a
+        // sync pool.get() INLINE on the runtime worker (prefetch_missing
+        // is an async fn reached from handle_scan_match standalone). The
+        // checkout now goes through get_async: idle-pop on the worker,
+        // blocking-pool hop when nothing is idle. Same SQL, same fold.
+        let existing = match pool.get_async().await.ok() {
+            Some(conn) => crate::decks_reads::one_row(
+                &conn,
+                "SELECT * FROM card_cache WHERE set_id = ?1 AND number = ?2 AND language = ?3 LIMIT 1",
+                &[SqlValue::Text(set.clone()), SqlValue::Text(number.clone()), SqlValue::Text(name.clone())],
+            )
+            .ok()
+            .flatten()
+            .and_then(|row| crate::decks_reads::parse_card_row(&row).ok()),
+            None => None,
+        };
+        if existing.is_some() {
             continue;
         }
         let path = format!(
@@ -2196,6 +2202,90 @@ mod tests {
             Hydrate::Done(m) => assert_eq!(m["card"]["language"], "Japanese"),
             _ => panic!("expected localized Done"),
         }
+    }
+
+    // LANE-B iter-62 (M5): the prefetch_missing getPrintingInLang cache
+    // lookup used to run a SYNC pool.get() inline on the runtime worker.
+    // legs_park tripwire shape: the single live slot is held by a runtime
+    // task (only another task on the SAME worker could free it), and the
+    // debug after_checkout_hook panics if any get() checkout executes on
+    // the runtime worker thread while the request is in flight. get_async
+    // never fires it (idle-pop path never calls get(); the hop runs
+    // get_conn on the blocking pool). RED-BEFORE-GREEN (measured): revert
+    // the lookup to pool.get() and this pin dies with the thread panic.
+    #[test]
+    fn prefetch_lookup_checkout_does_not_park_the_runtime_worker() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(include_str!("../tests/schema_fixture.sql"))
+            .unwrap();
+        let pool = Arc::new(
+            crate::db::DbPool::open_with(
+                &db_path,
+                crate::db::PoolConfig { max: 1, cache_kb: 1024, mmap_kb: 0, live_max: 1 },
+            )
+            .unwrap(),
+        );
+
+        let (tx, rx) = mpsc::channel::<bool>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let pool_rt = pool.clone();
+
+        std::thread::Builder::new()
+            .name("parked-prefetch-worker".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async move {
+                    let (scry, hits) = scry_mock().await;
+                    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+                    {
+                        let p = pool_rt.clone();
+                        tokio::spawn(async move {
+                            let h = p.get().unwrap_or_else(|e| panic!("HELD-CHECKOUT-FAIL {e:?}"));
+                            let _ = held_tx.send(());
+                            let _ = release_rx.await;
+                            drop(h);
+                        });
+                    }
+                    held_rx.await.unwrap();
+                    pool_rt.set_after_checkout_hook(Some(std::sync::Arc::new(|| {
+                        if std::thread::current().name() == Some("parked-prefetch-worker") {
+                            panic!(
+                                "CHECKOUT-ON-RUNTIME-WORKER: sync pool.get() ran inline \
+                                 on the parked runtime worker (M5 regression)"
+                            );
+                        }
+                    })));
+                    let cands = vec![serde_json::json!({"cardId": "mtg-aaaaaaaa-0000-0000-0000-000000000001"})];
+                    prefetch_missing(&scry, &pool_rt, &cands, "Japanese").await;
+                    let _ = tx.send(
+                        hits.lock().unwrap().iter().any(|h| h == "/cards/eld/126/ja"),
+                    );
+                });
+            })
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = release_tx.send(());
+
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Disconnected => panic!(
+                "prefetch_missing thread died mid-request — with the checkout tripwire \
+                 armed this means an inline sync pool.get() ran on the runtime worker \
+                 (see CHECKOUT-ON-RUNTIME-WORKER panic above)"
+            ),
+            std::sync::mpsc::RecvTimeoutError::Timeout => panic!(
+                "prefetch_missing never completed: the lookup parked the runtime worker on \
+                 the DbPool live cap (synchronous pool.get() inline on the worker)"
+            ),
+        });
+        assert!(reached, "pin must traverse the lookup into the getPrintingInLang leg");
+        assert!(pool.blocking_fallbacks() >= 1, "the fetch read must have hopped to the blocking pool");
+        assert_eq!(pool.live_count(), 0, "every leg must return its live slot");
     }
 
     fn pt(x: f64, y: f64) -> Pt {
