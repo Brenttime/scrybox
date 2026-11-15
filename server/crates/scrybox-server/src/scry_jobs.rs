@@ -617,13 +617,37 @@ async fn oracle_maintenance(db: &std::path::Path, maint: &tokio::sync::Mutex<()>
     }
 }
 
+/// REVIEW-concurrency-jobs M2 class (precedent: `moxfield.rs::spawn_scheduler`,
+/// own task per tick): a tick that panics must lose only itself, never the whole
+/// schedule. Every job tick runs on its own task and its JoinError is logged —
+/// the same visibility Node gives a rejected promise in a setInterval callback.
+/// Without this, one panic deep inside `run_maintenance`, `update_collection_prices`
+/// or `auto_update_tick` silently killed that timer for the life of the process
+/// (the loop task unwound with it) and skipped the sibling legs of the tick.
+///
+/// Must be awaited from a task on the jobs thread's LocalSet (spawn_local).
+async fn tick_isolated(name: &'static str, fut: impl std::future::Future<Output = ()> + 'static) {
+    if let Err(e) = tokio::task::spawn_local(fut).await {
+        tracing::error!("Job tick {name} panicked: {e}");
+    }
+}
+
+async fn run_oracle_tick(db: &std::path::Path, maint: &std::rc::Rc<tokio::sync::Mutex<()>>) {
+    let db = db.to_path_buf();
+    let maint = std::rc::Rc::clone(maint);
+    tick_isolated("oracle_maintenance", async move {
+        oracle_maintenance(&db, &maint).await;
+    })
+    .await;
+}
+
 /// startOracleTagsService: first run START_DELAY (30 s), then hourly.
 async fn oracle_loop(db: std::path::PathBuf, maint: std::rc::Rc<tokio::sync::Mutex<()>>) {
     tokio::time::sleep(scaled(crate::oracle_tags::START_DELAY_MS / 1000)).await;
-    oracle_maintenance(&db, &maint).await;
+    run_oracle_tick(&db, &maint).await;
     loop {
         tokio::time::sleep(scaled(crate::oracle_tags::MAINTENANCE_POLL_MS / 1000)).await;
-        oracle_maintenance(&db, &maint).await;
+        run_oracle_tick(&db, &maint).await;
     }
 }
 
@@ -636,10 +660,14 @@ pub fn purge_sessions(conn: &Connection) -> rusqlite::Result<usize> {
 async fn sessions_loop(db: std::path::PathBuf) {
     loop {
         tokio::time::sleep(scaled(24 * 3600)).await;
-        match open_conn(&db).and_then(|c| purge_sessions(&c).map_err(|e| e.to_string())) {
-            Ok(n) => tracing::info!("Session purge: {n} expired sessions removed."),
-            Err(e) => tracing::error!("Failed to purge expired sessions: {e}"),
-        }
+        let db2 = db.clone();
+        tick_isolated("session_purge", async move {
+            match open_conn(&db2).and_then(|c| purge_sessions(&c).map_err(|e| e.to_string())) {
+                Ok(n) => tracing::info!("Session purge: {n} expired sessions removed."),
+                Err(e) => tracing::error!("Failed to purge expired sessions: {e}"),
+            }
+        })
+        .await;
     }
 }
 
@@ -691,20 +719,25 @@ async fn weekly_loop(db: std::path::PathBuf, memo: crate::sets::ScryfallSetsMemo
     // a new memo dropped the cache and cost an extra upstream fetch).
     loop {
         tokio::time::sleep(scaled(7 * 24 * 3600)).await;
-        let scry = Scry::new(ScryEnv::from_env());
-        match open_conn(&db) {
-            Ok(conn) => {
-                if let Err(e) = fetch_and_cache_sets(&conn, &scry, true).await {
-                    tracing::error!("Weekly sets refresh failed: {e}");
+        let db2 = db.clone();
+        let memo2 = std::sync::Arc::clone(&memo);
+        tick_isolated("weekly_sets_refresh", async move {
+            let scry = Scry::new(ScryEnv::from_env());
+            match open_conn(&db2) {
+                Ok(conn) => {
+                    if let Err(e) = fetch_and_cache_sets(&conn, &scry, true).await {
+                        tracing::error!("Weekly sets refresh failed: {e}");
+                    }
                 }
+                Err(e) => tracing::error!("Weekly sets refresh: db open failed: {e}"),
             }
-            Err(e) => tracing::error!("Weekly sets refresh: db open failed: {e}"),
-        }
-        crate::catalog_build::auto_update_tick(
-            &db,
-            std::sync::Arc::new(Scry::new(ScryEnv::from_env())),
-            std::sync::Arc::clone(&memo),
-        );
+            crate::catalog_build::auto_update_tick(
+                &db2,
+                std::sync::Arc::new(Scry::new(ScryEnv::from_env())),
+                std::sync::Arc::clone(&memo2),
+            );
+        })
+        .await;
     }
 }
 
@@ -732,8 +765,11 @@ async fn hourly_loop(db: std::path::PathBuf, sweeping: std::sync::Arc<std::sync:
     // setting dead code — server.js comment, ported verbatim).
     loop {
         tokio::time::sleep(scaled(3600)).await;
-        sweep_once(&db, false, &sweeping).await;
-        // server.js: `.finally(() => oracleTags.checkpointWal())`.
+        let db2 = db.clone();
+        let sw = std::sync::Arc::clone(&sweeping);
+        tick_isolated("price_sweep", async move { sweep_once(&db2, false, &sw).await }).await;
+        // server.js: `.finally(() => oracleTags.checkpointWal())` — runs even
+        // when the sweep leg failed or panicked, hence outside the isolation.
         if let Ok(c) = open_conn(&db) {
             crate::oracle_tags::checkpoint_wal(&c);
         }
@@ -767,20 +803,27 @@ async fn boot_catchup(
     // checkpoint.
     tokio::time::sleep(scaled(30)).await;
     if jobs.oracle {
-        oracle_maintenance(&db, &maint).await;
+        // Per-leg isolation: a panic in the maintenance leg must not swallow
+        // the price leg below (tick_isolated also keeps this task itself alive).
+        run_oracle_tick(&db, &maint).await;
     }
     if jobs.scryfall {
-        if let Some(_guard) = try_begin_sweep(&sweeping) {
-            let scry = Scry::new(ScryEnv::from_env());
-            match open_conn(&db) {
-                Ok(conn) => {
-                    if let Err(e) = boot_price_catchup(&conn, &scry).await {
-                        tracing::error!("MTG boot price catch-up failed: {e}");
+        let db2 = db.clone();
+        let sw = std::sync::Arc::clone(&sweeping);
+        tick_isolated("boot_price_catchup", async move {
+            if let Some(_guard) = try_begin_sweep(&sw) {
+                let scry = Scry::new(ScryEnv::from_env());
+                match open_conn(&db2) {
+                    Ok(conn) => {
+                        if let Err(e) = boot_price_catchup(&conn, &scry).await {
+                            tracing::error!("MTG boot price catch-up failed: {e}");
+                        }
                     }
+                    Err(e) => tracing::error!("MTG boot price catch-up: db open failed: {e}"),
                 }
-                Err(e) => tracing::error!("MTG boot price catch-up: db open failed: {e}"),
             }
-        }
+        })
+        .await;
     }
     if let Ok(c) = open_conn(&db) {
         crate::oracle_tags::checkpoint_wal(&c);
@@ -789,9 +832,51 @@ async fn boot_catchup(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sweep_chunk, try_begin_sweep};
+    use super::{parse_sweep_chunk, tick_isolated, try_begin_sweep};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn tick_isolated_contains_panic_and_schedule_keeps_running() {
+        // REVIEW concurrency-jobs M2 class (moxfield spawn_scheduler precedent):
+        // one panicking job tick must lose only itself — the enclosing timer
+        // loop must fire the next tick. Pre-fix shape: the tick body ran
+        // INLINE in the loop task, so the panic unwound the whole schedule
+        // (neuter tick_isolated to `fut.await` to watch this test die).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let ticks_done = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            // The panicking tick must be swallowed (logged), never propagate.
+            super::tick_isolated("boom", async { panic!("job tick blew up") }).await;
+            // ...and the same schedule runs its following ticks.
+            for _ in 0..2 {
+                let t = std::rc::Rc::clone(&ticks_done);
+                tick_isolated("ok", async move { t.set(t.get() + 1) }).await;
+            }
+            assert_eq!(ticks_done.get(), 2, "schedule must survive a panicking tick");
+        });
+    }
+
+    #[test]
+    fn tick_isolated_passes_normal_ticks_through() {
+        // Non-vacuity for the test above: an isolated tick's side effects
+        // complete BEFORE tick_isolated returns (the loop awaits the handle).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+            let s = std::rc::Rc::clone(&seen);
+            tick_isolated("normal", async move { s.set(true) }).await;
+            assert!(seen.get(), "tick body completed before the await returned");
+        });
+    }
 
     #[test]
     fn sweep_chunk_env_parses_to_node_parity_default() {
