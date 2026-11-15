@@ -157,7 +157,18 @@ COPY --chmod=755 server/docker/entrypoint-rust.sh /entrypoint.sh
 # the bulk files live in the volume (see SCRYBOX_LSF_DATA_DIR below).
 COPY --chown=1000:1000 local-scryfall/static/ /app/scryfall/static/
 COPY --chown=1000:1000 local-scryfall/data/blocks.json local-scryfall/data/sets-meta.json local-scryfall/data/land_cycles.json /app/scryfall/data/
-# In-process cardscan OCR assets (empty unless SCRYBOX_OCR_SRC was staged).
+# In-process cardscan (TOTORO mono scan2): only the PP-OCRv6 recogniser ships
+# here (empty unless SCRYBOX_OCR_SRC was staged). OpenCV (core+imgproc,
+# 4.10 + IPP-ICV) is linked STATICALLY into scrybox-server, so no libopencv
+# joins the ldd closure. The indexes live in the volume at
+# SCRYBOX_CARDSCAN_DATA (a sidecar data/ dir can be mounted as-is); missing
+# ones are built at boot (printing index from the in-process Scryfall
+# engine's default-cards bulk, oracle titles from Scryfall oracle-cards).
+# CARDSCAN_URL unset = in-process; set it to keep proxying to a sidecar.
+# Build host: opencv-rs needs OPENCV_INCLUDE_PATHS / OPENCV_LINK_PATHS /
+# OPENCV_LINK_LIBS=static=opencv_imgproc,static=opencv_core,static=ippiw,
+# static=ippicv,static=zlib for a static OpenCV 4.10 (brain: ~/ocv/install4,
+# set in ~/.cargo/config.toml [env]) plus clang/libclang for binding gen.
 COPY server/docker/ocr/ /opt/ocr/
 
 ENV PORT=3001 \
@@ -170,7 +181,7 @@ ENV PORT=3001 \
     ORT_DYLIB_PATH=/opt/ort/lib/libonnxruntime.so.1 \
     SCRYBOX_JPEG_LIB=/opt/lib/libscryjpeg.so \
     SCRYBOX_OCR_MODEL_DIR=/opt/ocr \
-    SCRYBOX_CARDSCAN_DATA=/opt/ocr \
+    SCRYBOX_CARDSCAN_DATA=/app/database/cardscan-data \
     HTTPS_PORT=3443 \
     RUST_ROUTES=* \
     RUST_MIGRATIONS=true \
@@ -179,7 +190,10 @@ ENV PORT=3001 \
     SCRYBOX_LSF_STATIC_DIR=/app/scryfall/static \
     SCRYBOX_LSF_VENDORED_DIR=/app/scryfall/data \
     LOCAL_SCRYFALL_ENABLED=true \
-    LOCAL_WEB_PORTAL_ENABLED=true
+    LOCAL_WEB_PORTAL_ENABLED=true \
+    CARDSCAN_KEEP_CAPTURES=0 \
+    CARDSCAN_SCENE_FALLBACK=0 \
+    CARDSCAN_TITLE_ROTATE=0
 # The two ONNX models are NOT in the image (AGPL-3.0 vs MIT — operator
 # fetches them into the volume, same policy as the Node image).
 # TOTORO mono (local Scryfall engine in-process):

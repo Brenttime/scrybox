@@ -52,9 +52,9 @@ pub const BULK: [(&str, &str, &str); 2] = [
     ),
 ];
 
-type Https = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
+pub(crate) type Https = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
-fn client() -> Https {
+pub(crate) fn client() -> Https {
     let https = HttpsConnectorBuilder::new()
         .with_native_roots()
         .expect("native roots")
@@ -100,7 +100,7 @@ pub async fn live_url(c: &Https, bulk_type: &str) -> Option<String> {
 
 /// `.part` download with the 3600 s ceiling of the scripts; the part file
 /// never survives a failure.
-async fn download(c: &Https, url: &str, part: &Path) -> Result<u64, String> {
+pub(crate) async fn download(c: &Https, url: &str, part: &Path) -> Result<u64, String> {
     let fut = async {
         let res = get(c, url, Duration::from_secs(60)).await?;
         let mut f = tokio::fs::File::create(part).await.map_err(|e| format!("create {}: {e}", part.display()))?;

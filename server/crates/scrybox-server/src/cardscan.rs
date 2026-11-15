@@ -111,6 +111,22 @@ fn is_down_error_text(t: &str) -> bool {
         || l.contains("econnrefused") || l.contains("enotfound") || l.contains("eai_again")
 }
 
+/// TOTORO mono scan2: without an explicit CARDSCAN_URL the sidecar's five
+/// endpoints are served in-process (`scan_engine::handle`) on the blocking
+/// pool; an engine that cannot load (no SCRYBOX_CARDSCAN_DATA / model) maps
+/// to the same 503 'not running' arm a missing sidecar produced.
+async fn call_inproc(method: &'static str, path: &str, body: Vec<u8>, content_type: &str, extra: &[(&str, String)], timeout: Duration) -> Up {
+    let mut headers: Vec<(String, String)> = vec![("content-type".into(), content_type.to_string())];
+    headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let path = path.to_string();
+    let job = tokio::task::spawn_blocking(move || crate::scan_engine::handle(method, &path, &headers, &body));
+    match tokio::time::timeout(timeout, job).await {
+        Ok(Ok(Some((status, json)))) => Up::Resp { status, json: Some(json) },
+        Ok(Ok(None)) => Up::Down,
+        _ => Up::Failed,
+    }
+}
+
 async fn call_json(
     path: &str,
     body: String,
@@ -118,6 +134,9 @@ async fn call_json(
     extra: &[(&str, String)],
     timeout: Duration,
 ) -> Up {
+    if !crate::scan_engine::http_mode() {
+        return call_inproc("POST", path, body.into_bytes(), content_type, extra, timeout).await;
+    }
     let mut builder = hyper::Request::post(format!("{}{}", base_url(), path))
         .header(header::CONTENT_TYPE, content_type);
     for (k, v) in extra {
@@ -137,6 +156,9 @@ async fn call_json(
 }
 
 async fn call_bytes(path: &str, body: Vec<u8>, content_type: &str, extra: &[(&str, String)]) -> Up {
+    if !crate::scan_engine::http_mode() {
+        return call_inproc("POST", path, body, content_type, extra, TIMEOUT).await;
+    }
     let mut builder = hyper::Request::post(format!("{}{}", base_url(), path)).header(header::CONTENT_TYPE, content_type);
     for (k, v) in extra {
         if let Ok(hv) = HeaderValue::from_str(v) {
@@ -155,6 +177,9 @@ async fn call_bytes(path: &str, body: Vec<u8>, content_type: &str, extra: &[(&st
 }
 
 async fn call_get(path: &str, timeout: Duration) -> Up {
+    if !crate::scan_engine::http_mode() {
+        return call_inproc("GET", path, vec![], "", &[], timeout).await;
+    }
     let req = match hyper::Request::get(format!("{}{}", base_url(), path)).body(String::new()) {
         Ok(r) => r,
         Err(_) => return Up::Failed,

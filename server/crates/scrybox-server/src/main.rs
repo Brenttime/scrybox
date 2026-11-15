@@ -349,6 +349,8 @@ async fn run() {
     // background index build + daily bulk refresh). No-op unless
     // SCRYBOX_LSF_DATA_DIR / SCRYFALL_DATA_DIR is set.
     scrybox_server::lsf::start_from_env();
+    // TOTORO mono scan2: in-process cardscan (index build job; lazy engine).
+    scrybox_server::scan_engine::boot();
     let state = scrybox_server::AppState::new(cfg.clone());
     let jobs = scrybox_server::scry_jobs::JobSet::parse(
         &std::env::var("RUST_JOBS").unwrap_or_default(),

@@ -38,7 +38,10 @@ mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/ocr"
 # 6f327246...) plus its data/oracle_titles.json + oracle_index.meta.json.
 # Unset = ship nothing (the scan routes keep proxying to CARDSCAN_URL).
 if [ -n "${SCRYBOX_OCR_SRC:-}" ]; then
-  for f in PP-OCRv6_rec_small.onnx oracle_titles.json oracle_index.meta.json; do
+  # Only the 10 MB recogniser ships in the image; the cardscan indexes
+  # (oracle_titles 0.7 MB + printing_index 84 MB) live in the volume
+  # (SCRYBOX_CARDSCAN_DATA), built there at boot by scan_engine::jobs.
+  for f in PP-OCRv6_rec_small.onnx; do
     [ -f "$SCRYBOX_OCR_SRC/$f" ] || { echo "OCR asset missing: $SCRYBOX_OCR_SRC/$f"; exit 1; }
     cp "$SCRYBOX_OCR_SRC/$f" "$STAGE/ocr/$f"
   done

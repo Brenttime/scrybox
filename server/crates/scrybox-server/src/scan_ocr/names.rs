@@ -34,6 +34,8 @@ pub struct Oracle {
     norm_chars: Vec<Box<[char]>>,
     pub norm_map: HashMap<String, String>,
     pub excluded: HashSet<String>,
+    /// Python `ORACLE`: the exact searchable titles.
+    pub names: HashSet<String>,
 }
 
 impl Oracle {
@@ -68,13 +70,21 @@ impl Oracle {
     pub fn from_names(names: Vec<String>, excluded: HashSet<String>) -> Oracle {
         let mut norm_list = Vec::with_capacity(names.len());
         let mut norm_map = HashMap::with_capacity(names.len());
+        let set: HashSet<String> = names.iter().cloned().collect();
         for n in names {
             let k = norm_name(&n);
             norm_list.push(k.clone());
             norm_map.insert(k, n);
         }
         let norm_chars = norm_list.iter().map(|s: &String| s.chars().collect()).collect();
-        Oracle { norm_list, norm_chars, norm_map, excluded }
+        Oracle { norm_list, norm_chars, norm_map, excluded, names: set }
+    }
+
+    /// Append one searchable normalized title (NORM_MAP/NORM_LIST push).
+    pub fn push(&mut self, normalized: String, exact: String) {
+        self.norm_chars.push(normalized.chars().collect());
+        self.norm_list.push(normalized.clone());
+        self.norm_map.insert(normalized, exact);
     }
 
     /// Returns (name, score) like Python `(name or None, float)`.
