@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/scrybox-server"]
+members = ["crates/scrybox-server", "crates/local-scryfall"]
 
 [workspace.package]
 version = "0.1.0"

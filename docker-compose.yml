@@ -35,8 +35,8 @@ services:
   #   ports: ["127.0.0.1:8420:8420"]
   scryfall-local:
     build:
-      context: ./local-scryfall
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: local-scryfall/Dockerfile
     container_name: scryfall-local
     restart: unless-stopped
     environment:
