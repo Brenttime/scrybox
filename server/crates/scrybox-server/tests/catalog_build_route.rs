@@ -156,8 +156,19 @@ async fn catalogs_auth_ladder_and_list_shape() {
     assert_eq!(keys, ["progress", "last"]);
 }
 
+// REVIEW lane-B (Lane-A iter-22 find): the catalog-build job slot is a
+// PROCESS-GLOBAL (catalog_build.rs CURRENT). Polling "progress is null"
+// then POSTing is not atomic across tests in this binary — a sibling that
+// starts a job inside the window folds the unknown-game POST into the
+// 409 "already running" arm instead of "unknown game pokemon". Serialize
+// the whole job-relevant span (idle check -> POST -> settle) on a binary-
+// local lock; test threads are one-per-test (each #[tokio::test] owns its
+// current_thread runtime), so a std Mutex across awaits cannot self-deadlock.
+static JOB_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test]
 async fn build_unknown_game_is_409_and_stop_idle_is_false() {
+    let _job_guard = JOB_GLOBALS.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     seeded_db(dir.path());
     let node = spawn_fake_node().await;
@@ -192,6 +203,8 @@ async fn build_unknown_game_is_409_and_stop_idle_is_false() {
 
 #[tokio::test]
 async fn build_smoke_runs_to_done_and_last() {
+    // Holds the binary-local job slot through POST -> settle (see JOB_GLOBALS).
+    let _job_guard = JOB_GLOBALS.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     seeded_db(dir.path());
     let node = spawn_fake_node().await;

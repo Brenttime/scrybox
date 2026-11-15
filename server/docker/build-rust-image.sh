@@ -5,8 +5,10 @@
 #        -> scrybox-rust:<tag> (default tag: local)
 #
 # Thin wrapper: Dockerfile.rust is self-contained (ORT 1.27.0, static OpenCV
-# 4.10, libscryjpeg, the PP-OCRv6 recogniser and scrybox-server are all
-# built/fetched with pinned sha256s inside builder stages), so this is just
+# 4.10, libscryjpeg and scrybox-server are all built/fetched with pinned
+# sha256s inside builder stages; the PP-OCRv6 recogniser is operator-fetched
+# by the server at first use since iter-64 — see the `ocr` stage comment), so
+# this is just
 #   docker build -f Dockerfile.rust -t scrybox-rust:<tag> .
 # from a clean checkout. Extra args go to `docker build` (--no-cache,
 # --platform linux/arm64, --progress=plain, ...).

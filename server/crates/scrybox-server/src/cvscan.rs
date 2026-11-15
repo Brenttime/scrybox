@@ -2269,7 +2269,17 @@ mod tests {
             })
             .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Event-driven release, not a blind sleep (iter-64 flake fix): hold
+        // the conn until prefetch has actually attempted its hop to the
+        // blocking pool. Under full-suite CPU contention the mock scry legs
+        // could overrun a fixed sleep, the holder returned early and the DB
+        // leg legitimately idle-popped (blocking_fallbacks stayed 0). A
+        // reverted (inline get()) build never hops, so it times out here and
+        // still dies on the tripwire/thread-death arms — RED unaffected.
+        let hop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while pool.blocking_fallbacks() == 0 && std::time::Instant::now() < hop_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = release_tx.send(());
 
         let reached = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|e| match e {

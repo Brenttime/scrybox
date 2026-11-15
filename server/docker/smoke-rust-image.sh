@@ -28,4 +28,24 @@ until docker exec "$NAME" /bin/busybox wget -qO- http://localhost:3001/api/healt
 done
 uid=$(docker exec "$NAME" /bin/busybox sh -c 'for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = scrybox-server ] && /bin/busybox stat -c %u $p && break; done')
 [ "$uid" = 1000 ] || fail "scrybox-server runs as uid '$uid', want 1000"
-echo "SMOKE OK: $IMG (/tmp 1777 + uid-1000 writable, server uid 1000, health up)"
+# iter-64 operator-fetch policy: the PP-OCRv6 recogniser must NOT be baked
+# into the image any more (the server sha256-pins + fetches it at first use).
+if docker run --rm --entrypoint /bin/busybox "$IMG" test -e /opt/ocr 2>/dev/null; then
+  fail "image still ships /opt/ocr — iter-64 moved the recogniser to the operator-fetch policy"
+fi
+# SCRYBOX_SMOKE_OCR=1 additionally proves the self-heal end to end: the boot
+# prefetch must install the pinned recogniser into the volume (needs network
+# to the ModelScope mirror, so it stays opt-in for offline builders).
+if [ "${SCRYBOX_SMOKE_OCR:-0}" = 1 ]; then
+  ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+  want=$(sed -n 's/^ARG OCR_SHA256=//p' "$ROOT/Dockerfile.rust" | head -1)
+  [ -n "$want" ] || fail "OCR_SHA256 pin not found in $ROOT/Dockerfile.rust"
+  i=0
+  until [ -f "$VOL/models/ocr/PP-OCRv6_rec_small.onnx" ]; do
+    i=$((i + 1)); [ $i -lt 180 ] || fail "OCR recogniser not operator-fetched within 180 s"; sleep 1
+  done
+  got=$(sha256sum "$VOL/models/ocr/PP-OCRv6_rec_small.onnx" | cut -d' ' -f1)
+  [ "$got" = "$want" ] || fail "OCR recogniser sha mismatch: got $got, pin $want"
+  echo "SMOKE OK: OCR recogniser operator-fetched at boot + sha-pinned ($got)"
+fi
+echo "SMOKE OK: $IMG (/tmp 1777 + uid-1000 writable, server uid 1000, health up, no baked OCR model)"
