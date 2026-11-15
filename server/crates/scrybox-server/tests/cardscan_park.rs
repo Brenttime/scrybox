@@ -201,17 +201,19 @@ fn parked_probe(
         });
     });
 
-    // Counter-observed release (LANE-A iter-24, legs_park iter-22 shape):
-    // free the holder when the FIRST get_async idle-miss registers (the
-    // blocking-pool hop — hence the live-cap wait — has demonstrably
-    // started) instead of a blind 300 ms sleep that a loaded scheduler can
-    // beat. If the release lands before the handler reaches its checkout,
-    // the holder's conn is popped back from idle inline: the pin goes
-    // false-RED (no hop ever happened) or vacuously GREEN on pools that
-    // close returned conns — both closed by the assert below. 5 s fallback
-    // for shapes that legitimately never miss. Pre-fix park still reddens:
-    // a worker parked on the Condvar can never run the releasing task, so
-    // the counter never fires, the fallback expires, recv_timeout panics.
+    // Counter-observed release (LANE-A iter-24 == LANE-B iter-65, both
+    // adopted the legs_park iter-22 shape independently — merged, the two
+    // implementations are identical): free the holder when the FIRST
+    // get_async idle-miss registers (the blocking-pool hop — hence the
+    // live-cap wait — has demonstrably started) instead of a blind 300 ms
+    // sleep that a loaded scheduler can beat. If the release lands before
+    // the handler reaches its checkout, the holder's conn is popped back
+    // from idle inline: the pin goes false-RED (no hop ever happened) or
+    // vacuously GREEN on pools that close returned conns — both closed by
+    // the assert below. 5 s fallback for shapes that legitimately never
+    // miss. Pre-fix park still reddens: a worker parked on the Condvar
+    // can never run the releasing task, so the counter never fires, the
+    // fallback expires, recv_timeout panics.
     {
         let start = std::time::Instant::now();
         while pool.blocking_fallbacks() == 0
@@ -234,6 +236,12 @@ fn parked_probe(
          release — the hold was vacuous (the handler popped the returned idle conn inline)"
     );
     assert_eq!(status, expected, "{method} {uri} answered {status}, expected {expected}");
+    assert!(
+        pool.blocking_fallbacks() >= 1,
+        "{method} {uri} answered {status} without EVER hopping to the blocking pool — \
+         with the only live slot held by a runtime task that means the request never took \
+         its get_async checkout (pin vacuous), not that it was safe"
+    );
     (status, bytes, pool)
 }
 
