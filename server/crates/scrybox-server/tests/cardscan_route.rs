@@ -78,6 +78,18 @@ fn body_marker_junk(body: &str) -> bool {
 fn mock_sidecar() -> &'static str {
     static URL: OnceLock<String> = OnceLock::new();
     URL.get_or_init(|| {
+        // Single-writer env block (cardscan_park URL_SET class): every
+        // harness calls mock_sidecar() BEFORE building its router, so this
+        // is the one process-wide writer of SCAN_TELEMETRY_DIR. The
+        // telemetry pin's own OnceLock-then-set_var raced
+        // telemetry_no_records_and_env_off's earlier telemetry request:
+        // cardscan::telemetry_dir() snapshots its static OnceLock on FIRST
+        // request, so the env could land after the snapshot and the pin's
+        // JSONL file never appeared (measured ~1/15 parallel runs).
+        std::env::set_var(
+            "SCAN_TELEMETRY_DIR",
+            std::env::temp_dir().join(format!("scrybox-ccroute-telemetry-{}", std::process::id())),
+        );
         let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         std_l.set_nonblocking(true).unwrap();
         let addr = std_l.local_addr().unwrap();
@@ -578,20 +590,31 @@ async fn scan_validation() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn telemetry_writes_jsonl_with_meta() {
+async fn telemetry_writes_jsonl_with_meta_and_off_arm() {
+    // Merged from telemetry_writes_jsonl_with_meta + telemetry_no_records_
+    // and_env_off (iter-59): the handler reads std::env::var("SCAN_TELEMETRY")
+    // per REQUEST, so the env-off test's raw set_var/remove_var window raced
+    // this pin's write request in parallel — 204 with no file (measured ~1/5
+    // parallel runs). One test, sequential arms: on-write first, then off.
     let h = harness(&["cardscan"]).await;
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        let d = h._dir.path().join(format!("tel-{}", std::process::id()));
-        std::env::set_var("SCAN_TELEMETRY_DIR", &d);
-        d
-    }).clone();
+    // SCAN_TELEMETRY_DIR is written by the single-writer mock_sidecar()
+    // block BEFORE any router exists (cardscan::telemetry_dir() snapshots a
+    // static OnceLock on the first telemetry request process-wide, so a
+    // per-test set_var could land after the snapshot — see mock_sidecar).
+    let dir = std::env::temp_dir().join(format!("scrybox-ccroute-telemetry-{}", std::process::id()));
+    let day = scrybox_server::cardscan::cardscan_day();
+    let file = dir.join(format!("{day}.jsonl"));
+    // Fresh run: clear stale lines from previous invocations (crashed runs
+    // leave files behind in temp; the assert counts lines).
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     let body = r#"{"session":"s3cr3t-very-long-session-id","platform":"ios","records":[{"pass":"t","ms":1},{"pass":"u"},{"pass":"v"}]}"#;
     let (st, _, _) =
         call(&h.router, "POST", "/api/cardscan/telemetry", &[("authorization", "Bearer sess-1"), ("content-type", "application/json"), ("user-agent", "UA/1")], Some(body)).await;
     assert_eq!(st, StatusCode::NO_CONTENT);
-    let day = scrybox_server::cardscan::cardscan_day();
-    let file = dir.join(format!("{day}.jsonl"));
     let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(lines.len(), 3);
@@ -605,11 +628,8 @@ async fn telemetry_writes_jsonl_with_meta() {
     assert!(l0["recv"].as_str().unwrap().ends_with('Z'));
     // fresh recv per record is allowed to be equal (ms clock); shape only.
     assert!(lines[2]["recv"].as_str().unwrap().ends_with('Z'));
-}
 
-#[tokio::test]
-async fn telemetry_no_records_and_env_off() {
-    let h = harness(&["cardscan"]).await;
+    // --- no-records arms (env still on) ---
     let (st, _, b) = call(&h.router, "POST", "/api/cardscan/telemetry", &JSON_CT, Some(r#"{"records":[]}"#)).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&b), json!({"ok":false,"error":"No records"}));
@@ -626,10 +646,14 @@ async fn telemetry_no_records_and_env_off() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&b)["error"], "No records");
 
+    // --- env-off arm: sequential, no window for the parallel write pin ---
     std::env::set_var("SCAN_TELEMETRY", "0");
     let (st, _, _) = call(&h.router, "POST", "/api/cardscan/telemetry", &JSON_CT, Some(r#"{"records":[{"a":1}]}"#)).await;
-    assert_eq!(st, StatusCode::NO_CONTENT);
     std::env::remove_var("SCAN_TELEMETRY");
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    // The off arm must not have appended.
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text.lines().count(), 3, "SCAN_TELEMETRY=0 must not append");
 }
 
 

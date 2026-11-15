@@ -75,7 +75,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection::{body_etag, etag_matches, gzip_bytes, json_num, wants_encoding};
 use crate::db::DbPool;
 use crate::poison::LockExt;
@@ -398,11 +398,11 @@ fn sqlv_json(v: rusqlite::types::Value) -> Value {
 /// `want` drives Node's GET-only API-key rule (middleware/auth.js:24-26:
 /// `req.method !== 'GET'` + API key → 403 'API keys are read-only') —
 /// REVIEW-auth.md H2.
-fn gate_core(st: &AppState, headers: &HeaderMap, want: &Method) -> Result<(std::sync::Arc<DbPool>, Cond, i64), Response> {
+async fn gate_core(st: &AppState, headers: &HeaderMap, want: &Method) -> Result<(std::sync::Arc<DbPool>, Cond, i64), Response> {
     let pool = st.db.clone().ok_or_else(|| Response::new(Body::empty()))?;
     let cond = if *want == Method::GET { get_cond(headers) } else { Cond::Post };
     let token = bearer_token(headers).map(str::to_string);
-    let user = authenticate(&pool, token.as_deref(), *want == Method::GET).map_err(|res| res)?;
+    let user = authenticate_async(&pool, token.as_deref(), *want == Method::GET).await.map_err(|res| res)?;
     Ok((pool, cond, user.id))
 }
 
@@ -502,7 +502,7 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
         return crate::proxy(State(st), req).await;
     }
     let headers = req.headers().clone();
-    let (pool, _cond, _uid) = match gate_core(&st, &headers, &Method::POST) {
+    let (pool, _cond, _uid) = match gate_core(&st, &headers, &Method::POST).await {
         Ok(v) => v,
         Err(res) => return res,
     };
@@ -650,7 +650,7 @@ pub async fn handle_card_decks(State(st): State<AppState>, Path(id): Path<String
         return crate::proxy(State(st), req).await;
     }
     let headers = req.headers().clone();
-    let (pool, cond, uid) = match gate_core(&st, &headers, &Method::GET) {
+    let (pool, cond, uid) = match gate_core(&st, &headers, &Method::GET).await {
         Ok(v) => v,
         Err(res) => return res,
     };
@@ -726,7 +726,7 @@ pub async fn handle_price_history(State(st): State<AppState>, Path(id): Path<Str
     }
     let query = req.uri().query().map(str::to_string);
     let headers = req.headers().clone();
-    let (pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET) {
+    let (pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET).await {
         Ok(v) => v,
         Err(res) => return res,
     };
@@ -1175,7 +1175,7 @@ pub async fn handle_cotd(State(st): State<AppState>, req: Request) -> Response {
     }
     let query = req.uri().query().map(str::to_string);
     let headers = req.headers().clone();
-    let (pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET) {
+    let (pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET).await {
         Ok(v) => v,
         Err(res) => return res,
     };
@@ -1313,7 +1313,7 @@ pub async fn handle_suggest(State(st): State<AppState>, req: Request) -> Respons
     }
     let query = req.uri().query().map(str::to_string);
     let headers = req.headers().clone();
-    let (_pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET) {
+    let (_pool, cond, _uid) = match gate_core(&st, &headers, &Method::GET).await {
         Ok(v) => v,
         Err(res) => return res,
     };

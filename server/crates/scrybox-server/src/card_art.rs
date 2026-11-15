@@ -341,7 +341,7 @@ async fn auth_then_404(st: &AppState, req: Request) -> Response {
         BodyOutcome::Parsed(_) => {}
     }
     let is_get = parts.method == axum::http::Method::GET;
-    if let Err(res) = crate::settings::authenticate(&pool, &parts.headers, is_get) {
+    if let Err(res) = crate::settings::authenticate_async(&pool, &parts.headers, is_get).await {
         return crate::collection_writes::node_exact(res).await;
     }
     crate::static_assets::express_default_404(&parts.method, parts.uri.path())
@@ -443,7 +443,7 @@ async fn handle_post(State(st): State<AppState>, req: Request) -> Response {
         return crate::proxy(State(st), crate::collection_writes::rebuild(parts, &bytes)).await;
     };
     // authenticateToken (is_get=false: API keys answer the read-only 403).
-    let _user = match crate::settings::authenticate(&pool, &parts.headers, false) {
+    let _user = match crate::settings::authenticate_async(&pool, &parts.headers, false).await {
         Ok(u) => u,
         // auth.rs builds axum::Json bodies; Node's authenticateToken answers
         // through res.json (charset + ETag) — restamp, same as node_exact's
@@ -538,7 +538,7 @@ async fn handle_delete(State(st): State<AppState>, req: Request) -> Response {
     let Some(raw_id) = raw_id_of(parts.uri.path()).map(str::to_string) else {
         return crate::proxy(State(st), crate::collection_writes::rebuild(parts, &bytes)).await;
     };
-    let _user = match crate::settings::authenticate(&pool, &parts.headers, false) {
+    let _user = match crate::settings::authenticate_async(&pool, &parts.headers, false).await {
         Ok(u) => u,
         // auth.rs builds axum::Json bodies; Node's authenticateToken answers
         // through res.json (charset + ETag) — restamp, same as node_exact's

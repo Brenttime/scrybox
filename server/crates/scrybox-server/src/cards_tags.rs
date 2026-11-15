@@ -15,7 +15,7 @@ use axum::{
 };
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::card_norm::normalize_card;
 use crate::collection_writes::{node_exact, parse_body, BodyOutcome};
 use crate::scryfall::ScryOpts;
@@ -247,7 +247,7 @@ pub async fn handle_oracle(State(st): State<AppState>, req: Request) -> Response
     let headers = req.headers().clone();
     // authenticateToken: Bearer session; API keys answer GETs.
     let token = bearer_token(&headers).map(|s| s.to_string());
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return node_exact(res).await;
     }
     let scry = st.scry.clone();
@@ -494,7 +494,7 @@ pub async fn handle_oracle_tags(State(st): State<AppState>, req: Request) -> Res
     let headers = req.headers().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let token = bearer_token(&headers).map(|s| s.to_string());
-    if let Err(res) = authenticate(&pool, token.as_deref(), true) {
+    if let Err(res) = authenticate_async(&pool, token.as_deref(), true).await {
         return node_exact(res).await;
     }
     let fallback = query_param(query.as_deref(), "oracle_id");
@@ -601,7 +601,7 @@ pub async fn handle_role_tags(State(st): State<AppState>, req: Request) -> Respo
         BodyOutcome::Parsed(v) => v,
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -800,7 +800,7 @@ pub async fn handle_tag_stats(State(st): State<AppState>, req: Request) -> Respo
         BodyOutcome::Parsed(v) => v,
     };
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), false) {
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

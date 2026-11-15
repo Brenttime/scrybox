@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::collection_writes::{node_exact, parse_body, BodyOutcome};
 use crate::mfx_payload::js_parse_int;
 use crate::AppState;
@@ -350,7 +350,7 @@ pub async fn handle_backups_collection(State(st): State<AppState>, req: Request)
     }
     let token = bearer_token(&headers).map(|s| s.to_string());
     let is_get = method == Method::GET;
-    let user = match authenticate(st.db.as_ref().unwrap(), token.as_deref(), is_get) {
+    let user = match authenticate_async(st.db.as_ref().unwrap(), token.as_deref(), is_get).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -419,7 +419,7 @@ pub async fn handle_backup_download(State(st): State<AppState>, AxPath(file): Ax
     let (parts, _body) = req.into_parts();
     let headers = parts.headers;
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(st.db.as_ref().unwrap(), token.as_deref(), true) {
+    let user = match authenticate_async(st.db.as_ref().unwrap(), token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

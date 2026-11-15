@@ -18,7 +18,7 @@ use axum::{
 };
 use serde_json::{Map, Value};
 
-use crate::auth::{authenticate, bearer_token};
+use crate::auth::{authenticate_async, bearer_token};
 use crate::cards_tags::{json_error, json_response, query_param};
 use crate::collection_writes::node_exact;
 use crate::AppState;
@@ -209,7 +209,7 @@ async fn standalone_miss(st: &AppState, req: Request, admin: bool) -> Response {
     }
     let is_get = parts.method == axum::http::Method::GET;
     let token = bearer_token(&parts.headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), is_get) {
+    let user = match authenticate_async(&pool, token.as_deref(), is_get).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -248,7 +248,7 @@ pub async fn handle_catalog_languages(State(st): State<AppState>, req: Request) 
     let headers = req.headers().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
@@ -363,7 +363,7 @@ pub async fn handle_scan_sets(State(st): State<AppState>, req: Request) -> Respo
     let headers = req.headers().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let token = bearer_token(&headers).map(|s| s.to_string());
-    let user = match authenticate(&pool, token.as_deref(), true) {
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };

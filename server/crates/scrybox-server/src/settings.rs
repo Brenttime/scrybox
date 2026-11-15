@@ -478,6 +478,10 @@ pub async fn route_version(State(st): State<AppState>, req: Request) -> Response
     }
 }
 
+/// Blocking-thread form (parity with auth::authenticate). The request-path
+/// callers all moved to authenticate_async in the iter-60 M5 sweep; this
+/// stays for code already on a blocking thread.
+#[allow(dead_code)]
 pub(crate) fn authenticate(pool: &DbPool, headers: &HeaderMap, is_get: bool) -> Result<auth::AuthUser, Response> {
     let token = auth::bearer_token(headers).map(str::to_string);
     auth::authenticate(pool, token.as_deref(), is_get)
