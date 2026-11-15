@@ -54,6 +54,20 @@ pub const BULK: [(&str, &str, &str); 2] = [
 
 pub(crate) type Https = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
+/// Test-only switch: when set (and `cfg(test)`), the next `refresh_pass`
+/// panics — the injection point for the refresh-scheduler panic-isolation
+/// pins below. Never set outside a test binary (guarded in refresh_pass).
+#[cfg(test)]
+pub(crate) static LSF_TEST_PANIC_SWITCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only entry counter: incremented at the very top of `refresh_pass`,
+/// before the panic switch fires, so pins can observe that the scheduler
+/// ENTERED a daily tick even when that tick then panics (LANE-B iter-67).
+#[cfg(test)]
+pub(crate) static LSF_TEST_PASS_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn client() -> Https {
     let https = HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -260,6 +274,13 @@ async fn rebuild(eng: &Arc<InProcessEngine>) -> Option<crate::lsf::Loaded> {
 /// One refresh pass (also the unit tests' entry point). Returns true when a
 /// new index was installed.
 pub async fn refresh_pass(eng: &Arc<InProcessEngine>) -> bool {
+    #[cfg(test)]
+    {
+        LSF_TEST_PASS_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if LSF_TEST_PANIC_SWITCH.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            panic!("lsf_data test panic injection: refresh_pass");
+        }
+    }
     let dir = eng.data_dir.clone();
     let Some(_lock) = try_lock(&dir) else { return false };
     let c = client();
@@ -310,6 +331,22 @@ pub async fn refresh_pass(eng: &Arc<InProcessEngine>) -> bool {
     }
 }
 
+/// Per-tick panic isolation for the refresh scheduler (REVIEW concurrency-jobs
+/// M2 same-class sweep, LANE-B iter-67 — same convention as `scry_jobs::tick_isolated`
+/// and the moxfield scheduler's per-tick spawn). Runs one tick as a task on the
+/// current runtime and turns a tick panic into a logged error instead of an
+/// unwind of the enclosing loop task: without this, one panic deep inside
+/// `refresh_pass` (fetch, gunzip, build, health check) killed the daily refresh
+/// AND the 15-minute external-change poll for the life of the process, with no
+/// restart and no log line.
+///
+/// Must be awaited from a task on the engine runtime (`eng.rt.spawn`).
+pub(crate) async fn tick_isolated(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Err(e) = tokio::spawn(fut).await {
+        tracing::error!("local scryfall: {name} tick panicked: {e}");
+    }
+}
+
 /// Seconds until the next local HH:MM (default 05:00 — the host cron's slot).
 fn secs_until(hh: u32, mm: u32) -> u64 {
     use chrono::{Local, Timelike};
@@ -337,28 +374,159 @@ pub async fn refresh_loop(eng: Arc<InProcessEngine>) {
         let until = Duration::from_secs(secs_until(hh, mm));
         if until <= poll {
             tokio::time::sleep(until).await;
-            refresh_pass(&eng).await;
+            let eng = Arc::clone(&eng);
+            tick_isolated("daily_refresh", async move {
+                refresh_pass(&eng).await;
+            })
+            .await;
             tokio::time::sleep(Duration::from_secs(61)).await;
         } else {
             tokio::time::sleep(poll).await;
             // Cheap external-change check only (no network).
-            let dir = eng.data_dir.clone();
-            let stale = eng.current().map(|l| l.fingerprint != crate::lsf::fingerprint(&dir)).unwrap_or(true);
-            let has_cards = dir.join("default-cards.jsonl.gz").exists();
-            if stale && has_cards {
-                if let Some(_lock) = try_lock(&dir) {
-                    drop(_lock);
-                    if let Some(l) = rebuild(&eng).await {
-                        eng.install(l);
-                        tracing::info!("local scryfall: bulk files changed on disk — index reloaded");
-                    } else {
-                        // Remember the failed fingerprint so we do not rebuild-loop.
-                        tracing::error!("ALERT local scryfall: on-disk bulk files failed to load — old index kept");
-                        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            let eng = Arc::clone(&eng);
+            tick_isolated("disk_change_poll", async move {
+                let dir = eng.data_dir.clone();
+                let stale = eng
+                    .current()
+                    .map(|l| l.fingerprint != crate::lsf::fingerprint(&dir))
+                    .unwrap_or(true);
+                let has_cards = dir.join("default-cards.jsonl.gz").exists();
+                if stale && has_cards {
+                    if let Some(_lock) = try_lock(&dir) {
+                        drop(_lock);
+                        if let Some(l) = rebuild(&eng).await {
+                            eng.install(l);
+                            tracing::info!("local scryfall: bulk files changed on disk — index reloaded");
+                        } else {
+                            // Remember the failed fingerprint so we do not rebuild-loop.
+                            tracing::error!("ALERT local scryfall: on-disk bulk files failed to load — old index kept");
+                            tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                        }
                     }
                 }
-            }
+            })
+            .await;
         }
     }
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serializes the tests that mutate process env (SCRYBOX_LSF_*).
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // LANE-B iter-67 — REVIEW concurrency-jobs M2, same-class sweep beyond the
+    // scry_jobs timer loops (iter-66): the local-scryfall refresh scheduler.
+    // Pre-fix, the daily `refresh_pass` leg and the 15-min disk-poll leg ran
+    // INLINE in the single refresh_loop task: one panic anywhere in fetch /
+    // gunzip / index-build / health-check unwound the loop task, killing ALL
+    // future refresh legs for the life of the process, silently (and the boot
+    // task in lsf.rs never even reached refresh_loop if ensure_data/build
+    // panicked). Convention matches scry_jobs::tick_isolated: each tick runs
+    // as its own task; the JoinError becomes a logged error.
+
+    /// Positive control + tripwire: a tick's side effects are visible when
+    /// tick_isolated returns, and a panicking tick resolves as a JoinError
+    /// (the arm that logs) instead of unwinding the caller.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tick_isolated_contains_panics_and_lets_caller_run_next_tick() {
+        static TICKS: AtomicUsize = AtomicUsize::new(0);
+        TICKS.store(0, Ordering::SeqCst);
+
+        tick_isolated("panicking_tick", async {
+            TICKS.fetch_add(1, Ordering::SeqCst);
+            panic!("injected tick panic");
+        })
+        .await;
+        // Caller survived the panic: the NEXT tick ran to completion.
+        tick_isolated("normal_tick", async {
+            TICKS.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(TICKS.load(Ordering::SeqCst), 2, "panicking tick must not strand the caller before the next tick");
+    }
+
+    /// RED-BEFORE-GREEN shape (measured): with tick_isolated neutered to an
+    /// inline await (pre-fix scheduler shape), the injected panic in the first
+    /// daily tick unwinds the loop task -> LSF_TEST_PASS_ENTRIES never reaches
+    /// 1 and the poll below times out (test fails). Post-fix: the panic is
+    /// contained, the counter hits 1, and the loop task stays alive after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_loop_survives_panicking_daily_tick() {
+        use std::time::{Duration, Instant};
+
+        // Deterministic daily branch: schedule the refresh at the top of the
+        // NEXT local minute (secs_until <= 60 s forces the daily leg; the
+        // disk-poll leg never runs). SCRYBOX_LSF_FETCH=off keeps it offline.
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let now = chrono::Local::now();
+        let secs = chrono::Timelike::num_seconds_from_midnight(&now);
+        let (hh, mm) = if secs % 60 == 59 {
+            // <1 s to the minute boundary: target the minute after next.
+            let t = secs + 61;
+            (t / 3600 % 24, t / 60 % 60)
+        } else {
+            let t = secs + (60 - secs % 60);
+            (t / 3600 % 24, t / 60 % 60)
+        };
+        std::env::set_var("SCRYBOX_LSF_REFRESH_AT", format!("{hh:02}:{mm:02}"));
+        std::env::set_var("SCRYBOX_LSF_FETCH", "off"); // no network, ever
+        let eng = crate::lsf::InProcessEngine::for_test(dir.path().to_path_buf());
+
+        LSF_TEST_PASS_ENTRIES.store(0, Ordering::SeqCst);
+        LSF_TEST_PANIC_SWITCH.store(true, Ordering::SeqCst);
+
+        let h = tokio::spawn(refresh_loop(Arc::clone(&eng)));
+        let start = Instant::now();
+        while LSF_TEST_PASS_ENTRIES.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(90) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::env::remove_var("SCRYBOX_LSF_REFRESH_AT");
+        std::env::remove_var("SCRYBOX_LSF_FETCH");
+
+        assert_eq!(
+            LSF_TEST_PASS_ENTRIES.load(Ordering::SeqCst),
+            1,
+            "daily tick must ENTER refresh_pass (isolated) even when that pass panics — \
+             pre-fix the panic unwound the loop task before the counter could be observed \
+             and the poll below timed out at 0"
+        );
+        assert!(!h.is_finished(), "refresh_loop task must survive a panicking tick");
+        h.abort();
+    }
+
+    /// The panic switch arms EXACTLY one pass: the armed call surfaces as a
+    /// JoinError::is_panic through the isolation task, the next call takes the
+    /// normal fetch-off arms and returns false (no lingering panic state).
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_switch_arms_exactly_once() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SCRYBOX_LSF_FETCH", "off");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let eng = crate::lsf::InProcessEngine::for_test(dir.path().to_path_buf());
+        LSF_TEST_PASS_ENTRIES.store(0, Ordering::SeqCst);
+        LSF_TEST_PANIC_SWITCH.store(true, Ordering::SeqCst);
+
+        let e1 = Arc::clone(&eng);
+        let caught = tokio::spawn(async move { refresh_pass(&e1).await })
+            .await
+            .err()
+            .expect("armed switch must make refresh_pass panic");
+        assert!(caught.is_panic(), "switch panic must surface as a JoinError::is_panic");
+
+        // Disarmed: the second pass takes the normal (fetch-off) arms without panicking.
+        let e2 = Arc::clone(&eng);
+        let again = tokio::spawn(async move { refresh_pass(&e2).await }).await;
+        std::env::remove_var("SCRYBOX_LSF_FETCH");
+        assert!(again.is_ok() && !again.unwrap(), "disarmed pass must return false, not panic");
+        assert_eq!(LSF_TEST_PASS_ENTRIES.load(Ordering::SeqCst), 2, "both passes entered");
+    }
+}

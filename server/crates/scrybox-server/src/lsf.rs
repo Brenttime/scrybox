@@ -122,6 +122,22 @@ pub struct InProcessEngine {
 }
 
 impl InProcessEngine {
+    /// Test-only bare engine: empty live slot, caller's runtime, temp data dir.
+    /// Avoids the leaked-thread runtime of `init` for scheduler pins that only
+    /// need `data_dir`/`current()` semantics (LANE-B iter-67).
+    #[cfg(test)]
+    pub(crate) fn for_test(data_dir: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            rt: tokio::runtime::Handle::current(),
+            live: RwLock::new(None),
+            data_dir,
+            static_dir: String::new(),
+            vendored_dir: None,
+            boot_started: Instant::now(),
+            ready_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     pub fn is_ready(&self) -> bool {
         self.live.read().map(|g| g.is_some()).unwrap_or(false)
     }
@@ -349,14 +365,32 @@ pub fn start_from_env() {
     tracing::info!(data_dir = %data_dir.display(), "local scryfall: in-process engine booting");
     let eng2 = Arc::clone(eng);
     eng.rt.spawn(async move {
-        if !matches!(env_nonempty("SCRYBOX_LSF_FETCH").as_deref(), Some("off" | "0" | "false")) {
-            crate::lsf_data::ensure_data(&eng2.data_dir).await;
-        }
-        let e3 = Arc::clone(&eng2);
-        match tokio::task::spawn_blocking(move || e3.build()).await {
-            Ok(Some(l)) => eng2.install(l),
-            _ => tracing::warn!("local scryfall: no index (bulk data missing/unloadable) — searches take the engine-down arms until the refresh job lands data"),
-        }
+        // Per-tick panic isolation on the boot legs (LANE-B iter-67, same M2
+        // class as the scry_jobs loops): pre-fix, a panic inside ensure_data
+        // (fetch/gunzip) unwound this task BEFORE refresh_loop was ever
+        // entered — the engine then never fetched, built, or refreshed again
+        // for the life of the process, silently. Each leg now panics into a
+        // logged error; the following legs still run.
+        crate::lsf_data::tick_isolated("boot_ensure_data", {
+            let eng = Arc::clone(&eng2);
+            async move {
+                if !matches!(env_nonempty("SCRYBOX_LSF_FETCH").as_deref(), Some("off" | "0" | "false")) {
+                    crate::lsf_data::ensure_data(&eng.data_dir).await;
+                }
+            }
+        })
+        .await;
+        crate::lsf_data::tick_isolated("boot_build", {
+            let eng = Arc::clone(&eng2);
+            async move {
+                let e3 = Arc::clone(&eng);
+                match tokio::task::spawn_blocking(move || e3.build()).await {
+                    Ok(Some(l)) => eng.install(l),
+                    _ => tracing::warn!("local scryfall: no index (bulk data missing/unloadable) — searches take the engine-down arms until the refresh job lands data"),
+                }
+            }
+        })
+        .await;
         tracing::info!(first_ready_ms = eng2.first_ready_ms(), "local scryfall: boot done");
         crate::lsf_data::refresh_loop(eng2).await;
     });
