@@ -69,7 +69,7 @@ use crate::collection_writes::{
 };
 use crate::db::DbPool;
 use crate::decks_reads::{js_trim, rows_map};
-use crate::settings::{admin_gate, authenticate};
+use crate::settings::{admin_gate, authenticate_async};
 use crate::stats::js_fixed_parsed;
 use crate::AppState;
 
@@ -143,13 +143,13 @@ fn fail(context: &str, status: StatusCode, msg: &str) -> Response {
 /// change a byte parity compares.
 pub(crate) async fn authorize(
     st: &AppState,
-    pool: &DbPool,
+    pool: &std::sync::Arc<DbPool>,
     headers: &HeaderMap,
     _method: &Method,
     is_get: bool,
     _path: &str,
 ) -> Result<auth::AuthUser, Response> {
-    let user = authenticate(pool, headers, is_get)?;
+    let user = authenticate_async(pool, headers, is_get).await?;
     if !is_get {
         // invalidateOnWrite twin: synchronous (a client reading /api/stats
         // right after its admin write lands must see fresh numbers).
