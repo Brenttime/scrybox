@@ -545,7 +545,25 @@ mod exec_sync_low_tests {
     use std::path::{Path, PathBuf};
 
     fn script(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("mfx-{name}-{}.sh", std::process::id()));
+        // LANE-A iter-25 flake (REVIEW.md line 41): the old name was
+        // mfx-{name}-{pid}.sh. On a shared build host (/tmp on brain, several
+        // suites from several worktrees at once) a reused PID from an earlier
+        // run made two processes share one path — the spawn raced the other
+        // process's writer and execve returned ETXTBSY, surfacing through the
+        // spawn-Err arm as "Could not reach Moxfield: Text file busy
+        // (os error 26)" instead of the asserted "Command failed: …"
+        // (scratch/iterA25/workspace.log:793). pid + wallclock-ns + per-proc
+        // sequence: the path is never reused, so no stranger can hold it open.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mfx-{name}-{}-{nanos:x}-{seq:x}.sh",
+            std::process::id()
+        ));
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         #[cfg(unix)]
         {
@@ -592,7 +610,11 @@ mod exec_sync_low_tests {
     #[tokio::test]
     async fn l2_timeout_keeps_partial_stderr() {
         let bin = script("err", "echo late-oops >&2\nexec sleep 30");
-        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(300));
+        // 1.2 s, not 300 ms: under full-battery load (brain) 300 ms could
+        // fire before the child had even exec'd (LANE-A iter-25 flake
+        // report, REVIEW.md). The verdict (partial stderr wins) is
+        // window-independent; only wall-clock ordering was pinned before.
+        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(1200));
         let err = api.get("/v2/x", &[]).await.unwrap_err();
         let _ = std::fs::remove_file(&bin);
         assert_eq!(err.status, 0);
@@ -603,7 +625,7 @@ mod exec_sync_low_tests {
     #[tokio::test]
     async fn l2_timeout_without_stderr_reports_command_failed() {
         let bin = script("silent", "exec sleep 30");
-        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(300));
+        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_millis(1200));
         let err = api.get("/v2/x", &[]).await.unwrap_err();
         let _ = std::fs::remove_file(&bin);
         assert!(
@@ -612,6 +634,40 @@ mod exec_sync_low_tests {
             err.message
         );
         assert!(err.message.contains(&bin.to_string_lossy().to_string()), "{:?}", err.message);
+    }
+
+    // LANE-A iter-25 flake regression half 1 (REVIEW.md line 41): the flake's
+    // message was "Could not reach Moxfield: Text file busy (os error 26)" —
+    // the spawn-Err arm, reached when execve hits ETXTBSY because a stranger
+    // holds the script path open for writing. Under the old PID-only helper
+    // name, concurrent suites on the shared build host could share a path
+    // (reused PID); this pins that no two script() calls EVER share one.
+    // Red under the old helper: same name + same pid => identical paths.
+    #[test]
+    fn script_paths_are_never_reused_across_calls() {
+        let a = script("reuse", "echo a");
+        let b = script("reuse", "echo b");
+        assert_ne!(a, b, "helper reused the same path for two calls");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    // Flake regression half 2 (mechanism pin, deterministic): holding the
+    // binary open for writing while get() spawns reproduces the flake arm
+    // exactly — the raw OS error surfaces through the spawn-Err arm instead
+    // of "Command failed:". Documents WHY path uniqueness is the product of
+    // the fix (Node's execFile behaves identically on spawn errors, so the
+    // product arm stays as-is).
+    #[tokio::test]
+    async fn l2_etxtbsy_at_spawn_surfaces_raw_os_error() {
+        let bin = script("busy", "exec sleep 30");
+        let holder = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+        let api = MfxApi::for_test(bin.to_string_lossy(), Duration::from_secs(2));
+        let err = api.get("/v2/x", &[]).await.unwrap_err();
+        drop(holder);
+        let _ = std::fs::remove_file(&bin);
+        assert_eq!(err.message, "Could not reach Moxfield: Text file busy (os error 26)");
+        assert_eq!(err.status, 0);
     }
 
     // exec-sync L1: i64::MAX quantities saturate instead of wrapping.
