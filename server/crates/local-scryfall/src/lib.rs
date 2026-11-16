@@ -11,5 +11,6 @@ pub mod eval;
 pub mod index;
 pub mod prints;
 pub mod query;
+pub mod store;
 
 pub use boot::{load_index, router, state, BootOpts};

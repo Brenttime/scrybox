@@ -314,11 +314,17 @@ pub async fn search(
         )
     };
 
-    let joined: String = ids
-        .iter()
-        .map(|&i| &*ix.jsons[i as usize])
-        .collect::<Vec<&str>>()
-        .join(",");
+    let joined: String = {
+        let mut out = String::with_capacity(ids.iter().map(|&i| ix.jsons.raw_len(i as usize) + 1).sum());
+        let mut rd = ix.jsons.reader();
+        for (k, &i) in ids.iter().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+            rd.append_to(i as usize, &mut out);
+        }
+        out
+    };
 
     let warnings_json = serde_json::to_string(&warnings).unwrap_or_else(|_| "[]".into());
     // Envelope parity with Scryfall's /cards/search: object/type/context list
@@ -447,7 +453,7 @@ pub async fn suggest(
 
 pub async fn card(State(st): State<SharedState>, Path(id): Path<String>) -> Response {
     match lookup_card(&st.ix, &id) {
-        Some(i) => json_response(st.ix.jsons[i].to_string(), StatusCode::OK),
+        Some(i) => json_response(st.ix.jsons.get(i), StatusCode::OK),
         None => err(StatusCode::NOT_FOUND, &format!("card not found: {id}")),
     }
 }
@@ -512,7 +518,7 @@ pub async fn collection(State(st): State<SharedState>, Json(body): Json<serde_js
             continue;
         };
         match lookup_card(ix, &key) {
-            Some(i) => data.push(ix.jsons[i].to_string()),
+            Some(i) => data.push(ix.jsons.get(i)),
             None => not_found.push(ident.to_string()),
         }
     }

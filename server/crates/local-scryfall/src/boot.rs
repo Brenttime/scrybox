@@ -242,7 +242,26 @@ pub fn load_index(o: &BootOpts) -> Option<Index> {
         ix.oracle_lang_idx.len(),
         ix.oracle_lang_idx.values().map(|b| b.len()).max().unwrap_or(0),
     );
+    ix.strings.shrink_to_fit();
+    release_free_heap();
     Some(ix)
+}
+
+/// Hand the build's transient heap (parse intermediates, intern maps) back
+/// to the OS. glibc keeps freed chunks of every arena mapped until
+/// `malloc_trim`; without this the RSS after a (re)build stays near the
+/// build peak. No-op off glibc.
+pub fn release_free_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: plain libc call, no pointers.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 pub fn state(ix: Index) -> SharedState {

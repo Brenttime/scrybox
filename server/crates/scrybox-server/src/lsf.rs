@@ -162,8 +162,16 @@ impl InProcessEngine {
 
     pub fn install(&self, l: Loaded) {
         tracing::info!(cards = l.cards, built_ms = l.built_ms as u64, "local scryfall: index installed (in-process)");
-        if let Ok(mut g) = self.live.write() {
-            *g = Some(Arc::new(l));
+        let prev = match self.live.write() {
+            Ok(mut g) => g.replace(Arc::new(l)),
+            Err(_) => None,
+        };
+        // Hot swap: free the previous index (unless an in-flight request
+        // still holds it) and hand its pages back to the OS right away,
+        // instead of carrying two indexes' worth of RSS until glibc reuses it.
+        if let Some(p) = prev {
+            drop(p);
+            local_scryfall::boot::release_free_heap();
         }
         let _ = self.ready_ms.compare_exchange(
             0,
