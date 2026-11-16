@@ -172,7 +172,7 @@ Per-route cutover checklist:
 - Migrations today are idempotent `CREATE IF NOT EXISTS` statements plus `table_info` probes with `ALTER`.
   In P6, freeze the current schema as migration `0001_baseline` and gate it on `PRAGMA user_version`.
   The baseline step must detect and accept every historical shape (including the legacy
-  `pokemon_cards.db` rename and `dbrename` / `legacydepokemon` / `legacyartcleanup` paths).
+  TCG card-database rename and the `dbrename` / `legacyartcleanup` migration paths).
 - Keep `price_history` and `collection_query_cache` semantics identical, since stats depend on them.
 - Back up before every phase deploy (`backup.js` behaviour, then a manual snapshot).
 
