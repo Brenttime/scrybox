@@ -1585,7 +1585,7 @@ impl CollectionCache {
 /// `ARENA_MAX_DEFAULT` IN CODE so the win no longer depends on the launcher
 /// exporting `MALLOC_ARENA_MAX` (an explicit, valid env value still wins —
 /// it is glibc's own boot-time setting and the operator's intent).
-pub(crate) fn tune_allocator() {
+pub fn tune_allocator() {
     #[cfg(target_env = "gnu")]
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, ALLOC_MMAP_THRESHOLD_BYTES);

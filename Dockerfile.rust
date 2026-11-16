@@ -130,6 +130,8 @@ WORKDIR /src
 COPY shared/ /src/shared/
 COPY server/ /src/server/
 WORKDIR /src/server
+# Optional cargo features (TOTORO mem A/B: SCRYBOX_FEATURES=jemalloc).
+ARG SCRYBOX_FEATURES=""
 RUN --mount=type=cache,id=scrybox-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=scrybox-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=scrybox-target-${TARGETARCH},target=/src/server/target \
@@ -139,7 +141,7 @@ RUN --mount=type=cache,id=scrybox-cargo-registry,target=/usr/local/cargo/registr
     else \
       export OPENCV_LINK_LIBS=static=opencv_imgproc,static=opencv_core,static=zlib; \
     fi; \
-    cargo build --release --locked -p scrybox-server; \
+    cargo build --release --locked -p scrybox-server ${SCRYBOX_FEATURES:+--features $SCRYBOX_FEATURES}; \
     mkdir -p /out; cp target/release/scrybox-server /out/scrybox-server
 
 # =========================================

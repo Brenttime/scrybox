@@ -248,6 +248,13 @@ fn blocking_threads_from_env() -> usize {
 fn main() {
     #[cfg(feature = "jemalloc")]
     jemalloc_cap::apply();
+    // TOTORO mem: glibc arena cap / mmap threshold BEFORE any thread exists.
+    // It used to run first inside `app()`, after the tokio workers and the
+    // in-process local-scryfall runtime (8 threads) had already allocated —
+    // glibc had by then created ~a dozen arenas (17 64 MiB-aligned heaps
+    // counted at boot), so M_ARENA_MAX=2 capped nothing and the lsf build
+    // + scan/browse transients fragmented across all of them.
+    scrybox_server::collection::tune_allocator();
     // #[tokio::main] equivalent (multi-thread, enable_all) with the blocking
     // pool bounded — see DEFAULT_BLOCKING_THREADS.
     let rt = tokio::runtime::Builder::new_multi_thread()
