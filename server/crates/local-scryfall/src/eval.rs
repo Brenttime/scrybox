@@ -1538,7 +1538,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                     HAS_SPOTLIGHT => c.flags & F_SPOTLIGHT != 0,
                     HAS_TEXT => c.flags & F_HAS_TEXT != 0,
                     HAS_FLAVOR => !ix.strings[c.flavor as usize].is_empty(),
-                    HAS_ALCHEMY => &*ix.strings[c.set_type as usize] == "alchemy",
+                    HAS_ALCHEMY => &ix.strings[c.set_type as usize] == "alchemy",
                     // parity w5 §4 (borrow-plan): these arms previously fell
                     // through to a catch-all binding (the HAS_* constants
                     // were never imported — the arms compiled as wildcard
@@ -1565,7 +1565,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                         // The old oracle_stats.has_artseries route never
                         // fired: art prints carry their OWN oracle_id.
                         let r = ix.card_oracle[i as usize] as usize;
-                        if &*ix.strings[c.layout as usize] == "art_series" {
+                        if &ix.strings[c.layout as usize] == "art_series" {
                             return c.flags2 & F2_NAME_SLASH != 0;
                         }
                         ix.side.art_or.get(r).copied().unwrap_or(0) != 0
@@ -1728,7 +1728,7 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             let q = v.clone();
             scan(ix, move |i| {
                 let c = &ix.cards[i as usize];
-                &*ix.strings[c.watermark as usize] == q.as_str()
+                &ix.strings[c.watermark as usize] == q.as_str()
             })
         }
         Filter::Produces(kind) => {
@@ -2170,7 +2170,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     let non_aux = |c: &crate::index::Card| {
         c.flags2 & F2_TOKEN == 0
             && !matches!(
-                &*ix.strings[c.layout as usize],
+                &ix.strings[c.layout as usize],
                 "token"
                     | "art_series"
                     | "emblem"
@@ -2269,7 +2269,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
             // dfc upstream (proven: is:dfc list diff).
             return scan(ix, |i| {
                 let c = &ix.cards[i as usize];
-                let lay = &*ix.strings[c.layout as usize];
+                let lay = &ix.strings[c.layout as usize];
                 matches!(
                     lay,
                     "transform" | "modal_dfc" | "double_faced_token" | "battle" | "prepare"
@@ -2317,7 +2317,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if c.flags2 & F2_HIDDEN != 0 {
                     return false;
                 }
-                let st = &*ix.strings[c.set_type as usize];
+                let st = &ix.strings[c.set_type as usize];
                 if matches!(st, "memorabilia") {
                     // sets_catalog probe (2026-10-26): upstream's 8190 has
                     // ZERO memorabilia cards but DOES include every
@@ -2396,7 +2396,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if c.flags & F_DIGITAL != 0 && c.games & G_PAPER == 0 {
                     return false;
                 }
-                let lay = &*ix.strings[c.layout as usize];
+                let lay = &ix.strings[c.layout as usize];
                 if lay == "reversible_card" {
                     return false;
                 }
@@ -2422,7 +2422,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 let c = &ix.cards[i as usize];
                 ix.oracle_lc(i).contains("oathbreaker")
                     && (c.flags & F_PLANESWALKER != 0
-                        || &*ix.strings[ix.cards[i as usize].layout as usize] == "vanguard")
+                        || &ix.strings[ix.cards[i as usize].layout as usize] == "vanguard")
             });
         }
         "brawler" => {
@@ -2433,7 +2433,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
                     return false;
                 }
-                let lay = &*ix.strings[c.layout as usize];
+                let lay = &ix.strings[c.layout as usize];
                 if lay == "reversible_card" {
                     return false;
                 }
@@ -2558,7 +2558,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 if c.flags2 & (F2_TOKEN | F2_HIDDEN) != 0 {
                     return false;
                 }
-                &*ix.strings[c.set_type as usize] == "alchemy"
+                &ix.strings[c.set_type as usize] == "alchemy"
             });
         }
         "funny" => return ix.settype_idx.get("funny").cloned().unwrap_or_else(RoaringBitmap::new),
@@ -2631,7 +2631,7 @@ fn eval_is(tag: &str, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
     // (calibrated against upstream lists; tokens never carry these tags).
     {
         let c0 = |i: u32| &ix.cards[i as usize];
-        let layis = |i: u32, l: &str| &*ix.strings[c0(i).layout as usize] == l;
+        let layis = |i: u32, l: &str| &ix.strings[c0(i).layout as usize] == l;
         match t {
             "transform" | "tdfc" => {
                 return scan(ix, |i| {

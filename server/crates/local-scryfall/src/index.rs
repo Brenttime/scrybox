@@ -602,8 +602,8 @@ pub struct Card {
     pub keywords: u32,
     pub layout: u32,
     pub image_small: u32,
-    pub image_normal: u32,
-    pub scryfall_uri: u32,
+    // image_normal / scryfall_uri are NOT interned: they are only ever
+    // served inside the pre-serialized JSON body (~18 MB of unique URLs).
     pub cmc: f32,
     pub power: f32,    // NAN = absent / *
     pub toughness: f32, // NAN = absent / *
@@ -773,12 +773,26 @@ pub struct SetEntry {
     pub n_lands: u32,
 }
 
+/// Initial per-card capacity for the streaming build (default-cards has
+/// ~120k rows; slack is released once the stream ends).
+const CARD_CAP_GUESS: usize = 128 * 1024;
+
+/// Token-pass view of a card (borrowed from the interned strings).
+struct TokSrc<'a> {
+    name: &'a str,
+    type_line: &'a str,
+    oracle_text: &'a str,
+    keywords_joined: &'a str,
+}
+
 pub struct Index {
     pub cards: Vec<Card>,
-    pub strings: Vec<Box<str>>,
-    /// Pre-serialized compact JSON per card (served verbatim, zero re-serialization).
-    pub jsons: Vec<Box<str>>,
-    pub id_map: HashMap<Box<str>, u32>,
+    /// every interned string, one contiguous arena (`strings[i]` -> &str).
+    pub strings: crate::store::StrArena,
+    /// Pre-serialized compact JSON per card (served verbatim, zero
+    /// re-serialization), zstd-compressed per document (byte-exact).
+    pub jsons: crate::store::JsonStore,
+    pub id_map: crate::store::IdMap,
 
     // lowercased mirror offsets (into `strings`) for scans
     pub name_lc: Vec<u32>,
@@ -2419,52 +2433,23 @@ impl Index {
         let mut reader = BufReader::with_capacity(1 << 20, dec);
 
         // 1. parallel parse of gz lines into owned intermediates
-        let mut raws: Vec<RawC> = Vec::with_capacity(120_000);
-        let mut source_bytes = 0u64;
-        loop {
-            let mut chunk: Vec<String> = Vec::with_capacity(2048);
-            let mut eof = false;
-            for _ in 0..2048 {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        source_bytes += n as u64;
-                        let t = line.trim_end();
-                        if !t.is_empty() {
-                            chunk.push(line);
-                        }
-                    }
-                    Err(e) => panic!("read error: {e}"),
-                }
-            }
-            let parsed: Vec<RawC> = chunk.par_iter().filter_map(|l| parse_line(l)).collect();
-            raws.extend(parsed);
-            if eof {
-                break;
-            }
-        }
-        let parse_ms = t0.elapsed().as_millis();
 
         // 2. intern strings, build cards + lc mirrors + pre-serialized JSON
         let mut ix = Index {
-            cards: Vec::with_capacity(raws.len()),
-            strings: Vec::with_capacity(600_000),
-            jsons: Vec::with_capacity(raws.len()),
-            id_map: HashMap::with_capacity(raws.len()),
-            name_lc: Vec::with_capacity(raws.len()),
-            name_text: Vec::with_capacity(raws.len()),
-            type_lc: Vec::with_capacity(raws.len()),
-            oracle_lc: Vec::with_capacity(raws.len()),
-            otext_lc: Vec::with_capacity(raws.len()),
-            cost_all: Vec::with_capacity(raws.len()),
-            artist_lc: Vec::with_capacity(raws.len()),
-            set_name_lc: Vec::with_capacity(raws.len()),
-            mana_norm: Vec::with_capacity(raws.len()),
-            pip: Vec::with_capacity(raws.len()),
+            cards: Vec::with_capacity(CARD_CAP_GUESS),
+            strings: crate::store::StrArena::with_capacity(900_000, 64 << 20),
+            jsons: crate::store::JsonStore::with_capacity(CARD_CAP_GUESS),
+            id_map: crate::store::IdMap::default(),
+            name_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            name_text: Vec::with_capacity(CARD_CAP_GUESS),
+            type_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            oracle_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            otext_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            cost_all: Vec::with_capacity(CARD_CAP_GUESS),
+            artist_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            set_name_lc: Vec::with_capacity(CARD_CAP_GUESS),
+            mana_norm: Vec::with_capacity(CARD_CAP_GUESS),
+            pip: Vec::with_capacity(CARD_CAP_GUESS),
             name_tokens: HashMap::new(),
             type_tokens: HashMap::new(),
             text_tokens: HashMap::new(),
@@ -2472,7 +2457,7 @@ impl Index {
             keyword_tokens: HashMap::new(),
             keyword_phrase: HashMap::new(),
             kw_enum: std::collections::HashSet::new(),
-            prefix: Vec::with_capacity(raws.len()),
+            prefix: Vec::with_capacity(CARD_CAP_GUESS),
             color_bits: Default::default(),
             color_incl: Default::default(),
             ci_bits: Default::default(),
@@ -2528,7 +2513,7 @@ impl Index {
                 let day = doy - (153 * mp + 2) / 5 + 1;
                 (y as u32) * 10_000 + m as u32 * 100 + day as u32
             },
-            card_oracle: Vec::with_capacity(raws.len()),
+            card_oracle: Vec::with_capacity(CARD_CAP_GUESS),
             oracle_id_off: Vec::with_capacity(40_000),
             oracle_vis: Vec::with_capacity(40_000),
             oracle_ci: Vec::new(),
@@ -2551,211 +2536,255 @@ impl Index {
             set_detail_json: HashMap::new(),
             universe: RoaringBitmap::new(),
             build_ms: 0,
-            source_bytes,
+            source_bytes: 0,
         };
         let mut intern: HashMap<Box<str>, u32> = HashMap::with_capacity(300_000);
 
-        for r in &raws {
-            let mut s = |v: &str| -> u32 {
-                if let Some(&o) = intern.get(v) {
-                    return o;
+        let mut parse_dur = std::time::Duration::ZERO;
+        let mut source_bytes = 0u64;
+        loop {
+            let mut chunk: Vec<String> = Vec::with_capacity(2048);
+            let mut eof = false;
+            for _ in 0..2048 {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        source_bytes += n as u64;
+                        let t = line.trim_end();
+                        if !t.is_empty() {
+                            chunk.push(line);
+                        }
+                    }
+                    Err(e) => panic!("read error: {e}"),
                 }
-                let b: Box<str> = v.into();
-                let off = ix.strings.len() as u32;
-                ix.strings.push(b.clone());
-                intern.insert(b, off);
-                off
-            };
-            let c = Card {
-                id: s(&r.id),
-                oracle_id: s(&r.oracle_id),
-                name: s(&r.name),
-                set: s(&r.set),
-                set_name: s(&r.set_name),
-                set_type: s(&r.set_type),
-                collector_number: s(&r.collector_number),
-                cn_key: s(&r.cn_key),
-                type_line: s(&r.type_line),
-                mana_cost: s(&r.mana_cost),
-                oracle_text: s(&r.oracle_text),
-                artist: s(&r.artist),
-                keywords: s(&r.keywords_joined),
-                layout: s(&r.layout),
-                image_small: s(&r.img_small),
-                image_normal: s(&r.img_normal),
-                scryfall_uri: s(&r.uri),
-                cmc: r.cmc,
-                power: r.power,
-                toughness: r.toughness,
-                loyalty: r.loyalty,
-                defense: r.def,
-                colors: r.colors,
-                ci: r.ci,
-                face_pack: r.face_pack,
-                rarity: r.rarity,
-                set_type_code: set_type_code(&r.set_type),
-                legal: r.legal,
-                flags: r.flags,
-                flags2: r.flags2,
-                reprint: r.reprint,
-                atypical: r.atypical,
-                masterpiece: r.masterpiece,
-                face_pow: r.face_pow,
-                face_tou: r.face_tou,
-                face_loy: r.face_loy,
-                face_def: r.face_def,
-                cn_val: r.cn_val,
-                released: r.released,
-                prices: r.prices,
-                edhrec: r.edhrec,
-                lang: s(&r.lang),
-                flavor: s(&r.flavor),
-                watermark: s(&r.watermark),
-                illustration: s(&r.illustration),
-                ptypes: s(&r.ptypes),
-                stamp: r.stamp,
-                border: r.border,
-                frame: r.frame,
-                games: r.games,
-                finishes: r.finishes,
-                produced: r.produced,
-                ffx: r.ffx,
-                new_flags: 0,
-            };
-            let idx = ix.cards.len() as u32;
-            ix.cards.push(c);
-            ix.id_map.insert(r.id.as_str().into(), idx);
+            }
+            let tp = Instant::now();
+            let parsed: Vec<RawC> = chunk.par_iter().filter_map(|l| parse_line(l)).collect();
+            parse_dur += tp.elapsed();
+            // intern each parsed chunk immediately: the build never holds
+            // more than one chunk of parse intermediates (streaming build).
+            for r in &parsed {
+                let mut s = |v: &str| -> u32 {
+                    if let Some(&o) = intern.get(v) {
+                        return o;
+                    }
+                    let off = ix.strings.push(v);
+                    intern.insert(v.into(), off);
+                    off
+                };
+                let c = Card {
+                    id: s(&r.id),
+                    oracle_id: s(&r.oracle_id),
+                    name: s(&r.name),
+                    set: s(&r.set),
+                    set_name: s(&r.set_name),
+                    set_type: s(&r.set_type),
+                    collector_number: s(&r.collector_number),
+                    cn_key: s(&r.cn_key),
+                    type_line: s(&r.type_line),
+                    mana_cost: s(&r.mana_cost),
+                    oracle_text: s(&r.oracle_text),
+                    artist: s(&r.artist),
+                    keywords: s(&r.keywords_joined),
+                    layout: s(&r.layout),
+                    image_small: s(&r.img_small),
+                    cmc: r.cmc,
+                    power: r.power,
+                    toughness: r.toughness,
+                    loyalty: r.loyalty,
+                    defense: r.def,
+                    colors: r.colors,
+                    ci: r.ci,
+                    face_pack: r.face_pack,
+                    rarity: r.rarity,
+                    set_type_code: set_type_code(&r.set_type),
+                    legal: r.legal,
+                    flags: r.flags,
+                    flags2: r.flags2,
+                    reprint: r.reprint,
+                    atypical: r.atypical,
+                    masterpiece: r.masterpiece,
+                    face_pow: r.face_pow,
+                    face_tou: r.face_tou,
+                    face_loy: r.face_loy,
+                    face_def: r.face_def,
+                    cn_val: r.cn_val,
+                    released: r.released,
+                    prices: r.prices,
+                    edhrec: r.edhrec,
+                    lang: s(&r.lang),
+                    flavor: s(&r.flavor),
+                    watermark: s(&r.watermark),
+                    illustration: s(&r.illustration),
+                    ptypes: s(&r.ptypes),
+                    stamp: r.stamp,
+                    border: r.border,
+                    frame: r.frame,
+                    games: r.games,
+                    finishes: r.finishes,
+                    produced: r.produced,
+                    ffx: r.ffx,
+                    new_flags: 0,
+                };
+                let idx = ix.cards.len() as u32;
+                ix.cards.push(c);
+                ix.id_map.insert(r.id.as_str(), idx);
 
-            ix.name_lc.push(s(&r.name.to_lowercase()));
-            ix.name_text.push(s(&r.name_text));
-            ix.type_lc.push(s(&r.type_line.to_lowercase()));
-            ix.oracle_lc.push(s(&r.oracle_text.to_lowercase()));
-            ix.otext_lc
-                .push(s(&crate::index::strip_paren_text(&r.oracle_text).to_lowercase()));
-            ix.cost_all.push(s(&r.mana_cost_all));
-            ix.artist_lc.push(s(&r.artist.to_lowercase()));
-            ix.set_name_lc.push(s(&r.set_name.to_lowercase()));
-            ix.mana_norm.push(s(
-                &r.mana_cost.replace(['{', '}'], "").to_lowercase(),
-            ));
-            ix.pip.push(Self::pip_pack(&r.mana_cost));
+                ix.name_lc.push(s(&r.name.to_lowercase()));
+                ix.name_text.push(s(&r.name_text));
+                ix.type_lc.push(s(&r.type_line.to_lowercase()));
+                ix.oracle_lc.push(s(&r.oracle_text.to_lowercase()));
+                ix.otext_lc
+                    .push(s(&crate::index::strip_paren_text(&r.oracle_text).to_lowercase()));
+                ix.cost_all.push(s(&r.mana_cost_all));
+                ix.artist_lc.push(s(&r.artist.to_lowercase()));
+                ix.set_name_lc.push(s(&r.set_name.to_lowercase()));
+                ix.mana_norm.push(s(
+                    &r.mana_cost.replace(['{', '}'], "").to_lowercase(),
+                ));
+                ix.pip.push(Self::pip_pack(&r.mana_cost));
 
-            // pre-serialized compact JSON (served verbatim)
-            let mut j = String::with_capacity(1024);
-            j.push_str("{\"id\":");
-            push_json_str(&mut j, &r.id);
-            j.push_str(",\"oracle_id\":");
-            push_json_str(&mut j, &r.oracle_id);
-            j.push_str(",\"name\":");
-            push_json_str(&mut j, &r.name);
-            j.push_str(",\"set\":");
-            push_json_str(&mut j, &r.set);
-            j.push_str(",\"set_name\":");
-            push_json_str(&mut j, &r.set_name);
-            j.push_str(",\"collector_number\":");
-            push_json_str(&mut j, &r.collector_number);
-            j.push_str(",\"type_line\":");
-            push_json_str(&mut j, &r.type_line);
-            j.push_str(",\"mana_cost\":");
-            push_json_str(&mut j, &r.mana_cost);
-            j.push_str(",\"cmc\":");
-            j.push_str(&if r.cmc.is_nan() { "null".into() } else { fmt_f32(r.cmc) });
-            j.push_str(",\"colors\":[");
-            for (i, letter) in ['W', 'U', 'B', 'R', 'G'].iter().enumerate() {
-                if r.colors & (1 << i) != 0 {
-                    if j.as_bytes()[j.len() - 1] != b'[' {
+                // pre-serialized compact JSON (served verbatim)
+                let mut j = String::with_capacity(1024);
+                j.push_str("{\"id\":");
+                push_json_str(&mut j, &r.id);
+                j.push_str(",\"oracle_id\":");
+                push_json_str(&mut j, &r.oracle_id);
+                j.push_str(",\"name\":");
+                push_json_str(&mut j, &r.name);
+                j.push_str(",\"set\":");
+                push_json_str(&mut j, &r.set);
+                j.push_str(",\"set_name\":");
+                push_json_str(&mut j, &r.set_name);
+                j.push_str(",\"collector_number\":");
+                push_json_str(&mut j, &r.collector_number);
+                j.push_str(",\"type_line\":");
+                push_json_str(&mut j, &r.type_line);
+                j.push_str(",\"mana_cost\":");
+                push_json_str(&mut j, &r.mana_cost);
+                j.push_str(",\"cmc\":");
+                j.push_str(&if r.cmc.is_nan() { "null".into() } else { fmt_f32(r.cmc) });
+                j.push_str(",\"colors\":[");
+                for (i, letter) in ['W', 'U', 'B', 'R', 'G'].iter().enumerate() {
+                    if r.colors & (1 << i) != 0 {
+                        if j.as_bytes()[j.len() - 1] != b'[' {
+                            j.push(',');
+                        }
+                        j.push('"');
+                        j.push(*letter);
+                        j.push('"');
+                    }
+                }
+                j.push_str("],\"color_identity\":[");
+                for (i, letter) in ['W', 'U', 'B', 'R', 'G'].iter().enumerate() {
+                    if r.ci & (1 << i) != 0 {
+                        if j.as_bytes()[j.len() - 1] != b'[' {
+                            j.push(',');
+                        }
+                        j.push('"');
+                        j.push(*letter);
+                        j.push('"');
+                    }
+                }
+                j.push_str("],\"rarity\":");
+                push_json_str(&mut j, str_of_rarity(r.rarity));
+                j.push_str(",\"oracle_text\":");
+                push_json_str(&mut j, &r.oracle_text);
+                j.push_str(",\"keywords\":[");
+                let mut first = true;
+                for kw in r.keywords_joined.split(' ') {
+                    if !kw.is_empty() {
+                        if !first {
+                            j.push(',');
+                        }
+                        first = false;
+                        push_json_str(&mut j, kw);
+                    }
+                }
+                j.push_str("],\"power\":");
+                j.push_str(&if r.power.is_nan() { "null".into() } else if r.power == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.power)) });
+                j.push_str(",\"toughness\":");
+                j.push_str(&if r.toughness.is_nan() { "null".into() } else if r.toughness == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.toughness)) });
+                j.push_str(",\"loyalty\":");
+                j.push_str(&if r.loyalty.is_nan() { "null".into() } else if r.loyalty == STAR { "\"*\"".into() } else { fmt_f32(r.loyalty) });
+                j.push_str(",\"layout\":");
+                push_json_str(&mut j, &r.layout);
+                j.push_str(",\"image_uris\":{\"small\":");
+                push_json_str(&mut j, &r.img_small);
+                j.push_str(",\"normal\":");
+                push_json_str(&mut j, &r.img_normal);
+                j.push_str("}");
+                // flat fields the frontend reads directly
+                j.push_str(",\"image_url\":");
+                push_json_str(&mut j, &r.img_normal);
+                j.push_str(",\"legal\":\"");
+                let mut first = true;
+                for (fi, f) in FORMATS.iter().enumerate() {
+                    if ((r.legal >> (fi as u32 * 2)) & 3) as u32 == L_LEGAL {
+                        if !first {
+                            j.push(',');
+                        }
+                        first = false;
+                        j.push_str(f);
+                    }
+                }
+                j.push('"');
+                j.push_str(",\"scryfall_uri\":");
+                push_json_str(&mut j, &r.uri);
+                j.push_str(",\"artist\":");
+                push_json_str(&mut j, &r.artist);
+                j.push_str(",\"released_at\":");
+                j.push_str(&if r.released == 0 {
+                    "null".to_string()
+                } else {
+                    let d = r.released.to_string();
+                    format!("\"{}-{}-{}\"", &d[0..4], &d[4..6], &d[6..8])
+                });
+                j.push_str(",\"legalities\":{");
+                for (fi, f) in FORMATS.iter().enumerate() {
+                    if fi > 0 {
                         j.push(',');
                     }
-                    j.push('"');
-                    j.push(*letter);
-                    j.push('"');
-                }
-            }
-            j.push_str("],\"color_identity\":[");
-            for (i, letter) in ['W', 'U', 'B', 'R', 'G'].iter().enumerate() {
-                if r.ci & (1 << i) != 0 {
-                    if j.as_bytes()[j.len() - 1] != b'[' {
-                        j.push(',');
+                    push_json_str(&mut j, f);
+                    j.push(':');
+                    match ((r.legal >> (fi as u32 * 2)) & 3) as u32 {
+                        L_LEGAL => j.push_str("\"legal\""),
+                        L_BANNED => j.push_str("\"banned\""),
+                        L_RESTRICTED => j.push_str("\"restricted\""),
+                        _ => j.push_str("\"not_legal\""),
                     }
-                    j.push('"');
-                    j.push(*letter);
-                    j.push('"');
                 }
+                j.push_str("}}");
+                ix.jsons.push(j);
             }
-            j.push_str("],\"rarity\":");
-            push_json_str(&mut j, str_of_rarity(r.rarity));
-            j.push_str(",\"oracle_text\":");
-            push_json_str(&mut j, &r.oracle_text);
-            j.push_str(",\"keywords\":[");
-            let mut first = true;
-            for kw in r.keywords_joined.split(' ') {
-                if !kw.is_empty() {
-                    if !first {
-                        j.push(',');
-                    }
-                    first = false;
-                    push_json_str(&mut j, kw);
-                }
+            drop(parsed);
+            if eof {
+                break;
             }
-            j.push_str("],\"power\":");
-            j.push_str(&if r.power.is_nan() { "null".into() } else if r.power == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.power)) });
-            j.push_str(",\"toughness\":");
-            j.push_str(&if r.toughness.is_nan() { "null".into() } else if r.toughness == STAR { "\"*\"".into() } else { format!("\"{}\"", fmt_f32(r.toughness)) });
-            j.push_str(",\"loyalty\":");
-            j.push_str(&if r.loyalty.is_nan() { "null".into() } else if r.loyalty == STAR { "\"*\"".into() } else { fmt_f32(r.loyalty) });
-            j.push_str(",\"layout\":");
-            push_json_str(&mut j, &r.layout);
-            j.push_str(",\"image_uris\":{\"small\":");
-            push_json_str(&mut j, &r.img_small);
-            j.push_str(",\"normal\":");
-            push_json_str(&mut j, &r.img_normal);
-            j.push_str("}");
-            // flat fields the frontend reads directly
-            j.push_str(",\"image_url\":");
-            push_json_str(&mut j, &r.img_normal);
-            j.push_str(",\"legal\":\"");
-            let mut first = true;
-            for (fi, f) in FORMATS.iter().enumerate() {
-                if ((r.legal >> (fi as u32 * 2)) & 3) as u32 == L_LEGAL {
-                    if !first {
-                        j.push(',');
-                    }
-                    first = false;
-                    j.push_str(f);
-                }
-            }
-            j.push('"');
-            j.push_str(",\"scryfall_uri\":");
-            push_json_str(&mut j, &r.uri);
-            j.push_str(",\"artist\":");
-            push_json_str(&mut j, &r.artist);
-            j.push_str(",\"released_at\":");
-            j.push_str(&if r.released == 0 {
-                "null".to_string()
-            } else {
-                let d = r.released.to_string();
-                format!("\"{}-{}-{}\"", &d[0..4], &d[4..6], &d[6..8])
-            });
-            j.push_str(",\"legalities\":{");
-            for (fi, f) in FORMATS.iter().enumerate() {
-                if fi > 0 {
-                    j.push(',');
-                }
-                push_json_str(&mut j, f);
-                j.push(':');
-                match ((r.legal >> (fi as u32 * 2)) & 3) as u32 {
-                    L_LEGAL => j.push_str("\"legal\""),
-                    L_BANNED => j.push_str("\"banned\""),
-                    L_RESTRICTED => j.push_str("\"restricted\""),
-                    _ => j.push_str("\"not_legal\""),
-                }
-            }
-            j.push_str("}}");
-            ix.jsons.push(j.into_boxed_str());
         }
+        ix.source_bytes = source_bytes;
+        let parse_ms = parse_dur.as_millis();
+        // capacities above were a size guess (the card count is unknown
+        // until the stream ends): release the slack.
+        ix.cards.shrink_to_fit();
+        ix.id_map.finish();
+        for v in [
+            &mut ix.name_lc, &mut ix.name_text, &mut ix.type_lc, &mut ix.oracle_lc, &mut ix.otext_lc,
+            &mut ix.cost_all, &mut ix.artist_lc, &mut ix.set_name_lc, &mut ix.mana_norm, &mut ix.pip,
+        ] {
+            v.shrink_to_fit();
+        }
+        ix.jsons.finish();
         let intern_ms = t0.elapsed().as_millis();
         drop(intern);
-        let raws = raws; // keep for token pass below
+        // The parse intermediates are the build's largest transient
+        // (~250 MB): free them now. The token pass below reads the same
+        // four fields back from the interned strings (Card.name/type_line/
+        // oracle_text/keywords were interned verbatim from these RawC fields).
 
         // 2.5 oracle table: intern oracle_ids to dense rows, compute default-search
         // visibility (per the calibrated rule — each condition checked INDEPENDENTLY
@@ -2770,12 +2799,12 @@ impl Index {
         // flags bits: 1=has printing w/ good set_type, 2=has good layout, 4=has good set code
         let mut oracle_flags: Vec<u8> = Vec::with_capacity(ix.oracle_vis.len());
         for (oid, st, lay, set) in card_keys {
-            let row = match ix.oracle_intern.get(&*ix.strings[oid as usize]) {
+            let row = match ix.oracle_intern.get(&ix.strings[oid as usize]) {
                 Some(&r) => r,
                 None => {
                     let r = ix.oracle_id_off.len() as u32;
                     ix.oracle_id_off.push(oid);
-                    ix.oracle_intern.insert(ix.strings[oid as usize].clone(), r);
+                    ix.oracle_intern.insert(Box::<str>::from(&ix.strings[oid as usize]), r);
                     oracle_flags.push(0);
                     r
                 }
@@ -2871,7 +2900,7 @@ impl Index {
                 } else {
                     tok_cnt[r] += 1;
                 }
-                if &*ix.strings[c.layout as usize] == "art_series" {
+                if &ix.strings[c.layout as usize] == "art_series" {
                     st.has_artseries = true;
                 }
                 st.games |= c.games;
@@ -2886,15 +2915,15 @@ impl Index {
                 illus_seen[r].insert(c.illustration);
                 // oracle-row "ever in" indexes
                 ix.in_sets
-                    .entry(ix.strings[c.set as usize].clone())
+                    .entry(Box::<str>::from(&ix.strings[c.set as usize]))
                     .or_default()
                     .insert(r as u32);
                 ix.in_set_types
-                    .entry(ix.strings[c.set_type as usize].clone())
+                    .entry(Box::<str>::from(&ix.strings[c.set_type as usize]))
                     .or_default()
                     .insert(r as u32);
                 ix.in_langs
-                    .entry(ix.strings[c.lang as usize].clone())
+                    .entry(Box::<str>::from(&ix.strings[c.lang as usize]))
                     .or_default()
                     .insert(r as u32);
                 ix.in_rarities
@@ -2973,13 +3002,23 @@ impl Index {
         }
 
         // 3. token inverted indexes (parallel, per-thread maps merged)
+        let raws: Vec<TokSrc<'_>> = ix
+            .cards
+            .iter()
+            .map(|c| TokSrc {
+                name: &ix.strings[c.name as usize],
+                type_line: &ix.strings[c.type_line as usize],
+                oracle_text: &ix.strings[c.oracle_text as usize],
+                keywords_joined: &ix.strings[c.keywords as usize],
+            })
+            .collect();
         let merge = |mut a: HashMap<String, RoaringBitmap>, b: HashMap<String, RoaringBitmap>| {
             for (k, v) in b {
                 a.entry(k).and_modify(|e| *e |= &v).or_insert(v);
             }
             a
         };
-        let mk = |get: fn(&RawC) -> String| -> HashMap<String, RoaringBitmap> {
+        let mk = |get: fn(&TokSrc<'_>) -> String| -> HashMap<String, RoaringBitmap> {
             raws.par_iter()
                 .enumerate()
                 .fold(HashMap::<String, RoaringBitmap>::new, |mut m, (i, r)| {
@@ -3040,8 +3079,8 @@ impl Index {
                 m
             })
             .reduce(HashMap::new, merge);
-        ix.type_tokens = mk(|r| r.type_line.clone());
-        ix.keyword_tokens = mk(|r| r.keywords_joined.clone());
+        ix.type_tokens = mk(|r| r.type_line.to_string());
+        ix.keyword_tokens = mk(|r| r.keywords_joined.to_string());
         // exact keyword-phrase index: gate to prints that actually count for
         // keyword matching upstream (non-token, non-hidden, non-aux print).
         ix.keyword_phrase = (0..raws.len())
@@ -3164,11 +3203,11 @@ impl Index {
                 .or_default()
                 .insert(i);
             ix.layout_idx
-                .entry(ix.strings[c.layout as usize].clone())
+                .entry(Box::<str>::from(&ix.strings[c.layout as usize]))
                 .or_default()
                 .insert(i);
             ix.settype_idx
-                .entry(ix.strings[c.set_type as usize].clone())
+                .entry(Box::<str>::from(&ix.strings[c.set_type as usize]))
                 .or_default()
                 .insert(i);
             ix.border_idx
@@ -3207,7 +3246,7 @@ impl Index {
                     }
                 }
                 ix.lang_idx
-                    .entry(ix.strings[c.lang as usize].clone())
+                    .entry(Box::<str>::from(&ix.strings[c.lang as usize]))
                     .or_default()
                     .insert(i);
             }
@@ -3249,12 +3288,12 @@ impl Index {
         // Scryfall "rarity" sort: mythic -> rare -> uncommon -> common
         by_rarity.sort_unstable_by_key(|&i| {
             let c = &ix.cards[i as usize];
-            (255u16 - c.rarity as u16, &*ix.strings[c.set as usize], c.cn_val)
+            (255u16 - c.rarity as u16, &ix.strings[c.set as usize], c.cn_val)
         });
         let mut by_set: Vec<u32> = (0..n as u32).collect();
         by_set.sort_unstable_by_key(|&i| {
             let c = &ix.cards[i as usize];
-            (&*ix.strings[c.set as usize], c.cn_val)
+            (&ix.strings[c.set as usize], c.cn_val)
         });
         let mut by_released: Vec<u32> = (0..n as u32).collect();
         by_released.sort_unstable_by(|&a, &b| {
@@ -3283,7 +3322,7 @@ impl Index {
                 if ix.strings[c.set as usize].is_empty() {
                     continue;
                 }
-                if matches!(&*ix.strings[c.set_type as usize], "asset" | "stock" | "gallery") {
+                if matches!(&ix.strings[c.set_type as usize], "asset" | "stock" | "gallery") {
                     continue;
                 }
                 let idx = match map.get(&c.set) {
@@ -3349,6 +3388,8 @@ impl Index {
         }
 
         // 6. universe complement helper is caller's job; store build time
+        ix.card_oracle.shrink_to_fit();
+        ix.prefix.shrink_to_fit();
         ix.build_ms = t0.elapsed().as_millis() - parse_ms;
         eprintln!(
             "index: {} cards | parse {}ms | build {}ms | strings {} | ~{} MB",
@@ -3362,8 +3403,8 @@ impl Index {
     }
 
     pub fn estimate_mb(&self) -> usize {
-        let jsons: usize = self.jsons.iter().map(|j| j.len() + 16).sum();
-        let strs: usize = self.strings.iter().map(|s| s.len() + 24).sum();
+        let jsons: usize = self.jsons.heap_bytes();
+        let strs: usize = self.strings.heap_bytes();
         let toks: usize = self
             .name_tokens
             .iter()
@@ -3591,8 +3632,7 @@ impl Index {
                 if let Some(&o) = cache.get(s) {
                     return o;
                 }
-                ix.strings.push(s.to_string().into_boxed_str());
-                let o = ix.strings.len() as u32 - 1;
+                let o = ix.strings.push(s);
                 cache.insert(s.to_string(), o);
                 o
             };
