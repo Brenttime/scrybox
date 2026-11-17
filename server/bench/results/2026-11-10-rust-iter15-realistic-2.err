@@ -1,0 +1,6 @@
+{"name":"health","conc":16,"n":18307,"variants":1,"rps":1829.6,"p50_ms":7.8,"p99_ms":19.66,"p999_ms":33.17,"max_ms":40.35,"peak_rss_mb":2193.6,"codes":{"200":18307},"bench":"single"}
+{"name":"collection_page_varied","conc":16,"n":47624,"variants":52,"rps":4647.2,"p50_ms":1.67,"p99_ms":10.53,"p999_ms":239.1,"max_ms":447.62,"peak_rss_mb":2075.4,"codes":{"200":47624},"bench":"single"}
+{"name":"collection_full_varied","conc":2,"n":299,"variants":6,"rps":19.2,"p50_ms":34.8,"p99_ms":896.13,"p999_ms":1657.29,"max_ms":1657.29,"peak_rss_mb":2624.6,"codes":{"200":299},"bench":"single"}
+{"name":"stats_varied","conc":16,"n":118399,"variants":52,"rps":11838.7,"p50_ms":0.93,"p99_ms":7.97,"p999_ms":15.9,"max_ms":41.52,"peak_rss_mb":2929.3,"codes":{"200":118399},"bench":"single"}
+{"name":"search_db_varied","conc":16,"n":344,"variants":52,"rps":31.7,"p50_ms":334.54,"p99_ms":2046.43,"p999_ms":2600.49,"max_ms":2600.49,"peak_rss_mb":3581.1,"codes":{"200":344},"bench":"single"}
+{"name":"search_coll_varied","conc":16,"n":130988,"variants":52,"rps":13098.8,"p50_ms":0.88,"p99_ms":6.48,"p999_ms":24.56,"max_ms":203.22,"peak_rss_mb":3436.5,"codes":{"200":130988},"bench":"single"}

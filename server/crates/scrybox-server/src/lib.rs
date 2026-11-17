@@ -1,0 +1,1266 @@
+//! Scrybox front server (strangler fig).
+//!
+//! `/api/health` is answered natively (backed by a cached Node health ping,
+//! health.rs). Routes
+//! listed in `RUST_ROUTES` are served by their ported Rust handlers; every
+//! other request is reverse-proxied to the Node backend unchanged, so
+//! behaviour (headers, status codes, bodies) stays exactly what Node
+//! produces. Static frontend serving from Rust is opt-in
+//! (`SCRYBOX_STATIC_DIR`); misses fall through to Node.
+
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
+    Router,
+};
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
+use tower_http::services::ServeDir;
+
+pub mod auth;
+pub mod auth_routes;
+pub mod auth_support;
+pub mod admin_users;
+pub mod backup;
+pub mod cards_meta;
+pub mod card_cache;
+pub mod card_sets;
+pub mod catalog_build;
+pub mod card_norm;
+pub mod cardscan;
+pub mod card_art;
+pub mod cards_tags;
+pub mod catalog_read;
+pub mod collq;
+pub mod scryq;
+pub mod cvscan;
+pub mod scan_ocr;
+pub mod scan_engine;
+pub mod ip_limit;
+pub mod oidc;
+pub mod oracle_tags;
+pub mod collection;
+pub mod collection_writes;
+pub mod db;
+pub mod decks_writes;
+pub mod decks_reads;
+pub mod decks_combos;
+pub mod export;
+pub mod flight;
+pub mod npz;
+pub mod settings;
+pub mod limited;
+pub mod lsf;
+pub mod lsf_data;
+pub mod lists_body_writes;
+pub mod lists_reads;
+pub mod lists_writes;
+pub mod health;
+pub mod manabox;
+pub mod marketplace;
+pub mod migrations;
+pub mod mfx_payload;
+pub mod moxfield;
+pub mod moxfield_api;
+pub mod model_assets;
+pub mod name_index;
+pub mod poison;
+pub mod precons;
+pub mod rules;
+pub mod scryfall;
+pub mod secheaders;
+pub mod scry_jobs;
+pub mod search;
+pub mod secret_lair;
+pub mod seed_cards;
+pub mod sets;
+pub mod sidecar;
+pub mod stats;
+mod stats_sql;
+pub mod stats_subs;
+pub mod search_history;
+pub mod shared;
+pub mod spa;
+pub mod static_assets;
+pub mod tls;
+pub mod util;
+
+/// Runtime configuration. Read from env in `main`; built directly in tests.
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Address the Rust server binds (front door).
+    pub bind: SocketAddr,
+    /// Base URL of the Node backend, e.g. `http://127.0.0.1:3002` (no trailing slash).
+    pub node_upstream: String,
+    /// Optional built frontend (`frontend/dist`). None = Node serves static too.
+    pub static_dir: Option<PathBuf>,
+    /// Routes Rust owns (per-route kill switch, plan section 3). Empty in P0.
+    pub rust_routes: BTreeSet<String>,
+    /// The SQLite copy shared with Node (`SCRYBOX_DB_PATH`). Ported routes
+    /// read through it; without it they stay disabled and everything proxies.
+    pub db_path: Option<PathBuf>,
+    /// scryfall-local sidecar base URL (`SCRYBOX_SIDECAR_URL`, e.g.
+    /// `http://172.29.0.2:8420`). The `search_sidecar` leg pages it directly
+    /// (same base the Node container uses via LOCAL_SCRYFALL_URL); unset
+    /// disables that leg — those requests keep proxying to Node.
+    pub sidecar_url: Option<String>,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, String> {
+        let bind = std::env::var("SCRYBOX_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:3001".into())
+            .parse()
+            .map_err(|e| format!("SCRYBOX_BIND: {e}"))?;
+        let node_upstream = std::env::var("SCRYBOX_NODE_UPSTREAM")
+            .unwrap_or_else(|_| "http://127.0.0.1:3002".into())
+            .trim_end_matches('/')
+            .to_string();
+        // Lane B unit 7: an EXPLICITLY EMPTY upstream declares a Node-free
+        // deployment (the scrybox-rust image). Unported routes then answer
+        // 502 (there is nothing to proxy to), and /api/health is answered
+        // locally with Node's own handler shape instead of probing a peer
+        // that does not exist. Unset still means the classic test-lane
+        // default :3002.
+        let standalone = std::env::var("SCRYBOX_NODE_UPSTREAM").map(|v| v.trim().is_empty()).unwrap_or(false);
+        if !standalone && !node_upstream.starts_with("http://") {
+            return Err("SCRYBOX_NODE_UPSTREAM must be an http:// URL".into());
+        }
+        let static_dir = std::env::var_os("SCRYBOX_STATIC_DIR")
+            .map(PathBuf::from)
+            // An empty-but-set value must not mount ServeDir: its fallback
+            // never answers non-GET requests, so every POST to a
+            // Rust-unregistered API path would die 405 (allow: GET,HEAD)
+            // instead of reaching the proxy.
+            .filter(|p| !p.as_os_str().is_empty());
+        let rust_routes = std::env::var("RUST_ROUTES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Ok(Self { bind, node_upstream, static_dir, rust_routes, db_path: std::env::var_os("SCRYBOX_DB_PATH").map(PathBuf::from), sidecar_url: lsf::resolve_sidecar_url(std::env::var("SCRYBOX_SIDECAR_URL").ok().map(|s| s.trim_end_matches('/').to_string()).filter(|s| !s.is_empty())) })
+    }
+}
+
+type HttpClient = Client<HttpConnector, Body>;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: Config,
+    pub(crate) client: HttpClient,
+    /// Read pool over the shared DB copy; `None` when SCRYBOX_DB_PATH unset.
+    pub db: Option<Arc<db::DbPool>>,
+    pub collection_cache: Arc<collection::CollectionCache>,
+    /// Response cache for the ported search route, keyed by
+    /// (params, user, collection_read_revision).
+    pub search_cache: Arc<search::SearchCache>,
+    /// In-memory name index speeding the search route's LIKE filter
+    /// (name_index.rs). Process-wide so invalidation rebuilds once.
+    pub name_index: Arc<name_index::NameIndex>,
+    /// Per-user owned-qty snapshots (name_index::OwnedCache) replacing the
+    /// per-request owned CTE re-materialization in the search route.
+    pub owned_index: Arc<name_index::OwnedCache>,
+    /// Response cache for the native /stats route (stats.rs mirrors
+    /// backend/src/utils/statsCache.js); disabled without a DB, same rule.
+    pub stats_cache: Arc<stats::StatsCache>,
+    /// In-process half of the shared `collection_query_cache` (match lists
+    /// for the collection-scope q leg, collq.rs) + walk single-flight.
+    pub collq_cache: Arc<collq::CollQCache>,
+    /// Pre-warm cost gate (collection.rs, iter 15): shapes whose last build
+    /// was cheaper than this never fan out. `SCRYBOX_PREWARM_MIN_COST_MS`
+    /// overrides; tests set the field directly.
+    pub prewarm_min_cost_ms: u64,
+    /// Kill switch for the search cache-path stale background refresh
+    /// (queryLocal's floating bulkFetchByIdentifier, scryfallApi.js). On in
+    /// production (Node has no such switch); cargo tests off it in the
+    /// harness — the refresh POSTs ride `st.scry`, which defaults to
+    /// api.scryfall.com and would make the suite non-hermetic — and flip it
+    /// back on with a mock Scry in the dedicated refresh case.
+    /// `SCRYBOX_DISABLE_STALE_REFRESH=1|true` mirrors the other job switches.
+    pub stale_refresh: bool,
+    /// `/api/health` response cache + prober (iter 17). Read from env.
+    pub health_cache: Arc<health::HealthCache>,
+    /// TRUST_PROXY twin for the auth limiter's client-IP decision (iter 20).
+    /// Tests set this directly; `new` parses the same env Node's server.js
+    /// reads, with the same ladder.
+    pub trust_proxy: ip_limit::Trust,
+    /// scryfallApi.js `LOCAL_SCRYFALL` — LOCAL_SCRYFALL_ENABLED === 'true',
+    /// read ONCE at boot like Node's module-load read. Drives the
+    /// collection-q mode split: sidecar mode walks the engine for EVERY
+    /// query (card_cache SQL is outage-fallback only), upstream mode gets
+    /// the SQLite answer legs (search.rs / collq.rs local legs).
+    pub local_scrayfall: bool,
+    /// Shared Scryfall client (Lane B): rate-limited queue + 404 breaker.
+    /// One per process so the queue is global, like Node's module state.
+    pub scry: Arc<scryfall::Scry>,
+    /// Moxfield API client (Lane B unit 3): execs curl/curl-impersonate,
+    /// GET only. `from_env` at boot (MOXFIELD_API_BASE / MOXFIELD_CURL_BIN /
+    /// curl-impersonate probe), like Node's require-time constants; tests
+    /// point it at a mock by setting the field.
+    pub mfx: Arc<crate::moxfield_api::MfxApi>,
+    /// cardSets.js getScryfallSets memo (tree=1 folds, 6 h TTL).
+    pub scryfall_sets: sets::ScryfallSetsMemo,
+    /// ManaPool order client (marketplace.rs httpGet twin). Trait-typed so
+    /// route tests inject a stub, exactly like the Node unit tests inject
+    /// `httpGet` into utils/marketplaceOrders.
+    pub mp_http: Arc<dyn marketplace::MpHttp>,
+    /// authLimiter twin (middleware/auth.js): one fixed window per client IP
+    /// shared by login/register/bootstrap/api-key/settings.
+    pub auth_limiter: Arc<ip_limit::FixedWindowLimiter>,
+    /// Repo `shared/` directory (SCRYBOX_SHARED_DIR): the layers
+    /// `cardArt.BUNDLED_DIR` and `utils/languages.js` read. None makes the
+    /// catalog_art file-dependent handlers proxy instead of guessing.
+    pub shared_dir: Option<std::path::PathBuf>,
+    /// CV_MODEL_DIR — catalog meta/model dir catalog.js/cvScan.js stat.
+    /// None => catalog-read handlers proxy (no silent empty answers).
+    pub model_dir: Option<std::path::PathBuf>,
+    /// utils/deckListCache.js `store` twin (decks_reads): userId ->
+    /// (deck_list_revision, built body bytes). Per process like Node's
+    /// module-level Map; per AppState in tests keeps fixtures isolated.
+    pub deck_list_cache: Arc<std::sync::Mutex<std::collections::HashMap<i64, (i64, Vec<u8>)>>>,
+    /// Spellbook/EDHREC client (decks_combos fetch twin). Trait-typed so
+    /// route tests inject a stub, exactly like `mp_http` (provider-leg
+    /// ruling: URLs are Node module constants, so the real legs are
+    /// excluded from parity and stub-proven in unit tests instead).
+    pub deck_http: Arc<dyn decks_combos::DecksProviders>,
+    /// routes/decks.js `edhrecMem` Map twin: slug -> { t, cards } (bounded
+    /// twin, MEM_CACHE_CAP). Per process like Node's module-level Map; per
+    /// AppState in tests keeps fixtures isolated.
+    pub edhrec_mem: Arc<std::sync::Mutex<std::collections::HashMap<String, decks_combos::EdhrecEntry>>>,
+    /// EDHREC_CACHE_DIR; default dirname(DB)/edhrec-cache — the same shared
+    /// bind-mounted database volume precons_index_path uses.
+    pub edhrec_cache_dir: Option<std::path::PathBuf>,
+    /// preconData.js `indexFile` — the shared MTGJSON mirror
+    /// (dirname(DB)/precons.json), the SAME file the Node container reads
+    /// through its /app/database bind mount. Tests point it at a temp dir.
+    pub precons_index_path: std::path::PathBuf,
+    /// preconData.MTGJSON_BASE; SCRYBOX_MTGJSON_BASE overrides for tests
+    /// only (snapshot at boot, like SettingsEnv — an env read per request
+    /// would race across parallel integration tests).
+    pub mtgjson_base: String,
+    /// rules.js CACHE — the shared rules doc (dirname(DB)/mtg-rules.json,
+    /// same bind-mounted file the Node container reads). RULES_CACHE env
+    /// override like the Node twin.
+    pub rules_cache_path: std::path::PathBuf,
+    /// rules.js hard-coded upstream URLs (test hooks; production keeps the
+    /// JS constants — same snapshot pattern as `mtgjson_base`).
+    pub rules_index_url: String,
+    pub rules_commander_url: String,
+    pub rules_cr_base: String,
+    /// rules.js module-level `mem` + `kwMem` (per-process), + the `inflight`
+    /// build-dedup twin. Per AppState so fixtures stay isolated.
+    pub rules_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    pub kw_mem: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    pub rules_build: Arc<tokio::sync::Mutex<()>>,
+    /// Memory queue item 6 (MEMORY.md #9): set once by the native-route
+    /// traffic layer when the FIRST real (non-health) request arrives.
+    /// Shares state across AppState clones (Arc), so the layer's write is
+    /// visible to boot-time tasks awaiting the gate.
+    pub(crate) traffic_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes everyone awaiting `traffic_seen` flipping to true.
+    pub(crate) traffic_notify: Arc<tokio::sync::Notify>,
+}
+
+impl AppState {
+    pub fn new(cfg: Config) -> Self {
+        let mut conn = HttpConnector::new();
+        conn.set_nodelay(true);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build(conn);
+        let db = cfg.db_path.as_ref().and_then(|path| {
+            // Gate D DB tuning: pool sized to cores, one GLOBAL page-cache
+            // budget split across connections, right-sized mmap window.
+            let default_max = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
+            let pcfg = db::PoolConfig::from_env(default_max);
+            match db::DbPool::open_with(path, pcfg) {
+                Ok(pool) => {
+                    // Hit-path checkouts (auth + revision) run inline on
+                    // runtime workers; pre-fill so they never pay connect().
+                    pool.warm(pcfg.max);
+                    Some(Arc::new(pool))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, path = %path.display(), "cannot open DB copy; Rust routes disabled");
+                    None
+                }
+            }
+        });
+        let precons_index_path = crate::precons::default_index_path(cfg.db_path.as_ref());
+        let mtgjson_base = std::env::var("SCRYBOX_MTGJSON_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::precons::MTGJSON.to_string());
+        let rules_cache_path = std::env::var("RULES_CACHE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::rules::default_cache_path(cfg.db_path.as_ref()));
+        let edhrec_cache_dir = std::env::var_os("EDHREC_CACHE_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| precons_index_path.parent().map(|d| d.join("edhrec-cache")));
+        Self { cfg, client, db, collection_cache: Arc::new(collection::CollectionCache::new()), search_cache: Arc::new(search::SearchCache::new()), name_index: Arc::new(name_index::NameIndex::new()), owned_index: Arc::new(name_index::OwnedCache::new()), stats_cache: Arc::new(stats::StatsCache::new()), collq_cache: Arc::new(collq::CollQCache::new()), prewarm_min_cost_ms: std::env::var("SCRYBOX_PREWARM_MIN_COST_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(collection::PREWARM_MIN_COST_MS_DEFAULT), stale_refresh: !std::env::var("SCRYBOX_DISABLE_STALE_REFRESH").map(|v| v == "true" || v == "1").unwrap_or(false), health_cache: Arc::new(health::HealthCache::new_from_env()), trust_proxy: std::env::var("TRUST_PROXY").map(|v| ip_limit::Trust::from_env_value(&v)).unwrap_or(ip_limit::Trust::None), local_scrayfall: std::env::var("LOCAL_SCRYFALL_ENABLED").map(|v| v == "true").unwrap_or(false), auth_limiter: Arc::new(ip_limit::FixedWindowLimiter::new(20, 15 * 60 * 1000)), scry: Arc::new(scryfall::Scry::new(scryfall::ScryEnv::from_env())), mfx: std::sync::Arc::new(crate::moxfield_api::MfxApi::from_env()), scryfall_sets: std::sync::Arc::new(std::sync::Mutex::new(None)), mp_http: std::sync::Arc::new(crate::marketplace::RealHttp), shared_dir: std::env::var_os("SCRYBOX_SHARED_DIR").map(std::path::PathBuf::from), model_dir: std::env::var_os("CV_MODEL_DIR").map(std::path::PathBuf::from), deck_list_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), deck_http: std::sync::Arc::new(crate::decks_combos::RealDecksProviders), edhrec_mem: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())), edhrec_cache_dir, precons_index_path, mtgjson_base, rules_cache_path, rules_index_url: crate::rules::DEFAULT_INDEX_URL.to_string(), rules_commander_url: crate::rules::DEFAULT_COMMANDER_URL.to_string(), rules_cr_base: crate::rules::DEFAULT_CR_BASE.to_string(), rules_mem: Arc::new(std::sync::Mutex::new(None)), kw_mem: Arc::new(std::sync::Mutex::new(None)), rules_build: Arc::new(tokio::sync::Mutex::new(())), traffic_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)), traffic_notify: Arc::new(tokio::sync::Notify::new()) }
+    }
+
+    /// Kill-switch decision for a route name (`collection`, `stats`, ...).
+    pub fn owns(&self, route: &str) -> bool {
+        self.db.is_some() && (self.cfg.rust_routes.contains("*") || self.cfg.rust_routes.contains(route))
+    }
+
+    /// Memory queue item 6 (MEMORY.md #9): record that the process has seen
+    /// its FIRST real request (the traffic layer calls this for every
+    /// non-`/api/health` request). One-shot: after the flip the bool stays
+    /// true and everyone parked on `traffic_notify::notified()` wakes.
+    pub(crate) fn note_traffic(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.traffic_seen.swap(true, Ordering::SeqCst) {
+            self.traffic_notify.notify_waiters();
+            // ...plus a stored permit: `notify_waiters` only wakes ALREADY
+            // registered waiters, so a waiter that registers between the
+            // swap and a racing loop-check (see wait_traffic) would never
+            // see the edge. The permit makes the NEXT notified() return
+            // immediately; the loop re-reads the bool, so no spurious pass.
+            self.traffic_notify.notify_one();
+        }
+    }
+
+    /// Test/ops hook mirroring what the traffic layer does per real request
+    /// (used by tests/stats_boot_warm_gate.rs to open the gate directly).
+    pub fn open_traffic_gate_for_test(&self) {
+        self.note_traffic();
+    }
+}
+
+/// Resolve once `note_traffic` has fired (immediately if it already has).
+/// Takes the two gate Arcs (not `&AppState`) so spawned `'static` tasks and
+/// tests can share the exact same code path.
+pub(crate) async fn wait_traffic(seen: &Arc<std::sync::atomic::AtomicBool>, notify: &Arc<tokio::sync::Notify>) {
+    use std::sync::atomic::Ordering;
+    // The bool is the source of truth; the Notify is the wake-up edge
+    // (notify_waiters for parked waiters + one stored permit in
+    // note_traffic for the register-after-notify window, so no lost
+    // wakeup and no spurious early pass: every wake re-reads the bool).
+    while !seen.load(Ordering::SeqCst) {
+        notify.notified().await;
+    }
+}
+
+/// Hop-by-hop headers (RFC 9110 section 7.6.1) are connection-scoped and must not be forwarded.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+fn strip_hop_by_hop(h: &mut HeaderMap) {
+    // Headers named in `Connection:` are hop-by-hop too.
+    let named: Vec<HeaderName> = h
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|n| HeaderName::from_bytes(n.trim().as_bytes()).ok())
+        .collect();
+    for n in named {
+        h.remove(n);
+    }
+    for n in HOP_BY_HOP {
+        h.remove(*n);
+    }
+}
+
+fn json_error(status: StatusCode, msg: &str) -> Response {
+    (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// Node-http twin: express answers an early response (e.g. the auth gate's
+/// 401) without consuming the request body, and Node's http server then reads
+/// the remainder to /dev/null so the client finishes its upload and receives
+/// the response. hyper instead drops the unread body and RSTs — a client
+/// still mid-upload sees EPIPE instead of the 401. Drain (never parse) with
+/// Node-comparable bounds before answering early.
+pub(crate) async fn drain_request_body(body: &mut Body) {
+    // Node has no request cap at the http layer; the bigJson route parsers
+    // top out at 15–40 MB. 100 MB read-and-discard bounds hostile input.
+    const CAP: u64 = 100 * 1024 * 1024;
+    const WINDOW: Duration = Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let mut read: u64 = 0;
+    loop {
+        if read >= CAP || started.elapsed() > WINDOW {
+            return;
+        }
+        let frame = match tokio::time::timeout(WINDOW, http_body_util::BodyExt::frame(body)).await {
+            Ok(Some(Ok(f))) => f,
+            _ => return,
+        };
+        match frame.into_data() {
+            Ok(d) => read += d.len() as u64,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Reverse-proxy one request to Node, streaming both bodies.
+pub async fn proxy(State(st): State<AppState>, mut req: Request) -> Response {
+    // Lane B unit 7b (e2e-on-Rust): in standalone (Node-free) mode this is
+    // ALSO where Node's one authentication gate lives. A request reaching a
+    // proxy leg — router fallback, or a native dispatcher handing back a
+    // method/plan it does not serve — is, in Node, a request that would have
+    // passed `authenticateToken` before its route ran. Unauthenticated
+    // traffic must therefore see the gate's 401/403/500 arms, not the
+    // dead-upstream 502 (POST /api/search with no token: Node says 401 before
+    // any body parsing, and this must not answer 502). Authenticated traffic
+    // to an unported path keeps the 502 — the route is simply not ported
+    // (readiness manifest). Internal proxy legs from handlers that already
+    // authenticated just pay one more µs-cached SELECT.
+    if st.cfg.node_upstream.is_empty() {
+        // Node-free: the ONE central no-route path (body parser -> admin /
+        // global auth gate -> large parsers -> finalhandler 404), shared
+        // with every native handler's unowned arm.
+        return collection_writes::standalone_unmatched(&st, req).await;
+    }
+    // statsCache.invalidateOnWrite twin: an authenticated non-GET /api write
+    // bumps that user's stats generation so their cached /stats body is
+    // dropped (best-effort; never delays or fails the proxied request).
+    stats::on_proxied_write(&st, req.method(), req.uri().path(), req.headers());
+    let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let uri: Uri = match format!("{}{}", st.cfg.node_upstream, pq).parse() {
+        Ok(u) => u,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Bad request URI"),
+    };
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    *req.uri_mut() = uri;
+    *req.version_mut() = hyper::Version::HTTP_11;
+    let h = req.headers_mut();
+    strip_hop_by_hop(h);
+    // Append the real client to X-Forwarded-For so Node (TRUST_PROXY=loopback)
+    // keys its rate limiters on the client, not on 127.0.0.1.
+    if let Some(ip) = peer {
+        let xff = match h.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            Some(prev) => format!("{prev}, {ip}"),
+            None => ip.to_string(),
+        };
+        if let Ok(v) = HeaderValue::from_str(&xff) {
+            h.insert("x-forwarded-for", v);
+        }
+    }
+    match st.client.request(req).await {
+        Ok(res) => {
+            let (mut parts, body) = res.into_parts();
+            strip_hop_by_hop(&mut parts.headers);
+            Response::from_parts(parts, Body::new(body))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "node upstream request failed");
+            json_error(StatusCode::BAD_GATEWAY, "Upstream unavailable")
+        }
+    }
+}
+
+/// REVIEW-errors H2: twin of Node's generic error handler
+/// (`server.js:642` — `console.error(err)` then
+/// `res.status(500).json({error:'Internal server error'})`), used as the
+/// custom response of the CatchPanicLayer in `app()`. The body and its
+/// Content-Type/Content-Length/ETag stamp order come from the same
+/// `express_json` twin the static-asset miss path already live-pins; the
+/// COEP/helmet/cors headers arrive on the way back out through the
+/// secheaders guard (the catcher sits INNER of that layer). Node's
+/// `console.error(err)` twin is the tracing::error below — the panic text
+/// goes to the log, never to the client.
+pub fn node_panic_500(err: Box<dyn std::any::Any + Send>) -> Response {
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic (non-string payload)".to_string()
+    };
+    tracing::error!(panic = %msg, "handler panicked — answering Node's 500");
+    crate::static_assets::express_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{\"error\":\"Internal server error\"}",
+    )
+}
+
+/// Original request method, recorded by the standalone HEAD layer before it
+/// re-dispatches HEAD as GET (finalhandler's `Cannot HEAD /x` needs it).
+#[derive(Clone, Debug)]
+pub struct OrigMethod(pub axum::http::Method);
+
+thread_local! {
+    /// Route patterns registered while `app()` builds (see `RRoute`).
+    static ROUTE_PATS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `.route` twin that records the pattern, so the standalone routing layer
+/// can resolve Express's case-insensitive / non-strict matches against
+/// exactly the routes this process registered.
+trait RRoute<S> {
+    fn rroute(self, path: &str, m: axum::routing::MethodRouter<S>) -> Self;
+}
+impl<S: Clone + Send + Sync + 'static> RRoute<S> for Router<S> {
+    fn rroute(self, path: &str, m: axum::routing::MethodRouter<S>) -> Self {
+        ROUTE_PATS.with(|v| v.borrow_mut().push(path.to_string()));
+        self.route(path, m)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Seg<'a> {
+    // Ord: matchit priority, static > param > catch-all.
+    Catch,
+    Param,
+    Lit(&'a str),
+}
+
+fn pat_segs(p: &str) -> Vec<Seg<'_>> {
+    p.split('/')
+        .skip(1)
+        .map(|s| {
+            if s.starts_with("{*") {
+                Seg::Catch
+            } else if s.starts_with('{') {
+                Seg::Param
+            } else {
+                Seg::Lit(s)
+            }
+        })
+        .collect()
+}
+
+/// Match `segs` against `pat`; `ci` = case-insensitive literals. Returns
+/// the per-segment priority key (higher = more specific) on a match.
+fn seg_match(pat: &[Seg<'_>], segs: &[&str], ci: bool) -> Option<Vec<u8>> {
+    let mut key = Vec::new();
+    for (i, ps) in pat.iter().enumerate() {
+        match ps {
+            Seg::Catch => {
+                let rest = &segs[i.min(segs.len())..];
+                if rest.is_empty() || rest.join("/").is_empty() {
+                    return None;
+                }
+                key.push(0);
+                return Some(key);
+            }
+            _ if i >= segs.len() => return None,
+            Seg::Param => {
+                if segs[i].is_empty() {
+                    return None;
+                }
+                key.push(1);
+            }
+            Seg::Lit(l) => {
+                let ok = if ci { l.eq_ignore_ascii_case(segs[i]) } else { *l == segs[i] };
+                if !ok {
+                    return None;
+                }
+                key.push(2);
+            }
+        }
+    }
+    (pat.len() == segs.len()).then_some(key)
+}
+
+/// Express default routing (no `case sensitive routing` / `strict routing`
+/// set in server.js): `/API/Stats` and `/api/stats/` reach the `/api/stats`
+/// route. Returns the registered spelling of `path` when it differs and
+/// only a case/trailing-slash relaxation makes it match; `None` when the
+/// path already matches as typed (or matches nothing). Params and
+/// catch-all tails keep their original bytes. Scoped to `/api` — static
+/// and SPA lookups are filesystem-cased on Node too.
+pub(crate) fn express_canonical_path(path: &str, pats: &[String]) -> Option<String> {
+    let first = path.split('/').nth(1)?;
+    if !first.eq_ignore_ascii_case("api") {
+        return None;
+    }
+    let exact: Vec<&str> = path.split('/').skip(1).collect();
+    let parsed: Vec<Vec<Seg<'_>>> = pats.iter().filter(|p| p.starts_with("/api")).map(|p| pat_segs(p)).collect();
+    if parsed.iter().any(|p| seg_match(p, &exact, false).is_some()) {
+        return None;
+    }
+    let trimmed = if path.len() > 1 && path.ends_with('/') { &path[..path.len() - 1] } else { path };
+    let segs: Vec<&str> = trimmed.split('/').skip(1).collect();
+    let best = parsed
+        .iter()
+        .filter_map(|p| seg_match(p, &segs, true).map(|k| (k, p)))
+        .max_by(|a, b| a.0.cmp(&b.0))?
+        .1;
+    let mut out = String::new();
+    for (i, s) in segs.iter().enumerate() {
+        out.push('/');
+        match best.get(i) {
+            Some(Seg::Lit(l)) => out.push_str(l),
+            _ => out.push_str(s),
+        }
+    }
+    (out != path).then_some(out)
+}
+
+/// Standalone-only outer layer giving the Rust router Express's routing
+/// semantics for EVERY route: (1) HEAD runs the GET handler and answers its
+/// headers with no body (Express routes HEAD to GET handlers when no HEAD
+/// route exists); (2) case-insensitive, trailing-slash-optional path
+/// matching (`express_canonical_path`). The original method rides in
+/// `OrigMethod` and the original URI in axum's `OriginalUri`, so
+/// finalhandler 404s and the API-key GET-only rule still see what the
+/// client sent.
+async fn express_routing(
+    State(pats): State<Arc<Vec<String>>>,
+    mut req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(canon) = express_canonical_path(req.uri().path(), &pats) {
+        let pq = match req.uri().query() {
+            Some(q) => format!("{canon}?{q}"),
+            None => canon,
+        };
+        if let Ok(pq) = pq.parse::<axum::http::uri::PathAndQuery>() {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(u) = Uri::from_parts(parts) {
+                *req.uri_mut() = u;
+            }
+        }
+    }
+    let orig = req.method().clone();
+    req.extensions_mut().insert(OrigMethod(orig.clone()));
+    if orig != axum::http::Method::HEAD {
+        return next.run(req).await;
+    }
+    *req.method_mut() = axum::http::Method::GET;
+    let res = auth::HEAD_AS_GET.scope(true, next.run(req)).await;
+    let (mut parts, body) = res.into_parts();
+    if !parts.headers.contains_key(header::CONTENT_LENGTH) {
+        if let Some(n) = axum::body::HttpBody::size_hint(&body).exact() {
+            parts.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+        }
+    }
+    Response::from_parts(parts, Body::empty())
+}
+
+/// Build the router. Ported routes are mounted explicitly; everything else
+/// falls back to Node (optionally after a static-file lookup).
+pub fn app(state: AppState) -> Router {
+    // Health cache prober (iter 17): keeps the last healthy Node response
+    // warm so the handler answers from memory while fresh. SCRYBOX_HEALTH_CACHE=0
+    // disables both the prober and the cache lookup (iter-16 live proxy).
+    ROUTE_PATS.with(|v| v.borrow_mut().clear());
+    health::spawn_prober(&state);
+    // Heap hygiene (memory queue item 2, MEMORY.md #4): in-code glibc
+    // tuning (mmap threshold, arena cap) plus malloc_trim on an idle timer,
+    // independent of route-group ownership so the kill switches can't
+    // disable it. Idempotent with the collection/search paths.
+    collection::spawn_idle_trim_timer(&state);
+    let router = Router::new().rroute("/api/health", get(health::handle));
+    // Ported API routes behind the per-route kill switch. Non-GET methods on
+    // an owned path still proxy to Node (the handler dispatches internally).
+    let router = if state.owns("collection") {
+        // Background pre-warm (iter 14, owner hint): pre-builds post-bump
+        // bodies for recently-requested shapes through the shared
+        // single-flight slot, so the first request after a write never
+        // rides the blocking build. Bodies come from the identical
+        // build path — strict parity untouched. Ops kill switch:
+        // SCRYBOX_COLLECTION_PREWARM=0 restores iter-12 behavior exactly.
+        if std::env::var("SCRYBOX_COLLECTION_PREWARM").map(|v| v != "0").unwrap_or(true) {
+            collection::spawn_refresher(&state);
+        }
+        router.rroute("/api/collection", any(collection::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("search") {
+        // Gate D iter-24: deferred malloc_trim for the search cache's
+        // churned bodies (rev-prune/eviction arm the flag; this timer pays
+        // it back, never a serving thread).
+        search::spawn_trim_timer(&state);
+        router.rroute("/api/search", any(search::handle))
+    } else {
+        router
+    };
+    // Collection WRITE group (cardlist / bulk / PUT+DELETE :id). The
+    // handlers dispatch internally: methods the port does not own, and the
+    // PUT card_id branch whose target printing is not in card_cache (Node
+    // would hydrate it from Scryfall), are proxied to Node untouched.
+    let router = if state.owns("collection_writes") {
+        router
+            .rroute("/api/collection/cardlist", any(collection_writes::handle_cardlist))
+            .rroute("/api/collection/bulk", any(collection_writes::handle_bulk))
+            .rroute("/api/collection/{id}", any(collection_writes::handle_entry))
+    } else {
+        router
+    };
+    // Collection ADD group (iter 24): POST /api/collection and POST
+    // /api/collection/bulk-add. Registered as a `post`-only MethodRouter on
+    // /api/collection so it overrides the `collection` group's `any` fallback
+    // for POST only; GET keeps answering. Any add whose card (or localized
+    // printing) is not in card_cache — Node would fetch it from Scryfall —
+    // forwards to Node untouched, so the Rust port never needs a Scryfall
+    // client (that's lane B's scryfallApi territory).
+    let router = if state.owns("collection_adds") {
+        // With the `collection` group mounted, its `any()` fallback answers
+        // every non-POST method and the merged POST entry wins for POST.
+        // Alone, this group must NOT swallow GET with a 405 — a kill-switch
+        // combination has to look like the port doesn't exist, so the
+        // MethodRouter falls through to the Node proxy for other methods.
+        let adds = if state.owns("collection") {
+            post(collection_writes::handle_add)
+        } else {
+            post(collection_writes::handle_add).fallback(crate::proxy)
+        };
+        router
+            .rroute("/api/collection", adds)
+            .rroute("/api/collection/bulk-add", any(collection_writes::handle_bulk_add))
+    } else {
+        router
+    };
+    let router = if state.owns("stats") {
+        // Background refresher (iter 13): polls the revision counter and
+        // pre-builds post-bump bodies for recently-active users. Lives with
+        // the router (same runtime); tests that build a Router get it too,
+        // which is the point — the bounded-staleness tests exercise it.
+        stats::spawn_refresher(&state);
+        router.rroute("/api/stats", any(stats::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("stats_subs") {
+        // GET /api/stats/history, /api/stats/networth, /api/stats/top-mover
+        // (iter 25). commander-of-the-day stays on Node (Scryfall leg is
+        // Lane B surface — forwarding it whole-request would not make it
+        // native). Exact paths only: '/api/stats/' trailing-slash variants
+        // keep Express's loose-match answer through the proxy, same policy
+        // as the /stats mount, and mounting these never changes what
+        // /api/stats itself resolves to — the groups stay independent.
+        router
+            .rroute("/api/stats/history", any(stats_subs::handle_history))
+            .rroute("/api/stats/networth", any(stats_subs::handle_networth))
+            .rroute("/api/stats/top-mover", any(stats_subs::handle_top_mover))
+    } else {
+        router
+    };
+    // Auth route group (iter 20, FULL PORT P1): everything under /api/auth
+    // not in the known-route table is proxied by the handler itself, so
+    // Express keeps authoring the 404 pages.
+    let router = if state.owns("auth") {
+        router
+            .rroute("/api/auth", any(auth_routes::handle))
+            .rroute("/api/auth/{*rest}", any(auth_routes::handle))
+    } else {
+        router
+    };
+    // Sets route group (Lane B unit 1): native GET /api/sets (flat + tree).
+    let router = if state.owns("sets") {
+        router.rroute("/api/sets", any(sets::handle))
+    } else {
+        router
+    };
+    // Cards tags group (Lane B unit 2a): Tagger oracle views. Methods/paths
+    // the port does not own proxy to Node untouched, so Express still
+    // authors everything else under /api/cards (e.g. /cards/highlight).
+    let router = if state.owns("cards_tags") {
+        router
+            .rroute("/api/cards/{id}/oracle", any(cards_tags::handle_oracle))
+            .rroute("/api/cards/{id}/oracle-tags", any(cards_tags::handle_oracle_tags))
+            .rroute("/api/cards/role-tags", any(cards_tags::handle_role_tags))
+            .rroute("/api/cards/tag-stats", any(cards_tags::handle_tag_stats))
+    } else {
+        router
+    };
+    // Search-history + shared group (iter 27): the "stats/sets/search-history/
+    // shared" P2 cluster's remainder. search-history owns exactly
+    // /api/search-history (trailing-slash variants keep Express's
+    // loose-match answer through the proxy, per the iter-25 ruling); shared
+    // owns the PUBLIC GET /api/shared/:token (Node mounts it above the auth
+    // gate — Rust answers it without any session too). Methods/paths the
+    // port does not own proxy to Node untouched.
+    let router = if state.owns("search_history") {
+        router.rroute("/api/search-history", any(search_history::handle))
+    } else {
+        router
+    };
+    let router = if state.owns("shared") {
+        router.rroute("/api/shared/{token}", any(shared::handle))
+    } else {
+        router
+    };
+    // Lane B unit 2b: catalog_art = the stateless card-art reads and the
+    // two DB/FS-only catalog views. Unit 6d: the mutating card-art legs
+    // (POST upload, DELETE) joined them natively via route_card; the
+    // build-control routes stay unregistered so the catch-all proxies them.
+    let router = if state.owns("catalog_art") {
+        router
+            .rroute("/api/card-art/index", any(card_art::handle_index))
+            // matchit has no `{param}.png` suffix segments — Node's route is
+            // `/:cardId.png`; route_card dispatches GET/POST/DELETE on the
+            // decoded id and proxies anything outside the group's shapes.
+            .rroute("/api/card-art/{cardId}", any(card_art::route_card))
+            .rroute("/api/admin/catalogs/languages", any(catalog_read::handle_catalog_languages))
+            .rroute("/api/scan-sets", any(catalog_read::handle_scan_sets))
+    } else {
+        router
+    };
+    // Lane B unit 6c: catalog_build = the admin build-control group +
+    // modelAssets (RUST_ROUTES=catalog_build). The catch-all proxies these
+    // paths while the group is off, so Node keeps its own engine there.
+    let router = if state.owns("catalog_build") {
+        router
+            .rroute("/api/admin/catalogs", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/progress", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/build", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/catalogs/stop", any(catalog_build::handle_catalogs))
+            .rroute("/api/admin/models", any(model_assets::handle_models))
+            .rroute("/api/admin/models/download", any(model_assets::handle_models))
+            .rroute("/api/admin/models/scan-index", any(model_assets::handle_models))
+            .rroute("/api/admin/models/scan-index/refresh", any(model_assets::handle_models))
+    } else {
+        router
+    };
+    // Lane A iter-49: POST /api/admin/seed-cards (admin.js:19 — the last
+    // Lane-A route) under `seed_cards`. Non-POST rides the proxy verbatim
+    // (Node's router.use auth + final-handler 404 chain). (Iter-50: after
+    // the 22:25 adjudication, lane B's seed_cards failed parity on
+    // ps_seed_oversize_no_token — global normalJson 413 above auth — so the
+    // Lane-A twin is authoritative; see PROGRESS.)
+    let router = if state.owns("seed_cards") {
+        router.rroute("/api/admin/seed-cards", any(seed_cards::route_seed_cards))
+    } else {
+        router
+    };
+    // Lane A iter-28/29/30: deck writes (PUT/DELETE + POST/checkout/return,
+    // `decks_writes`) and deck reads (GET list / detail / locations,
+    // `decks_reads`). Both groups share the /api/decks and /api/decks/{id}
+    // shapes, so one dispatcher route owns each: GET goes to decks_reads
+    // when that group is on, POST/PUT/DELETE to decks_writes, and everything
+    // else (or groups that are off) falls through to the catch-all proxy —
+    // never 405 here.
+    let router = if state.owns("decks_reads") {
+        router.rroute("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+    } else {
+        router
+    };
+    // Lane A iter-5: provider-read pair (Commander Spellbook combos proxy +
+    // EDHREC synergy map) under the `decks_combos` name. Off -> the catch-all
+    // proxies both untouched.
+    let router = if state.owns("decks_combos") {
+        router
+            .rroute("/api/decks/{id}/combos", any(decks_combos::handle_combos))
+            .rroute("/api/decks/{id}/synergy", any(decks_combos::handle_synergy))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") && state.owns("decks_writes") {
+        router.rroute("/api/decks", any(decks_writes::route_collection))
+    } else if state.owns("decks_reads") {
+        router.rroute("/api/decks", any(decks_reads::handle_list))
+    } else if state.owns("decks_writes") {
+        router.rroute("/api/decks", any(decks_writes::handle_create))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_reads") || state.owns("decks_writes") {
+        router.rroute("/api/decks/{id}", any(decks_reads::route_entry))
+    } else {
+        router
+    };
+    let router = if state.owns("decks_writes") {
+        router
+            .rroute("/api/decks/{id}/cards/{card_id}", any(decks_writes::handle_card))
+            .rroute("/api/decks/{id}/cards", any(decks_writes::handle_add_card))
+            .rroute("/api/decks/{id}/register-collection", any(decks_writes::handle_register))
+            .rroute("/api/decks/{id}/checkout", any(decks_writes::handle_checkout))
+            .rroute("/api/decks/{id}/return", any(decks_writes::handle_return))
+    } else {
+        router
+    };
+    // Lane A iter-34: settings group (GET/PUT /api/settings,
+    // GET /api/settings/version) under `settings`. Other methods ride the
+    // catch-all proxy — never 405.
+    let router = if state.owns("settings") {
+        router
+            .rroute("/api/settings", any(settings::route_settings))
+            .rroute("/api/settings/version", any(settings::route_version))
+    } else {
+        router
+    };
+    // Lane A iter-35: precons group (GET /api/precons, POST
+    // /api/precons/import) under `precons`. Handlers self-check
+    // group+method and forward anything else — never 405/404 locally.
+    let router = if state.owns("precons") {
+        router
+            .rroute("/api/precons", any(precons::route_precons))
+            .rroute("/api/precons/import", any(precons::route_import))
+    } else {
+        router
+    };
+    // Lane A iter-36: rules group (GET /api/rules, GET /api/rules/keywords)
+    // under `rules`. Handlers self-check group+method and forward anything
+    // else — never 405/404 locally.
+    let router = if state.owns("rules") {
+        router
+            .rroute("/api/rules", any(rules::route_rules))
+            .rroute("/api/rules/keywords", any(rules::route_keywords))
+    } else {
+        router
+    };
+    // Lane A iter-48: POST /api/limited/analyze (routes/limited.js) under
+    // `limited`. The handler self-checks the method; anything else rides the
+    // proxy so Node's final-handler 404 (router.post does not match) is kept.
+    let router = if state.owns("limited") {
+        router.rroute("/api/limited/analyze", any(limited::handle))
+    } else {
+        router
+    };
+    // Lane A iter-37: secret_lair group (GET /api/secret-lair,
+    // GET /api/secret-lair/preview, POST /api/secret-lair/add) under
+    // `secret_lair`. Handlers self-check group+method and forward anything
+    // else — never 405/404 locally.
+    let router = if state.owns("secret_lair") {
+        router
+            .rroute("/api/secret-lair", any(secret_lair::route_search))
+            .rroute("/api/secret-lair/preview", any(secret_lair::route_preview))
+            .rroute("/api/secret-lair/add", any(secret_lair::route_add))
+    } else {
+        router
+    };
+    // Lane A iter-38: export group (routes/importExport.js) under `export`:
+    // GET /api/export, POST /api/export (view subset), POST /api/import.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("export") {
+        router
+            .rroute("/api/export", any(export::route_export).post(export::route_export_post))
+            .rroute("/api/import", any(export::route_import))
+    } else {
+        router
+    };
+    // Lane A iter-39: cards-meta group (stats.js card routes + the
+    // collection.js suggest) under `cards_meta`: POST /api/cards/highlight,
+    // GET /api/cards/{id}/decks, GET /api/cards/{id}/price-history,
+    // GET /api/stats/commander-of-the-day, GET /api/suggest.
+    // Handlers self-check owns+method and proxy everything else.
+    let router = if state.owns("cards_meta") {
+        router
+            .rroute("/api/cards/highlight", any(cards_meta::handle_highlight))
+            .rroute("/api/cards/{id}/decks", any(cards_meta::handle_card_decks))
+            .rroute("/api/cards/{id}/price-history", any(cards_meta::handle_price_history))
+            .rroute("/api/stats/commander-of-the-day", any(cards_meta::handle_cotd))
+            .rroute("/api/suggest", any(cards_meta::handle_suggest))
+    } else {
+        router
+    };
+    // Lane A iter-40: admin USERS group (GET/POST /api/admin/users,
+    // PUT/DELETE /api/admin/users/:id) under `admin_users`. The rest of
+    // admin.js (seed-cards, catalogs, models, backups) is Lane B's unit-4
+    // surface; everything unmatched here rides the catch-all proxy —
+    // never a local 404/405.
+    let router = if state.owns("admin_users") {
+        router
+            .rroute("/api/admin/users", any(admin_users::route_users))
+            .rroute("/api/admin/users/{id}", any(admin_users::route_user))
+    } else {
+        router
+    };
+    // Lane A iter-41: MARKETPLACE slice 1 (GET/PUT /api/marketplace/accounts,
+    // GET /api/marketplace/recent/:source) under `marketplace`. POST
+    // /preview and POST /add (orderFromRequest + parseOrderPayload + the
+    // bulkAddToCollection core) are slice 2 and stay proxied; unmatched
+    // methods ride the catch-all proxy, never a local 404/405.
+    let router = if state.owns("marketplace") {
+        router
+            .rroute("/api/marketplace/accounts", any(marketplace::route_accounts))
+            .rroute("/api/marketplace/recent/{source}", any(marketplace::route_recent))
+            .rroute("/api/marketplace/preview", any(marketplace::route_preview))
+            .rroute("/api/marketplace/add", any(marketplace::route_add))
+    } else {
+        router
+    };
+    // Lane A iter-31: card-list READS (GET /, /card-matches, /:id,
+    // /:id/cardlist) under `lists_reads`. The write routes (POST/PUT/DELETE,
+    // /order, cheapest-printings, printing, bulk*) stay proxied: the
+    // /api/lists/{id} dispatcher answers GET natively and forwards every
+    // other method, so shapes are never 405'd here.
+    let router = if state.owns("lists_reads") {
+        let router = router
+            .rroute("/api/lists/card-matches", any(lists_reads::handle_card_matches))
+            .rroute("/api/lists/{id}", any(lists_reads::route_entry))
+            .rroute("/api/lists/{id}/cardlist", any(lists_reads::handle_cardlist));
+        if state.owns("lists_writes") {
+            // iter-32: /api/lists POST + /order are native under lists_writes;
+            // the collection dispatcher keeps GET with lists_reads.
+            router
+                .rroute("/api/lists", any(lists_writes::route_collection))
+                .rroute("/api/lists/order", any(lists_writes::handle_order))
+        } else {
+            router.rroute("/api/lists", any(lists_reads::handle_collection))
+        }
+    } else if state.owns("lists_writes") {
+        router
+            .rroute("/api/lists", any(lists_writes::route_collection))
+            .rroute("/api/lists/order", any(lists_writes::handle_order))
+            // The /:id dispatcher answers PUT/DELETE natively here; its GET
+            // leg self-checks lists_reads and proxies when that group is off.
+            .rroute("/api/lists/{id}", any(lists_reads::route_entry))
+    } else {
+        router
+    };
+    // Lane A iter-33: card-list CARD-BODY writes (add card, bulk add/remove,
+    // remove-from-collection, cheapest-printings, change printing, remove
+    // card) ride the same `lists_writes` kill switch. Handlers self-check the
+    // group and the method, forwarding anything else to Node (never 405).
+    let router = if state.owns("lists_writes") {
+        router
+            .rroute("/api/lists/{id}/cards", any(lists_body_writes::handle_add_card))
+            .rroute("/api/lists/{id}/cards/bulk", any(lists_body_writes::handle_bulk_add))
+            .rroute("/api/lists/{id}/cards/bulk-remove", any(lists_body_writes::handle_bulk_remove))
+            .rroute("/api/lists/{id}/remove-from-collection", any(lists_body_writes::handle_remove_from_collection))
+            .rroute("/api/lists/{id}/cheapest-printings", any(lists_body_writes::handle_cheapest_printings))
+            .rroute("/api/lists/{id}/cards/{card_id}/printing", any(lists_body_writes::handle_printing))
+            .rroute("/api/lists/{id}/cards/{card_id}", any(lists_body_writes::handle_remove_card))
+    } else {
+        router
+    };
+    // Lane B unit 3a: Moxfield sync — status, author CRUD, forced syncs,
+    // per-deck enable switch, all under RUST_ROUTES=moxfield. The 20-second
+    // scheduler + boot catch-up ride the same gate (Node's twin is disabled
+    // with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER, server.js).
+    let router = if state.owns("moxfield") {
+        // Scheduler twin of Node's server.js kill switch. Lane-B iter-49
+        // cutover: the live tick is Rust-owned — restart-rust-b.sh defaults
+        // SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=0 and the Node container boots
+        // with the /app/moxfield.disabled flag file (docker-cp overlay on
+        // server.js) so exactly one side ticks. Set the env to 1 (e.g.
+        // SCRYBOX_DISABLE_MOXFIELD_SCHEDULER_B=1) to quiesce this instance;
+        // tick/boot-catch-up semantics are also proven by cargo tests.
+        let sched_off = std::env::var("SCRYBOX_DISABLE_MOXFIELD_SCHEDULER")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if sched_off {
+            tracing::info!("Moxfield scheduler disabled (SCRYBOX_DISABLE_MOXFIELD_SCHEDULER) — no tick runs on this instance");
+        } else {
+            moxfield::spawn_scheduler(&state);
+        }
+        router
+            .rroute("/api/moxfield", any(moxfield::handle_status))
+            .rroute("/api/moxfield/authors", any(moxfield::handle_add_author))
+            .rroute("/api/moxfield/authors/{id}", any(moxfield::handle_delete_author))
+            .rroute("/api/moxfield/authors/{id}/sync-decklist", any(moxfield::handle_sync_decklist))
+            .rroute("/api/moxfield/authors/{id}/sync-contents", any(moxfield::handle_sync_contents))
+            .rroute("/api/moxfield/decks/{publicId}/sync", any(moxfield::handle_deck_sync))
+            .rroute("/api/moxfield/decks/{publicId}", any(moxfield::handle_deck_update))
+    } else {
+        router
+    };
+    // Lane B unit 3b: ManaBox sync + backup job, both under
+    // RUST_ROUTES=manabox_backup. iter-49 cutover: the live 24h timer is
+    // Rust-owned — restart-rust-b.sh defaults SCRYBOX_DISABLE_AUTO_BACKUP=0
+    // and the Node container boots with /app/auto-backup.disabled
+    // (docker-cp overlay on server.js). Set the env to 1 to quiesce this
+    // instance for a quiesced-DB run.
+    let router = if state.owns("manabox_backup") {
+        let backup_off = std::env::var("SCRYBOX_DISABLE_AUTO_BACKUP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if backup_off {
+            tracing::info!("Auto-backup disabled (SCRYBOX_DISABLE_AUTO_BACKUP) — no timer runs on this instance");
+        } else {
+            backup::spawn_auto_backup(&state);
+        }
+        router
+            .rroute("/api/manabox-sync/preview", any(manabox::handle_preview))
+            .rroute("/api/manabox-sync/apply", any(manabox::handle_apply))
+            .rroute("/api/manabox-sync/runs", any(manabox::handle_runs))
+            .rroute("/api/manabox-sync/runs/{id}/report", any(manabox::handle_report))
+            .rroute("/api/admin/backups", any(backup::handle_backups_collection))
+            .rroute("/api/admin/backups/{file}/download", any(backup::handle_backup_download))
+    } else {
+        router
+    };
+    // Lane B unit 5b: the static trio (see static_assets.rs). Kill-switch
+    // group `static_assets`: off => everything proxies to Node's own
+    // handlers. The portal leg additionally mirrors Node's registration
+    // gate: the routes only exist when LOCAL_WEB_PORTAL_ENABLED === 'true'.
+    let router = if state.owns("static_assets") {
+        router
+            .rroute("/scan-assets", any(static_assets::handle_scan_assets))
+            // Explicit trailing-slash exacts: matchit's catch-all does NOT
+            // match an empty tail, and under static_spa the SPA wildcard
+            // would otherwise swallow these (live :3312-vs-:3320 diff).
+            .rroute("/scan-assets/", any(static_assets::handle_scan_assets))
+            .rroute("/scan-assets/{*rest}", any(static_assets::handle_scan_assets))
+            .rroute("/models/cornelius.onnx", any(static_assets::handle_model))
+    } else {
+        router
+    };
+    let router = if state.owns("static_assets")
+        && std::env::var("LOCAL_WEB_PORTAL_ENABLED").as_deref() == Ok("true")
+    {
+        router
+            .rroute("/scryfall-portal", any(static_assets::handle_portal))
+            .rroute("/scryfall-portal/", any(static_assets::handle_portal))
+            .rroute("/scryfall-portal/{*rest}", any(static_assets::handle_portal))
+    } else {
+        router
+    };
+    // Lane B unit 5c: the SPA mount itself (see spa.rs). Registered as a
+    // WILDCARD ROUTE, not the fallback: Node's catch-all sits behind every
+    // API router, so unmatched /api/* must still reach the router-level
+    // proxy below — the gate is Node's exact `req.path.startsWith('/api')`,
+    // so even '/apifoo' proxies (on Node it next()s to finalhandler). Kill-
+    // switch group `static_spa`; without a build dir the group is inert
+    // (Node serves the SPA, exactly like a dist-less Node install).
+    let router = if state.owns("static_spa") && state.cfg.static_dir.is_some() {
+        router
+            .rroute("/", any(spa::handle))
+            .rroute("/{*rest}", any(spa::handle))
+    } else {
+        router
+    };
+    // Lane B unit 6a: cardscan sidecar-proxy group (see cardscan.rs). All
+    // eleven router.js routes; unowned methods/paths fall through to the
+    // router-level proxy, so a kill-switched group is invisible. Merged as a
+    // sub-router so the compression() twin wraps ONLY this group's replies
+    // (axum .layer covers every route registered on that Router at the
+    // time — a direct .layer here would also buffer other lanes' bodies).
+    let router = if state.owns("cardscan") {
+        let cs = axum::Router::new()
+            .rroute("/api/cardscan/status", any(cardscan::handle_status))
+            .rroute("/api/cardscan/detect", any(cardscan::handle_detect))
+            .rroute("/api/cardscan/frame", any(cardscan::handle_frame))
+            .rroute("/api/cardscan/choices", any(cardscan::handle_choices))
+            .rroute("/api/cardscan/cards", any(cardscan::handle_cards))
+            .rroute("/api/cardscan/telemetry", any(cardscan::handle_telemetry))
+            .rroute("/api/cardscan", any(cardscan::handle_scan))
+            .rroute("/api/cardscan/scan", any(cardscan::handle_scan))
+            .layer(axum::middleware::from_fn(cardscan::compress));
+        router.merge(cs)
+    } else {
+        router
+    };
+    // Lane B unit 6b: cvScan.js twin + POST /api/scan-match, behind
+    // RUST_ROUTES=scan_match. Same compression() twin treatment as the
+    // cardscan group (Node's global compression() gzips this JSON too).
+    let router = if state.owns("scan_match") {
+        let sm = axum::Router::new()
+            .rroute("/api/scan-match", any(cvscan::handle_scan_match))
+            .layer(axum::middleware::from_fn(cardscan::compress));
+        router.merge(sm)
+    } else {
+        router
+    };
+    // Lane B unit 5a: security-header stack (COEP/helmet-8/cors twins) over
+    // the NATIVE routes only. Attached before the fallback is registered so
+    // proxied traffic keeps Node's own header output untouched — axum
+    // applies .layer() only to the routes added above it.
+    //
+    // REVIEW-errors H2 red-before-fix hook (tests/panic_500.rs): a route
+    // that ALWAYS panics, registered only under the same full production
+    // layer stack (CatchPanic inside secheaders::guard). Gated on an env
+    // var nothing in production sets; when unset the route does not exist,
+    // not even as a 404 (falls through to proxy like every unowned path).
+    let router = if std::env::var("SCRYBOX_TEST_PANIC_ROUTE").is_ok() {
+        // Diverging handler as a named async fn with an explicit return
+        // type: an inline `|| async { panic!(..) }` closure leaves the
+        // future's Output = ! and trips the (deny-by-default)
+        // never-type-fallback rust_2024_compat lint.
+        async fn boom() -> StatusCode {
+            panic!("SCRYBOX_TEST_PANIC_ROUTE: intentional handler panic (REVIEW-errors H2 test)")
+        }
+        router.rroute("/api/__test_panic", any(boom))
+    } else {
+        router
+    };
+    // Memory queue item 6 (MEMORY.md #9, Gate D): first-traffic trigger.
+    // The boot-time eager warmers (stats boot warm today; the pattern is
+    // reusable) park on `wait_traffic()` until the FIRST real request
+    // arrives, so an idle process never pays their HWM. /api/health is
+    // excluded on purpose: uptime probes (docker/orchestrator) poll it
+    // forever, and a health-only process is by definition still idle.
+    // Mounted with the routes above the fallback (like secheaders), so
+    // proxied/static traffic never touches it.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        |State(st): State<AppState>, req: Request, next: axum::middleware::Next| async move {
+            if req.uri().path() != "/api/health" {
+                st.note_traffic();
+            }
+            next.run(req).await
+        },
+    ));
+    // REVIEW-errors H2 (fix queue): tower-http CatchPanicLayer answering
+    // Node's generic error handler (server.js:642 `res.status(500).json(
+    // {error:'Internal server error'})`) byte-for-byte on a handler panic
+    // instead of hyper resetting the connection. Placed INNER of the
+    // secheaders guard (layers added later are outer in axum): the panic
+    // unwinds out of the handler into the catcher, the resulting 500 then
+    // travels back OUT through the guard, which stamps the same COEP/
+    // helmet/cors twin headers Node's stack had already set before the
+    // route threw. Only covers routes registered above (the native ones);
+    // the Node-proxy fallback carries Node's own error output by design.
+    // Requires panic = "unwind" (workspace Cargo.toml profile — do not set
+    // panic = "abort").
+    let router = router.layer(tower_http::catch_panic::CatchPanicLayer::custom(
+        node_panic_500,
+    ));
+    let router = router.layer(axum::middleware::from_fn(crate::secheaders::guard));
+    let router = match state.cfg.static_dir.clone() {
+        Some(dir) => {
+            // Static hits are served by Rust; misses (API, SPA deep links,
+            // /scan-assets, portal) go to Node unchanged.
+            let fallback = axum::routing::any(proxy).with_state(state.clone());
+            if state.cfg.node_upstream.is_empty() {
+                // Node-free: no Node stamps helmet/COEP/cors on the
+                // fallback's replies (unknown /api 401/404, static misses),
+                // so the secheaders twin must cover the fallback too.
+                let fallback = fallback.layer(axum::middleware::from_fn(crate::secheaders::guard));
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            } else {
+                router.fallback_service(ServeDir::new(dir).fallback(fallback))
+            }
+        }
+        None if state.cfg.node_upstream.is_empty() => router.fallback_service(
+            axum::routing::any(proxy)
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn(crate::secheaders::guard)),
+        ),
+        None => router.fallback(proxy),
+    };
+    let pats = Arc::new(ROUTE_PATS.with(|v| std::mem::take(&mut *v.borrow_mut())));
+    let standalone = state.cfg.node_upstream.is_empty();
+    let router = router
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // REVIEW-auth H1 backstop: DefaultBodyLimit at the largest route
+        // parser ceiling (manabox-sync 40mb, server.js:464). Raw to_bytes
+        // reads already cap themselves per-route (collection_writes::
+        // read_parts / cards_tags::read_body); this guards any future
+        // extractor-based (Json/Form/Bytes) route against unbounded
+        // buffering. Note axum's extractor-only semantics: it does NOT
+        // touch the raw proxy path — correct, Node streams those.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            40 * 1024 * 1024,
+        ))
+        .with_state(state);
+    if !standalone {
+        // Hybrid: Node still authors every relaxed match / HEAD through the
+        // proxy, exactly as before.
+        return router;
+    }
+    // URI rewrite must happen BEFORE routing, so the layer wraps the whole
+    // inner Router as a service under an empty outer Router.
+    let svc = tower::Layer::layer(&axum::middleware::from_fn_with_state(pats, express_routing), router);
+    Router::new().fallback_service(svc)
+}

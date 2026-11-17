@@ -1,0 +1,91 @@
+{
+  "at": "2026-11-10T10:01:54.485Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": {
+    "every_ms": 2000,
+    "ticks": 33,
+    "errors": 0,
+    "target": "http://127.0.0.1:3312/api/collection/4"
+  },
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 17145,
+      "variants": 1,
+      "rps": 1713.5,
+      "p50_ms": 7.78,
+      "p99_ms": 25.05,
+      "peak_rss_mb": 560.2,
+      "codes": {
+        "200": 17145
+      }
+    },
+    {
+      "name": "collection_page_varied",
+      "conc": 16,
+      "n": 50295,
+      "variants": 52,
+      "rps": 4947.4,
+      "p50_ms": 1.62,
+      "p99_ms": 8.76,
+      "peak_rss_mb": 439.9,
+      "codes": {
+        "200": 50295
+      }
+    },
+    {
+      "name": "collection_full_varied",
+      "conc": 2,
+      "n": 385,
+      "variants": 6,
+      "rps": 25,
+      "p50_ms": 34.43,
+      "p99_ms": 523.79,
+      "peak_rss_mb": 677.1,
+      "codes": {
+        "200": 385
+      }
+    },
+    {
+      "name": "stats_varied",
+      "conc": 16,
+      "n": 190034,
+      "variants": 52,
+      "rps": 19001.5,
+      "p50_ms": 0.65,
+      "p99_ms": 3.42,
+      "peak_rss_mb": 901.8,
+      "codes": {
+        "200": 190034
+      }
+    },
+    {
+      "name": "search_db_varied",
+      "conc": 16,
+      "n": 51365,
+      "variants": 52,
+      "rps": 5136.5,
+      "p50_ms": 0.69,
+      "p99_ms": 5.31,
+      "peak_rss_mb": 1147.4,
+      "codes": {
+        "200": 51365
+      }
+    },
+    {
+      "name": "search_coll_varied",
+      "conc": 16,
+      "n": 192384,
+      "variants": 52,
+      "rps": 19238.4,
+      "p50_ms": 0.64,
+      "p99_ms": 3.07,
+      "peak_rss_mb": 1116.3,
+      "codes": {
+        "200": 192384
+      }
+    }
+  ]
+}

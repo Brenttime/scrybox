@@ -1,0 +1,103 @@
+{
+  "at": "2026-11-09T15:13:16.575Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 18279,
+      "rps": 1827.2,
+      "p50_ms": 7.8,
+      "p99_ms": 19.98,
+      "peak_rss_mb": 6.5,
+      "codes": {
+        "200": 18279
+      }
+    },
+    {
+      "name": "collection_page100",
+      "conc": 16,
+      "n": 300,
+      "rps": 28.8,
+      "p50_ms": 541.2,
+      "p99_ms": 719.54,
+      "peak_rss_mb": 9.4,
+      "codes": {
+        "200": 300
+      }
+    },
+    {
+      "name": "collection_full_27MB",
+      "conc": 2,
+      "n": 14,
+      "rps": 0.9,
+      "p50_ms": 2319.2,
+      "p99_ms": 3045.16,
+      "peak_rss_mb": 11.7,
+      "codes": {
+        "200": 14
+      }
+    },
+    {
+      "name": "stats",
+      "conc": 16,
+      "n": 10964,
+      "rps": 1095.6,
+      "p50_ms": 13.9,
+      "p99_ms": 22.41,
+      "peak_rss_mb": 10.3,
+      "codes": {
+        "200": 10964
+      }
+    },
+    {
+      "name": "search_coll_t_creature_c_g",
+      "conc": 16,
+      "n": 149,
+      "rps": 13.7,
+      "p50_ms": 1123.54,
+      "p99_ms": 1567.88,
+      "peak_rss_mb": 11.3,
+      "codes": {
+        "200": 149
+      }
+    },
+    {
+      "name": "search_coll_sol_ring",
+      "conc": 16,
+      "n": 156,
+      "rps": 14.3,
+      "p50_ms": 1080.7,
+      "p99_ms": 1698.02,
+      "peak_rss_mb": 12.2,
+      "codes": {
+        "200": 156
+      }
+    },
+    {
+      "name": "search_db_name_sol_ring",
+      "conc": 16,
+      "n": 112,
+      "rps": 10.1,
+      "p50_ms": 1533.01,
+      "p99_ms": 1857.45,
+      "peak_rss_mb": 11.3,
+      "codes": {
+        "200": 112
+      }
+    },
+    {
+      "name": "login_burst",
+      "conc": 4,
+      "n": 141,
+      "rps": 13.8,
+      "p50_ms": 286.91,
+      "p99_ms": 352.93,
+      "peak_rss_mb": 9.8,
+      "codes": {
+        "200": 141
+      }
+    }
+  ]
+}

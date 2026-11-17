@@ -1,0 +1,6 @@
+{"name":"health","conc":16,"n":16602,"variants":1,"rps":1659.4,"p50_ms":8.48,"p99_ms":23.99,"peak_rss_mb":403.9,"codes":{"200":16602}}
+{"name":"collection_page_varied","conc":16,"n":36495,"variants":52,"rps":3581.5,"p50_ms":2.61,"p99_ms":49.01,"peak_rss_mb":377,"codes":{"200":36495}}
+{"name":"collection_full_varied","conc":2,"n":433,"variants":6,"rps":28.4,"p50_ms":29.92,"p99_ms":516.73,"peak_rss_mb":651.1,"codes":{"200":433}}
+{"name":"stats_varied","conc":16,"n":50827,"variants":52,"rps":5082.7,"p50_ms":1.75,"p99_ms":3.96,"peak_rss_mb":848,"codes":{"200":50827}}
+{"name":"search_db_varied","conc":16,"n":24318,"variants":52,"rps":2430.6,"p50_ms":1.93,"p99_ms":139.4,"peak_rss_mb":1120.7,"codes":{"200":24318}}
+{"name":"search_coll_varied","conc":16,"n":3941,"variants":52,"rps":391.7,"p50_ms":35.05,"p99_ms":86.38,"peak_rss_mb":1048.6,"codes":{"200":3941}}

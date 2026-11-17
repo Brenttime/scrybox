@@ -1,0 +1,97 @@
+{"name":"health","conc":16,"n":16975,"variants":1,"rps":1696.3,"p50_ms":8.52,"p99_ms":18.91,"peak_rss_mb":154.7,"codes":{"200":16975}}
+{"name":"collection_page_varied","conc":16,"n":33655,"variants":52,"rps":3308.3,"p50_ms":2.6,"p99_ms":87.31,"peak_rss_mb":249.7,"codes":{"200":33655}}
+{"name":"collection_full_varied","conc":2,"n":471,"variants":6,"rps":30.6,"p50_ms":29.75,"p99_ms":496.81,"peak_rss_mb":644.2,"codes":{"200":471}}
+{"name":"stats_varied","conc":16,"n":56085,"variants":52,"rps":5608.5,"p50_ms":1.86,"p99_ms":4.26,"peak_rss_mb":699.4,"codes":{"200":56085}}
+{"name":"search_db_varied","conc":16,"n":252,"variants":52,"rps":23.2,"p50_ms":506.75,"p99_ms":2899.6,"peak_rss_mb":776.9,"codes":{"200":252}}
+{"name":"search_coll_varied","conc":16,"n":3921,"variants":52,"rps":389.7,"p50_ms":35.36,"p99_ms":87.83,"peak_rss_mb":717.6,"codes":{"200":3921}}
+{
+  "at": "2026-11-10T04:54:50.057Z",
+  "concurrency": 16,
+  "duration_s": 10,
+  "write_mix": {
+    "every_ms": 2000,
+    "ticks": 34,
+    "errors": 0,
+    "target": "http://127.0.0.1:3312/api/collection/4"
+  },
+  "results": [
+    {
+      "name": "health",
+      "conc": 16,
+      "n": 16975,
+      "variants": 1,
+      "rps": 1696.3,
+      "p50_ms": 8.52,
+      "p99_ms": 18.91,
+      "peak_rss_mb": 154.7,
+      "codes": {
+        "200": 16975
+      }
+    },
+    {
+      "name": "collection_page_varied",
+      "conc": 16,
+      "n": 33655,
+      "variants": 52,
+      "rps": 3308.3,
+      "p50_ms": 2.6,
+      "p99_ms": 87.31,
+      "peak_rss_mb": 249.7,
+      "codes": {
+        "200": 33655
+      }
+    },
+    {
+      "name": "collection_full_varied",
+      "conc": 2,
+      "n": 471,
+      "variants": 6,
+      "rps": 30.6,
+      "p50_ms": 29.75,
+      "p99_ms": 496.81,
+      "peak_rss_mb": 644.2,
+      "codes": {
+        "200": 471
+      }
+    },
+    {
+      "name": "stats_varied",
+      "conc": 16,
+      "n": 56085,
+      "variants": 52,
+      "rps": 5608.5,
+      "p50_ms": 1.86,
+      "p99_ms": 4.26,
+      "peak_rss_mb": 699.4,
+      "codes": {
+        "200": 56085
+      }
+    },
+    {
+      "name": "search_db_varied",
+      "conc": 16,
+      "n": 252,
+      "variants": 52,
+      "rps": 23.2,
+      "p50_ms": 506.75,
+      "p99_ms": 2899.6,
+      "peak_rss_mb": 776.9,
+      "codes": {
+        "200": 252
+      }
+    },
+    {
+      "name": "search_coll_varied",
+      "conc": 16,
+      "n": 3921,
+      "variants": 52,
+      "rps": 389.7,
+      "p50_ms": 35.36,
+      "p99_ms": 87.83,
+      "peak_rss_mb": 717.6,
+      "codes": {
+        "200": 3921
+      }
+    }
+  ]
+}

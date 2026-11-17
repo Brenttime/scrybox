@@ -219,4 +219,4 @@ async function runTests() {
 
 runTests()
   .then(() => setTimeout(() => process.exit(0), 500))
-  .catch(err => { console.error('FAIL: collectioncatalog.e2e -', err.message); setTimeout(() => process.exit(1), 500); });
+  .catch(err => { console.error('FAIL: collectioncatalog.e2e -', err.message); console.error(err.stack); setTimeout(() => process.exit(1), 500); });

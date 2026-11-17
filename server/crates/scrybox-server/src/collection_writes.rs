@@ -1,0 +1,2687 @@
+//! Native port of the `backend/src/routes/collection.js` WRITE routes:
+//! `GET /collection/cardlist`, `PUT /collection/:id`, `DELETE /collection/:id`
+//! and `POST /collection/bulk`. Mounted under the `collection_writes` name in
+//! RUST_ROUTES; anything on those paths the port does not own (methods, and
+//! the PUT card_id branch when the target printing is not in card_cache —
+//! Node would hydrate it from Scryfall, which Rust never does) is forwarded
+//! to Node through the existing `crate::proxy` path so upstream stays
+//! canonical there.
+//!
+//! Every status, body and message was written against the actual Node source
+//! (routes/collection.js, utils/collectionHelpers.js, utils/deckRules.js,
+//! utils/splitPrice.js, utils/cardIdentity.js, shared/cardListText.js) — the
+//! brief's prose is secondary to that source wherever they disagree (see the
+//! module tests; deliberate deviations are documented on the functions).
+
+use std::sync::{Arc, OnceLock};
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::extract::Request;
+use rusqlite::types::Value as SqlValue;
+use rusqlite::Connection;
+use serde_json::{json, Map, Value};
+
+use crate::auth::{authenticate_async, bearer_token};
+use crate::collection::{body_etag, etag_matches, json_num, sqlite_value, truthy, js_parse_int};
+use crate::db::DbPool;
+use crate::stats;
+use crate::AppState;
+
+// ---------------------------------------------------------------------------
+// Constants mirroring routes/collection.js
+// ---------------------------------------------------------------------------
+
+/// routes/collection.js `PRINTING_VALUES` (also the collection.printing CHECK).
+const PRINTING_VALUES: &[&str] = &["Normal", "Holofoil"];
+/// routes/collection.js `BULK_ACTIONS` (line 852 — favorite is NOT in it).
+const BULK_ACTIONS: &[&str] = &[
+    "delete", "trade", "untrade", "condition", "printing", "purchase_split", "add_to_deck",
+];
+/// routes/collection.js `BULK_CONDITIONS`.
+const BULK_CONDITIONS: &[&str] = &[
+    "Near Mint", "Lightly Played", "Moderately Played", "Heavily Played", "Damaged",
+];
+/// routes/collection.js `BULK_PRINTINGS`.
+const BULK_PRINTINGS: &[&str] = &["Normal", "Holofoil"];
+/// deckRules.js `isBasicLand` canonical basic names.
+const BASIC_NAMES: &[&str] = &["Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"];
+
+/// Node's withAllocationLock is a per-process FIFO mutex. Rust mirrors it with
+/// one async mutex around every allocation-guarded section (plus BEGIN
+/// IMMEDIATE for cross-process serialisation against Node's own writes).
+pub(crate) fn alloc_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+// ---------------------------------------------------------------------------
+// Response helpers (same Node-exact shape as auth_routes.rs: res.json emits
+// application/json; charset=utf-8 + the Express default weak body ETag)
+// ---------------------------------------------------------------------------
+
+pub(crate) use crate::util::{json_error_express as json_error, json_response};
+
+/// Re-stamp an error Response produced elsewhere (auth.rs builds axum::Json
+/// bodies without the Express charset/ETag) into Node's exact res.json form,
+/// keeping the JSON body byte-identical.
+pub(crate) async fn node_exact(res: Response) -> Response {
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap_or_default();
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) => json_response(status, &v),
+        Err(_) => (status, Body::from(bytes)).into_response(),
+    }
+}
+
+/// routes/collection.js:695/816/834/840 — PUT and DELETE share it.
+const ENTRY_NOT_FOUND: &str = "Collection entry not found";
+/// routes/collection.js:820 — ALLOCATION_CONFLICT.
+const ALLOCATION_CONFLICT: &str = "Check in the deck using this card before reducing the owned quantity.";
+
+// ---------------------------------------------------------------------------
+// JS semantics helpers
+// ---------------------------------------------------------------------------
+
+/// JS `String(value)` for the JSON values that can arrive in a request body
+/// (or come out of SQLite through `sqlite_value`).
+pub(crate) fn js_to_string(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "null".to_string(), // `null` prints as null; undefined handled by callers passing None
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|e| match e {
+                // Array.prototype.toString = join(","): null/undefined render
+                // empty, nested arrays recurse, objects render as [object Object].
+                Value::Null => String::new(),
+                Value::Array(inner) => js_array_join(inner),
+                _ => js_to_string(Some(e)),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(Value::Object(_)) => "[object Object]".to_string(),
+    }
+}
+
+fn js_array_join(a: &[Value]) -> String {
+    a.iter()
+        .map(|e| match e {
+            Value::Null => String::new(),
+            Value::Array(inner) => js_array_join(inner),
+            _ => js_to_string(Some(e)),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// JS `Number(value)` for comparisons (`Number(owned_qty) - Number(x) <
+/// Number(locked_qty)` and friends).
+fn js_to_number(v: Option<&Value>) -> f64 {
+    match v {
+        None | Some(Value::Null) => 0.0,
+        Some(Value::Bool(b)) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+        Some(other) => {
+            let s = js_to_string(Some(other)).trim().to_string();
+            if s.is_empty() {
+                0.0
+            } else {
+                s.parse::<f64>().unwrap_or(f64::NAN)
+            }
+        }
+    }
+}
+
+/// `Math.round` (closest integer, ties toward +Infinity), NaN/Infinity
+/// passed through.
+fn math_round(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x;
+    }
+    let f = x.floor();
+    if x - f >= 0.5 {
+        f + 1.0
+    } else {
+        f
+    }
+}
+
+/// JS `parseInt(String(v), 10)` (NaN modelled as None).
+pub(crate) fn js_parse_int_v(v: Option<&Value>) -> Option<i64> {
+    js_parse_int(&js_to_string(v))
+}
+
+/// JS `parseFloat(String(s))` — longest valid numeric prefix, leading
+/// whitespace and sign allowed, "Infinity" recognised.
+fn js_parse_float(s: &str) -> f64 {
+    let t = s.trim_start_matches(|c: char| c.is_whitespace());
+    let (sign, rest) = match t.as_bytes().first() {
+        Some(b'+') => (1.0, &t[1..]),
+        Some(b'-') => (-1.0, &t[1..]),
+        _ => (1.0, t),
+    };
+    if let Some(stripped) = rest.strip_prefix("Infinity") {
+        let _ = stripped;
+        return sign * f64::INFINITY;
+    }
+    let b = rest.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_digits = i;
+    if i < b.len() && b[i] == b'.' {
+        let mut j = i + 1;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        let frac_digits = j - (i + 1);
+        if int_digits == 0 && frac_digits == 0 {
+            return f64::NAN;
+        }
+        i = j;
+    } else if int_digits == 0 {
+        return f64::NAN;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_start {
+            i = j;
+        }
+    }
+    sign * rest[..i].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// `(total).toFixed(2)` for the purchase_split message. total >= 0 (or -0) is
+/// validated before this runs; per the spec ladder it reduces to the closest
+/// cent with ties toward +Infinity, i.e. Math.round(total*100) (brief +
+/// ECMA-262 agree here).
+fn js_fixed2(total: f64) -> String {
+    if total.is_nan() {
+        return "NaN".to_string();
+    }
+    if total.is_infinite() {
+        // Only +Infinity survives the total >= 0 gate (-Infinity fails).
+        return "Infinity".to_string();
+    }
+    let c = math_round(total * 100.0);
+    if c == 0.0 {
+        return "0.00".to_string(); // also the -0 case
+    }
+    if c.abs() >= 9.007_199_254_740_992e15 {
+        return format!("{total:.2}"); // unrealistic money; keep digits
+    }
+    let ci = c as i64;
+    format!("{}.{:02}", ci / 100, ci % 100)
+}
+
+/// Bind a JSON body value to SQLite the way Node's sqlite3 driver binds the
+/// JS value. Objects/arrays are rejected: node-sqlite3 throws on binding
+/// them, which the route's catch turns into the route's 500 — reproduced via
+/// `WriteError::Bind`.
+fn json_to_sql(v: Option<&Value>) -> Result<SqlValue, WriteError> {
+    Ok(match v {
+        None | Some(Value::Null) => SqlValue::Null,
+        Some(Value::Bool(b)) => SqlValue::Integer(if *b { 1 } else { 0 }),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(i) => SqlValue::Integer(i),
+            None => SqlValue::Real(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        Some(Value::String(s)) => SqlValue::Text(s.clone()),
+        Some(_) => return Err(WriteError::Bind),
+    })
+}
+
+pub(crate) fn json_to_sql_value(v: &Value) -> SqlValue {
+    // For values read back out of SQLite (already normalised JSON) — no bind
+    // errors possible.
+    json_to_sql(Some(v)).unwrap_or(SqlValue::Null)
+}
+
+/// Row-map value with a JSON null default (rows come from SQLite, so they
+/// can never contain the object/array forms `json_to_sql` rejects).
+fn dv(m: &Map<String, Value>, k: &str) -> Value {
+    m.get(k).cloned().unwrap_or(Value::Null)
+}
+
+/// JS truthiness over `Option<&Value>` (collection::truthy takes &Value).
+pub(crate) fn tr(v: Option<&Value>) -> bool {
+    v.is_some_and(|x| truthy(x))
+}
+
+// ---------------------------------------------------------------------------
+// SQL fragments — twins of utils/cardIdentity.js
+// ---------------------------------------------------------------------------
+
+fn sql_card_key(alias: &str) -> String {
+    format!("LOWER(TRIM(COALESCE({alias}.name, '')))")
+}
+
+/// cardIdentity.sqlIsBasicLand — exposed for decks_reads (deckOwnership).
+pub(crate) fn sql_is_basic_land_expr(alias: &str) -> String {
+    sql_is_basic_land(alias)
+}
+
+fn sql_is_basic_land(alias: &str) -> String {
+    let subtypes = format!("LOWER(COALESCE({alias}.subtypes, ''))");
+    let is_land =
+        format!("(LOWER(COALESCE({alias}.supertype, '')) = 'land' OR INSTR({subtypes}, '\"land\"') > 0)");
+    let is_basic_type = format!(
+        "({key} IN ('plains', 'island', 'swamp', 'mountain', 'forest', 'wastes') OR INSTR({subtypes}, '\"basic\"') > 0)",
+        key = sql_card_key(alias)
+    );
+    format!("({is_land} AND {is_basic_type})")
+}
+
+// ---------------------------------------------------------------------------
+// DB plumbing
+// ---------------------------------------------------------------------------
+
+pub(crate) enum WriteError {
+    Sql(rusqlite::Error),
+    /// node-sqlite3 refuses to bind an object/array — same 500 as its throw.
+    Bind,
+}
+
+impl From<rusqlite::Error> for WriteError {
+    fn from(e: rusqlite::Error) -> Self {
+        WriteError::Sql(e)
+    }
+}
+
+impl std::fmt::Debug for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Sql(e) => write!(f, "sql: {e}"),
+            WriteError::Bind => write!(f, "unsupported bind value"),
+        }
+    }
+}
+
+pub(crate) fn get_row_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<Map<String, Value>>, WriteError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    match rows.next()? {
+        None => Ok(None),
+        Some(r) => {
+            let mut m = Map::with_capacity(cols.len());
+            for (i, c) in cols.iter().enumerate() {
+                m.insert(c.clone(), sqlite_value(r, i)?);
+            }
+            Ok(Some(m))
+        }
+    }
+}
+
+pub(crate) fn get_rows_map(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Vec<Map<String, Value>>, WriteError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let mut m = Map::with_capacity(cols.len());
+        for (i, c) in cols.iter().enumerate() {
+            m.insert(c.clone(), sqlite_value(r, i)?);
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+fn get_i64(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<Option<i64>, WriteError> {
+    Ok(get_row_map(conn, sql, params)?
+        .and_then(|m| m.values().next().cloned())
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))))
+}
+
+/// A BEGIN IMMEDIATE transaction with guaranteed finalisation. Node's
+/// withAllocationLock is only an in-process mutex (no DB transaction); Rust
+/// additionally needs a real write transaction so the multi-statement
+/// allocate/read-check-write sequences are atomic and serialise against
+/// Node's own writes on the shared WAL file.
+pub(crate) struct Tx<'a> {
+    conn: &'a Connection,
+    done: bool,
+}
+
+impl<'a> Tx<'a> {
+    pub(crate) fn begin(conn: &'a Connection) -> Result<Self, WriteError> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(Self { conn, done: false })
+    }
+    pub(crate) fn commit(&mut self) -> Result<(), WriteError> {
+        // done flips ONLY after COMMIT succeeds (name_index::Txn shape).
+        // Setting it first turned a failed COMMIT (BUSY, I/O, deferred-FK)
+        // into a swallowed rollback: Drop saw done==true, the pooled
+        // connection went back to the pool still holding the WAL write
+        // lock, and every later writer hit it.
+        self.conn.execute_batch("COMMIT")?;
+        self.done = true;
+        Ok(())
+    }
+    pub(crate) fn rollback(&mut self) {
+        if !self.done {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
+/// logicalInventoryStatus(database, userId, cardId) — collectionHelpers.js,
+/// with sqlCardKey/sqlIsBasicLand expanded as in cardIdentity.js.
+pub(crate) fn logical_inventory_status(
+    conn: &Connection,
+    user_id: i64,
+    card_id: &Value,
+) -> Result<Option<Map<String, Value>>, WriteError> {
+    let sql = format!(
+        "SELECT
+           target.id AS card_id,
+           {key} AS card_key,
+           CASE WHEN {basic} THEN 1 ELSE 0 END AS is_basic_land,
+           (
+             SELECT COALESCE(SUM(c.quantity), 0)
+             FROM collection c
+             JOIN card_cache owned_cc ON owned_cc.id = c.card_id
+             WHERE c.user_id = ?1
+               AND c.quantity > 0
+               AND {owned_key} = {key}
+           ) AS owned_qty,
+           (
+             SELECT COALESCE(SUM(dc.quantity), 0)
+             FROM deck_cards dc
+             JOIN card_cache locked_cc ON locked_cc.id = dc.card_id
+             JOIN decks d ON d.id = dc.deck_id
+             WHERE d.user_id = ?2
+               AND d.checked_out = 1
+               AND dc.quantity > 0
+               AND NOT {locked_basic}
+               AND {locked_key} = {key}
+           ) AS locked_qty
+         FROM card_cache target
+         WHERE target.id = ?3"
+    ,
+        key = sql_card_key("target"),
+        basic = sql_is_basic_land("target"),
+        owned_key = sql_card_key("owned_cc"),
+        locked_basic = sql_is_basic_land("locked_cc"),
+        locked_key = sql_card_key("locked_cc"),
+    );
+    get_row_map(conn, &sql, &[SqlValue::Integer(user_id), SqlValue::Integer(user_id), json_to_sql_value(card_id)])
+}
+
+/// setStackQuantity(database, userId, entryId, target) — collectionHelpers.js
+/// lines 134-174, ported exactly: grow by inserting single-copy rows that
+/// mirror the edited row; shrink the siblings (ORDER BY id DESC, newest
+/// first) before touching the edited row; finally pin the edited row to
+/// `target`. NOTE: the brief described a MIN_STACK_QTY/stackable variant —
+/// that does NOT exist in the Node source of this repo, which wins.
+fn set_stack_quantity(
+    conn: &Connection,
+    user_id: i64,
+    entry_id: &Value,
+    target: i64,
+) -> Result<(), WriteError> {
+    let row = match get_row_map(
+        conn,
+        "SELECT * FROM collection WHERE id = ? AND user_id = ?",
+        &[json_to_sql_value(entry_id), SqlValue::Integer(user_id)],
+    )? {
+        Some(r) => r,
+        None => return Ok(()), // Node returns 0 (no-op)
+    };
+    let siblings = get_rows_map(
+        conn,
+        "SELECT id, quantity FROM collection
+         WHERE user_id = ?1 AND card_id = ?2 AND condition = ?3 AND printing = ?4
+           AND language = ?5 AND id != ?6 AND quantity > 0
+           AND COALESCE(is_proxy, 0) = ?7
+         ORDER BY id DESC",
+        &[
+            SqlValue::Integer(user_id),
+            json_to_sql_value(&dv(&row, "card_id")),
+            json_to_sql_value(&dv(&row, "condition")),
+            json_to_sql_value(&dv(&row, "printing")),
+            json_to_sql_value(&dv(&row, "language")),
+            json_to_sql_value(entry_id),
+            SqlValue::Integer(if tr(row.get("is_proxy")) { 1 } else { 0 }),
+        ],
+    )?;
+
+    let mut current: f64 = js_to_number(row.get("quantity")).max(0.0);
+    for s in &siblings {
+        current += js_to_number(s.get("quantity")).max(0.0);
+    }
+
+    // Grow: one single-card row per missing copy, mirroring the edited row.
+    while current < target as f64 {
+        conn.execute(
+            "INSERT INTO collection (
+               card_id, user_id, quantity, condition, printing, language, purchase_price,
+               is_trade, favorite, is_proxy
+             ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params_from_iter(vec![
+                json_to_sql(row.get("card_id"))?,
+                SqlValue::Integer(user_id),
+                json_to_sql(row.get("condition"))?,
+                json_to_sql(row.get("printing"))?,
+                json_to_sql(row.get("language"))?,
+                json_to_sql(row.get("purchase_price"))?,
+                json_to_sql(row.get("is_trade"))?,
+                json_to_sql(row.get("favorite"))?,
+                SqlValue::Integer(if tr(row.get("is_proxy")) { 1 } else { 0 }),
+            ]),
+        )?;
+        current += 1.0;
+    }
+
+    // Shrink: trim candidates (newest first) first, edited row last.
+    for s in &siblings {
+        if current <= target as f64 {
+            break;
+        }
+        let have = js_to_number(s.get("quantity")).max(0.0);
+        let drop = have.min(current - target as f64);
+        current -= drop;
+        if drop >= have {
+            conn.execute(
+                "DELETE FROM collection WHERE id = ? AND user_id = ?",
+                rusqlite::params_from_iter(vec![json_to_sql(s.get("id"))?, SqlValue::Integer(user_id)]),
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE collection SET quantity = quantity - ? WHERE id = ? AND user_id = ?",
+                rusqlite::params_from_iter(vec![
+                    SqlValue::Real(drop),
+                    json_to_sql(s.get("id"))?,
+                    SqlValue::Integer(user_id),
+                ]),
+            )?;
+        }
+    }
+
+    if current > target as f64 {
+        conn.execute(
+            "UPDATE collection SET quantity = ? WHERE id = ? AND user_id = ?",
+            rusqlite::params_from_iter(vec![SqlValue::Integer(target), json_to_sql_value(entry_id), SqlValue::Integer(user_id)]),
+        )?;
+    }
+    Ok(())
+}
+
+fn placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+// ---------------------------------------------------------------------------
+// Body parsing — normalJson (express.json {limit:'1mb', strict:true}) which
+// server.js mounts globally ahead of the auth gate for non-large paths, so
+// parse failures outrank auth errors exactly as in Node.
+// ---------------------------------------------------------------------------
+
+pub(crate) enum BodyOutcome {
+    Parsed(Value),
+    /// entity.parse.failed → the global error handler's 500.
+    Invalid,
+    /// entity.too.large → the global handler's 413.
+    TooLarge,
+}
+
+pub(crate) fn is_json_ct(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            main == "application/json"
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn parse_body(headers: &HeaderMap, bytes: &[u8]) -> BodyOutcome {
+    if !is_json_ct(headers) {
+        // body-parser leaves req.body undefined; Node's route would throw on
+        // destructuring it (unhandled rejection). The port treats it as `{}`,
+        // matching the auth_routes convention — documented deviation.
+        return BodyOutcome::Parsed(Value::Object(Map::new()));
+    }
+    if bytes.len() > 1024 * 1024 {
+        return BodyOutcome::TooLarge;
+    }
+    if bytes.is_empty() {
+        return BodyOutcome::Parsed(Value::Object(Map::new()));
+    }
+    match serde_json::from_slice::<Value>(bytes) {
+        // express.json({strict:true}): only objects (and arrays — which
+        // destructure to nothing useful, like auth_routes) are legal.
+        Ok(v) if v.is_object() => BodyOutcome::Parsed(v),
+        Ok(v) if v.is_array() => BodyOutcome::Parsed(Value::Object(Map::new())),
+        _ => BodyOutcome::Invalid,
+    }
+}
+
+/// THE standalone (no Node upstream) answer for any request no native
+/// handler serves — the router fallback (`crate::proxy`) and every native
+/// handler's unowned method/shape land here. Mirrors server.js order for a
+/// request no Express route matches: the global `normalJson` parser (pre-auth,
+/// for EVERY path; skipped only for the large-body paths, whose matcher is
+/// the custom middleware's case-sensitive `req.path` test), then for `/api`
+/// (Express mounts are case-insensitive) the admin router's
+/// `authenticateToken, requireAdmin` under `/api/admin`, else the global
+/// `authenticateToken` gate, then the post-auth bigJson parsers (mounted, so
+/// case-insensitive; a body already parsed by normalJson is skipped), then
+/// finalhandler's `Cannot METHOD /path` 404 — METHOD/path being the ORIGINAL
+/// request's (HEAD stays HEAD, `/API/Foo/` stays as typed). Parser failures
+/// land in the generic error handler (413 too-large / 500 `Internal server
+/// error`).
+pub(crate) async fn standalone_unmatched(st: &AppState, req: Request) -> Response {
+    const LARGE: &[(&str, usize)] = &[
+        ("/api/import", BODY_BIG),
+        ("/api/scan-match", BODY_BIG),
+        ("/api/search", BODY_BIG),
+        ("/api/cardscan", BODY_BIG),
+        ("/api/manabox-sync", BODY_MANABOX),
+    ];
+    let method = req
+        .extensions()
+        .get::<crate::OrigMethod>()
+        .map(|m| m.0.clone())
+        .unwrap_or_else(|| req.method().clone());
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let lower = path.to_ascii_lowercase();
+    let under = |base: &str, p: &str| p == base || p.starts_with(&format!("{base}/"));
+    // server.js largeJsonPaths middleware: exact-case req.path test.
+    let skip_normal = LARGE.iter().any(|(p, _)| under(p, &path));
+    // app.use('/api/import', bigJson) etc.: case-insensitive mounts.
+    let big = LARGE.iter().find(|(p, _)| under(p, &lower)).map(|(_, cap)| *cap);
+    let read_cap = if skip_normal { big.unwrap_or(BODY_NORMAL) } else { BODY_NORMAL };
+    let (parts, bytes, oversize) = read_parts(req, read_cap).await;
+    let parse = |cap: usize| -> Option<Response> {
+        if !is_json_ct(&parts.headers) {
+            return None;
+        }
+        if oversize || bytes.len() > cap {
+            return Some(too_large());
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) if v.is_object() || v.is_array() => None,
+            _ => Some(internal_error()),
+        }
+    };
+    if !skip_normal {
+        if let Some(r) = parse(BODY_NORMAL) {
+            return r;
+        }
+    }
+    if under("/api", &lower) {
+        if let Some(pool) = st.db.as_ref() {
+            let is_get = method == Method::GET;
+            if under("/api/admin", &lower) {
+                let user = match crate::auth::authenticate_async(pool, crate::auth::bearer_token(&parts.headers).map(|s| s.to_string()).as_deref(), is_get).await {
+                    Ok(u) => u,
+                    Err(r) => return r,
+                };
+                if let Some(r) = crate::settings::admin_gate(&user) {
+                    return r;
+                }
+            } else {
+                let token = bearer_token(&parts.headers).map(|s| s.to_string());
+                if let Err(r) = crate::auth::authenticate_async(pool, token.as_deref(), is_get).await {
+                    return r;
+                }
+            }
+        }
+        if skip_normal {
+            if let Some(cap) = big {
+                if let Some(r) = parse(cap) {
+                    return r;
+                }
+            }
+        }
+    }
+    crate::static_assets::express_default_404(&method, &path)
+}
+
+/// Unowned method on a native route: hybrid forwards to Node; standalone
+/// answers Node's no-route arms natively (see `standalone_unmatched`).
+pub(crate) async fn unowned(st: AppState, req: Request) -> Response {
+    if st.cfg.node_upstream.is_empty() {
+        return standalone_unmatched(&st, req).await;
+    }
+    crate::proxy(State(st), req).await
+}
+
+pub(crate) fn too_large() -> Response {
+    json_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Upload too large. Try exporting/importing in smaller batches.",
+    )
+}
+
+pub(crate) fn internal_error() -> Response {
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+}
+
+// ---------------------------------------------------------------------------
+// Router entries
+// ---------------------------------------------------------------------------
+
+/// Node's body-parser ceilings (backend/src/server.js:204-205,460-464,
+/// routes/cardscan.js:148). read_parts/read_body stream AT MOST cap+1 bytes:
+/// a hostile (or broken) client can never grow the front's RSS by streaming
+/// an unbounded body — the old `to_bytes(.., usize::MAX)` reads buffered
+/// everything before the size-check arms ran (REVIEW-auth.md H1).
+pub(crate) const BODY_NORMAL: usize = 1024 * 1024; // express.json 1mb (pre-auth global)
+pub(crate) const BODY_BIG: usize = 15 * 1024 * 1024; // bigJson 15mb (post-auth)
+pub(crate) const BODY_MANABOX: usize = 40 * 1024 * 1024; // manabox-sync 40mb
+pub(crate) const BODY_TELEMETRY: usize = 512 * 1024; // cardscan telemetry
+
+/// Buffer the request body with the route's Node-parser ceiling. Returns
+/// `(parts, bytes, oversize)`. On oversize the stream was abandoned at the
+/// cap (body-parser does the same), bytes is empty, and `content-length` is
+/// removed from the parts so a replay/proxy leg never forwards a short body
+/// under the original length (Node's parser abandons the stream here too;
+/// a downstream that ignores the body — Node's behaviour for a content-type
+/// its parser skips — sees an equivalent body-less request).
+pub(crate) async fn read_parts(req: Request, cap: usize) -> (axum::http::request::Parts, Vec<u8>, bool) {
+    let (parts, body) = req.into_parts();
+    match axum::body::to_bytes(body, cap.saturating_add(1)).await {
+        Ok(b) => (parts, b.to_vec(), false),
+        Err(_) => {
+            let mut parts = parts;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            (parts, Vec::new(), true)
+        }
+    }
+}
+
+pub(crate) fn rebuild(parts: axum::http::request::Parts, bytes: &[u8]) -> Request {
+    Request::from_parts(parts, Body::from(bytes.to_vec()))
+}
+
+/// `GET /collection/cardlist` — routes/collection.js:349.
+pub async fn handle_cardlist(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::GET {
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'cardlist'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("cardlist".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
+    }
+    let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    let headers = parts.headers.clone();
+    let uri = parts.uri.clone();
+
+    match parse_body(&headers, &bytes) {
+        BodyOutcome::TooLarge => return too_large(),
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::Parsed(_) => {}
+    }
+
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate_async(&pool, token.as_deref(), true).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+
+    match cardlist(&pool, user.id, &uri, &headers).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!(error = ?e, "cardlist failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to build card list")
+        }
+    }
+}
+
+/// shared/cardListText.js `norm`: String(v == null ? '' : v).trim().
+fn norm(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(x) => js_to_string(Some(x)).trim().to_string(),
+    }
+}
+
+async fn cardlist(pool: &std::sync::Arc<DbPool>, user_id: i64, uri: &Uri, headers: &HeaderMap) -> Result<Response, WriteError> {
+    let conn = pool.get_async().await?;
+    // Node: `Number(unresolved && unresolved.count) > 0` — count is always
+    // numeric from COUNT(*).
+    let count = get_i64(
+        &conn,
+        "SELECT COUNT(*) AS count
+         FROM collection c
+         LEFT JOIN card_cache cc ON cc.id = c.card_id
+         WHERE c.user_id = ?1 AND c.quantity > 0 AND cc.id IS NULL",
+        &[SqlValue::Integer(user_id)],
+    )?
+    .unwrap_or(0);
+    if count > 0 {
+        return Ok(json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The collection contains cards whose details are unavailable. Repair their metadata before exporting.",
+        ));
+    }
+    // Node: req.query.style === 'detailed' ? 'detailed' : 'plain'.
+    let style = uri
+        .query()
+        .map(|q| {
+            form_urlencoded::parse(q.as_bytes())
+                .find(|(k, _)| k == "style")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let detailed = style == "detailed";
+
+    let rows = get_rows_map(
+        &conn,
+        "SELECT c.quantity, cc.name, cc.set_id, cc.number
+         FROM collection c
+         JOIN card_cache cc ON c.card_id = cc.id
+         WHERE c.user_id = ?1 AND c.quantity > 0
+         ORDER BY c.added_at DESC, c.id DESC",
+        &[SqlValue::Integer(user_id)],
+    )?;
+
+    // shared/cardListText.js buildCardListText, over exactly the selected
+    // columns (no set_code/collector_number on these rows).
+    let mut lines: Vec<String> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let qty = js_parse_int_v(r.get("quantity")).unwrap_or(1);
+        if qty <= 0 {
+            continue;
+        }
+        let name = norm(r.get("name"));
+        let line = if detailed {
+            let set = r
+                .get("set_id")
+                .map(|v| if tr(Some(v)) { js_to_string(Some(v)).trim().to_uppercase() } else { String::new() })
+                .unwrap_or_default();
+            let num = norm(r.get("number"));
+            let mut l = name;
+            if !set.is_empty() {
+                l.push_str(&format!(" ({set})"));
+            }
+            if !num.is_empty() {
+                l.push_str(&format!(" {num}"));
+            }
+            format!("{qty} {l}")
+        } else {
+            format!("{qty} {name}")
+        };
+        lines.push(line);
+    }
+    let text = lines.join("\n");
+    let bytes = text.into_bytes();
+    let tag = body_etag(&bytes);
+
+    // Express send(): a matching If-None-Match answers 304, and express
+    // strips Content-Type/Content-Length on 304 while keeping the ETag.
+    let inm = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
+    if inm.is_some_and(|inm| etag_matches(Some(inm), &tag)) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, HeaderValue::from_str(&tag).unwrap())],
+        )
+            .into_response());
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8")),
+            (header::ETAG, HeaderValue::from_str(&tag).unwrap()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+/// `PUT`/`DELETE` `/collection/:id` — routes/collection.js:686 / :829.
+pub async fn handle_entry(Path(id): Path<String>, State(st): State<AppState>, req: Request) -> Response {
+    let method = req.method().clone();
+    if method != Method::PUT && method != Method::DELETE {
+        return unowned(st, req).await;
+    }
+    let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    let headers = parts.headers.clone();
+
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::TooLarge => return too_large(),
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::Parsed(b) => b,
+    };
+
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+
+    let resp = if method == Method::PUT {
+        match put_entry(&pool, &id, user.id, &body).await {
+            PutOutcome::Response(r) => r,
+            // Rust does not port Node's Scryfall hydration (cardApi.js): hand
+            // the untouched original request to Node so its own
+            // getCardById/cache-retry path answers (and performs the write).
+            PutOutcome::Forward(_) if !st.cfg.node_upstream.is_empty() => {
+                return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+            }
+            // Standalone: run Node's own fetch leg (cardApi.getCardById →
+            // scryGet + cacheCards), then re-run the port; a still-missing
+            // target is Node's `Card ID ${newCardId} not found.` 404.
+            PutOutcome::Forward(nc) => {
+                let _ = crate::cvscan::fetch_card_by_id(&st.scry, &pool, &nc).await;
+                match put_entry(&pool, &id, user.id, &body).await {
+                    PutOutcome::Response(r) => r,
+                    PutOutcome::Forward(nc) => {
+                        json_error(StatusCode::NOT_FOUND, &format!("Card ID {nc} not found."))
+                    }
+                }
+            }
+        }
+    } else {
+        delete_entry(&pool, &id, user.id).await
+    };
+
+    // Node bumps the user's stats generation via the invalidateOnWrite
+    // middleware on every authenticated write; mirror it for the native
+    // success responses (400/404/409 skips are documented deviations).
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &method, format!("/api/collection/{id}").as_str(), &headers);
+    }
+    resp
+}
+
+/// `POST /collection/bulk` — routes/collection.js:856.
+pub async fn handle_bulk(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'bulk'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("bulk".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
+    }
+    let Some(pool) = st.db.clone() else { return crate::proxy(State(st), req).await };
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    let headers = parts.headers.clone();
+
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::TooLarge => return too_large(),
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::Parsed(b) => b,
+    };
+
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+
+    let resp = match bulk(&pool, user.id, &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = ?e, "bulk action failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Bulk action failed")
+        }
+    };
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &Method::POST, "/api/collection/bulk", &headers);
+    }
+    let _ = parts;
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// PUT /collection/:id
+// ---------------------------------------------------------------------------
+
+enum PutOutcome {
+    Response(Response),
+    /// Target printing (`newCardId`) missing from card_cache.
+    Forward(String),
+}
+
+async fn put_entry(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> PutOutcome {
+    match put_inner(pool, id, user_id, body).await {
+        Ok(PutOutcome::Response(r)) => PutOutcome::Response(r),
+        Ok(PutOutcome::Forward(nc)) => PutOutcome::Forward(nc),
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to update entry");
+            PutOutcome::Response(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update entry"))
+        }
+    }
+}
+
+fn defined<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
+    // `x !== undefined` after JSON destructure: the key being present is
+    // exactly "defined" (a JSON null IS defined in Node's check).
+    body.get(key)
+}
+
+async fn put_inner(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Result<PutOutcome, WriteError> {
+    let conn = pool.get_async().await?;
+
+    // Entry lookup — SELECT *, id bound as the raw TEXT route param exactly
+    // like Node (INTEGER affinity does the numeric comparison).
+    let id_param = SqlValue::Text(id.to_string());
+    let entry = match get_row_map(
+        &conn,
+        "SELECT * FROM collection WHERE id = ?1 AND user_id = ?2",
+        &[id_param, SqlValue::Integer(user_id)],
+    )? {
+        Some(e) => e,
+        None => return Ok(PutOutcome::Response(json_error(StatusCode::NOT_FOUND, ENTRY_NOT_FOUND))),
+    };
+
+    // Printing change: the new printing must be a different row of the same
+    // game card (canonical English name). BEFORE the body-printing
+    // validation, exactly as Node orders it.
+    let new_card_id: Option<String> = match defined(body, "card_id") {
+        Some(v) if !v.is_null() => {
+            let s = js_to_string(Some(v));
+            if s != js_to_string(entry.get("card_id")) {
+                Some(s)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // Node's `updates`/`params` arrays: card_id is pushed by the printing
+    // branch (collection.js:718), the rest below in Node's order.
+    let mut updates: Vec<(&str, Value)> = Vec::new();
+
+    if let Some(nc) = &new_card_id {
+        // cardApi.hydrate is a no-op in Node; cache miss ⇒ Node fetches from
+        // Scryfall — not portable here, so forward the whole request.
+        let target = get_row_map(
+            &conn,
+            "SELECT * FROM card_cache WHERE id = ?1",
+            &[SqlValue::Text(nc.clone())],
+        )?;
+        let Some(target) = target else { return Ok(PutOutcome::Forward(nc.clone())) };
+
+        let current_name = get_row_map(
+            &conn,
+            "SELECT name FROM card_cache WHERE id = ?1",
+            &[json_to_sql(entry.get("card_id"))?],
+        )?
+        .and_then(|r| r.get("name").cloned());
+        let norm = |v: Option<&Value>| js_to_string(v).trim().to_string();
+        if norm(current_name.as_ref()) != norm(target.get("name")) {
+            return Ok(PutOutcome::Response(json_error(
+                StatusCode::BAD_REQUEST,
+                "A printing change must stay on the same card.",
+            )));
+        }
+        // Node collection.js:718 — updates.push('card_id = ?'); params.push(newCardId)
+        updates.push(("card_id", Value::String(nc.clone())));
+    }
+
+    // quantity !== undefined ? Math.max(1, parseInt(quantity, 10) || 1) : null
+    let requested_qty: Option<i64> = if defined(body, "quantity").is_some() {
+        let parsed = js_parse_int_v(defined(body, "quantity"));
+        let x = match parsed {
+            None | Some(0) => 1,
+            Some(p) => p,
+        };
+        Some(x.max(1))
+    } else {
+        None
+    };
+
+    if let Some(v) = defined(body, "condition") {
+        updates.push(("condition", v.clone()));
+    }
+    if let Some(v) = defined(body, "printing") {
+        let ok = PRINTING_VALUES.iter().any(|p| Some(*p) == v.as_str());
+        if !ok {
+            return Ok(PutOutcome::Response(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid printing: {}", js_to_string(Some(v))),
+            )));
+        }
+        updates.push(("printing", v.clone()));
+    }
+    if let Some(v) = defined(body, "language") {
+        updates.push(("language", v.clone()));
+    }
+    if let Some(v) = defined(body, "purchase_price") {
+        updates.push(("purchase_price", v.clone()));
+    }
+    if let Some(v) = defined(body, "is_trade") {
+        updates.push(("is_trade", Value::Bool(tr(Some(v)))));
+    }
+    if let Some(v) = defined(body, "notes") {
+        updates.push(("notes", v.clone()));
+    }
+    if let Some(v) = defined(body, "is_proxy") {
+        updates.push(("is_proxy", Value::Bool(tr(Some(v)))));
+    }
+
+    let touches_physical_stack = defined(body, "quantity").is_some()
+        || new_card_id.is_some()
+        || defined(body, "condition").is_some()
+        || defined(body, "printing").is_some()
+        || defined(body, "language").is_some()
+        || defined(body, "is_proxy").is_some();
+
+    let run_update = |conn: &Connection, current_entry: &Map<String, Value>| -> Result<(), WriteError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let cols: Vec<String> = updates.iter().map(|(c, _)| format!("{c} = ?")).collect();
+        let mut params: Vec<SqlValue> = updates
+            .iter()
+            .map(|(_, v)| json_to_sql(Some(v)))
+            .collect::<Result<_, _>>()?;
+        params.push(json_to_sql_value(current_entry.get("id").unwrap_or(&Value::Null)));
+        params.push(SqlValue::Integer(user_id));
+        conn.execute(
+            &format!("UPDATE collection SET {} WHERE id = ? AND user_id = ?", cols.join(", ")),
+            rusqlite::params_from_iter(params.iter()),
+        )?;
+        Ok(())
+    };
+
+    if !touches_physical_stack {
+        // Node: saveEntry() without the allocation lock — the entry read up
+        // front, a plain UPDATE, no quantity reconciliation.
+        run_update(&conn, &entry)?;
+        return Ok(PutOutcome::Response(json_response(
+            StatusCode::OK,
+            &json!({ "message": "Collection entry updated successfully" }),
+        )));
+    }
+
+    // withAllocationLock(saveEntry): in-process mutex + BEGIN IMMEDIATE.
+    // H3/M3 (REVIEW-writes): never hold a pool connection across the
+    // alloc_lock wait — under the pool's live cap a queue of writers each
+    // holding a checkout would starve the lock holder (deadlock). `entry`
+    // is materialised; current_entry is re-read under the lock anyway.
+    drop(conn);
+    let _guard = alloc_lock().lock().await;
+    let conn = pool.get_async().await?;
+    let mut tx = Tx::begin(&conn)?;
+
+    let current_entry = match get_row_map(
+        &conn,
+        "SELECT * FROM collection WHERE id = ?1 AND user_id = ?2",
+        &[SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)],
+    )? {
+        Some(c) => c,
+        None => {
+            tx.rollback();
+            return Ok(PutOutcome::Response(json_error(
+                StatusCode::NOT_FOUND,
+                "Collection entry not found",
+            )));
+        }
+    };
+
+    if let Some(tq) = requested_qty {
+        // cardIdForStack = newCardId || currentEntry.card_id
+        let card_id_for_stack: Value = match &new_card_id {
+            Some(s) => Value::String(s.clone()),
+            None => current_entry.get("card_id").cloned().unwrap_or(Value::Null),
+        };
+        let target_condition = defined(body, "condition")
+            .cloned()
+            .unwrap_or_else(|| current_entry.get("condition").cloned().unwrap_or(Value::Null));
+        let target_printing = defined(body, "printing")
+            .cloned()
+            .unwrap_or_else(|| current_entry.get("printing").cloned().unwrap_or(Value::Null));
+        let target_language = defined(body, "language")
+            .cloned()
+            .unwrap_or_else(|| current_entry.get("language").cloned().unwrap_or(Value::Null));
+        let target_proxy = match defined(body, "is_proxy") {
+            Some(v) => tr(Some(v)),
+            None => tr(current_entry.get("is_proxy")),
+        };
+
+        let siblings = get_rows_map(
+            &conn,
+            "SELECT quantity FROM collection
+             WHERE user_id = ?1 AND card_id = ?2 AND condition = ?3 AND printing = ?4
+               AND language = ?5 AND id != ?6 AND quantity > 0
+               AND COALESCE(is_proxy, 0) = ?7",
+            &[
+                SqlValue::Integer(user_id),
+                json_to_sql(Some(&card_id_for_stack))?,
+                json_to_sql(Some(&target_condition))?,
+                json_to_sql(Some(&target_printing))?,
+                json_to_sql(Some(&target_language))?,
+                json_to_sql_value(entry.get("id").unwrap_or(&Value::Null)),
+                SqlValue::Integer(if target_proxy { 1 } else { 0 }),
+            ],
+        )?;
+
+        let mut projected = js_to_number(current_entry.get("quantity")).max(0.0);
+        for s in &siblings {
+            projected += js_to_number(s.get("quantity")).max(0.0);
+        }
+        let reduction = (projected - tq as f64).max(0.0);
+        if reduction > 0.0 {
+            let status = logical_inventory_status(&conn, user_id, current_entry.get("card_id").unwrap_or(&Value::Null))?;
+            let conflict = match status {
+                None => true,
+                Some(s) => {
+                    js_to_number(s.get("owned_qty")) - reduction < js_to_number(s.get("locked_qty"))
+                }
+            };
+            if conflict {
+                tx.rollback();
+                return Ok(PutOutcome::Response(json_error(StatusCode::CONFLICT, ALLOCATION_CONFLICT)));
+            }
+        }
+    }
+
+    // run_update binds current_entry.id exactly like Node binds entry.id
+    // (both are the same integer row id).
+    run_update(&conn, &current_entry)?;
+    if let Some(tq) = requested_qty {
+        set_stack_quantity(&conn, user_id, entry.get("id").unwrap_or(&Value::Null), tq)?;
+    }
+    tx.commit()?;
+
+    Ok(PutOutcome::Response(json_response(
+        StatusCode::OK,
+        &json!({ "message": "Collection entry updated successfully" }),
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /collection/:id
+// ---------------------------------------------------------------------------
+
+async fn delete_entry(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Response {
+    match delete_inner(pool, id, user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = ?e, "Failed to remove card");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to remove card")
+        }
+    }
+}
+
+async fn delete_inner(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64) -> Result<Response, WriteError> {
+    let _guard = alloc_lock().lock().await;
+    let conn = pool.get_async().await?;
+    let mut tx = Tx::begin(&conn)?;
+
+    let entry = match get_row_map(
+        &conn,
+        "SELECT id, card_id, quantity FROM collection WHERE id = ?1 AND user_id = ?2",
+        &[SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)],
+    )? {
+        Some(e) => e,
+        None => {
+            tx.rollback();
+            return Ok(json_error(StatusCode::NOT_FOUND, ENTRY_NOT_FOUND));
+        }
+    };
+
+    let status = logical_inventory_status(&conn, user_id, entry.get("card_id").unwrap_or(&Value::Null))?;
+    let conflict = match &status {
+        None => true,
+        Some(s) => {
+            js_to_number(s.get("owned_qty")) - js_to_number(entry.get("quantity"))
+                < js_to_number(s.get("locked_qty"))
+        }
+    };
+    if conflict {
+        tx.rollback();
+        // routes/collection.js:837 — DELETE's own 409 string.
+        return Ok(json_error(
+            StatusCode::CONFLICT,
+            "Check in the deck using this card before removing it.",
+        ));
+    }
+
+    let changes = conn.execute(
+        "DELETE FROM collection WHERE id = ? AND user_id = ?",
+        rusqlite::params_from_iter(vec![
+            json_to_sql(entry.get("id"))?,
+            SqlValue::Integer(user_id),
+        ]),
+    )?;
+    tx.commit()?;
+    if changes == 0 {
+        return Ok(json_error(StatusCode::NOT_FOUND, ENTRY_NOT_FOUND));
+    }
+    Ok(json_response(StatusCode::OK, &json!({ "message": "Card removed from collection" })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /collection/bulk
+// ---------------------------------------------------------------------------
+
+async fn bulk(pool: &std::sync::Arc<DbPool>, user_id: i64, body: &Value) -> Result<Response, WriteError> {
+    // const { entry_ids = [], action, value } = req.body — a missing key
+    // takes the [] default; an explicit null fails Array.isArray.
+    let entry_ids_val = defined(body, "entry_ids").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+    let entry_ids: Vec<Value> = match &entry_ids_val {
+        Value::Array(a) if !a.is_empty() => a.clone(),
+        _ => return Ok(json_error(StatusCode::BAD_REQUEST, "entry_ids is required")),
+    };
+    let action = match defined(body, "action").and_then(Value::as_str) {
+        Some(a) if BULK_ACTIONS.contains(&a) => a.to_string(),
+        _ => return Ok(json_error(StatusCode::BAD_REQUEST, "Invalid action")),
+    };
+    let value = defined(body, "value").cloned();
+
+    // entry_ids.map(n => parseInt(n, 10)).filter(Number.isInteger)
+    let ids: Vec<i64> = entry_ids.iter().filter_map(|n| js_parse_int_v(Some(n))).collect();
+    if ids.is_empty() {
+        return Ok(json_error(StatusCode::BAD_REQUEST, "No valid entry_ids"));
+    }
+    let ph = placeholders(ids.len());
+    let id_params: Vec<SqlValue> = ids.iter().map(|i| SqlValue::Integer(*i)).collect();
+
+    match action.as_str() {
+        "add_to_deck" => bulk_add_to_deck(pool, user_id, value.as_ref(), &id_params, &ph).await,
+        "delete" => bulk_delete(pool, user_id, &id_params, &ph).await,
+        "trade" | "untrade" => {
+            let conn = pool.get_async().await?;
+            let set = if action == "trade" { 1 } else { 0 };
+            let mut params = vec![SqlValue::Integer(set)];
+            params.extend(id_params.iter().cloned());
+            params.push(SqlValue::Integer(user_id));
+            let changes = conn.execute(
+                &format!("UPDATE collection SET is_trade = ? WHERE id IN ({ph}) AND user_id = ?"),
+                rusqlite::params_from_iter(params.iter()),
+            )?;
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({ "message": format!("Updated {changes} card(s)"), "affected": changes }),
+            ))
+        }
+        "condition" | "printing" => {
+            let allowed: &[&str] = if action == "condition" { BULK_CONDITIONS } else { BULK_PRINTINGS };
+            let ok = value.as_ref().and_then(Value::as_str).is_some_and(|v| allowed.contains(&v));
+            if !ok {
+                return Ok(json_error(StatusCode::BAD_REQUEST, &format!("Invalid {action}")));
+            }
+            // withAllocationLock around the single stack-key UPDATE.
+            let _guard = alloc_lock().lock().await;
+            let conn = pool.get_async().await?;
+            let mut params = vec![json_to_sql(value.as_ref())?];
+            params.extend(id_params.iter().cloned());
+            params.push(SqlValue::Integer(user_id));
+            let changes = conn.execute(
+                &format!("UPDATE collection SET {action} = ? WHERE id IN ({ph}) AND user_id = ?"),
+                rusqlite::params_from_iter(params.iter()),
+            )?;
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({ "message": format!("Set {action} on {changes} card(s)"), "affected": changes }),
+            ))
+        }
+        "purchase_split" => bulk_purchase_split(pool, user_id, value.as_ref(), &id_params, &ph).await,
+        // Every BULK_ACTION has a branch above; anything reaching here would
+        // be one Node itself has no branch for → falls to Unknown action.
+        _ => Ok(json_error(StatusCode::BAD_REQUEST, "Unknown action")),
+    }
+}
+
+async fn bulk_delete(pool: &std::sync::Arc<DbPool>, user_id: i64, id_params: &[SqlValue], ph: &str) -> Result<Response, WriteError> {
+    let _guard = alloc_lock().lock().await;
+    let conn = pool.get_async().await?;
+    let mut tx = Tx::begin(&conn)?;
+    let mut params: Vec<SqlValue> = id_params.to_vec();
+    params.push(SqlValue::Integer(user_id));
+    let removals = get_rows_map(
+        &conn,
+        &format!(
+            "SELECT MIN(c.card_id) AS card_id, SUM(c.quantity) AS remove_qty
+             FROM collection c
+             JOIN card_cache selected_cc ON selected_cc.id = c.card_id
+             WHERE c.id IN ({ph}) AND c.user_id = ? AND c.quantity > 0
+             GROUP BY {}",
+            sql_card_key("selected_cc")
+        ),
+        &params,
+    )?;
+    for removal in &removals {
+        let status = logical_inventory_status(&conn, user_id, removal.get("card_id").unwrap_or(&Value::Null))?;
+        let conflict = match &status {
+            None => true,
+            Some(s) => {
+                js_to_number(s.get("owned_qty")) - js_to_number(removal.get("remove_qty"))
+                    < js_to_number(s.get("locked_qty"))
+            }
+        };
+        if conflict {
+            tx.rollback();
+            return Ok(json_error(
+                StatusCode::CONFLICT,
+                "Check in the deck using the selected card before removing it.",
+            ));
+        }
+    }
+    let changes = conn.execute(
+        &format!("DELETE FROM collection WHERE id IN ({ph}) AND user_id = ?"),
+        rusqlite::params_from_iter(params.iter()),
+    )?;
+    tx.commit()?;
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({ "message": format!("Deleted {changes} card(s)"), "affected": changes }),
+    ))
+}
+
+/// utils/splitPrice.js splitPrice(prices, total, method) — verbatim, integer
+/// cents with the remainder landing on the last card.
+fn split_price(prices: &[f64], total: f64, method: &str) -> Vec<f64> {
+    let n = prices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cents = math_round(total * 100.0);
+    let sum: f64 = prices.iter().map(|p| if p.is_nan() || *p == 0.0 { 0.0 } else { *p }).sum();
+    let weighted = method == "weighted" && sum > 0.0;
+    let mut allocated = 0.0f64;
+    prices
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == n - 1 {
+                return (cents - allocated) / 100.0;
+            }
+            let share = if weighted {
+                math_round(cents * (if p.is_nan() { 0.0 } else { *p }) / sum)
+            } else {
+                math_round(cents / n as f64)
+            };
+            allocated += share;
+            share / 100.0
+        })
+        .collect()
+}
+
+async fn bulk_purchase_split(
+    pool: &std::sync::Arc<DbPool>,
+    user_id: i64,
+    value: Option<&Value>,
+    id_params: &[SqlValue],
+    ph: &str,
+) -> Result<Response, WriteError> {
+    // const total = parseFloat(value && value.total);
+    let total_str = match value {
+        Some(v) if tr(Some(v)) && v.is_object() => match v.get("total") {
+            Some(t) => js_to_string(Some(t)),
+            None => "undefined".to_string(),
+        },
+        // Falsy value, or a primitive without a `total` property.
+        _ => "undefined".to_string(),
+    };
+    let total = js_parse_float(&total_str);
+    if !(total >= 0.0) {
+        return Ok(json_error(
+            StatusCode::BAD_REQUEST,
+            "total must be a non-negative number",
+        ));
+    }
+    let method = match value {
+        Some(v) if tr(Some(v)) && v.is_object() && v.get("method") == Some(&Value::String("equal".into())) => {
+            "equal"
+        }
+        _ => "weighted",
+    };
+
+    let conn = pool.get_async().await?;
+    let mut params: Vec<SqlValue> = id_params.to_vec();
+    params.push(SqlValue::Integer(user_id));
+    let rows = get_rows_map(
+        &conn,
+        &format!(
+            "SELECT c.id, COALESCE(cc.price_trend, 0) AS price FROM collection c
+             LEFT JOIN card_cache cc ON cc.id = c.card_id
+             WHERE c.id IN ({ph}) AND c.user_id = ?"
+        ),
+        &params,
+    )?;
+    if rows.is_empty() {
+        return Ok(json_error(StatusCode::BAD_REQUEST, "No valid entries"));
+    }
+    // r.price || 0 — falsy (null/0/''/NaN) prices count as 0.
+    let prices: Vec<f64> = rows
+        .iter()
+        .map(|r| {
+            let p = r.get("price");
+            if tr(p) {
+                js_to_number(p)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let sum: f64 = prices.iter().sum();
+    let weighted = method == "weighted" && sum > 0.0;
+    let shares = split_price(&prices, total, method);
+    for (i, row) in rows.iter().enumerate() {
+        conn.execute(
+            "UPDATE collection SET purchase_price = ? WHERE id = ? AND user_id = ?",
+            rusqlite::params_from_iter(vec![
+                SqlValue::Real(shares[i]),
+                json_to_sql(row.get("id"))?,
+                SqlValue::Integer(user_id),
+            ]),
+        )?;
+    }
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "message": format!(
+                "Split ${} across {} card(s) ({})",
+                js_fixed2(total),
+                rows.len(),
+                if weighted { "by value" } else { "evenly" }
+            ),
+            "affected": rows.len(),
+        }),
+    ))
+}
+
+/// deckRules.js isBasicLand(card).
+pub(crate) fn is_basic_land(card: &Map<String, Value>) -> bool {
+    let subs: Vec<Value> = match card.get("subtypes") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::String(s)) if !s.is_empty() => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let has = |needle: &str| subs.iter().any(|s| s == &Value::String(needle.into()));
+    let supertype_land = card.get("supertype") == Some(&Value::String("Land".into()));
+    let name = js_to_string(card.get("name"));
+    (has("Land") || supertype_land)
+        && (has("Basic") || BASIC_NAMES.contains(&name.as_str()))
+}
+
+/// deckRules.js validateDeckAddition — returns Err(message) for the reject
+/// strings. deckId is unused by the Node implementation; kept out. Callers
+/// that get a raw body value (decks.js POST /:id/cards passes `quantity`
+/// straight to parseInt) parse it first and pass the finite non-negative
+/// number through; the internal re-parse of the number is a no-op.
+pub(crate) fn validate_deck_addition(
+    conn: &Connection,
+    user_id: i64,
+    card_id: &Value,
+    new_qty: f64,
+) -> Result<Result<(), String>, WriteError> {
+    // const qty = parseInt(newQty, 10);
+    let qty_str = js_to_string(Some(&json_num(new_qty)));
+    let qty = match js_parse_int(&qty_str) {
+        Some(q) if q >= 0 => q,
+        _ => return Ok(Err("Invalid quantity".to_string())),
+    };
+    let card = match get_row_map(
+        conn,
+        "SELECT id, name, supertype, subtypes FROM card_cache WHERE id = ?1",
+        &[json_to_sql_value(card_id)],
+    )? {
+        Some(c) => c,
+        None => return Ok(Err("Card not found".to_string())),
+    };
+    let name = card.get("name").cloned().unwrap_or(Value::Null);
+    let owned_row = get_row_map(
+        conn,
+        &format!(
+            "SELECT COALESCE(SUM(c.quantity), 0) AS owned
+             FROM collection c
+             JOIN card_cache owned_cc ON owned_cc.id = c.card_id
+             WHERE c.user_id = ?1 AND c.quantity > 0
+               AND {} = LOWER(TRIM(?2))",
+            sql_card_key("owned_cc")
+        ),
+        &[SqlValue::Integer(user_id), json_to_sql_value(&name)],
+    )?;
+    let owned: Value = owned_row.and_then(|r| r.get("owned").cloned()).unwrap_or(Value::from(0));
+    let owned_num = js_to_number(Some(&owned));
+    if (qty as f64) > owned_num {
+        let unit = if owned.as_f64() == Some(1.0) { "copy" } else { "copies" };
+        let owned_display = js_to_string(Some(&owned));
+        return Ok(Err(format!(
+            "You only own {owned_display} {unit} of {}.",
+            js_to_string(Some(&name))
+        )));
+    }
+    if !is_basic_land(&card) && qty > 4 {
+        return Ok(Err(format!(
+            "Cannot have more than 4 copies of {}.",
+            js_to_string(Some(&name))
+        )));
+    }
+    Ok(Ok(()))
+}
+
+async fn bulk_add_to_deck(
+    pool: &std::sync::Arc<DbPool>,
+    user_id: i64,
+    value: Option<&Value>,
+    id_params: &[SqlValue],
+    ph: &str,
+) -> Result<Response, WriteError> {
+    // const deckId = parseInt(value, 10); if (!deckId) 400
+    let deck_id = match js_parse_int_v(value) {
+        Some(d) if d != 0 => d,
+        _ => return Ok(json_error(StatusCode::BAD_REQUEST, "Invalid deck_id")),
+    };
+    let conn = pool.get_async().await?;
+    let deck = get_row_map(
+        &conn,
+        "SELECT id, checked_out FROM decks WHERE id = ? AND user_id = ?",
+        &[SqlValue::Integer(deck_id), SqlValue::Integer(user_id)],
+    )?;
+    let Some(deck) = deck else {
+        return Ok(json_error(StatusCode::NOT_FOUND, "Deck not found"));
+    };
+    if tr(deck.get("checked_out")) {
+        return Ok(json_error(
+            StatusCode::CONFLICT,
+            "Check this deck in before changing its cards.",
+        ));
+    }
+
+    let mut params: Vec<SqlValue> = id_params.to_vec();
+    params.push(SqlValue::Integer(user_id));
+    let rows = get_rows_map(
+        &conn,
+        &format!(
+            "SELECT MIN(c.card_id) AS card_id, SUM(c.quantity) AS total_qty
+             FROM collection c
+             JOIN card_cache selected_cc ON selected_cc.id = c.card_id
+             WHERE c.id IN ({ph}) AND c.user_id = ? AND c.quantity > 0
+             GROUP BY {}",
+            sql_card_key("selected_cc")
+        ),
+        &params,
+    )?;
+
+    let ek = sql_card_key("existing_cc");
+    let tk = sql_card_key("target_cc");
+
+    let mut added: f64 = 0.0;
+    let mut rejected: Vec<String> = Vec::new();
+    for row in &rows {
+        let row_card_id = row.get("card_id").cloned().unwrap_or(Value::Null);
+        let equivalent = get_row_map(
+            &conn,
+            &format!(
+                "SELECT dc.card_id
+                 FROM deck_cards dc
+                 JOIN card_cache existing_cc ON existing_cc.id = dc.card_id
+                 JOIN card_cache target_cc ON target_cc.id = ?1
+                 WHERE dc.deck_id = ?2
+                   AND {ek} = {tk}
+                 ORDER BY (dc.card_id = ?3) DESC, dc.card_id
+                 LIMIT 1"
+            ),
+            &[
+                json_to_sql_value(&row_card_id),
+                SqlValue::Integer(deck_id),
+                json_to_sql_value(&row_card_id),
+            ],
+        )?
+        .and_then(|r| r.get("card_id").cloned());
+        let effective = equivalent.clone().unwrap_or_else(|| row_card_id.clone());
+
+        let existing = get_row_map(
+            &conn,
+            &format!(
+                "SELECT COALESCE(SUM(dc.quantity), 0) AS quantity
+                 FROM deck_cards dc
+                 JOIN card_cache existing_cc ON existing_cc.id = dc.card_id
+                 JOIN card_cache target_cc ON target_cc.id = ?1
+                 WHERE dc.deck_id = ?2
+                   AND {ek} = {tk}"
+            ),
+            &[json_to_sql_value(&effective), SqlValue::Integer(deck_id)],
+        )?;
+        let current = existing
+            .as_ref()
+            .map(|e| js_to_number(e.get("quantity")))
+            .unwrap_or(0.0);
+        let total_qty = js_to_number(row.get("total_qty"));
+        let new_qty = current + total_qty;
+
+        if let Err(msg) = validate_deck_addition(&conn, user_id, &effective, new_qty)? {
+            rejected.push(msg);
+            continue;
+        }
+
+        let conflict = json_error(
+            StatusCode::CONFLICT,
+            "The deck was checked out before all selected cards could be added.",
+        );
+        if equivalent.is_some() {
+            // Collapse legacy alt-printing rows of this game card into the
+            // one row that carries the new quantity (then drop the zeros).
+            let changes = conn.execute(
+                &format!(
+                    "UPDATE deck_cards
+                     SET quantity = CASE WHEN card_id = ?1 THEN ?2 ELSE 0 END
+                     WHERE deck_id = ?3
+                       AND EXISTS (
+                         SELECT 1 FROM decks guarded_deck
+                         WHERE guarded_deck.id = deck_cards.deck_id
+                           AND guarded_deck.user_id = ?4
+                           AND guarded_deck.checked_out = 0
+                       )
+                       AND card_id IN (
+                         SELECT existing_cc.id
+                         FROM card_cache existing_cc
+                         JOIN card_cache target_cc ON target_cc.id = ?5
+                         WHERE {ek} = {tk}
+                       )"
+                ),
+                rusqlite::params_from_iter(vec![
+                    json_to_sql_value(&effective),
+                    json_to_sql(Some(&json_num(new_qty)))?,
+                    SqlValue::Integer(deck_id),
+                    SqlValue::Integer(user_id),
+                    json_to_sql_value(&effective),
+                ]),
+            )?;
+            if changes == 0 {
+                return Ok(conflict);
+            }
+            conn.execute(
+                "DELETE FROM deck_cards WHERE deck_id = ? AND quantity <= 0",
+                rusqlite::params_from_iter(vec![SqlValue::Integer(deck_id)]),
+            )?;
+        } else {
+            let changes = conn.execute(
+                "INSERT INTO deck_cards (deck_id, card_id, quantity)
+                 SELECT ?1, ?2, ?3
+                 WHERE EXISTS (
+                   SELECT 1 FROM decks guarded_deck
+                   WHERE guarded_deck.id = ?4
+                     AND guarded_deck.user_id = ?5
+                     AND guarded_deck.checked_out = 0
+                 )",
+                rusqlite::params_from_iter(vec![
+                    SqlValue::Integer(deck_id),
+                    json_to_sql_value(&effective),
+                    json_to_sql(Some(&json_num(new_qty)))?,
+                    SqlValue::Integer(deck_id),
+                    SqlValue::Integer(user_id),
+                ]),
+            )?;
+            if changes == 0 {
+                return Ok(conflict);
+            }
+        }
+        added += total_qty;
+    }
+
+    let added_display = js_to_string(Some(&json_num(added)));
+    let msg = if !rejected.is_empty() {
+        if added > 0.0 {
+            format!("Added {added_display} card(s). {}", rejected[0])
+        } else {
+            rejected[0].clone()
+        }
+    } else {
+        format!("Added {added_display} card(s) to deck")
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({ "message": msg, "affected": json_num(added), "rejected": rejected.len() }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// POST /collection and POST /collection/bulk-add (collection_adds group)
+// ---------------------------------------------------------------------------
+//
+// Native port of routes/collection.js `addCardToCollection` (+ its two
+// routes) and `bulkAddToCollection`. The Scryfall-touching legs — the
+// `cardApi.getCardById` cache-miss fetch and the `getPrintingInLang`
+// network fetch behind `printingInLanguage` — are never attempted here:
+// whenever the plan would need them (card or localized printing absent
+// from card_cache), the whole request forwards to Node untouched, exactly
+// like the PUT card_id branch above. Scryfall is lane B's scryfallApi
+// territory; this module stays read-DB-only + INSERT.
+//
+// Two documented deviations (both only reachable on DB failure, which
+// Node's separate autocommit statements would half-apply anyway):
+//   - inserts + recordPrice share one BEGIN IMMEDIATE transaction, so a
+//     mid-add DB error rolls the whole add back instead of leaving rows;
+//   - bulk-add plans every entry (validation + cache probes) before any
+//     write, so a Forward decision cannot strand already-inserted cards.
+
+/// JS falsiness of a body value: `!card_id` — a missing key (undefined),
+/// null, false, 0/NaN and "" are falsy; every array/object is truthy.
+pub(crate) fn js_falsy(v: Option<&Value>) -> bool {
+    match v {
+        None => true,
+        Some(v) => !truthy(v),
+    }
+}
+
+/// Input for `languages.toName`/`resolve` from a JSON/sqlite value: JS
+/// String()-coerces inside resolve(), and null/undefined take the falsy
+/// DEFAULT (English) path, modelled as None.
+fn lang_input(v: Option<&Value>) -> Option<String> {
+    match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(js_to_string(Some(other))),
+    }
+}
+
+/// Read-only phase of one `addCardToCollection` call: everything up to (but
+/// not including) the INSERTs, decided from the merged body. `Reject` is the
+/// only caller-visible AddCardError the native path can reach (both throws
+/// in addCardToCollection are 400; the 404 requires the Scryfall fetch,
+/// which is a `Forward` here).
+#[derive(Clone)]
+pub(crate) enum AddPlan {
+    Ready {
+        card_id: SqlValue,
+        count: i64,
+        stack: bool,
+        condition: Value,
+        printing: Value,
+        language: Value,
+        purchase_price: Value,
+        is_trade: bool,
+        price: Value,
+    },
+    Reject(String),
+    /// card_cache miss on a STRING id (unit 7c): Node runs
+    /// `cardApi.getCardById` — a Scryfall GET `/cards/{rawId}` +
+    /// `cacheCards([norm])` — and only then continues (or 404s
+    /// `Card ID {id} not found.`). getCardById is lane B's scryfallApi
+    /// territory: the handler attempts that leg natively via the shared
+    /// Scry client and re-plans; any outcome the native leg cannot own
+    /// (transport, non-200, Node deployed) falls back to Forward.
+    FetchCard(String),
+    Forward,
+}
+
+/// Pure-read twin of addCardToCollection's pre-insert block (hydration is a
+/// no-op since v3). Node-strict order: card_id → printing → cache lookup →
+/// printingInLanguage → quantity/stack/pricing defaults.
+pub(crate) fn plan_add(conn: &Connection, merged: &Map<String, Value>) -> Result<AddPlan, WriteError> {
+    plan_add_ex(conn, merged, false)
+}
+
+/// `loc_exhausted`: the standalone getPrintingInLang network leg already
+/// ran (and cached whatever Scryfall answered in that language), so a
+/// still-missing localized row is Node's `null` → keep the picked row.
+fn plan_add_ex(conn: &Connection, merged: &Map<String, Value>, loc_exhausted: bool) -> Result<AddPlan, WriteError> {
+    let card_id_v = merged.get("card_id");
+    if js_falsy(card_id_v) {
+        return Ok(AddPlan::Reject("card_id is required".into()));
+    }
+    let printing_default = Value::String("Normal".into());
+    let printing = merged.get("printing").unwrap_or(&printing_default);
+    // Array.prototype.includes is strict ===: only exact strings match.
+    if !PRINTING_VALUES.iter().any(|p| Some(*p) == printing.as_str()) {
+        return Ok(AddPlan::Reject(format!(
+            "Invalid printing: {}",
+            js_to_string(Some(printing))
+        )));
+    }
+
+    let mut row = match get_row_map(
+        conn,
+        "SELECT * FROM card_cache WHERE id = ?1",
+        &[json_to_sql(card_id_v)?],
+    )? {
+        Some(r) => r,
+        // Node would cardApi.getCardById() → Scryfall. A string id names
+        // that leg exactly (FetchCard); anything else (number, object)
+        // Node answers through its own coercion ladder — not Rust's to do.
+        None => match card_id_v {
+            Some(Value::String(s)) => return Ok(AddPlan::FetchCard(s.clone())),
+            _ => return Ok(AddPlan::Forward),
+        },
+    };
+
+    let language_default = Value::String("English".into());
+    let language = merged.get("language").unwrap_or(&language_default);
+    let mut card_id_bind = json_to_sql(card_id_v)?;
+
+    // cardApi.printingInLanguage(card, language) — null keeps the picked row.
+    let card_lang = row.get("language").cloned().unwrap_or(Value::Null);
+    if crate::search::to_name(lang_input(Some(&card_lang)).as_deref())
+        != crate::search::to_name(lang_input(Some(language)).as_deref())
+    {
+        let (_code, scry) = crate::search::lang_codes(lang_input(Some(language)).as_deref());
+        // getPrintingInLang early-outs on scryfall code 'en', empty set or
+        // empty number (all keep the picked row without touching the DB).
+        if scry != "en" {
+            let set_raw = match row.get("set_id") {
+                Some(v) if truthy(v) => js_to_string(Some(v)),
+                _ => String::new(),
+            };
+            let set = set_raw
+                .strip_prefix("mtg-")
+                .unwrap_or(&set_raw)
+                .to_lowercase();
+            let number = row.get("number").cloned();
+            if !set.is_empty() && !js_falsy(number.as_ref()) {
+                match get_row_map(
+                    conn,
+                    "SELECT * FROM card_cache WHERE set_id = ?1 AND number = ?2 AND language = ?3 LIMIT 1",
+                    &[
+                        SqlValue::Text(set),
+                        json_to_sql(number.as_ref())?,
+                        SqlValue::Text(crate::search::to_name(Some(&scry))),
+                    ],
+                )? {
+                    Some(loc) => {
+                        // Node: card = localized; cardId = localized.id.
+                        card_id_bind = match loc.get("id") {
+                            Some(v) => json_to_sql_value(v),
+                            None => SqlValue::Null,
+                        };
+                        row = loc;
+                    }
+                    // getPrintingInLang null after its fetch leg: keep row.
+                    None if loc_exhausted => {}
+                    // Network fetch + cacheCards — Node's job (hybrid), or
+                    // the standalone leg in `plan_add_standalone`.
+                    None => return Ok(AddPlan::Forward),
+                }
+            }
+        }
+    }
+
+    // count = Math.max(1, parseInt(quantity, 10) || 1) — undefined/NaN/0
+    // all land on 1.
+    let count = match merged.get("quantity") {
+        None => 1,
+        Some(v) => js_parse_int_v(Some(v)).unwrap_or(1).max(1),
+    };
+    let stack = merged.get("stackable").map(truthy).unwrap_or(false);
+    let purchase_price = match merged.get("purchase_price") {
+        Some(v) if truthy(v) => v.clone(),
+        _ => Value::from(0),
+    };
+    Ok(AddPlan::Ready {
+        card_id: card_id_bind,
+        count,
+        stack,
+        condition: merged
+            .get("condition")
+            .cloned()
+            .unwrap_or_else(|| Value::String("Near Mint".into())),
+        printing: printing.clone(),
+        language: language.clone(),
+        purchase_price,
+        is_trade: tr(merged.get("is_trade")),
+        price: row.get("price_trend").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// priceHelpers.recordPrice — the movement-guarded INSERT (not the brief's
+/// older date-keyed OR-REPLACE; the source is canonical). Returns whether a
+/// row landed.
+pub(crate) fn record_price(conn: &Connection, card_id: &SqlValue, price: &Value) -> Result<bool, WriteError> {
+    let p = js_to_number(Some(price));
+    let card_empty = match card_id {
+        SqlValue::Null => true,
+        SqlValue::Text(s) => s.is_empty(),
+        _ => false,
+    };
+    if card_empty || !(p > 0.0) {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "WITH latest(price, recorded_at) AS (
+           SELECT price, recorded_at
+           FROM price_history
+           WHERE card_id = ?1
+           ORDER BY recorded_at DESC, rowid DESC
+           LIMIT 1
+         ), candidate(ts) AS (SELECT strftime('%Y-%m-%d %H:%M:%f', 'now'))
+         INSERT INTO price_history (card_id, price, recorded_at)
+         SELECT ?1, ?2, CASE
+           WHEN (SELECT recorded_at FROM latest) IS NULL
+             OR (SELECT recorded_at FROM latest) < candidate.ts THEN candidate.ts
+           ELSE strftime('%Y-%m-%d %H:%M:%f', (SELECT recorded_at FROM latest), '+0.001 seconds')
+         END
+         FROM candidate
+         WHERE NOT EXISTS (SELECT 1 FROM latest WHERE price = ?2)",
+        rusqlite::params![card_id, p],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Writes the planned copies (stack = one qty-N row; else one qty-1 row per
+/// copy, matching Node's sequential INSERTs) and records the price, in one
+/// BEGIN IMMEDIATE transaction so the revision triggers fire on commit like
+/// every other native write group.
+pub(crate) fn execute_add(conn: &Connection, user_id: i64, plan: &AddPlan) -> Result<(i64, Vec<i64>), WriteError> {
+    let AddPlan::Ready { card_id, count, stack, condition, printing, language, purchase_price, is_trade, price } = plan else {
+        return Ok((0, Vec::new()));
+    };
+    let mut tx = Tx::begin(conn)?;
+    let mut ids: Vec<i64> = Vec::new();
+    // H4 (REVIEW-writes.md): iterate the copies lazily. The previous
+    // `vec![1; count as usize]` materialised 8·quantity bytes BEFORE any
+    // SQL ran, so {"quantity":"4000000000"} was a 32 GiB allocation that
+    // OOM-aborted the whole process (Node's for-loop at collection.js:569
+    // is unbounded but allocation-free). The unbounded loop itself is
+    // Node-parity; a sane cap needs the same change in Node — owner call.
+    let quantities: Box<dyn Iterator<Item = i64> + '_> = if *stack {
+        Box::new(std::iter::once(*count))
+    } else {
+        Box::new(std::iter::repeat(1i64).take(*count as usize))
+    };
+    let mut last = 0i64;
+    for q in quantities {
+        conn.execute(
+            "INSERT INTO collection (
+               card_id, user_id, quantity, condition, printing, language, purchase_price,
+               is_trade
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                card_id,
+                user_id,
+                q,
+                json_to_sql_value(condition),
+                json_to_sql_value(printing),
+                json_to_sql_value(language),
+                json_to_sql_value(purchase_price),
+                if *is_trade { 1 } else { 0 },
+            ],
+        )?;
+        last = conn.last_insert_rowid();
+        ids.push(last);
+    }
+    record_price(conn, card_id, price)?;
+    tx.commit()?;
+    Ok((last, ids))
+}
+
+/// The getCardById cache-miss leg shared by POST /collection and the bulk
+/// bulk-add pass (`cardApi.getCardById` → `scryGet('/cards/{rawId}')` →
+/// `cacheCards([normalizeCard(data)])`, then the row is re-planned). Answers
+/// the leg cannot own (non-200/404/transport, or a throwing cacheCards) all
+/// become Node's `null` → `AddCardError(404, 'Card ID {card_id} not found.')`;
+/// `Unusable` additionally marks "hybrid may still proxy this request"
+/// (`NotFound` = getCardById saw the engine's own 404 — Node's null either
+/// way, kept to document the two transport shapes).
+enum FetchCardOutcome {
+    Ready(AddPlan),
+    NotFound,
+    Unusable,
+}
+
+async fn fetch_card_then_replan(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    card_id: &str,
+    merged: &Map<String, Value>,
+) -> FetchCardOutcome {
+    let raw_id = card_id.strip_prefix("mtg-").unwrap_or(card_id).to_string();
+    let path = format!("/cards/{}", crate::sidecar::encode_uri_component(&raw_id));
+    // Relative URL = Node's `scryGet('/cards/…')`: resolve() swaps
+    // to the sidecar base when LOCAL_SCRYFALL is on (and skips
+    // pacing there), else the upstream base with full pacing.
+    let got = st
+        .scry
+        .get_opt(&path, &crate::scryfall::ScryOpts::default())
+        .await;
+    let v = match got {
+        Ok(Some(v)) if v.is_object() => v,
+        // Ok(None) = the engine's 404 (Node: scryGet null → getCardById
+        // catch); Err/* = transport/shape — both are Node's null, and
+        // Unusable additionally flags "hybrid may still proxy".
+        Ok(None) => return FetchCardOutcome::NotFound,
+        _ => return FetchCardOutcome::Unusable,
+    };
+    let norm = crate::sidecar::normalize_card(&v, &crate::search::to_name(None));
+    let pool_w = Arc::clone(pool);
+    let wrote = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = pool_w.get().map_err(|e| e.to_string())?;
+        crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&norm))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if let Err(e) = wrote {
+        // Node: a throwing cacheCards lands inside getCardById's catch →
+        // null → AddCardError 404 (route catch only sees what escapes it).
+        tracing::error!(error=%e, "add card: getCardById cache write failed");
+        return FetchCardOutcome::Unusable;
+    }
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(_) => return FetchCardOutcome::Unusable,
+    };
+    match plan_add(&conn, merged) {
+        Ok(p @ AddPlan::Ready { .. }) => FetchCardOutcome::Ready(p),
+        // Still not ownable (localized printing, defensive): the
+        // pre-7c contract — Node authors the rest.
+        _ => FetchCardOutcome::Unusable,
+    }
+}
+
+/// Standalone (no Node upstream) outcome of one addCardToCollection plan.
+pub(crate) enum StandalonePlan {
+    Plan(AddPlan),
+    /// `AddCardError(404, `Card ID ${card_id} not found.`)`.
+    NotFound(String),
+}
+
+/// Standalone twin of addCardToCollection's pre-insert block INCLUDING its
+/// network legs (`cardApi.getCardById` and `printingInLanguage` →
+/// `getPrintingInLang`), so no plan ever needs a Node to forward to.
+/// Never returns `AddPlan::Forward`/`FetchCard`. A non-string card_id that
+/// misses card_cache is Node's `cardId.startsWith` TypeError → `Err`
+/// (the routes' generic 500 / per-entry 'Failed to add card').
+pub(crate) async fn plan_add_standalone(
+    st: &AppState,
+    pool: &Arc<DbPool>,
+    merged: &Map<String, Value>,
+) -> Result<StandalonePlan, WriteError> {
+    let plan = {
+        let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
+        plan_add_ex(&conn, merged, false)?
+    };
+    let plan = match plan {
+        AddPlan::FetchCard(card_id) => {
+            if crate::cvscan::fetch_card_by_id(&st.scry, pool, &card_id).await.is_none() {
+                return Ok(StandalonePlan::NotFound(card_id));
+            }
+            let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
+            match plan_add_ex(&conn, merged, false)? {
+                // Cache write landed but the row is unreadable: Node's null.
+                AddPlan::FetchCard(card_id) => return Ok(StandalonePlan::NotFound(card_id)),
+                p => p,
+            }
+        }
+        p => p,
+    };
+    if !matches!(plan, AddPlan::Forward) {
+        return Ok(StandalonePlan::Plan(plan));
+    }
+    // Forward = non-string id cache miss, or localized printing miss.
+    let row = {
+        let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
+        get_row_map(&conn, "SELECT * FROM card_cache WHERE id = ?1", &[json_to_sql(merged.get("card_id"))?])?
+    };
+    let Some(row) = row else { return Err(WriteError::Bind) };
+    let language_default = Value::String("English".into());
+    let language = merged.get("language").unwrap_or(&language_default);
+    let (want_code, scry_code) = crate::search::lang_codes(lang_input(Some(language)).as_deref());
+    let set_raw = match row.get("set_id") {
+        Some(v) if truthy(v) => js_to_string(Some(v)),
+        _ => String::new(),
+    };
+    let set = set_raw.strip_prefix("mtg-").unwrap_or(&set_raw).to_lowercase();
+    let number = js_to_string(row.get("number"));
+    let name = crate::search::to_name(Some(&scry_code));
+    let path = format!(
+        "/cards/{}/{}/{}",
+        crate::sidecar::encode_uri_component(&set),
+        crate::sidecar::encode_uri_component(&number),
+        scry_code
+    );
+    if let Ok(Some(v)) = st.scry.get_opt(&path, &crate::scryfall::ScryOpts::default()).await {
+        if v.is_object() {
+            let norm = crate::sidecar::normalize_card(&v, &name);
+            let got = crate::search::lang_codes(norm.get("language").and_then(Value::as_str)).0;
+            if got == want_code {
+                let pool_w = Arc::clone(pool);
+                let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let conn = pool_w.get().map_err(|e| e.to_string())?;
+                    crate::card_cache::cache_normalized_cards(&conn, std::slice::from_ref(&norm))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            }
+        }
+    }
+    let conn = pool.get_async().await.map_err(|_| WriteError::Bind)?;
+    Ok(StandalonePlan::Plan(plan_add_ex(&conn, merged, true)?))
+}
+
+/// `POST /collection` — routes/collection.js route 3.
+pub async fn handle_add(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        return unowned(st, req).await;
+    }
+    let Some(pool) = st.db.clone() else {
+        return crate::proxy(State(st), req).await;
+    };
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    let headers = parts.headers.clone();
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // express.json hands a non-object body to destructuring as values that
+    // never carry card_id; `{}` models both cases (parse_body already maps
+    // arrays there).
+    let empty = Map::new();
+    let m = body.as_object().unwrap_or(&empty);
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "add card pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+        }
+    };
+    let standalone = st.cfg.node_upstream.is_empty();
+    let planned = if standalone {
+        match plan_add_standalone(&st, &pool, m).await {
+            Ok(StandalonePlan::Plan(p)) => Ok(p),
+            Ok(StandalonePlan::NotFound(card_id)) => {
+                return json_error(StatusCode::NOT_FOUND, &format!("Card ID {card_id} not found."));
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        plan_add(&conn, m)
+    };
+    let plan = match planned {
+        Ok(AddPlan::Reject(msg)) => return json_error(StatusCode::BAD_REQUEST, &msg),
+        Ok(AddPlan::FetchCard(card_id)) => {
+            // Node's cache-miss leg is cardApi.getCardById → scryGet
+            // `/cards/{rawId}` → cacheCards([normalizeCard(data)]), then the
+            // row is re-read (unit 7c). Any answer that leg cannot own —
+            // non-200/404/transport (Node's catch turns them all into a
+            // null → 404), or a deployed Node that should author its own
+            // fetch (hybrid mode keeps byte-parity by proxying) — falls
+            // back to the pre-7c Forward behavior.
+            match fetch_card_then_replan(&st, &pool, &card_id, m).await {
+                FetchCardOutcome::Ready(p) => p,
+                FetchCardOutcome::NotFound | FetchCardOutcome::Unusable => {
+                    if !st.cfg.node_upstream.is_empty() {
+                        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+                    }
+                    // Standalone: Node's getCardById catch → null →
+                    // AddCardError(404, `Card ID ${card_id} not found.`).
+                    return json_error(
+                        StatusCode::NOT_FOUND,
+                        &format!("Card ID {card_id} not found."),
+                    );
+                }
+            }
+        }
+        Ok(AddPlan::Forward) => return crate::proxy(State(st), rebuild(parts, &bytes)).await,
+        Ok(p @ AddPlan::Ready { .. }) => p,
+        Err(e) => {
+            tracing::error!(error=?e, "add card failed");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card");
+        }
+    };
+    let resp = match execute_add(&conn, user.id, &plan) {
+        Ok((last, ids)) => json_response(
+            StatusCode::OK,
+            &json!({ "message": "Card added to collection", "id": last, "ids": ids }),
+        ),
+        Err(e) => {
+            tracing::error!(error=?e, "add card failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to add card")
+        }
+    };
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &Method::POST, "/api/collection", &headers);
+    }
+    resp
+}
+
+/// One pass-1 outcome per bulk-add entry. `Failed` carries the per-entry
+/// report body; `Forward` (any of them) forwards the WHOLE request, since
+/// Node must author the Scryfall fetches (and their side effects) itself.
+enum BulkEntry {
+    Ready { plan: AddPlan, card_id: Option<Value>, index: usize },
+    Failed { error: String, card_id: Option<Value>, index: usize },
+    /// Cache-miss entry: Node's addCardToCollection authors the
+    /// getCardById fetch itself. Kept aside (pass 1 stays pure reads) so
+    /// the legs can run sequentially, in request order, before any write.
+    Fetch { merged: Map<String, Value>, card_id: Option<Value>, index: usize },
+    /// Non-string id miss or localized-printing miss: hybrid forwards the
+    /// whole request; standalone resolves it via `plan_add_standalone`.
+    Forward { merged: Map<String, Value>, card_id: Option<Value>, index: usize },
+}
+
+/// routes/collection.js bulkAddToCollection + its route (BULK_ADD_MAX=250).
+pub async fn handle_bulk_add(State(st): State<AppState>, req: Request) -> Response {
+    if req.method() != Method::POST {
+        // Express: `PUT|DELETE /collection/:id` also matches this literal
+        // segment (id = 'bulk-add'). Standalone answers that route natively.
+        if st.cfg.node_upstream.is_empty() && (req.method() == Method::PUT || req.method() == Method::DELETE) {
+            return handle_entry(Path("bulk-add".to_string()), State(st), req).await;
+        }
+        return unowned(st, req).await;
+    }
+    let Some(pool) = st.db.clone() else {
+        return crate::proxy(State(st), req).await;
+    };
+    let (parts, bytes, oversize) = read_parts(req, BODY_NORMAL).await;
+    if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
+        return crate::collection_writes::too_large();
+    }
+    let headers = parts.headers.clone();
+    let body = match parse_body(&headers, &bytes) {
+        BodyOutcome::Parsed(b) => b,
+        BodyOutcome::Invalid => return internal_error(),
+        BodyOutcome::TooLarge => return too_large(),
+    };
+    let token = bearer_token(&headers).map(|s| s.to_string());
+    let user = match authenticate_async(&pool, token.as_deref(), false).await {
+        Ok(u) => u,
+        Err(res) => return node_exact(res).await,
+    };
+    // `const { card_ids = [], ...shared } = req.body` — null/non-array and
+    // a missing key both take the falsy 400 branch.
+    let body_map = body.as_object().cloned();
+    let card_ids: Vec<Value> = match body_map.as_ref().and_then(|m| m.get("card_ids")) {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return json_error(StatusCode::BAD_REQUEST, "card_ids is required"),
+    };
+    if card_ids.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "card_ids is required");
+    }
+    if card_ids.len() > 250 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Cannot add more than 250 cards at once.",
+        );
+    }
+    let mut shared = body_map.unwrap_or_default();
+    shared.remove("card_ids");
+
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "bulk add pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        }
+    };
+
+    // Pass 1 — pure reads: the {...shared, ...perCard, card_id} merge and
+    // every validation/probe, before any write can commit.
+    let mut outcomes: Vec<BulkEntry> = Vec::with_capacity(card_ids.len());
+    for (index, entry) in card_ids.iter().enumerate() {
+        // `entry && typeof entry === 'object'` — null is NOT keyed; arrays
+        // are (and carry no card_id, like any other object).
+        let keyed = matches!(entry, Value::Object(_) | Value::Array(_));
+        let mut merged = shared.clone();
+        let card_id: Option<Value> = if keyed {
+            let obj = entry.as_object();
+            let cid = obj.and_then(|o| o.get("card_id")).cloned();
+            if let Some(o) = obj {
+                for k in ["quantity", "purchase_price", "condition", "printing"] {
+                    if let Some(v) = o.get(k) {
+                        // perCard only overrides when the value is neither
+                        // null nor stringifies to ''.
+                        if !v.is_null() && js_to_string(Some(v)) != "" {
+                            merged.insert(k.into(), v.clone());
+                        }
+                    }
+                }
+            }
+            cid
+        } else {
+            Some(entry.clone())
+        };
+        if let Some(v) = card_id.clone() {
+            merged.insert("card_id".into(), v);
+        }
+        outcomes.push(match plan_add(&conn, &merged) {
+            Ok(p @ AddPlan::Ready { .. }) => BulkEntry::Ready { plan: p, card_id, index },
+            Ok(AddPlan::Reject(msg)) => BulkEntry::Failed { error: msg, card_id, index },
+            Ok(AddPlan::Forward) => BulkEntry::Forward { merged, card_id, index },
+            // A FetchCard entry with a deployed Node forwards the WHOLE
+            // request (hybrid keeps byte-parity by letting Node author the
+            // multi-entry fetches itself). Standalone rides the same
+            // getCardById leg the single route owns — resolved below,
+            // sequentially, before any write.
+            Ok(AddPlan::FetchCard(_)) => BulkEntry::Fetch { merged, card_id, index },
+            // Non-AddCardError: Node console.errors and reports the generic
+            // per-card message.
+            Err(e) => {
+                tracing::error!(error=?e, "bulk add card failed");
+                BulkEntry::Failed { error: "Failed to add card".into(), card_id, index }
+            }
+        });
+    }
+    drop(conn);
+    if !st.cfg.node_upstream.is_empty() && outcomes.iter().any(|o| matches!(o, BulkEntry::Forward { .. })) {
+        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+    }
+
+    // Sequential getCardById legs, in request order — Node's
+    // bulkAddToCollection awaits addCardToCollection per entry, and the
+    // cache hydration of entry N is visible to entry N+1 (duplicate cache
+    // misses fetch upstream exactly once). Only standalone runs them:
+    // hybrid forwarded the whole request above.
+    if st.cfg.node_upstream.is_empty() {
+        for i in 0..outcomes.len() {
+            let (merged, card_id, index) = match &outcomes[i] {
+                BulkEntry::Fetch { merged, card_id, index }
+                | BulkEntry::Forward { merged, card_id, index } => {
+                    (merged.clone(), card_id.clone(), *index)
+                }
+                _ => continue,
+            };
+            // Node: getCardById catch → null → AddCardError(404) — the bulk
+            // core's catch reports the AddCardError message per entry; a
+            // non-AddCardError (TypeError on a non-string id) is the
+            // generic per-card message.
+            outcomes[i] = match plan_add_standalone(&st, &pool, &merged).await {
+                Ok(StandalonePlan::Plan(AddPlan::Reject(error))) => BulkEntry::Failed { error, card_id, index },
+                Ok(StandalonePlan::Plan(plan)) => BulkEntry::Ready { plan, card_id, index },
+                Ok(StandalonePlan::NotFound(cid)) => BulkEntry::Failed {
+                    error: format!("Card ID {cid} not found."),
+                    card_id,
+                    index,
+                },
+                Err(e) => {
+                    tracing::error!(error=?e, "bulk add card failed");
+                    BulkEntry::Failed { error: "Failed to add card".into(), card_id, index }
+                }
+            };
+        }
+    } else if outcomes.iter().any(|o| matches!(o, BulkEntry::Fetch { .. })) {
+        // Hybrid: Node authors the fetches itself (pre-7c Forward behavior).
+        return crate::proxy(State(st), rebuild(parts, &bytes)).await;
+    }
+    let conn = match pool.get_async().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error=?e, "bulk add pool failure");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+        }
+    };
+
+    // Pass 2 — sequential writes in request order, per-entry transactions
+    // (a throwing entry costs Node exactly that one entry: its INSERT
+    // autocommits never ran; Rust rolls back only that entry's tx).
+    let mut added: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let fail_obj = |card_id: &Option<Value>, error: &str, index: usize| {
+        let mut m = Map::new();
+        if let Some(v) = card_id {
+            m.insert("card_id".into(), v.clone());
+        }
+        m.insert("error".into(), json!(error));
+        m.insert("index".into(), json!(index));
+        Value::Object(m)
+    };
+    for outcome in outcomes {
+        match outcome {
+            BulkEntry::Ready { plan, card_id, index } => match execute_add(&conn, user.id, &plan) {
+                Ok((id, ids)) => {
+                    let mut m = Map::new();
+                    if let Some(v) = card_id {
+                        m.insert("card_id".into(), v.clone());
+                    }
+                    m.insert("id".into(), json!(id));
+                    m.insert("ids".into(), json!(ids));
+                    m.insert("index".into(), json!(index));
+                    added.push(Value::Object(m));
+                }
+                Err(e) => {
+                    tracing::error!(error=?e, "bulk add card failed");
+                    failed.push(fail_obj(&card_id, "Failed to add card", index));
+                }
+            },
+            BulkEntry::Failed { error, card_id, index } => {
+                failed.push(fail_obj(&card_id, &error, index));
+            }
+            // Resolved by the sequential fetch legs above (standalone) or
+            // short-circuited into a whole-request forward (hybrid).
+            BulkEntry::Fetch { .. } => {
+                unreachable!("fetch entries resolve before the write pass")
+            }
+            BulkEntry::Forward { .. } => unreachable!("handled by the pre-write forward"),
+        }
+    }
+
+    let qty = match shared.get("quantity") {
+        Some(v) => js_parse_int_v(Some(v)).unwrap_or(1).max(1),
+        None => 1,
+    };
+    let status = if !failed.is_empty() && added.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    let message = if !failed.is_empty() {
+        format!(
+            "Added {} of {} cards; {} failed.",
+            added.len(),
+            card_ids.len(),
+            failed.len()
+        )
+    } else {
+        format!(
+            "Added {} card{}{} to collection.",
+            added.len(),
+            if added.len() == 1 { "" } else { "s" },
+            if qty > 1 { format!(" (x{qty} each)") } else { String::new() }
+        )
+    };
+    let mut out = Map::new();
+    out.insert("message".into(), json!(message));
+    out.insert("added".into(), json!(added.len()));
+    out.insert("entries".into(), Value::Array(added));
+    out.insert("failed".into(), Value::Array(failed));
+    let resp = json_response(status, &Value::Object(out));
+    if resp.status().is_success() {
+        stats::on_proxied_write(&st, &Method::POST, "/api/collection/bulk-add", &headers);
+    }
+    resp
+}
+
+#[cfg(test)]
+mod tx_tests {
+    //! LANE-B review H1/H2-writes: `Tx` must leave the connection in a
+    //! clean autocommit state when COMMIT itself fails — Node's
+    //! withTransaction rolls back on the COMMIT failure too. Red before the
+    //! fix: commit() set `done` before executing COMMIT, so the guard's
+    //! rollback/Drop skipped it and the connection stayed inside an open
+    //! transaction (pool lock-leak class, cf. the admin_users DELETE note).
+
+    use super::*;
+
+    fn fk_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE child  (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Begin a guard and park a deferred FK violation inside it, then fail
+    /// the COMMIT (defer_foreign_keys defers the check to COMMIT time —
+    /// SQLITE_CONSTRAINT surfaces from the COMMIT statement itself, leaving
+    /// the transaction OPEN exactly like a BUSY/IO commit failure).
+    fn begin_failing_commit(conn: &Connection) -> Tx<'_> {
+        let mut tx = Tx::begin(conn).unwrap();
+        conn.execute_batch("PRAGMA defer_foreign_keys = ON;").unwrap();
+        conn.execute("INSERT INTO child (parent_id) VALUES (42)", []).unwrap();
+        assert!(tx.commit().is_err(), "deferred FK must fail the COMMIT");
+        tx
+    }
+
+    #[test]
+    fn commit_failure_then_explicit_rollback_returns_conn_to_autocommit() {
+        let conn = fk_conn();
+        let mut tx = begin_failing_commit(&conn);
+        // The failed COMMIT must NOT have disarmed the guard: rollback()
+        // now has to actually issue the ROLLBACK.
+        tx.rollback();
+        assert!(conn.is_autocommit(), "conn still inside a transaction after rollback()");
+    }
+
+    #[test]
+    fn commit_failure_then_drop_rolls_back() {
+        let conn = fk_conn();
+        {
+            let _tx = begin_failing_commit(&conn);
+        } // Drop must roll the failed commit back.
+        assert!(conn.is_autocommit(), "conn still inside a transaction after Drop");
+        // And the connection is usable for the next BEGIN IMMEDIATE — the
+        // pool-leak signature was every later writer hitting it.
+        let mut tx2 = Tx::begin(&conn).unwrap();
+        tx2.rollback();
+    }
+
+    #[test]
+    fn positive_control_successful_commit_is_clean_and_permanent() {
+        // Guards against the two failure tests above passing vacuously:
+        // the happy path must COMMIT (row visible) AND leave autocommit ON.
+        let conn = fk_conn();
+        let mut tx = Tx::begin(&conn).unwrap();
+        conn.execute("INSERT INTO parent (id) VALUES (7)", []).unwrap();
+        tx.commit().unwrap();
+        assert!(conn.is_autocommit());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM parent WHERE id = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "successful commit must persist");
+    }
+}
+
+#[cfg(test)]
+mod worker_park_tests {
+    //! LANE-A iter-14 (M5 family, audit follow-up to iter-13's search/health
+    //! root-catch): the per-request checkouts on the collection WRITE
+    //! handlers' hot paths — the `cardlist` probe below stands in for the
+    //! whole converted set (handle_cardlist/handle_entry/handle_bulk/
+    //! handle_add/handle_bulk_add and their helpers) — must not park the
+    //! runtime worker on the DbPool live cap. During the iter-78/81/82/83/12
+    //! bench freezes the workers themselves blocked in `pool.get()` while
+    //! the multi-leg builds held every live slot. `cardlist` now checks out
+    //! via `DbPool::get_async()` (idle-pop on the worker, blocking-pool hop
+    //! on miss), so a capped pool can only ever stall the BLOCKING pool.
+    //! RED before the conversion (measured): with `pool.get()` restored in
+    //! `cardlist`, the 150 ms heartbeat never fires and the test panics.
+
+    use super::*;
+    use crate::db::{DbPool, PoolConfig};
+    use axum::http::Uri;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cardlist_never_parks_a_runtime_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cardlist-park.db");
+        // DbPool opens READ_WRITE without CREATE — the file must exist.
+        rusqlite::Connection::open(&path).unwrap();
+        let pool = std::sync::Arc::new(
+            DbPool::open_with(
+                &path,
+                PoolConfig { max: 1, cache_kb: 2048, mmap_kb: 0, live_max: 1 },
+            )
+            .unwrap(),
+        );
+        {
+            let c = pool.get().unwrap();
+            c.execute_batch(
+                "CREATE TABLE collection (id INTEGER PRIMARY KEY, card_id INTEGER, user_id INTEGER, quantity INTEGER, added_at TEXT);
+                 CREATE TABLE card_cache (id INTEGER PRIMARY KEY, name TEXT, set_id TEXT, number TEXT);
+                 INSERT INTO collection (card_id, user_id, quantity, added_at) VALUES (1, 1, 2, '2026-01-01');
+                 INSERT INTO card_cache (id, name, set_id, number) VALUES (1, 'Sol Ring', 'm19', '1');",
+            )
+            .unwrap();
+        }
+        // Occupy the only live slot: idle empty, live == live_max. Any
+        // further get() parks its calling thread on the live-cap Condvar.
+        let held = pool.get_owned().unwrap();
+        std::thread::spawn(move || {
+            // Release at 1.2 s so a RED run FAILS (the parked worker wakes,
+            // the runtime joins) instead of deadlocking the test binary.
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            drop(held);
+        });
+
+        let p1 = std::sync::Arc::clone(&pool);
+        let probe = tokio::spawn(async move {
+            cardlist(
+                &p1,
+                1,
+                &Uri::from_static("/api/collection/cardlist"),
+                &HeaderMap::new(),
+            )
+            .await
+        });
+        let beat = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        });
+        // Drive from the test's main (NON-worker) thread: if the probe
+        // parked the sole worker, the 150 ms heartbeat can never fire.
+        // (Build the timeout futures INSIDE the runtime context —
+        // tokio::time::timeout registers its timer at construction.)
+        tokio::time::timeout(std::time::Duration::from_millis(400), beat)
+            .await
+            .expect("cardlist parked the runtime worker (heartbeat starved)");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+            .await
+            .expect("cardlist never completed after the cap released")
+            .unwrap()
+            .unwrap();
+        assert!(resp.status().is_success(), "cardlist must answer through the async checkout");
+    }
+}

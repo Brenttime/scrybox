@@ -252,7 +252,14 @@ app.use(compression());
 
 // Initialize Database on startup
 let dbReady = false;
-db.initDb()
+// Lane B unit 4: the Rust front owns schema init/migrations when the test
+// container sets SCRYBOX_SKIP_DB_INIT=true (src/migrations.rs is the ported
+// twin of db.initDb, gated by RUST_MIGRATIONS + PRAGMA user_version).
+// Production default unchanged: Node still runs initDb().
+const initDbPromise = process.env.SCRYBOX_SKIP_DB_INIT === 'true'
+  ? (console.log('DB init disabled (SCRYBOX_SKIP_DB_INIT) — Rust owns migrations.'), Promise.resolve())
+  : db.initDb();
+initDbPromise
   .then(async () => {
     dbReady = true;
     console.log('Database tables verified/created successfully.');
@@ -269,8 +276,15 @@ db.initDb()
     const splitCount = await splitStackedEntries(db);
     if (splitCount > 0) console.log(`Split ${splitCount} stacked collection copies into individual rows.`);
 
-    // Sync sets on startup.
-    await scryfallApi.fetchAndCacheSets();
+    // Sync sets on startup. Lane B port ruling: when the Rust front runs the
+    // set-sync job (RUST_JOBS=scryfall) the test container recreates with
+    // SCRYBOX_DISABLE_SETS_REFRESH=true so the job never runs twice. Off by
+    // default — production Node behaviour is unchanged.
+    if (process.env.SCRYBOX_DISABLE_SETS_REFRESH === 'true') {
+      console.log('Set sync disabled (SCRYBOX_DISABLE_SETS_REFRESH) — Rust job owns it.');
+    } else {
+      await scryfallApi.fetchAndCacheSets();
+    }
     // Load sets into the card-sort memory cache. The storage half of the old
     // compartmentSort went away with the Storage feature (d2fab84) and took the
     // boot-time import with it; the sort half lives in utils/cardSort, which is
@@ -304,9 +318,12 @@ db.initDb()
     // restart. Scryfall's guidance is that gameplay/set data changes rarely and
     // weekly is plenty — prices are on their own schedule below.
     setInterval(async () => {
+      // Lane B: when the Rust job owns set sync, skip only the Scryfall legs —
+      // the catalog auto-update is Node-internal and keeps its schedule.
+      const setsOwned = process.env.SCRYBOX_DISABLE_SETS_REFRESH !== 'true';
       try {
-        await scryfallApi.fetchAndCacheSets(true);
-        await loadSetsCache(db);
+        if (setsOwned) await scryfallApi.fetchAndCacheSets(true);
+        if (setsOwned) await loadSetsCache(db);
         await autoUpdateCatalogs();
       } catch (err) {
         console.error('Weekly sets refresh failed:', err);
@@ -324,6 +341,7 @@ db.initDb()
     // The checkpoint after the sweep retries any WAL truncate that an active
     // startup reader deferred.
     setInterval(() => {
+      if (process.env.SCRYBOX_DISABLE_PRICE_SWEEP === 'true') return; // Rust job owns the sweep (lane B)
       scryfallApi.updateCollectionPrices().catch((error) => {
         console.error('MTG price update failed:', error.message);
       }).finally(() => {
@@ -341,10 +359,12 @@ db.initDb()
       // runMaintenance de-duplicates with the Oracle service's own startup run.
       // Unforced, so a sweep still inside the interval does not run.
       await oracleTags.runMaintenance();
-      await scryfallApi.updateCollectionPrices().catch((error) => {
-        console.error('MTG boot price catch-up failed:', error.message);
-      });
-      await scryfallApi.refreshPriceEstimates();
+      if (process.env.SCRYBOX_DISABLE_PRICE_SWEEP !== 'true') {
+        await scryfallApi.updateCollectionPrices().catch((error) => {
+          console.error('MTG boot price catch-up failed:', error.message);
+        });
+        await scryfallApi.refreshPriceEstimates();
+      }
       await oracleTags.checkpointWal();
     }, 30000);
 
@@ -357,12 +377,29 @@ db.initDb()
     }, 1000 * 60 * 60 * 24);
 
     // Periodic auto-backup (BACKUP_INTERVAL_HOURS, default 24; 0 disables)
-    require('./backup').startAutoBackup();
+    //
+    // Lane B: when the Rust server owns the admin backup routes it also owns
+    // the timer — the test container runs with SCRYBOX_DISABLE_AUTO_BACKUP=true
+    // so the snapshot job never runs twice against the shared DB copy (same
+    // pattern as SCRYBOX_DISABLE_MOXFIELD_SCHEDULER).
+    if (process.env.SCRYBOX_DISABLE_AUTO_BACKUP === 'true') {
+      console.log('Auto-backup timer disabled (SCRYBOX_DISABLE_AUTO_BACKUP) — Rust job owns it.');
+    } else {
+      require('./backup').startAutoBackup();
+    }
 
     // Moxfield sync: the 20-second tick polls each tracked author's deck list
     // (slow interval) and checks every tracked deck's contents for changes
     // (fast interval). No-op until somebody adds an author.
-    require('./moxfieldScheduler').startMoxfieldScheduler();
+    //
+    // Lane B: when the Rust server owns the Moxfield routes it also owns the
+    // scheduler — the test container runs with SCRYBOX_DISABLE_MOXFIELD_SCHEDULER=true
+    // so the tick never runs twice (same pattern as SCRYBOX_DISABLE_SETS_REFRESH).
+    if (process.env.SCRYBOX_DISABLE_MOXFIELD_SCHEDULER === 'true') {
+      console.log('Moxfield scheduler disabled (SCRYBOX_DISABLE_MOXFIELD_SCHEDULER) — Rust scheduler owns it.');
+    } else {
+      require('./moxfieldScheduler').startMoxfieldScheduler();
+    }
   })
   .catch(err => {
     console.error('Failed to initialize database:', err);

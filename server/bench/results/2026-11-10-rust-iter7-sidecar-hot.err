@@ -1,0 +1,7 @@
+{"name":"health","conc":16,"n":17703,"variants":1,"rps":1769.6,"p50_ms":8.32,"p99_ms":18.05,"peak_rss_mb":340.5,"codes":{"200":17703}}
+{"name":"collection_page100","conc":16,"n":53433,"variants":1,"rps":5342.8,"p50_ms":2.69,"p99_ms":6.79,"peak_rss_mb":340.8,"codes":{"200":53433}}
+{"name":"collection_full_27MB","conc":2,"n":924,"variants":1,"rps":61.5,"p50_ms":30.15,"p99_ms":55.99,"peak_rss_mb":384.6,"codes":{"200":924}}
+{"name":"stats","conc":16,"n":86581,"variants":1,"rps":8658.1,"p50_ms":1.63,"p99_ms":3.84,"peak_rss_mb":384.9,"codes":{"200":86581}}
+{"name":"search_coll_t_creature_c_g","conc":16,"n":400,"variants":1,"rps":38.9,"p50_ms":396.87,"p99_ms":607.8,"peak_rss_mb":386.9,"codes":{"200":400}}
+{"name":"search_coll_sol_ring","conc":16,"n":2138,"variants":1,"rps":211.7,"p50_ms":67.72,"p99_ms":125.79,"peak_rss_mb":388.8,"codes":{"200":2138}}
+{"name":"search_db_name_sol_ring","conc":16,"n":70636,"variants":1,"rps":7063.6,"p50_ms":2.05,"p99_ms":4.59,"peak_rss_mb":388.8,"codes":{"200":70636}}

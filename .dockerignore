@@ -9,6 +9,10 @@ dist
 build
 out
 
+# Rust build tree (~4 GB with the iter+release profiles) — Dockerfile.rust
+# COPYs the staged binary from server/docker/bin, never target/.
+server/target
+
 # VCS / CI
 .git
 .github

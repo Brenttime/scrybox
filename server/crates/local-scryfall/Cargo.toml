@@ -1,0 +1,31 @@
+[package]
+name = "local-scryfall"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Local Scryfall search engine (memory-resident index) — library + standalone `scryfall-api` bin"
+
+[lib]
+name = "local_scryfall"
+path = "src/lib.rs"
+
+# Thin standalone binary: identical behaviour to the old scryfall-local
+# sidecar (same routes, env, port 8420), now a wrapper over the library.
+[[bin]]
+name = "scryfall-api"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+axum = "0.8.9"
+flate2 = "1.1.10"
+memchr = "2.8.3"
+rayon = "1.12.0"
+roaring = "0.11.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# Kept on 0.7 (the sidecar's version) so ServeDir/compression bytes are the
+# sidecar's own, not a re-implementation on the server's tower-http 0.6.
+tower-http = { version = "0.7.1", features = ["fs", "compression-gzip", "compression-br"] }
