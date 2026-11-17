@@ -184,7 +184,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /usr/local/bin/curl-impersonate and fall back to plain curl. The published
 # binary ships full debug symbols; strip --strip-all keeps behaviour identical
 # (verified: --version + a live decklist pull) at 4.9 MB instead of 30.8 MB.
-RUN wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/releases/download/v2.1.0/curl-impersonate-v2.1.0.x86_64-linux-gnu.tar.gz" \
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in amd64) a=x86_64 ;; arm64) a=aarch64 ;; *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; esac; \
+  wget -qO /tmp/ci.tgz "https://github.com/lexiforest/curl-impersonate/releases/download/v2.1.0/curl-impersonate-v2.1.0.${a}-linux-gnu.tar.gz" \
   && tar xzf /tmp/ci.tgz -C /usr/local/bin curl-impersonate \
   && chmod 0755 /usr/local/bin/curl-impersonate \
   && strip --strip-all /usr/local/bin/curl-impersonate \
@@ -215,10 +217,10 @@ RUN set -eu; \
              if (p ~ /^\//) print p } \
          }' /ldd.txt > /staging.list; \
     printf '%s\n' \
-      /lib/x86_64-linux-gnu/libnss_files.so.2 \
-      /lib/x86_64-linux-gnu/libnss_dns.so.2 \
-      /lib/x86_64-linux-gnu/libnss_compat.so.2 \
-      /lib/x86_64-linux-gnu/libresolv.so.2 \
+      /lib/$(uname -m)-linux-gnu/libnss_files.so.2 \
+      /lib/$(uname -m)-linux-gnu/libnss_dns.so.2 \
+      /lib/$(uname -m)-linux-gnu/libnss_compat.so.2 \
+      /lib/$(uname -m)-linux-gnu/libresolv.so.2 \
       >> /staging.list; \
     sort -u /staging.list | while read -r lib; do \
       [ -e "$lib" ] || { echo "MISSING LIB: $lib" >&2; exit 1; }; \
