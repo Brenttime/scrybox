@@ -69,8 +69,11 @@ for (const f of files) {
   const jsonPath = path.join(framesDir, f.replace(/\.jpg$/, '.json'));
   const srv = fs.existsSync(jsonPath) ? serverAnswer(JSON.parse(fs.readFileSync(jsonPath, 'utf8'))) : null;
   const img = sharp(path.join(framesDir, f)).rotate();
-  const full = await img.clone().ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const small = await img.clone().resize(CORN_SIZE, CORN_SIZE, { fit: 'fill' }).removeAlpha().raw().toBuffer();
+  let full, small;
+  try {
+    full = await img.clone().ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    small = await img.clone().resize(CORN_SIZE, CORN_SIZE, { fit: 'fill' }).removeAlpha().raw().toBuffer();
+  } catch (e) { console.error(`\nskip ${f}: ${e.message}`); continue; }   // truncated debug jpg
   // Every frame is independent here: the saved stream has gaps, and the
   // identity cache would turn later frames into free hits. Reset per frame so
   // each number below is a cold read.
@@ -93,7 +96,7 @@ for (const f of files) {
   rows.push({
     frame: f, ms: Math.round(ms), recCalls: reader.stats.recCalls - before.recCalls,
     status: cand ? cand.status : 'no card', sharp: cand?.sharpness, stage: r?.footer_stage, err: r?.error, ok: !!r?.ok, id: r?.scryfallId || null,
-    title: r?.title || null, footer: r?.footer_ocr, guess: r?.guess,
+    title: r?.title || null, title_raw: r?.title_raw, box: cand?.box, footer: r?.footer_ocr, guess: r?.guess,
     got: r?.ok ? `${r.title}[${r.set} ${r.num}] via ${r.via}` : (r ? `${r.error}${r.title ? ` (${r.title})` : ''}` : ''),
     server: srv, timings: out.timings,
   });

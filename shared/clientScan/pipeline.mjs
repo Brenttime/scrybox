@@ -19,7 +19,7 @@ import {
 } from './imaging.mjs';
 import {
   ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
-  footerNumbers, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
+  footerNumbers, footerNumbersPadded, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
 import { guessPrinting, CONTEXT_PRIMARY } from './guess.mjs';
@@ -155,6 +155,19 @@ function coversStage(rs, pad) {
 
 const TITLE_FIRST = [[0.030, 0.82, 0.025, 0.100], [0.040, 0.80, 0.055, 0.120]];
 const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [0.010, 0.95, 0.000, 0.090]];
+// Two-line titles (server scan_ocr TWO_LINE_TITLE_BANDS). Frames that print
+// the name in a large font with no title bar (Secret Lair "The Zeta Set":
+// "Oboro, Palace in / the Clouds") wrap a long name, so every single-line
+// strip reads a fragment that matches no name ("no confident card title" on
+// every pass, 2026-11-20 telemetry). Only a card still unnamed pays for it:
+// the two line bands are read in one recognizer call and their JOINED text is
+// matched like any other read (same NAME_MATCH_MIN, both lines >= TITLE_CONF).
+export const TWO_LINE_TITLE_BANDS = [[0.040, 0.80, 0.030, 0.100], [0.040, 0.80, 0.095, 0.160]];
+export function joinTitleLines(reads) {
+  const [a, b] = reads || [];
+  if (!a?.text?.trim() || !b?.text?.trim() || a.conf < TITLE_CONF || b.conf < TITLE_CONF) return null;
+  return { text: `${a.text.trim()} ${b.text.trim()}`, conf: Math.min(a.conf, b.conf) };
+}
 // One modern batch first: 6 strips cost about the same as 2 on the recognizer
 // (one ONNX run either way), and 0.86-0.94 is where modern footers resolve.
 // Replay: same matches, p50 matched read -29%, 2.3 vs 3.3 recognizer calls.
@@ -203,7 +216,7 @@ export function strongConflict(ix, title, pi, raws, held = []) {
   const twins = new Set(physicalTwins(ix, title, pi));
   const mine = ph[pi].num;
   const strong = [...strongNumbers(raws).keys(), ...held];
-  const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbers(raws));
+  const codes = new Set(footerCodes(ix, raws)), nums = new Set(footerNumbersPadded(raws));
   for (const o of pool) {
     if (twins.has(o)) continue;
     const n = ph[o].num;
@@ -682,6 +695,14 @@ export function createReader(env) {
     else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
+    if (!cands.length && !truncated) {
+      const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
+      if (lines.length === 2) {
+        const reads = await recognize(env, lines);
+        const joined = joinTitleLines(reads);
+        if (joined) { timings.title_two_line = 1; consider([joined], 3); }
+      }
+    }
     timings.title_ms = Math.round(now() - tA);
     const titleReads = cands.map(c => c.raw);
     const partial = (extra = {}) => ({ number: 1, ok: false, retry: true, error: 'card too close to the frame edge', near_edge_partial: truncated, title: null, ocr: titleReads, title_raw: titleRaw, ...extra });
@@ -827,7 +848,7 @@ export function createReader(env) {
       if (prior.deferred && si < lastStage) return null;
       const frames = [...pooled, raws];
       const all = frames.flat();
-      let g = resolveFooterGroup(ix, name, footerCodes(ix, all), footerNumbers(all), strongNumbers(all));
+      let g = resolveFooterGroup(ix, name, footerCodes(ix, all), footerNumbersPadded(all), strongNumbers(all));
       if (g == null) g = voteFooterGroup(ix, name, frames);
       // Rescue reads (this frame or a pooled one) never prove a printing that
       // another strong number on these frames contradicts.
@@ -915,7 +936,7 @@ export function createReader(env) {
       const reads = await recognize(env, strips(rects, `footer${si}`));
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
-      let g = resolveFooterGroup(ix, name, footerCodes(ix, raws), footerNumbers(raws), strongNumbers(raws));
+      let g = resolveFooterGroup(ix, name, footerCodes(ix, raws), footerNumbersPadded(raws), strongNumbers(raws));
       // A rescue-stage answer must not contradict ANY strong number read on
       // this frame (R2-#2 replay: rescue read "089/59%" -> DRC 89 while the
       // first batch read "080/505", the real MH2 80, dropped only by its set

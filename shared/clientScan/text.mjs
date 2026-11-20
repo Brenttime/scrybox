@@ -328,6 +328,42 @@ export function retroNumber(raw) {
 // still gives a real printing elsewhere (PP-OCRv5 read "089/303" -> Damn #89,
 // DRC), so a "N/T" read also carries T: the resolved set must actually run to
 // #T (DRC stops at 184; MH2 goes past 303).
+// Rarity letter + zero-padded 4-place collector number, the footer of frames
+// with no printed total (Secret Lair "The Zeta Set": `C 0031`). Port of the
+// server's footer_numbers_padded (scan_engine/printings.rs). The recognizer
+// reads these small serif digits as look-alike letters (`0031` -> `oosi`,
+// `c00ss`), so each token yields every digit reading. Readings are only
+// candidates: with a read set code they join the exact set+number pass
+// (`footerNumbersPadded`); without one they count as set-less evidence only
+// when two strips (or pooled frames) agree, like any other bare number (a lone
+// `U 0221` is never strong). resolveFooterGroup still needs a real collector
+// number of the read title, and readings naming two footers resolve nothing.
+const PADDED = /(?:^|[^a-z0-9])[cumrslt]\s*[.,\u00b7\u2022-]?\s*([0o][0-9oqdilz|!sb]{3})(?=$|[^a-z0-9])/g;
+const PADDED_ALTS = { o: ['0'], q: ['0'], d: ['0'], i: ['1'], l: ['1'], '|': ['1'], '!': ['1'], z: ['2'], s: ['5', '3'], b: ['8', '6'] };
+export function paddedNumbers(raws) {
+  const out = [];
+  for (const raw of raws) {
+    for (const m of String(raw).toLowerCase().matchAll(PADDED)) {
+      let reads = [''];
+      for (const c of m[1]) {
+        const alts = /\d/.test(c) ? [c] : PADDED_ALTS[c];
+        reads = reads.flatMap(r => alts.map(a => r + a));
+      }
+      for (const r of reads) {
+        const n = normalizeCollector(r);
+        if (n !== '0' && !out.includes(n)) out.push(n);
+      }
+    }
+  }
+  return out;
+}
+
+export function footerNumbersPadded(raws) {
+  const out = footerNumbers(raws);
+  for (const n of paddedNumbers(raws)) if (!out.includes(n)) out.push(n);
+  return out;
+}
+
 export function strongNumbers(raws) {
   const seen = new Map();
   const strong = new Map();
@@ -336,7 +372,7 @@ export function strongNumbers(raws) {
       const n = normalizeCollector(m[1]);
       if (Number(m[1]) <= Number(m[2]) * 2 + 50 && !strong.has(n)) strong.set(n, Number(m[2]));
     }
-    for (const n of footerNumbers([raw])) {
+    for (const n of [...footerNumbers([raw]), ...paddedNumbers([raw])]) {
       if (!seen.has(n)) seen.set(n, new Set());
       seen.get(n).add(i);
     }
