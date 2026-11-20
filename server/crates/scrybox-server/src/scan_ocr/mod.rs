@@ -55,6 +55,10 @@ pub struct Title {
 
 type Cand = (f64, f64, String, String, i32);
 
+/// (x0, x1, y0, y1) of the first and second line of a wrapped title
+/// (measured on Zeta Set scans: line one 0.040-0.095, line two 0.100-0.150).
+pub const TWO_LINE_TITLE_BANDS: [(f64, f64, f64, f64); 2] = [(0.040, 0.80, 0.030, 0.100), (0.040, 0.80, 0.095, 0.160)];
+
 fn better(a: &Cand, b: &Cand) -> bool {
     // Python tuple max: (score, confidence, name, raw, angle)
     a.0.partial_cmp(&b.0)
@@ -125,6 +129,35 @@ pub fn batch_scene_titles(
     if !ts.is_empty() {
         let out = rec_bgr(&ts)?;
         absorb(&to, &vec![0; to.len()], out, &mut results);
+    }
+
+    // Two-line titles. Frames that print the name in a large font with no
+    // title bar (Secret Lair "The Zeta Set": "Oboro, Palace in / the
+    // Clouds") wrap a long name onto a second line, so every single-line
+    // strip reads only a fragment that matches no oracle name. Only cards
+    // still unnamed pay for it: read the two line bands separately and match
+    // their joined text.
+    let (mut ws, mut wo) = (vec![], vec![]);
+    for (o, cands) in results.iter().enumerate() {
+        if !cands.is_empty() {
+            continue;
+        }
+        let lines: Vec<Rgb> =
+            TWO_LINE_TITLE_BANDS.iter().filter_map(|&(x0, x1, y0, y1)| title_strip(&images[o], x0, x1, y0, y1, tight_h)).collect();
+        if lines.len() == 2 {
+            ws.extend(lines);
+            wo.push(o);
+        }
+    }
+    if !ws.is_empty() {
+        let out = rec_bgr(&ws)?;
+        let mut joined = vec![];
+        for pair in out.chunks(2) {
+            let ((a, ca), (b, cb)) = (&pair[0], &pair[1]);
+            let ok = !a.trim().is_empty() && !b.trim().is_empty() && *ca >= 0.60 && *cb >= 0.60;
+            joined.push(if ok { (format!("{} {}", a.trim(), b.trim()), ca.min(*cb)) } else { (String::new(), 0.0) });
+        }
+        absorb(&wo, &vec![0; wo.len()], joined, &mut results);
     }
 
     let (mut rs, mut ro, mut ra) = (vec![], vec![], vec![]);

@@ -5,7 +5,7 @@
 
 use super::detect::{self, Cand, Gray};
 use super::num::{py_round, Hist};
-use super::printings::{footer_numbers, normalize_collector, retro_line_number, retro_total, Printings};
+use super::printings::{footer_numbers_padded, normalize_collector, retro_line_number, retro_total, Printings};
 use crate::scan_ocr::names::{norm_name, Oracle};
 use crate::scan_ocr::pil::Rgb;
 use crate::scan_ocr::{self, Title};
@@ -300,7 +300,7 @@ pub fn batch_scene_printings(ctx: &Ctx, images: &[Rgb], titles: &[Title]) -> Res
         for &o in &pending {
             let name = titles[o].name.clone().unwrap_or_default();
             let tn = norm_name(&name);
-            let numbers = footer_numbers(&raws[o]);
+            let numbers = footer_numbers_padded(&raws[o]);
             let codes = p.footer_codes(&raws[o]);
             let mut group = p.resolve_footer_group(&tn, &codes, &numbers);
             let mut e = Map::new();
@@ -488,7 +488,7 @@ fn identify_exact_printing(ctx: &Ctx, img: &Rgb, title: &str) -> Result<(Option<
         let r = footer_strip_raws(ctx, img, v)?;
         if is_set { set.extend(r) } else { col.extend(r) }
         let all: Vec<String> = col.iter().chain(set.iter()).cloned().collect();
-        let group = p.resolve_footer_group(&tn, &p.footer_codes(&all), &footer_numbers(&all));
+        let group = p.resolve_footer_group(&tn, &p.footer_codes(&all), &footer_numbers_padded(&all));
         if let Some(g) = group {
             if g.len() > 1 {
                 let mut e = ev(&col, &set);
