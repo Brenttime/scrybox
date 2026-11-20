@@ -627,6 +627,48 @@ pub fn footer_numbers(raws: &[String]) -> Vec<String> {
     numbers
 }
 
+/// Rarity letter + zero-padded 4-place collector number, the footer style
+/// of frames with no printed total (Secret Lair "The Zeta Set": `C 0031`).
+static PADDED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[^a-z0-9])[cumrslt]\s*[.,·•\-]?\s*([0o][0-9oqdilz|!sb]{3})(?:$|[^a-z0-9])").unwrap());
+
+/// Digit readings of an OCR'd padded number. The recogniser reads these
+/// small serif digits as look-alike letters (`0031` -> `oosi`, `003i`);
+/// every reading is only a candidate: `resolve_footer_group` still needs it
+/// to be a real collector number of the read title, and an ambiguous set of
+/// readings resolves to nothing.
+fn padded_readings(token: &str) -> Vec<String> {
+    let mut outs = vec![String::new()];
+    for c in token.chars() {
+        let alts: &[char] = match c {
+            '0'..='9' => &[c],
+            'o' | 'q' | 'd' => &['0'],
+            'i' | 'l' | '|' | '!' => &['1'],
+            'z' => &['2'],
+            's' => &['5', '3'],
+            'b' => &['8', '6'],
+            _ => return vec![],
+        };
+        outs = outs.iter().flat_map(|o| alts.iter().map(move |a| format!("{o}{a}"))).collect();
+    }
+    outs.into_iter().map(|o| normalize_collector(&o)).collect()
+}
+
+/// `footer_numbers` plus the readings of zero-padded `C 0031` numbers.
+pub fn footer_numbers_padded(raws: &[String]) -> Vec<String> {
+    let mut numbers = footer_numbers(raws);
+    for raw in raws {
+        let lower = raw.to_lowercase();
+        for c in PADDED.captures_iter(&lower) {
+            for n in padded_readings(&c[1]) {
+                if n != "0" && !numbers.contains(&n) {
+                    numbers.push(n);
+                }
+            }
+        }
+    }
+    numbers
+}
+
 /// `_strong_numbers(raws)`.
 pub fn strong_numbers(raws: &[String]) -> HashSet<String> {
     let mut strong = HashSet::new();
@@ -763,6 +805,18 @@ mod tests {
         assert_eq!(footer_numbers(&v(&["0330M"])), v(&["330m", "330"]));
         assert_eq!(footer_numbers(&v(&["12345"])), v(&["2345", "1234"]));
         assert_eq!(footer_numbers(&v(&["abc"])), Vec::<String>::new());
+    }
+
+    #[test]
+    fn zeta_padded_numbers_survive_letter_misreads() {
+        // `C 0031` (no printed total) as the recogniser reads it
+        assert!(footer_numbers_padded(&v(&["C 0031"])).contains(&"31".to_string()));
+        assert!(footer_numbers_padded(&v(&["c oosi"])).contains(&"31".to_string()));
+        assert!(footer_numbers_padded(&v(&["c00ss"])).contains(&"55".to_string()));
+        assert!(footer_numbers_padded(&v(&["R 0ii9"])).contains(&"119".to_string()));
+        // plain words and non-padded tokens add nothing
+        assert_eq!(footer_numbers_padded(&v(&["SLZ · EN MSCH"])), footer_numbers(&v(&["SLZ · EN MSCH"])));
+        assert_eq!(footer_numbers_padded(&v(&["c ooi"])), footer_numbers(&v(&["c ooi"])));
     }
 
     #[test]

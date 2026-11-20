@@ -490,6 +490,12 @@ fn border_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
     out
 }
 
+/// Largest outer-boundary contour, as a fraction of the frame. Cards with
+/// no dark border or frame (Secret Lair "The Zeta Set": cream paper edge to
+/// edge) are found only by this edge pass, so it must also accept a card
+/// held close: a 600 px tall card in a 1920x1080 frame is ~12% of it.
+const EDGE_MAX_FRAME_FRAC: f64 = 0.40;
+
 fn edge_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
     let step = step_of(img.w, img.h);
     let gray = gray_full.stride(step);
@@ -517,7 +523,7 @@ fn edge_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
         let (short, long) = (rw.min(rh), rw.max(rh));
         let ra = rw * rh;
         let fill = a / ra;
-        if !(0.62..=0.90).contains(&(short / long)) || !(0.025 * frame_area <= ra && ra <= 0.10 * frame_area) || fill < 0.55 {
+        if !(0.62..=0.90).contains(&(short / long)) || !(0.025 * frame_area <= ra && ra <= EDGE_MAX_FRAME_FRAC * frame_area) || fill < 0.55 {
             continue;
         }
         let mut q = scale(&expand_card_quad(&box_points(&r)), step);
