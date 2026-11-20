@@ -93,7 +93,7 @@ for (const f of files) {
   rows.push({
     frame: f, ms: Math.round(ms), recCalls: reader.stats.recCalls - before.recCalls,
     status: cand ? cand.status : 'no card', sharp: cand?.sharpness, stage: r?.footer_stage, err: r?.error, ok: !!r?.ok, id: r?.scryfallId || null,
-    title: r?.title || null, footer: r?.footer_ocr, guess: r?.guess,
+    title: r?.title || null, title_raw: r?.title_raw, box: cand?.box, footer: r?.footer_ocr, guess: r?.guess,
     got: r?.ok ? `${r.title}[${r.set} ${r.num}] via ${r.via}` : (r ? `${r.error}${r.title ? ` (${r.title})` : ''}` : ''),
     server: srv, timings: out.timings,
   });
