@@ -7,13 +7,14 @@
 // classic segmentation detector (shared/cardDetectPure.mjs) keys on the
 // paper's own boundary and finds the whole card. It runs here on the same
 // 384px copy the corner model already got (no extra capture, no zoom, no
-// request), resampled to the frame's aspect at OUTLINE_W wide, without the
+// request), resampled to the frame's aspect at OUTLINE_W (160) wide, ~27 ms
+// in Node (320 px: ~98 ms, same 4/4 synthetic Zeta reads), without the
 // warp. A result is only an outline candidate: the caller decides whether to
 // read it, and never lets it replace a proven read.
 import { createDetector } from '../cardDetectPure.mjs';
 import { portraitQuad } from './imaging.mjs';
 
-export const OUTLINE_W = 320;
+export const OUTLINE_W = 160;
 let det = null;
 let buf = null;
 
