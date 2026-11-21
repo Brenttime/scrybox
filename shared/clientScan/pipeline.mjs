@@ -805,9 +805,12 @@ export function createReader(env) {
         // A type line caught by a title strip ('Summon Elemental4' under
         // Mulldrifter, 'instantClaim' on a Zeta Nature's Claim, telemetry
         // sc3zv9p4-1196/1105) is not a title line and proves nothing either way.
+        // Only a confident line that names NO card vetoes: a line naming
+        // another card is that card's own title (a pile: 'Digsite Conservator'
+        // peeking above Gishath) and competes as a candidate, as before.
         const flatText = normName(r.text).replace(/ /g, '');
-        if (!joined && r.conf >= TITLE_PROOF_CONF && flatText.length >= 6 && !TYPE_LINE_START.test(flatText)) strongTitle.push(r.text);
         const found = findCardByOcr(env.index, r.text);
+        if (!found.name && !joined && r.conf >= TITLE_PROOF_CONF && flatText.length >= 6 && !TYPE_LINE_START.test(flatText)) strongTitle.push(r.text);
         if (!found.name) continue;
         // A clipped fragment ('ulldriter') never unlocks a nearest name that
         // another title's tail matches as well (Hulldrifter / Mulldrifter).
@@ -836,20 +839,15 @@ export function createReader(env) {
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     const flat = flatTitleCrops(cands, titleRange);
     if (flat) timings.title_flat = 1;
-    // Full title on the first useful read: a frame whose first batch read a
-    // confident line that names no card is most likely a wrapped two-line
-    // title (Oboro / Obeka / Raffine). Its two ordered line bands ride in the
-    // tight-title batch (one recognizer call, 3 + 2 strips) instead of a third
-    // call after two failed ones. Never near the frame edge (the whole-stage
-    // rule must not see a band a one-line card never needed).
+    // Full title on the first read: a frame the one-line strips did not name
+    // reads three ordered line bands in the same pass (one more recognizer
+    // call). They are NOT merged into the tight batch: a different batch
+    // changes the recognizer's padding and so its reads of the tight strips
+    // (full-corpus replay: Yuriko lost its title that way).
     let lineReads = null;
     if (flat && env.titleGate) timings.title_gated = 1;
     else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
-      const tight = strips(TITLE_TIGHT, 'title2');
-      const early = !cands.length && strongTitle.length && !nearEdge && !truncated ? strips(TWO_LINE_TITLE_BANDS, 'title3') : [];
-      const reads = await recognize(env, [...tight, ...early]);
-      consider(reads.slice(0, tight.length), 2);
-      if (early.length === TWO_LINE_TITLE_BANDS.length) { lineReads = reads.slice(tight.length); timings.title_two_line_early = 1; }
+      consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
     proveTitles();
     if (!cands.length && !truncated) {

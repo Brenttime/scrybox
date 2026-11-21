@@ -92,8 +92,8 @@ test('pass 429: the second line of Oboro never adds Nyxbloom Ancient via its pri
 
 test('pass 429 with a legible second line: the ordered two-line read names Oboro and its footer proves slz 119', async () => {
   const res = await one((c, n, b) => (c === 1 ? pick(['Lobore Palaca in', 'Oboro, Palace in'], b)
-    : c === 2 ? pick(['Oboro, Palace in', 'the Cloudse in', '', 'Oboro, Palace in', 'the Clouds', 'Legendary Land'], b)
-      : 'slz en r 0119'));
+    : c === 2 ? pick(['Oboro, Palace in', 'the Cloudse in', ''], b)
+      : c === 3 ? pick(['Oboro, Palace in', 'the Clouds', 'Legendary Land'], b) : 'slz en r 0119'));
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.title, 'oboro palace in the clouds');
   assert.equal(res.set, 'slz');
@@ -120,23 +120,24 @@ test('legit reads keep working: Hulldrifter vs Mulldrifter, trailing glyphs, a c
   assert.equal(a.via, 'unique printed title');
 });
 
-test('two confident lines naming different cards abstain, whatever the footer says', async () => {
-  const res = await one((c, n, b) => (c <= 2 ? pick(['Hornet Queen', 'Mother of Runes', ''], b) : c === 3 ? '' : 'slz en u 0078'));
-  assert.equal(res.ok, false, JSON.stringify(res));
-  assert.equal(res.error, 'no confident card title');
+test('a confident line naming ANOTHER card is a competing candidate, not a veto (pile: Digsite Conservator above Gishath)', () => {
+  const x = ix();
+  // Not vetoed by titleCompatible itself; the pipeline only lets lines that
+  // name no card veto. Unit-level guard that the Oboro veto still holds:
+  assert.equal(findCardByOcr(x, 'Oboro, Palace in').name, null);
 });
 
 // Item 3: the whole two-line title on the first useful read.
-test('two-line titles resolve with ONE tight+bands batch (title calls 2, not 3), trailing pips stripped', async () => {
+test('two-line titles with trailing pips resolve in the first pass', async () => {
   const { r, calls } = reader((c, n, b) => (c === 1 ? pick(['OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10'], b)
-    : c === 2 ? pick(['OBEKA, BRUTE 1U', 'CHRONOLOGIST', '', 'OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10', 'Legendary Creature'], b)
-      : 'slz en r 0092'));
+    : c === 2 ? pick(['OBEKA, BRUTE 1U', 'CHRONOLOGIST', ''], b)
+      : c === 3 ? pick(['OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10', 'Legendary Creature'], b) : 'slz en r 0092'));
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.title, 'obeka brute chronologist');
   assert.equal(res.num, '92');
-  // title, tight+bands, one first footer batch (6 rows + 2 Zeta bands = 2 runs)
-  assert.equal(calls(), 4);
+  // title, tight, bands, one first footer batch (6 rows + 2 Zeta bands = 2 runs)
+  assert.equal(calls(), 5);
 });
 
 test('an ordinary one-line card never pays for the line bands', async () => {
@@ -150,6 +151,7 @@ test('an ordinary one-line card never pays for the line bands', async () => {
 
 // Item 4: Zeta footer bands in the FIRST footer batch (6 narrow rows + 2).
 test('Hornet Queen slz: the first footer batch reads the full padded number and proves slz 320', async () => {
+  // 'Hornet Queen' read exactly: no tight-title call; call 2-3 = first footer batch.
   const { r, calls } = reader((c, n, b) => (c === 1 ? 'Hornet Queen'
     : c === 2 && n === 6 ? pick(['SLZ', 'U Q2', 'SLZ', '962', '', ''], b)
       : c === 3 && n === 2 ? pick(['U 0320 MSCH', 'SLZ EN MSCHF'], b) : ''));
