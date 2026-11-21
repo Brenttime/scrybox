@@ -114,6 +114,7 @@ const STAMP_SOLO = Object.freeze({ ncc: 0.66, contrast: 1.10 });
 const STAMP_OWN_NUMBERING = new Set(['cmb1', 'cmb2', 'ulst', 'mb2', 'mbc']);
 // A title line read at least this sure must agree with the matched name.
 const TITLE_PROOF_CONF = 0.90;
+const TYPE_LINE_START = /^(instant|sorcery|creature|summon|legendary|land|artifact|enchantment|planeswalker|tribal|kindred|battle|basic|snow|world|token)/;
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
 // A same-frame correction, never more than the stillness tolerance: a
@@ -801,7 +802,11 @@ export function createReader(env) {
         if (!r) continue;
         if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, batch]);
         if (!r.text || r.conf < TITLE_CONF) continue;
-        if (!joined && r.conf >= TITLE_PROOF_CONF && normName(r.text).replace(/ /g, '').length >= 6) strongTitle.push(r.text);
+        // A type line caught by a title strip ('Summon Elemental4' under
+        // Mulldrifter, 'instantClaim' on a Zeta Nature's Claim, telemetry
+        // sc3zv9p4-1196/1105) is not a title line and proves nothing either way.
+        const flatText = normName(r.text).replace(/ /g, '');
+        if (!joined && r.conf >= TITLE_PROOF_CONF && flatText.length >= 6 && !TYPE_LINE_START.test(flatText)) strongTitle.push(r.text);
         const found = findCardByOcr(env.index, r.text);
         if (!found.name) continue;
         // A clipped fragment ('ulldriter') never unlocks a nearest name that

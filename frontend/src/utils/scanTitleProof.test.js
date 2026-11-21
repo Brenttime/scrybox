@@ -176,3 +176,15 @@ test('non-Zeta titles keep the 6-strip first footer batch', async () => {
   const firstFooter = sizes.indexOf(6);
   assert.notEqual(sizes[firstFooter + 1], 2, JSON.stringify(sizes));
 });
+
+test('a confident TYPE line in a title strip is not a conflicting title (sc3zv9p4-1196, -1105)', async () => {
+  const m = await one((c, n, b) => (c === 1 ? pick(['Mulldrifter4T', 'Mulldrifter4'], b)
+    : c === 2 ? pick(['Mulldrifter4', 'Summon Elemental4', 'Mulldrifter4TT'], b) : 'slz en c 0025'));
+  assert.equal(m.ok, true, JSON.stringify(m));
+  assert.equal(m.title, 'mulldrifter');
+  const x = ix();
+  assert.equal(titleCompatible(x, 'nature s claim', 'instantClaim'), false, 'would conflict if it counted');
+  const nc = await one((c, n, b) => (c === 1 ? pick(['Instantre s Claim', 'instantlaim'], b)
+    : c === 2 ? pick(['instantClaim', "Nature's Claim C", ''], b) : 'slz en c 0082'));
+  assert.equal(nc.title, 'nature s claim', JSON.stringify(nc));
+});
