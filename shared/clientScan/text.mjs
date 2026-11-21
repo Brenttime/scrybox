@@ -248,6 +248,79 @@ export function findCardByOcrUncached(ix, text, threshold = NAME_MATCH_MIN) {
   return { name: null, score: bestR };
 }
 
+// --- title proof (2026-11-20 Zeta round) -------------------------------------
+// A fuzzy name match is only a candidate; these two checks decide whether the
+// frame actually PROVES it. Real failures: the 2nd line of a wrapped title
+// ('the Cloudse in' under 'Oboro, Palace in') scored .875 against the printed
+// alias 'The Cloudsea Djinn' and added Nyxbloom Ancient fca 16 four times; a
+// clipped 'ulldriter' scored .900 against Hulldrifter while the card was
+// Mulldrifter. Neither check completes a title from anything but its own read.
+
+// Every index name (canonical and printed aliases) that maps to `title`.
+export function namesOfTitle(ix, title) {
+  if (!ix.__namesOf) {
+    const m = new Map();
+    ix.names.forEach((n, i) => { const c = ix.canonOf(i); if (!m.has(c)) m.set(c, []); m.get(c).push(n); });
+    ix.__namesOf = m;
+  }
+  return ix.__namesOf.get(title) || [title];
+}
+
+const compact = (s) => normName(s).replace(/ /g, '');
+// Longest common subsequence of a and b as a share of the shorter one.
+function cover(a, b) {
+  if (!a.length || !b.length) return 0;
+  return (ratio(a, b) * (a.length + b.length)) / 2 / Math.min(a.length, b.length);
+}
+// A read is compatible with a title when one of the title's printed names and
+// the read cover each other (the read is a line, prefix or noisy copy of the
+// name, or the name plus trailing mana/letter glyphs). 'Oboro, Palace in' vs
+// Nyxbloom Ancient / The Cloudsea Djinn: .54 / .31; real noisy reads of the
+// right card ('Instantre s Claim', 'OBEKA, BRUTE 1UE'): .92 / .77.
+export const TITLE_COMPAT_MIN = 0.70;
+export function titleCompatible(ix, title, text, min = TITLE_COMPAT_MIN) {
+  const r = compact(text);
+  if (!r) return true;
+  return namesOfTitle(ix, title).some(n => cover(r, compact(n)) >= min);
+}
+
+// A fuzzy read missing the name's leading letter(s) ('ulldriter' for
+// Hulldrifter) is a fragment: other names end the same way ('Mulldrifter').
+// It may stand for its nearest name only when no other title matches the same
+// clipped tail as well. Exact reads (score 1) are never fragments here.
+export function clippedAmbiguous(ix, text, title) {
+  const q = normName(text);
+  if (!q) return false;
+  const memo = ix.__clipMemo || (ix.__clipMemo = new Map());
+  const key = `${title}\u0000${q}`;
+  if (memo.has(key)) return memo.get(key);
+  const res = clippedAmbiguousUncached(ix, q, title);
+  memo.set(key, res);
+  if (memo.size > FIND_MEMO_MAX) memo.delete(memo.keys().next().value);
+  return res;
+}
+function clippedAmbiguousUncached(ix, q, title) {
+  for (const n of namesOfTitle(ix, title)) {
+    if (q.length >= n.length || q[0] === n[0]) continue;
+    for (let k = 1; k <= 3; k++) {
+      if (q.slice(0, 3) !== n.slice(k, k + 3)) continue;
+      const clip = (ix.__clip ||= {})[k] ||= ix.names.map(x => x.slice(k));
+      const found = extractTop2(q, clip, 0.60);
+      if (!found.length) return true;
+      const best = found[0][1];
+      // Every name whose clipped tail matches about as well as the best one.
+      const rivals = new Set();
+      for (let i = 0; i < clip.length; i++) {
+        if (Math.abs(clip[i].length - q.length) > 4) continue;
+        if (ratio(q, clip[i]) >= best - 0.02) rivals.add(ix.canonOf(i));
+        if (rivals.size > 1) return true;
+      }
+      if (!rivals.has(title)) return true;
+    }
+  }
+  return false;
+}
+
 export function uniqueTitlePrinting(ix, title) {
   // 2026-10-09 iPhone: 'Mind Roots' read as 'Mind' -> added akh 219; the
   // 2026-09-26 frames: half-covered 'Flickering Hound' -> Flicker UDS 9.

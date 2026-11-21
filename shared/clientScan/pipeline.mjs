@@ -18,11 +18,12 @@ import {
   REC_H, CARD_W, CARD_H, portraitQuad, padQuad, SERVER_PAD, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
 } from './imaging.mjs';
 import {
-  ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
+  ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting, titleCompatible, clippedAmbiguous,
   footerNumbers, footerNumbersPadded, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
 import { guessPrinting, CONTEXT_PRIMARY } from './guess.mjs';
+import { paperOutline, quadArea, pointInQuad } from './outline.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -52,6 +53,10 @@ const NEAR_EDGE_MAX_COS = Math.cos(70 * Math.PI / 180);   // corners 70-110 deg
 // so reading those only burned ~370 ms before failing. Auto waits for a
 // sharper frame instead.
 const TITLE_SHARP_FLOOR = 500;
+// Outer-paper outline (outline.mjs) acceptance: at least 4% of the frame (the
+// detector's own floor), and 1.25x the corner model's quad when it replaces
+// one (an art-only box is ~0.55 of the paper on Zeta frames).
+const OUTLINE_MIN_AREA = 0.04, OUTLINE_GROW = 1.25;
 const STILL_DRIFT = 0.012;          // mean corner move / frame diagonal
 // Auto admits a card for OCR only after a short stable WINDOW, not one pair of
 // frames: Windows telemetry (23 cards) showed the first frame that passed a
@@ -107,6 +112,9 @@ const STAMP_SOLO = Object.freeze({ ncc: 0.66, contrast: 1.10 });
 // (Unfinity foil), MB2 and Mystery Booster Commander. The footer-free stamp
 // exit never fires when a title has a printing here.
 const STAMP_OWN_NUMBERING = new Set(['cmb1', 'cmb2', 'ulst', 'mb2', 'mbc']);
+// A title line read at least this sure must agree with the matched name.
+const TITLE_PROOF_CONF = 0.90;
+const TYPE_LINE_START = /^(instant|sorcery|creature|summon|legendary|land|artifact|enchantment|planeswalker|tribal|kindred|battle|basic|snow|world|token)/;
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
 // A same-frame correction, never more than the stillness tolerance: a
@@ -162,11 +170,36 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // every pass, 2026-11-20 telemetry). Only a card still unnamed pays for it:
 // the two line bands are read in one recognizer call and their JOINED text is
 // matched like any other read (same NAME_MATCH_MIN, both lines >= TITLE_CONF).
-export const TWO_LINE_TITLE_BANDS = [[0.040, 0.80, 0.030, 0.100], [0.040, 0.80, 0.095, 0.160]];
+export const TWO_LINE_TITLE_BANDS = [[0.040, 0.80, 0.030, 0.100], [0.040, 0.80, 0.095, 0.160], [0.040, 0.80, 0.155, 0.215]];
+// The third band: a tight paper outline (outline.mjs, synthetic Zeta frames)
+// puts the two lines at ~.08-.13 / .135-.19 of the padded card, one band lower
+// than on a loose quad. Consecutive bands are joined in order (1+2, 2+3);
+// 3 bands + the 3 tight-title strips are still one recognizer call.
 export function joinTitleLines(reads) {
   const [a, b] = reads || [];
   if (!a?.text?.trim() || !b?.text?.trim() || a.conf < TITLE_CONF || b.conf < TITLE_CONF) return null;
   return { text: `${a.text.trim()} ${b.text.trim()}`, conf: Math.min(a.conf, b.conf) };
+}
+// Mana cost / letter-pip glyphs at the right end of a title line read as a
+// short trailing token ('OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10') or glued
+// digits ('Mulldrifter4T'). Only a DIGIT-LED token of at most 4 characters
+// after a real word, or a digit-led tail (<= 3) glued to a word of 4+
+// letters, is removed: it never touches letters inside a word, and the
+// result still has to match an index name by the usual rules.
+export function stripTrailingSymbols(text) {
+  const t = String(text || '').trim();
+  const sep = /^(.*[a-z]{2,}[^a-z0-9]*)\s+(\d[0-9a-z]{0,3})$/i.exec(t);
+  if (sep) return sep[1].trim();
+  const glued = /^(.*[a-z]{4,})(\d[0-9a-z]{0,2})$/i.exec(t);
+  return glued ? glued[1] : t;
+}
+// Ordered two-line candidates: the stripped join first, then the raw join.
+export function joinTitleVariants(reads) {
+  const raw = joinTitleLines(reads);
+  if (!raw) return [];
+  const [a, b] = reads;
+  const st = { text: `${stripTrailingSymbols(a.text)} ${stripTrailingSymbols(b.text)}`, conf: raw.conf };
+  return st.text === raw.text ? [raw] : [st, raw];
 }
 // One modern batch first: 6 strips cost about the same as 2 on the recognizer
 // (one ONNX run either way), and 0.86-0.94 is where modern footers resolve.
@@ -276,6 +309,14 @@ const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 const TALL_ROWS = [0.88, 0.90, 0.92, 0.94, 0.86, 0.84];
 const TALL_H = 0.025;
 const FIRST_H = 0.030;
+// Secret Lair "The Zeta Set" prints 'C 0055' over 'SLZ · EN' at the far left,
+// the number ending near x=.23 of the padded card (just past the narrow
+// strips' .22) and the code line running to ~.35. Rarity/number band and
+// code/language band, read in the FIRST footer batch for titles with a
+// printing in these sets (Mother of Runes slz 6/127/248, Hornet Queen slz
+// 78/199/320 took a ~1.03 s cascade, Hornet first guessed 78 for 320).
+const ZETA_FOOTER_SETS = new Set(['slz']);
+const ZETA_RECTS = [[0, 0.32, 0.860, 0.895], [0, 0.42, 0.878, 0.912]];
 export const FOOTER_HEIGHTS = Object.freeze({ first: FIRST_H, tall: TALL_H });
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = RETRO_ALL_ROWS;
@@ -440,6 +481,35 @@ export function createReader(env) {
   // Printing guess (opts.guess = {sets: recent added sets}); absent = the
   // old abstain/picker behaviour.
   let curGuess = null;
+  // The outline probe() returned in place of corners (outline.mjs), if any.
+  let probeOutline = null;
+  let probeSmall = null;
+
+  // An outer-paper outline worth reading: card-shaped by the near-edge rule
+  // (plausibleCard), wholly inside the 1% edge band (the near-edge whole-stage
+  // rule is never exercised by an outline), at least MIN of the frame, and,
+  // when the corner model did give a quad, clearly larger than it and
+  // containing its centre (the art box inside the paper).
+  function outlineCandidate(small, ch, w, h, primary) {
+    const o = paperOutline(small, CORN_SIZE, CORN_SIZE, ch, w, h);
+    if (!o) return null;
+    const q = o.quad;
+    const ex = Math.max(2, EDGE_FRAC * w), ey = Math.max(2, EDGE_FRAC * h);
+    if (!q.every(p => p.x > ex && p.x < w - ex && p.y > ey && p.y < h - ey)) return null;
+    if (!plausibleCard(q)) return null;
+    // Every strip of every stage is projected through the PADDED outline, so
+    // that whole footprint must lie in the frame (no partial stages, ever).
+    if (!padQuad(q).every(p => p.x >= 0 && p.x <= w - 1 && p.y >= 0 && p.y <= h - 1)) return null;
+    const area = quadArea(q);
+    if (area < OUTLINE_MIN_AREA * w * h) return null;
+    if (primary) {
+      const pa = quadArea(primary);
+      if (area < OUTLINE_GROW * pa) return null;
+      const cx = primary.reduce((s, p) => s + p.x, 0) / 4, cy = primary.reduce((s, p) => s + p.y, 0) / 4;
+      if (!pointInQuad(q, cx, cy)) return null;
+    }
+    return q;
+  }
 
   async function detect(small, channels, frameW, frameH) {
     const out = await env.cornelius.run({ image: corneliusTensor(env.ort, small, channels) });
@@ -456,14 +526,26 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known, frameId = null, guess = null } = opts;
+    const { requireStill = false, quad: known, frameId = null, guess = null } = opts;
+    let smallChannels = opts.smallChannels ?? 4;
+    // The browser worker passes no small copy to read(): use probe()'s.
+    if (!small && known && probeSmall) { small = probeSmall.data; smallChannels = probeSmall.ch; }
+    probeSmall = null;
     curFrameId = frameId;
     curGuess = guess && typeof guess === 'object' ? { sets: Array.isArray(guess.sets) ? guess.sets.slice(0, CONTEXT_PRIMARY) : [] } : null;
     if (stampPres?.confirm && (frameId == null || typeof frameId !== stampPres.confirm.src)) stampPres.confirm = null;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
-    const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
+    let quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
+    // Outline-only card: probe() supplied it, or (replay, no probe) the
+    // corner model found nothing here and the outline did.
+    let outlineOnly = !!(known && probeOutline && known.length === 4 && known.every((p, i) => p.x === probeOutline[i].x && p.y === probeOutline[i].y));
+    if (known === undefined && !quad && env.paperOutline !== false && small) {
+      quad = outlineCandidate(small, smallChannels, w, h, null);
+      outlineOnly = !!quad;
+    }
+    probeOutline = null;
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
     if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; return base; }
@@ -495,7 +577,7 @@ export function createReader(env) {
     // auto it never advances the settle window and is never read.
     if (requireStill && frameId != null && frameId === lastFrameId && lastQuad) {
       cand.duplicate = true; cand.status = 'settling'; cand.still = stillRun;
-      return base;
+      return outlineOnly ? { ...base, candidates: [] } : base;
     }
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
@@ -524,7 +606,20 @@ export function createReader(env) {
     lastAt = tNow;
     readSince = false;
     let m = cardToFrame(padQuad(quad));
-    const sharp = titleSharpness(rgba, w, h, m);
+    let sharp = titleSharpness(rgba, w, h, m);
+    // A 'too blurry' corner quad that is really a sharp card's art box (the
+    // CMYK Cathartic Reunion fixture: [787,429,356,195], on the illustration):
+    // the outer-paper outline, when it is sharp, is read instead.
+    if (!outlineOnly && sharp < TITLE_SHARP_FLOOR && !clipped && !nearEdge && env.paperOutline !== false && small) {
+      const to = now();
+      const o = outlineCandidate(small, smallChannels, w, h, quad);
+      if (o) {
+        const mo = cardToFrame(padQuad(o));
+        const so = titleSharpness(rgba, w, h, mo);
+        if (so >= TITLE_SHARP_FLOOR) { quad = o; m = mo; sharp = so; cand.quad = o.map(p => [p.x, p.y]); cand.outline = 1; outlineOnly = 'blur'; timings.outline = 'sharp'; }
+      }
+      timings.outline_ms = Math.round(now() - to);
+    }
     cand.sharpness = Math.round(sharp * 10) / 10;
     // Fast settle needs real decoded-frame numbers (rVFC), not fingerprints.
     if (sharp < FAST_SETTLE_SHARP || typeof frameId !== 'number') fastRun = false;
@@ -552,7 +647,7 @@ export function createReader(env) {
     // 'settling' is a still card waiting out its window: nothing about it
     // suggests a swap, so tracking and pooled evidence survive it.
     if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; guessed = null; evidence = null; stampPres = null; }
-    if (!cand.eligible) return base;
+    if (!cand.eligible) return outlineOnly ? { ...base, candidates: [] } : base;
 
     // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
     // model's validated input): the caller's 384px copy comes from a cheap
@@ -579,7 +674,7 @@ export function createReader(env) {
       timings.total_ms = Math.round(now() - t0);
       return base;
     }
-    if (env.refineCorners !== false) {
+    if (env.refineCorners !== false && !outlineOnly) {
       const tr = now();
       const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
       const move = fine ? fine.reduce((s, p, i) => s + Math.hypot(p.x - quad[i].x, p.y - quad[i].y), 0) / 4 / diag : Infinity;
@@ -599,7 +694,35 @@ export function createReader(env) {
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
     const verifying = !!guessed && !nearEdge;
     if (verifying) timings.guess_verify = 1;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
+    let result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
+    // The corner model's quad gave no title: try the outer-paper outline of
+    // the same frame once (outline.mjs). Never on a near-edge card, never
+    // over a read that named a card, and only an outline clearly larger than
+    // the quad and around it (an art-only box). The outline read is a whole
+    // new read of this frame by the same rules; if it names no card either,
+    // the first result stands.
+    if (!outlineOnly && !result.ok && !result.title && !result.near_edge_partial && !nearEdge && env.paperOutline !== false && small) {
+      const to = now();
+      const o = outlineCandidate(small, smallChannels, w, h, readQuad);
+      if (o) {
+        const mo = cardToFrame(padQuad(o));
+        if (titleSharpness(rgba, w, h, mo) >= TITLE_SHARP_FLOOR) {
+          const t2 = {};
+          const r2 = await readCard(rgba, w, h, mo, t2, prior, requireStill && !lastDeferred && !verifying, false, o, requireStill && frameId != null, verifying);
+          if (r2.ok || r2.title) {
+            result = r2; Object.assign(timings, t2); cand.quad = o.map(p => [p.x, p.y]); cand.outline = 1; timings.outline = 'used';
+          } else timings.outline = 'tried';
+        } else timings.outline = 'blurry';
+      }
+      timings.outline_ms = Math.round(now() - to);
+    }
+    // An outline-only card that names nothing was never a card: same answer
+    // as before the outline existed ('no card').
+    if (outlineOnly === true && !result.ok && !result.title) {
+      lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null;
+      return { ...base, candidates: [], timings: { detect_ms: timings.detect_ms, outline: 'none', outline_ms: Math.round(now() - t0) } };
+    }
+    if (outlineOnly === true) { cand.outline = 1; timings.outline = "only"; }
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -672,14 +795,39 @@ export function createReader(env) {
     // Every title read, accepted or not, for scan telemetry: a failed title
     // otherwise leaves no trace of what the recognizer actually saw.
     const titleRaw = [];
-    const consider = (reads, batch) => {
+    // `joined` reads (two-line joins) are candidates only: a join of the
+    // wrong band pair ('the Clouds' + 'Legendary Land') proves nothing.
+    const consider = (reads, batch, joined = false) => {
       for (const r of reads) {
         if (!r) continue;
         if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, batch]);
         if (!r.text || r.conf < TITLE_CONF) continue;
+        // A type line caught by a title strip ('Summon Elemental4' under
+        // Mulldrifter, 'instantClaim' on a Zeta Nature's Claim, telemetry
+        // sc3zv9p4-1196/1105) is not a title line and proves nothing either way.
+        // Only a confident line that names NO card vetoes: a line naming
+        // another card is that card's own title (a pile: 'Digsite Conservator'
+        // peeking above Gishath) and competes as a candidate, as before.
+        const flatText = normName(r.text).replace(/ /g, '');
         const found = findCardByOcr(env.index, r.text);
-        if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
+        if (!found.name && !joined && r.conf >= TITLE_PROOF_CONF && flatText.length >= 6 && !TYPE_LINE_START.test(flatText)) strongTitle.push(r.text);
+        if (!found.name) continue;
+        // A clipped fragment ('ulldriter') never unlocks a nearest name that
+        // another title's tail matches as well (Hulldrifter / Mulldrifter).
+        if (found.score < 1 && clippedAmbiguous(env.index, r.text, found.name)) { timings.title_clipped = 1; continue; }
+        cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
+    };
+    // Title proof: every confident line read on this frame must be compatible
+    // with the name. 'the Cloudse in' matched the alias The Cloudsea Djinn
+    // (Nyxbloom Ancient) while the same frame read 'Oboro, Palace in' at 1.0:
+    // such a name is dropped before ANY exit (unique title, printed alias,
+    // footer, guess); the ordered two-line read of this frame may still name
+    // the card, otherwise the frame abstains.
+    const strongTitle = [];
+    const proveTitles = () => {
+      const keep = cands.filter(c => strongTitle.every(t => titleCompatible(env.index, c.name, t)));
+      if (keep.length < cands.length) { timings.title_conflict = 1; cands.length = 0; cands.push(...keep); }
     };
     const t1 = strips(TITLE_FIRST, 'title1');
     const titleRange = t1.map(s => s.range);
@@ -691,16 +839,27 @@ export function createReader(env) {
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     const flat = flatTitleCrops(cands, titleRange);
     if (flat) timings.title_flat = 1;
+    // Full title on the first read: a frame the one-line strips did not name
+    // reads three ordered line bands in the same pass (one more recognizer
+    // call). They are NOT merged into the tight batch: a different batch
+    // changes the recognizer's padding and so its reads of the tight strips
+    // (full-corpus replay: Yuriko lost its title that way).
+    let lineReads = null;
     if (flat && env.titleGate) timings.title_gated = 1;
     else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
+    proveTitles();
     if (!cands.length && !truncated) {
-      const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
-      if (lines.length === 2) {
-        const reads = await recognize(env, lines);
-        const joined = joinTitleLines(reads);
-        if (joined) { timings.title_two_line = 1; consider([joined], 3); }
+      if (!lineReads) {
+        const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
+        if (lines.length === TWO_LINE_TITLE_BANDS.length) lineReads = await recognize(env, lines);
+      }
+      if (lineReads) {
+        for (const r of lineReads) if (r?.text && titleRaw.length < 10) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, 3]);
+        const joined = [];
+        for (let i = 0; i + 1 < lineReads.length; i++) joined.push(...joinTitleVariants(lineReads.slice(i, i + 2)));
+        if (joined.length) { timings.title_two_line = 1; for (const j of joined) consider([j], 3, true); proveTitles(); }
       }
     }
     timings.title_ms = Math.round(now() - tA);
@@ -888,6 +1047,7 @@ export function createReader(env) {
     };
     // A title with a reprint-sheet or Mystery Booster printing (plst '<SET>-N',
     // or a set that stamps under its own numbering such as mb2).
+    const zetaTitle = (ix.byTitle[name] || []).some(o => ZETA_FOOTER_SETS.has(ix.printings[o][1]));
     const sheetLike = (ix.byTitle[name] || []).some(o => ph[o].sheet || STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
     // A printing under its own Mystery Booster numbering (mb2 232): its only
     // number is on the copyright line, so that line is the useful read. A
@@ -933,7 +1093,14 @@ export function createReader(env) {
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
       const hgt = stage === 'tall' ? TALL_H : si === 0 ? FIRST_H : 0.025;
       const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + hgt]);
+      // Zeta-style footer (title has a printing in a ZETA_FOOTER_SETS set):
+      // the first batch also reads a wider number band and a separate
+      // code/language band, so 'U 0320' is not clipped to 'U Q2' / '962'.
+      const zeta = si === 0 && zetaTitle;
+      if (zeta) { rects.push(...ZETA_RECTS); timings.zeta_bands = 1; }
       const reads = await recognize(env, strips(rects, `footer${si}`));
+      // Their reads join the same evidence: two different numbers of the
+      // title on this frame leave resolveFooterGroup ambiguous (null).
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       let g = resolveFooterGroup(ix, name, footerCodes(ix, raws), footerNumbersPadded(raws), strongNumbers(raws));
@@ -1028,8 +1195,19 @@ export function createReader(env) {
   // Corners only, from the 384px copy. A null here is a definite "no card" and
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
-    const quad = await detect(small, smallChannels, w, h);
+    let quad = await detect(small, smallChannels, w, h);
+    probeOutline = null;
+    // No corners: the outer-paper outline of the same 384px copy may still
+    // find a card (borderless cream paper the corner model misses). Only a
+    // read that then names the card counts; otherwise it stays 'no card'.
+    if (!quad && env.paperOutline !== false) {
+      const o = outlineCandidate(small, smallChannels, w, h, null);
+      if (o) { quad = o; probeOutline = o; }
+    }
     if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }
+    // read() gets only the full frame in the browser (the 384px copy goes back
+    // to the main thread): keep a copy for its outline check.
+    probeSmall = quad && env.paperOutline !== false ? { data: Uint8ClampedArray.from(small), ch: smallChannels } : null;
     return quad;
   }
 
