@@ -18,7 +18,7 @@ import {
   REC_H, CARD_W, CARD_H, portraitQuad, padQuad, SERVER_PAD, cardToFrame, sampleStrip, artSignature, cosine, titleSharpness, resizeLanczos3,
 } from './imaging.mjs';
 import {
-  ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting,
+  ctcDecode, findCardByOcr, normName, uniqueTitlePrinting, uniqueOcrPrinting, titleCompatible, clippedAmbiguous,
   footerNumbers, footerNumbersPadded, footerCodes, resolveFooterGroup, retroNumber, strongNumbers, looksLikeCopyright, voteFooterGroup, physicalTwins, normalizeCollector,
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
@@ -107,6 +107,8 @@ const STAMP_SOLO = Object.freeze({ ncc: 0.66, contrast: 1.10 });
 // (Unfinity foil), MB2 and Mystery Booster Commander. The footer-free stamp
 // exit never fires when a title has a printing here.
 const STAMP_OWN_NUMBERING = new Set(['cmb1', 'cmb2', 'ulst', 'mb2', 'mbc']);
+// A title line read at least this sure must agree with the matched name.
+const TITLE_PROOF_CONF = 0.90;
 const TITLE_CONF = 0.60, FOOTER_CONF = 0.45, RETRO_CONF = 0.60;
 const TITLE_EXACT_CONF = 0.90;
 // A same-frame correction, never more than the stillness tolerance: a
@@ -677,9 +679,25 @@ export function createReader(env) {
         if (!r) continue;
         if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, batch]);
         if (!r.text || r.conf < TITLE_CONF) continue;
+        if (r.conf >= TITLE_PROOF_CONF && normName(r.text).replace(/ /g, '').length >= 6) strongTitle.push(r.text);
         const found = findCardByOcr(env.index, r.text);
-        if (found.name) cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
+        if (!found.name) continue;
+        // A clipped fragment ('ulldriter') never unlocks a nearest name that
+        // another title's tail matches as well (Hulldrifter / Mulldrifter).
+        if (found.score < 1 && clippedAmbiguous(env.index, r.text, found.name)) { timings.title_clipped = 1; continue; }
+        cands.push({ score: found.score, conf: r.conf, name: found.name, raw: r.text });
       }
+    };
+    // Title proof: every confident line read on this frame must be compatible
+    // with the name. 'the Cloudse in' matched the alias The Cloudsea Djinn
+    // (Nyxbloom Ancient) while the same frame read 'Oboro, Palace in' at 1.0:
+    // such a name is dropped before ANY exit (unique title, printed alias,
+    // footer, guess); the ordered two-line read of this frame may still name
+    // the card, otherwise the frame abstains.
+    const strongTitle = [];
+    const proveTitles = () => {
+      const keep = cands.filter(c => strongTitle.every(t => titleCompatible(env.index, c.name, t)));
+      if (keep.length < cands.length) { timings.title_conflict = 1; cands.length = 0; cands.push(...keep); }
     };
     const t1 = strips(TITLE_FIRST, 'title1');
     const titleRange = t1.map(s => s.range);
@@ -695,12 +713,13 @@ export function createReader(env) {
     else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
       consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
     }
+    proveTitles();
     if (!cands.length && !truncated) {
       const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
       if (lines.length === 2) {
         const reads = await recognize(env, lines);
         const joined = joinTitleLines(reads);
-        if (joined) { timings.title_two_line = 1; consider([joined], 3); }
+        if (joined) { timings.title_two_line = 1; consider([joined], 3); proveTitles(); }
       }
     }
     timings.title_ms = Math.round(now() - tA);
