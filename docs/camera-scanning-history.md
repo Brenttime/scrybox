@@ -415,6 +415,32 @@ The title is never guessed.
   adds, bulk-add index, multi-card scope, per-place card records that end on
   lift, move, sustained motion or another title, double-faced names).
 
+## Zeta round 2: title proof, paper outline, two-line titles, Zeta footer bands (PR #158, 2026-11-21)
+Client only (`shared/clientScan/*`, `shared/cardDetectPure.mjs` warp:false option).
+- Title proof before every exit: a confident (>=.90) title line that names no
+  card must be compatible (LCS cover >=.70) with the matched name or the name
+  is dropped (alias 'The Cloudsea Djinn' from 'the Cloudse in' added Nyxbloom
+  Ancient fca 16 x4); type lines ('Summon Elemental4') don't count; a line
+  naming another card still only competes (piles). Clipped fuzzy reads
+  ('ulldriter') are dropped when another title's clipped tail matches as well.
+  Over all 2,500 logged title_raw arrays only the 10 known-wrong passes change.
+- Outer-paper outline (`outline.mjs`, 240 px from the 384 copy, ~56 ms) on
+  no corners, a 'too blurry' art box, or a title miss; only card-shaped, fully
+  in frame incl. padded strip footprint, 1.25x the quad and around it. An
+  outline-only read that names nothing stays 'no card'.
+- Two-line title: three ordered bands joined pairwise, digit-led trailing pips
+  stripped, joins are candidates only. Merging the bands into the tight batch
+  was tried and dropped: it changed the recognizer's reads (lost Yuriko).
+- slz titles: number band to x=.32 + code band in the first footer batch.
+- Results: synthetic Zeta fixtures 1/4 -> 4/4 proven. Full saved corpus (2,414
+  decodable frames, same load): cold identical (0 lost/changed/gained);
+  stream+auto+guess 0 lost, 0 changed, +2 (Burner Rocket, Unsummon; titles
+  checked, printings marked guesses). Cost: no-card frames p50 29 -> 107 ms,
+  title-miss frames p50 +~240 ms, rec calls 3.45 -> 3.47.
+- Open: B1 set-code digits as collector numbers ('M21·EN' -> #21), B3
+  art-signature cache emits identity without OCR, B4 generic near-edge
+  footprint check (done only for outline quads); outline cost on empty frames.
+
 ## Known open items
 - Measure the scanguess build on a real round (`guess` field in telemetry).
 - Title misses on sharp sos cards (Charging Strifeknight, Expressive
