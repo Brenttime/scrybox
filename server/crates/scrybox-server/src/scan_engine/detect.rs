@@ -201,7 +201,13 @@ pub fn order_card_quad(p: &Quad) -> Quad {
 
 /// `_expand_card_quad(quad)` with the default side/top/bottom.
 fn expand_card_quad(q: &Quad) -> Quad {
-    let (side, top, bottom) = (0.015f32, 0.01f32, 0.07f32);
+    expand_card_quad_by(q, 1.0)
+}
+
+/// `expand_card_quad` with its margins scaled by `k` (1.0 = the full
+/// border-pass margins, 0.0 = the outline itself).
+fn expand_card_quad_by(q: &Quad, k: f32) -> Quad {
+    let (side, top, bottom) = (0.015f32 * k, 0.01f32 * k, 0.07f32 * k);
     let [tl, tr, br, bl] = order_card_quad(q);
     let te = sub(tr, tl);
     let be = sub(br, bl);
@@ -527,10 +533,35 @@ fn edge_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
             continue;
         }
         let mut q = scale(&expand_card_quad(&box_points(&r)), step);
+        let mut anchor = "outer-boundary";
+        if quad_in_edge_band(&q, img.w, img.h) {
+            // The outer boundary IS the card edge (no inner border to grow
+            // from), so the border-pass expansion is only margin. When that
+            // margin alone reaches the frame edge band, use the tight outline
+            // instead of a clipped quad that would be rejected (or read from
+            // replicated border pixels) as "touches frame edge".
+            // Keep as much of the margin as fits: the footer/title strip rows
+            // are tuned on the expanded crop.
+            for k in [0.75f32, 0.5, 0.25, 0.0] {
+                let t = scale(&expand_card_quad_by(&box_points(&r), k), step);
+                if !quad_in_edge_band(&t, img.w, img.h) {
+                    q = t;
+                    anchor = "outer-boundary-tight";
+                    break;
+                }
+            }
+        }
         clip(&mut q, img.w, img.h);
-        out.push(cand(quad_box(&q), Some(quad_round_py(&q)), py_round(4.30 + 0.08 * fill.min(1.0), 3), "edge", "outer-boundary", Some(py_round(r.angle as f64, 1))));
+        out.push(cand(quad_box(&q), Some(quad_round_py(&q)), py_round(4.30 + 0.08 * fill.min(1.0), 3), "edge", anchor, Some(py_round(r.angle as f64, 1))));
     }
     out
+}
+
+/// Any corner inside the 1% frame-edge band `detect_uploaded_scene` rejects.
+fn quad_in_edge_band(q: &Quad, w: usize, h: usize) -> bool {
+    let ex = 2.max((0.01 * w as f64) as i64) as f32;
+    let ey = 2.max((0.01 * h as f64) as i64) as f32;
+    q.iter().any(|p| p[0] <= ex || p[1] <= ey || p[0] >= w as f32 - ex || p[1] >= h as f32 - ey)
 }
 
 fn touches_edge(b: &[i64; 4], fw: i64, fh: i64) -> bool {
@@ -563,6 +594,17 @@ fn drop_art_windows(c: Vec<Cand>) -> Vec<Cand> {
     c.into_iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| c).collect()
 }
 
+/// A quad-backed candidate whose box has card proportions (portrait or
+/// landscape, a few degrees of tilt).
+fn card_shaped(c: &Cand) -> bool {
+    let [_, _, w, h] = c.bx;
+    if c.quad.is_none() || w <= 0 || h <= 0 {
+        return false;
+    }
+    let r = w.min(h) as f64 / w.max(h) as f64;
+    (0.60..=0.86).contains(&r)
+}
+
 fn overlap(a: &[i64; 4], b: &[i64; 4]) -> (i64, i64, i64) {
     let [bx, by, bw, bh] = *a;
     let [ex, ey, ew, eh] = *b;
@@ -591,16 +633,22 @@ fn merge(c: Vec<Cand>, fw: i64, fh: i64) -> Vec<Cand> {
                 && smaller != 0
                 && inter as f64 / smaller as f64 >= 0.35;
             if (union != 0 && inter as f64 / union as f64 >= 0.45) || (smaller != 0 && inter as f64 / smaller as f64 >= 0.75) || twin {
-                dup = true;
-                if touches_edge(&e.bx, fw, fh)
-                    && !touches_edge(&cd.bx, fw, fh)
-                    && (bw * bh) as f64 >= 0.75 * (ew * eh) as f64
-                    && cd.score >= e.score - 0.2
-                {
+                let edge_over_inner = touches_edge(&e.bx, fw, fh) && !touches_edge(&cd.bx, fw, fh);
+                if edge_over_inner && (bw * bh) as f64 >= 0.75 * (ew * eh) as f64 && cd.score >= e.score - 0.2 {
+                    dup = true;
                     // selected.index(existing): first equal dict — the same slot
                     let first = sel.iter().position(|s| s.json == e.json).unwrap_or(i);
                     sel[first] = cd.clone();
+                    break;
                 }
+                if edge_over_inner && card_shaped(&cd) {
+                    // Edge status is per candidate: an outline that grew into
+                    // the frame edge (light card on a light table) must not
+                    // swallow a smaller, in-frame, card-shaped outline of the
+                    // same card. Keep evaluating it as its own candidate.
+                    continue;
+                }
+                dup = true;
                 break;
             }
         }
@@ -1138,5 +1186,38 @@ mod cv5_parity_tests {
             assert_eq!((m.w, m.h), (f(&r["wh"][0]), f(&r["wh"][1])), "{r}");
             assert!((m.angle - f(&r["angle"])).abs() < 1e-4, "{r}: {}", m.angle);
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_edge_tests {
+    use super::*;
+
+    fn q(b: [i64; 4]) -> Option<[[f64; 2]; 4]> {
+        let [x, y, w, h] = b.map(|v| v as f64);
+        Some([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+    }
+
+    /// Edge status is per candidate: an outline grown into the frame edge
+    /// must not swallow a smaller in-frame card outline of the same card.
+    #[test]
+    fn edge_touching_outline_keeps_inner_card_candidate() {
+        let big = [10, 60, 760, 1000]; // touches the left 1% band
+        let inner = [120, 160, 470, 660]; // card-shaped, well inside
+        let c = vec![cand(big, q(big), 4.40, "edge", "outer-boundary", None), cand(inner, q(inner), 4.30, "border", "enclosing-border", None)];
+        let out = merge(c, 1920, 1080);
+        assert!(out.iter().any(|c| c.bx == inner), "{:?}", out.iter().map(|c| c.bx).collect::<Vec<_>>());
+        // a non-card-shaped inner box (art window) is still a duplicate
+        let art = [120, 160, 470, 300];
+        let c = vec![cand(big, q(big), 4.40, "edge", "outer-boundary", None), cand(art, q(art), 4.30, "border", "enclosing-border", None)];
+        assert!(!merge(c, 1920, 1080).iter().any(|c| c.bx == art));
+    }
+
+    #[test]
+    fn edge_band_corner_test() {
+        let inside: Quad = [[30.0, 30.0], [500.0, 30.0], [500.0, 700.0], [30.0, 700.0]];
+        assert!(!quad_in_edge_band(&inside, 1920, 1080));
+        let touching: Quad = [[5.0, 30.0], [500.0, 30.0], [500.0, 700.0], [5.0, 700.0]];
+        assert!(quad_in_edge_band(&touching, 1920, 1080));
     }
 }
