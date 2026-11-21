@@ -169,11 +169,36 @@ const TITLE_TIGHT = [[0.045, 0.80, 0.045, 0.140], [0.050, 0.80, 0.090, 0.170], [
 // every pass, 2026-11-20 telemetry). Only a card still unnamed pays for it:
 // the two line bands are read in one recognizer call and their JOINED text is
 // matched like any other read (same NAME_MATCH_MIN, both lines >= TITLE_CONF).
-export const TWO_LINE_TITLE_BANDS = [[0.040, 0.80, 0.030, 0.100], [0.040, 0.80, 0.095, 0.160]];
+export const TWO_LINE_TITLE_BANDS = [[0.040, 0.80, 0.030, 0.100], [0.040, 0.80, 0.095, 0.160], [0.040, 0.80, 0.155, 0.215]];
+// The third band: a tight paper outline (outline.mjs, synthetic Zeta frames)
+// puts the two lines at ~.08-.13 / .135-.19 of the padded card, one band lower
+// than on a loose quad. Consecutive bands are joined in order (1+2, 2+3);
+// 3 bands + the 3 tight-title strips are still one recognizer call.
 export function joinTitleLines(reads) {
   const [a, b] = reads || [];
   if (!a?.text?.trim() || !b?.text?.trim() || a.conf < TITLE_CONF || b.conf < TITLE_CONF) return null;
   return { text: `${a.text.trim()} ${b.text.trim()}`, conf: Math.min(a.conf, b.conf) };
+}
+// Mana cost / letter-pip glyphs at the right end of a title line read as a
+// short trailing token ('OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10') or glued
+// digits ('Mulldrifter4T'). Only a DIGIT-LED token of at most 4 characters
+// after a real word, or a digit-led tail (<= 3) glued to a word of 4+
+// letters, is removed: it never touches letters inside a word, and the
+// result still has to match an index name by the usual rules.
+export function stripTrailingSymbols(text) {
+  const t = String(text || '').trim();
+  const sep = /^(.*[a-z]{2,}[^a-z0-9]*)\s+(\d[0-9a-z]{0,3})$/i.exec(t);
+  if (sep) return sep[1].trim();
+  const glued = /^(.*[a-z]{4,})(\d[0-9a-z]{0,2})$/i.exec(t);
+  return glued ? glued[1] : t;
+}
+// Ordered two-line candidates: the stripped join first, then the raw join.
+export function joinTitleVariants(reads) {
+  const raw = joinTitleLines(reads);
+  if (!raw) return [];
+  const [a, b] = reads;
+  const st = { text: `${stripTrailingSymbols(a.text)} ${stripTrailingSymbols(b.text)}`, conf: raw.conf };
+  return st.text === raw.text ? [raw] : [st, raw];
 }
 // One modern batch first: 6 strips cost about the same as 2 on the recognizer
 // (one ONNX run either way), and 0.86-0.94 is where modern footers resolve.
@@ -761,12 +786,14 @@ export function createReader(env) {
     // Every title read, accepted or not, for scan telemetry: a failed title
     // otherwise leaves no trace of what the recognizer actually saw.
     const titleRaw = [];
-    const consider = (reads, batch) => {
+    // `joined` reads (two-line joins) are candidates only: a join of the
+    // wrong band pair ('the Clouds' + 'Legendary Land') proves nothing.
+    const consider = (reads, batch, joined = false) => {
       for (const r of reads) {
         if (!r) continue;
         if (r?.text && titleRaw.length < 8) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, batch]);
         if (!r.text || r.conf < TITLE_CONF) continue;
-        if (r.conf >= TITLE_PROOF_CONF && normName(r.text).replace(/ /g, '').length >= 6) strongTitle.push(r.text);
+        if (!joined && r.conf >= TITLE_PROOF_CONF && normName(r.text).replace(/ /g, '').length >= 6) strongTitle.push(r.text);
         const found = findCardByOcr(env.index, r.text);
         if (!found.name) continue;
         // A clipped fragment ('ulldriter') never unlocks a nearest name that
@@ -796,17 +823,32 @@ export function createReader(env) {
     const exact = cands.length > 0 && cands.every(c => c.score === 1 && c.conf >= TITLE_EXACT_CONF && c.name === cands[0].name);
     const flat = flatTitleCrops(cands, titleRange);
     if (flat) timings.title_flat = 1;
+    // Full title on the first useful read: a frame whose first batch read a
+    // confident line that names no card is most likely a wrapped two-line
+    // title (Oboro / Obeka / Raffine). Its two ordered line bands ride in the
+    // tight-title batch (one recognizer call, 3 + 2 strips) instead of a third
+    // call after two failed ones. Never near the frame edge (the whole-stage
+    // rule must not see a band a one-line card never needed).
+    let lineReads = null;
     if (flat && env.titleGate) timings.title_gated = 1;
     else if (!exact && (!cands.length || Math.max(...cands.map(c => c.name.length)) < 12)) {
-      consider(await recognize(env, strips(TITLE_TIGHT, 'title2')), 2);
+      const tight = strips(TITLE_TIGHT, 'title2');
+      const early = !cands.length && strongTitle.length && !nearEdge && !truncated ? strips(TWO_LINE_TITLE_BANDS, 'title3') : [];
+      const reads = await recognize(env, [...tight, ...early]);
+      consider(reads.slice(0, tight.length), 2);
+      if (early.length === TWO_LINE_TITLE_BANDS.length) { lineReads = reads.slice(tight.length); timings.title_two_line_early = 1; }
     }
     proveTitles();
     if (!cands.length && !truncated) {
-      const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
-      if (lines.length === 2) {
-        const reads = await recognize(env, lines);
-        const joined = joinTitleLines(reads);
-        if (joined) { timings.title_two_line = 1; consider([joined], 3); proveTitles(); }
+      if (!lineReads) {
+        const lines = strips(TWO_LINE_TITLE_BANDS, 'title3');
+        if (lines.length === TWO_LINE_TITLE_BANDS.length) lineReads = await recognize(env, lines);
+      }
+      if (lineReads) {
+        for (const r of lineReads) if (r?.text && titleRaw.length < 10) titleRaw.push([r.text.slice(0, 60), Math.round(r.conf * 100) / 100, 3]);
+        const joined = [];
+        for (let i = 0; i + 1 < lineReads.length; i++) joined.push(...joinTitleVariants(lineReads.slice(i, i + 2)));
+        if (joined.length) { timings.title_two_line = 1; for (const j of joined) consider([j], 3, true); proveTitles(); }
       }
     }
     timings.title_ms = Math.round(now() - tA);

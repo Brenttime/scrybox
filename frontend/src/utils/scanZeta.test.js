@@ -99,9 +99,11 @@ function sharpFrame(w = 200, h = 280) {
 }
 const small = new Uint8ClampedArray(CORN_SIZE * CORN_SIZE * 4);
 
-// Calls: 1 title (2 strips), 2 tight title (3 strips), 3 two-line bands (2), 4+ footer.
+// Calls: 1 title (2 strips), 2 tight title (3 strips) + the 3 line bands when
+// batch 1 read a confident fragment, else 3 = line bands; then footer.
 test('pipeline: a wrapped two-line title (Oboro, Palace in / the Clouds) is matched and its padded footer proves slz 119', async () => {
-  const { r } = reader((c, n, b) => (c <= 2 ? 'oboro palace in' : c === 3 ? ['oboro palace in', 'the clouds'][b] : 'slz en r 0119'));
+  // A confident fragment in batch 1 puts the line bands into batch 2 (strips 3-5).
+  const { r } = reader((c, n, b) => (c === 1 ? 'oboro palace in' : c === 2 ? (b < 3 ? 'oboro palace in' : ['oboro palace in', 'the clouds', 'legendary land'][b - 3]) : 'slz en r 0119'));
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.title, 'oboro palace in the clouds');

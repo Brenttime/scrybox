@@ -92,8 +92,8 @@ test('pass 429: the second line of Oboro never adds Nyxbloom Ancient via its pri
 
 test('pass 429 with a legible second line: the ordered two-line read names Oboro and its footer proves slz 119', async () => {
   const res = await one((c, n, b) => (c === 1 ? pick(['Lobore Palaca in', 'Oboro, Palace in'], b)
-    : c === 2 ? pick(['Oboro, Palace in', 'the Cloudse in', ''], b)
-      : c === 3 ? pick(['Oboro, Palace in', 'the Clouds'], b) : 'slz en r 0119'));
+    : c === 2 ? pick(['Oboro, Palace in', 'the Cloudse in', '', 'Oboro, Palace in', 'the Clouds', 'Legendary Land'], b)
+      : 'slz en r 0119'));
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.title, 'oboro palace in the clouds');
   assert.equal(res.set, 'slz');
@@ -124,4 +124,23 @@ test('two confident lines naming different cards abstain, whatever the footer sa
   const res = await one((c, n, b) => (c <= 2 ? pick(['Hornet Queen', 'Mother of Runes', ''], b) : c === 3 ? '' : 'slz en u 0078'));
   assert.equal(res.ok, false, JSON.stringify(res));
   assert.equal(res.error, 'no confident card title');
+});
+
+// Item 3: the whole two-line title on the first useful read.
+test('two-line titles resolve with ONE tight+bands batch (title calls 2, not 3), trailing pips stripped', async () => {
+  const { r, calls } = reader((c, n, b) => (c === 1 ? pick(['OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10'], b)
+    : c === 2 ? pick(['OBEKA, BRUTE 1U', 'CHRONOLOGIST', '', 'OBEKA, BRUTE 1UE', 'CHRONOLOGIST 10', 'Legendary Creature'], b)
+      : 'slz en r 0092'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.title, 'obeka brute chronologist');
+  assert.equal(res.num, '92');
+  assert.equal(calls(), 3, 'title, tight+bands, one footer batch');
+});
+
+test('an ordinary one-line card never pays for the line bands', async () => {
+  const { r, calls } = reader((c, n, b) => (c === 1 ? pick(['Mother of Runes', 'Mother of Runes'], b) : 'slz en u 0006'));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(calls(), 2);
 });
