@@ -341,7 +341,28 @@ pub fn batch_scene_printings(ctx: &Ctx, images: &[Rgb], titles: &[Title]) -> Res
     if !pending.is_empty() && n_stages < 2 {
         retro_footer_pass(ctx, images, titles, &pending, &mut raws, &mut hints, &mut evidence, &mut held)?;
     }
+    for &o in &pending {
+        if hints[o].is_none() && !evidence[o].contains_key("choices") {
+            note_set_only(p, &titles[o].name.clone().unwrap_or_default(), &raws[o], &mut evidence[o]);
+        }
+    }
     Ok((hints, evidence))
+}
+
+fn tentative_json(p: &Printings, id: super::printings::Pid) -> Value {
+    let raw = p.dict(id);
+    json!({"tentative": true, "set_code": raw.get("set").cloned().unwrap_or(Value::Null),
+           "collector_number": normalize_collector(&py_str(raw.get("num").unwrap_or(&Value::Null)))})
+}
+
+/// A set code read with no collector digits is NOT printing proof: record
+/// the single in-set printing as a tentative, unresolved hint (no
+/// `resolved_by`, no `hints` entry), never as `title+set+collector`.
+fn note_set_only(p: &Printings, name: &str, raws: &[String], e: &mut Evidence) {
+    let tn = norm_name(name);
+    if let Some(g) = p.set_only_group(&tn, &p.footer_codes(raws)) {
+        e.insert("set_only".into(), tentative_json(p, g[0]));
+    }
 }
 
 fn truthy(v: &Value) -> bool {
@@ -488,7 +509,8 @@ fn identify_exact_printing(ctx: &Ctx, img: &Rgb, title: &str) -> Result<(Option<
         let r = footer_strip_raws(ctx, img, v)?;
         if is_set { set.extend(r) } else { col.extend(r) }
         let all: Vec<String> = col.iter().chain(set.iter()).cloned().collect();
-        let group = p.resolve_footer_group(&tn, &p.footer_codes(&all), &footer_numbers_padded(&all));
+        let codes = p.footer_codes(&all);
+        let group = p.resolve_footer_group(&tn, &codes, &footer_numbers_padded(&all));
         if let Some(g) = group {
             if g.len() > 1 {
                 let mut e = ev(&col, &set);
@@ -503,7 +525,10 @@ fn identify_exact_printing(ctx: &Ctx, img: &Rgb, title: &str) -> Result<(Option<
             return Ok((Some(card), e));
         }
     }
-    Ok((None, ev(&col, &set)))
+    let mut e = ev(&col, &set);
+    let all: Vec<String> = col.iter().chain(set.iter()).cloned().collect();
+    note_set_only(p, title, &all, &mut e);
+    Ok((None, e))
 }
 
 // ------------------------------------------------------------ history

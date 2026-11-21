@@ -41,7 +41,7 @@ pub struct FaceNames {
     pub flavor_name: Option<String>,
 }
 
-type Pid = u32;
+pub type Pid = u32;
 
 /// The loaded `printing_index.json` (open handle; see module docs).
 pub struct RawSrc(std::fs::File);
@@ -407,6 +407,15 @@ impl Printings {
         if !global.is_empty() {
             return self.group_of(t, &global);
         }
+        None
+    }
+
+    /// The one printing of title `t` in a read set code, with NO collector
+    /// digits read. Set-only: never collector proof, so callers must not
+    /// report it as `title+set+collector` (it was the index's number, not
+    /// the card's: `['DFT']` -> dft 136).
+    pub fn set_only_group(&self, t: &str, codes: &[String]) -> Option<Vec<Pid>> {
+        let tp = self.title_prints(t);
         if !codes.is_empty() && tp.len() > 1 {
             let mut in_set: IndexMap<Option<String>, Pid> = IndexMap::new();
             for code in codes {
@@ -865,5 +874,22 @@ mod tests {
         assert_eq!(dict["alpha"], Value::String("éé\"q".into()));
         assert_eq!(p.field(1, "num"), Value::from(128));
         assert_eq!(p.list[1].num.as_deref(), Some("128"));
+    }
+
+    /// Set-only readings (`['DFT']`, no digits) are never collector proof.
+    #[test]
+    fn set_only_reading_is_not_proof() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("oracle_titles.json"), r#"["Lightning Strike","Anger"]"#).unwrap();
+        let idx = r#"{"dft:136":{"id":"s1","name":"Lightning Strike","set":"dft","num":"136"},
+            "m19:152":{"id":"s2","name":"Lightning Strike","set":"m19","num":"152"},
+            "ddi:51":{"id":"a1","name":"Anger","set":"ddi","num":"51"},
+            "slz:54":{"id":"a2","name":"Anger","set":"slz","num":"54"}}"#;
+        std::fs::write(d.path().join("printing_index.json"), idx).unwrap();
+        let mut oracle = Oracle::load(d.path()).unwrap();
+        let p = Printings::load(d.path(), &mut oracle).unwrap();
+        let codes = vec!["dft".to_string()];
+        assert_eq!(p.resolve_footer_group("lightning strike", &codes, &[]), None, "set-only is not a resolution");
+        assert!(p.set_only_group("lightning strike", &codes).is_some(), "kept as a tentative hint");
     }
 }
