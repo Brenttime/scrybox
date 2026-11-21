@@ -128,5 +128,6 @@ test('pipeline: a one-line title that matches never pays for the two-line pass',
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.scryfallId, 'ts-slz31');
-  assert.equal(calls(), 2, 'title + first footer batch only');
+  // title + first footer batch only (6 rows + 2 Zeta bands: 2 recognizer runs)
+  assert.equal(calls(), 3);
 });

@@ -135,12 +135,44 @@ test('two-line titles resolve with ONE tight+bands batch (title calls 2, not 3),
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.title, 'obeka brute chronologist');
   assert.equal(res.num, '92');
-  assert.equal(calls(), 3, 'title, tight+bands, one footer batch');
+  // title, tight+bands, one first footer batch (6 rows + 2 Zeta bands = 2 runs)
+  assert.equal(calls(), 4);
 });
 
 test('an ordinary one-line card never pays for the line bands', async () => {
-  const { r, calls } = reader((c, n, b) => (c === 1 ? pick(['Mother of Runes', 'Mother of Runes'], b) : 'slz en u 0006'));
+  const sizes = [];
+  const { r } = reader((c, n, b) => { sizes.push(n); return c === 1 ? pick(['Hulldrifter', 'Hulldrifter'], b) : 'dft en c 0047'; });
   const res = (await r.read(sharpFrame(), small)).results[0];
   assert.equal(res.ok, true, JSON.stringify(res));
-  assert.equal(calls(), 2);
+  const title = sizes.slice(0, sizes.indexOf(6));
+  assert.ok(title.reduce((a, b) => a + b, 0) <= 4, `no tight/band strips before the footer: ${JSON.stringify(sizes)}`);
+});
+
+// Item 4: Zeta footer bands in the FIRST footer batch (6 narrow rows + 2).
+test('Hornet Queen slz: the first footer batch reads the full padded number and proves slz 320', async () => {
+  const { r, calls } = reader((c, n, b) => (c === 1 ? 'Hornet Queen'
+    : c === 2 && n === 6 ? pick(['SLZ', 'U Q2', 'SLZ', '962', '', ''], b)
+      : c === 3 && n === 2 ? pick(['U 0320 MSCH', 'SLZ EN MSCHF'], b) : ''));
+  const res = (await r.read(sharpFrame(), small, { guess: { sets: ['slz', 'slz', 'slz'] } })).results[0];
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.num, '320');
+  assert.equal(res.guess, undefined, 'proven, not guessed');
+  assert.equal(calls(), 3);
+});
+
+test('Zeta bands never override a contradicting number read on the same frame', async () => {
+  const { r } = reader((c, n, b) => (c === 1 ? 'Hornet Queen'
+    : c === 2 && n === 6 ? pick(['SLZ EN', 'U 0078', '', '', '', ''], b)
+      : c === 3 && n === 2 ? pick(['U 0320', 'SLZ EN'], b) : ''));
+  const res = (await r.read(sharpFrame(), small)).results[0];
+  assert.notEqual(res.ok && !res.guess && res.num, '320', JSON.stringify(res));
+  assert.notEqual(res.ok && !res.guess && res.num, '78', JSON.stringify(res));
+});
+
+test('non-Zeta titles keep the 6-strip first footer batch', async () => {
+  const sizes = [];
+  const { r } = reader((c, n) => { sizes.push(n); return c === 1 ? 'Hulldrifter' : ''; });
+  await r.read(sharpFrame(), small);
+  const firstFooter = sizes.indexOf(6);
+  assert.notEqual(sizes[firstFooter + 1], 2, JSON.stringify(sizes));
 });

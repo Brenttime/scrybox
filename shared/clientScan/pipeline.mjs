@@ -308,6 +308,14 @@ const WIDE_ROWS = [0.88, 0.90, 0.86, 0.92];
 const TALL_ROWS = [0.88, 0.90, 0.92, 0.94, 0.86, 0.84];
 const TALL_H = 0.025;
 const FIRST_H = 0.030;
+// Secret Lair "The Zeta Set" prints 'C 0055' over 'SLZ · EN' at the far left,
+// the number ending near x=.23 of the padded card (just past the narrow
+// strips' .22) and the code line running to ~.35. Rarity/number band and
+// code/language band, read in the FIRST footer batch for titles with a
+// printing in these sets (Mother of Runes slz 6/127/248, Hornet Queen slz
+// 78/199/320 took a ~1.03 s cascade, Hornet first guessed 78 for 320).
+const ZETA_FOOTER_SETS = new Set(['slz']);
+const ZETA_RECTS = [[0, 0.32, 0.860, 0.895], [0, 0.42, 0.878, 0.912]];
 export const FOOTER_HEIGHTS = Object.freeze({ first: FIRST_H, tall: TALL_H });
 const WIDE_X1 = 0.30;
 const RETRO_ROWS = RETRO_ALL_ROWS;
@@ -1036,6 +1044,7 @@ export function createReader(env) {
     };
     // A title with a reprint-sheet or Mystery Booster printing (plst '<SET>-N',
     // or a set that stamps under its own numbering such as mb2).
+    const zetaTitle = (ix.byTitle[name] || []).some(o => ZETA_FOOTER_SETS.has(ix.printings[o][1]));
     const sheetLike = (ix.byTitle[name] || []).some(o => ph[o].sheet || STAMP_OWN_NUMBERING.has(ix.printings[o][1]));
     // A printing under its own Mystery Booster numbering (mb2 232): its only
     // number is on the copyright line, so that line is the useful read. A
@@ -1081,7 +1090,14 @@ export function createReader(env) {
       const x1 = stage === 'wide' ? WIDE_X1 : 0.22;
       const hgt = stage === 'tall' ? TALL_H : si === 0 ? FIRST_H : 0.025;
       const rects = stage === 'rescue' ? RESCUE_RECTS : rows.map(y => [0, x1, y, y + hgt]);
+      // Zeta-style footer (title has a printing in a ZETA_FOOTER_SETS set):
+      // the first batch also reads a wider number band and a separate
+      // code/language band, so 'U 0320' is not clipped to 'U Q2' / '962'.
+      const zeta = si === 0 && zetaTitle;
+      if (zeta) { rects.push(...ZETA_RECTS); timings.zeta_bands = 1; }
       const reads = await recognize(env, strips(rects, `footer${si}`));
+      // Their reads join the same evidence: two different numbers of the
+      // title on this frame leave resolveFooterGroup ambiguous (null).
       if (truncated) return partial({ title: name, footer_ocr: raws });
       for (const r of reads) if (r.text && r.conf >= FOOTER_CONF) raws.push(r.text);
       let g = resolveFooterGroup(ix, name, footerCodes(ix, raws), footerNumbersPadded(raws), strongNumbers(raws));
