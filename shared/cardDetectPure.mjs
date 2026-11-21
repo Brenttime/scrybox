@@ -132,7 +132,7 @@ export function createDetector() {
   // enormously on area. Keep this comfortably below 1.
   const MAX_AREA_FRAC = 0.85;
 
-  function detectCard(rgbaData, w, h) {
+  function detectCard(rgbaData, w, h, opts = {}) {
     const gray = rgbaToGray(rgbaData, w, h);
     const blur = gaussianBlur5(gray, w, h);
 
@@ -214,6 +214,11 @@ export function createDetector() {
 
     if (!best || !best.pts) return null;
     const [tl, tr, brc, bl] = orderQuad(best.pts);
+    // Outline only (client scanner's outer-paper candidate): no warp.
+    if (opts.warp === false) {
+      return { quad: [tl, tr, brc, bl].map((p) => ({ x: p.x, y: p.y })),
+        pick: { source: best.source, score: +best.score.toFixed(4), fill: +best.fill.toFixed(2), par: +best.par.toFixed(2), ar: +best.ar.toFixed(3) } };
+    }
     const coeffs = getPerspectiveTransform(
       [tl, tr, brc, bl],
       [{ x: 0, y: 0 }, { x: WARP_W, y: 0 }, { x: WARP_W, y: WARP_H }, { x: 0, y: WARP_H }],

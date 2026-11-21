@@ -23,6 +23,7 @@ import {
 } from './text.mjs';
 import { readListStamp, STAMP_RECT, stampClearAbsent } from './stamp.mjs';
 import { guessPrinting, CONTEXT_PRIMARY } from './guess.mjs';
+import { paperOutline, quadArea, pointInQuad } from './outline.mjs';
 
 export const CORN_SIZE = 384;
 const TITLE_PROVEN = new Set(['unique physical printing', 'unique printed title']);
@@ -52,6 +53,10 @@ const NEAR_EDGE_MAX_COS = Math.cos(70 * Math.PI / 180);   // corners 70-110 deg
 // so reading those only burned ~370 ms before failing. Auto waits for a
 // sharper frame instead.
 const TITLE_SHARP_FLOOR = 500;
+// Outer-paper outline (outline.mjs) acceptance: at least 4% of the frame (the
+// detector's own floor), and 1.25x the corner model's quad when it replaces
+// one (an art-only box is ~0.55 of the paper on Zeta frames).
+const OUTLINE_MIN_AREA = 0.04, OUTLINE_GROW = 1.25;
 const STILL_DRIFT = 0.012;          // mean corner move / frame diagonal
 // Auto admits a card for OCR only after a short stable WINDOW, not one pair of
 // frames: Windows telemetry (23 cards) showed the first frame that passed a
@@ -442,6 +447,35 @@ export function createReader(env) {
   // Printing guess (opts.guess = {sets: recent added sets}); absent = the
   // old abstain/picker behaviour.
   let curGuess = null;
+  // The outline probe() returned in place of corners (outline.mjs), if any.
+  let probeOutline = null;
+  let probeSmall = null;
+
+  // An outer-paper outline worth reading: card-shaped by the near-edge rule
+  // (plausibleCard), wholly inside the 1% edge band (the near-edge whole-stage
+  // rule is never exercised by an outline), at least MIN of the frame, and,
+  // when the corner model did give a quad, clearly larger than it and
+  // containing its centre (the art box inside the paper).
+  function outlineCandidate(small, ch, w, h, primary) {
+    const o = paperOutline(small, CORN_SIZE, CORN_SIZE, ch, w, h);
+    if (!o) return null;
+    const q = o.quad;
+    const ex = Math.max(2, EDGE_FRAC * w), ey = Math.max(2, EDGE_FRAC * h);
+    if (!q.every(p => p.x > ex && p.x < w - ex && p.y > ey && p.y < h - ey)) return null;
+    if (!plausibleCard(q)) return null;
+    // Every strip of every stage is projected through the PADDED outline, so
+    // that whole footprint must lie in the frame (no partial stages, ever).
+    if (!padQuad(q).every(p => p.x >= 0 && p.x <= w - 1 && p.y >= 0 && p.y <= h - 1)) return null;
+    const area = quadArea(q);
+    if (area < OUTLINE_MIN_AREA * w * h) return null;
+    if (primary) {
+      const pa = quadArea(primary);
+      if (area < OUTLINE_GROW * pa) return null;
+      const cx = primary.reduce((s, p) => s + p.x, 0) / 4, cy = primary.reduce((s, p) => s + p.y, 0) / 4;
+      if (!pointInQuad(q, cx, cy)) return null;
+    }
+    return q;
+  }
 
   async function detect(small, channels, frameW, frameH) {
     const out = await env.cornelius.run({ image: corneliusTensor(env.ort, small, channels) });
@@ -458,14 +492,26 @@ export function createReader(env) {
   //   quad: corners already found by probe() for this same frame, so the
   //         caller can skip reading back the full frame when there is no card.
   async function read(frame, small, opts = {}) {
-    const { smallChannels = 4, requireStill = false, quad: known, frameId = null, guess = null } = opts;
+    const { requireStill = false, quad: known, frameId = null, guess = null } = opts;
+    let smallChannels = opts.smallChannels ?? 4;
+    // The browser worker passes no small copy to read(): use probe()'s.
+    if (!small && known && probeSmall) { small = probeSmall.data; smallChannels = probeSmall.ch; }
+    probeSmall = null;
     curFrameId = frameId;
     curGuess = guess && typeof guess === 'object' ? { sets: Array.isArray(guess.sets) ? guess.sets.slice(0, CONTEXT_PRIMARY) : [] } : null;
     if (stampPres?.confirm && (frameId == null || typeof frameId !== stampPres.confirm.src)) stampPres.confirm = null;
     const t0 = now();
     const { data: rgba, width: w, height: h } = frame;
     const timings = {};
-    const quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
+    let quad = known !== undefined ? known : await detect(small, smallChannels, w, h);
+    // Outline-only card: probe() supplied it, or (replay, no probe) the
+    // corner model found nothing here and the outline did.
+    let outlineOnly = !!(known && probeOutline && known.length === 4 && known.every((p, i) => p.x === probeOutline[i].x && p.y === probeOutline[i].y));
+    if (known === undefined && !quad && env.paperOutline !== false && small) {
+      quad = outlineCandidate(small, smallChannels, w, h, null);
+      outlineOnly = !!quad;
+    }
+    probeOutline = null;
     timings.detect_ms = Math.round(now() - t0);
     const base = { ok: true, engine: 'client', frame: { width: w, height: h }, candidates: [], results: [], timings };
     if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; return base; }
@@ -497,7 +543,7 @@ export function createReader(env) {
     // auto it never advances the settle window and is never read.
     if (requireStill && frameId != null && frameId === lastFrameId && lastQuad) {
       cand.duplicate = true; cand.status = 'settling'; cand.still = stillRun;
-      return base;
+      return outlineOnly ? { ...base, candidates: [] } : base;
     }
     const drift = lastQuad ? quad.reduce((s, p, i) => s + Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y), 0) / 4 / diag : Infinity;
     lastQuad = quad;
@@ -526,7 +572,20 @@ export function createReader(env) {
     lastAt = tNow;
     readSince = false;
     let m = cardToFrame(padQuad(quad));
-    const sharp = titleSharpness(rgba, w, h, m);
+    let sharp = titleSharpness(rgba, w, h, m);
+    // A 'too blurry' corner quad that is really a sharp card's art box (the
+    // CMYK Cathartic Reunion fixture: [787,429,356,195], on the illustration):
+    // the outer-paper outline, when it is sharp, is read instead.
+    if (!outlineOnly && sharp < TITLE_SHARP_FLOOR && !clipped && !nearEdge && env.paperOutline !== false && small) {
+      const to = now();
+      const o = outlineCandidate(small, smallChannels, w, h, quad);
+      if (o) {
+        const mo = cardToFrame(padQuad(o));
+        const so = titleSharpness(rgba, w, h, mo);
+        if (so >= TITLE_SHARP_FLOOR) { quad = o; m = mo; sharp = so; cand.quad = o.map(p => [p.x, p.y]); cand.outline = 1; outlineOnly = 'blur'; timings.outline = 'sharp'; }
+      }
+      timings.outline_ms = Math.round(now() - to);
+    }
     cand.sharpness = Math.round(sharp * 10) / 10;
     // Fast settle needs real decoded-frame numbers (rVFC), not fingerprints.
     if (sharp < FAST_SETTLE_SHARP || typeof frameId !== 'number') fastRun = false;
@@ -554,7 +613,7 @@ export function createReader(env) {
     // 'settling' is a still card waiting out its window: nothing about it
     // suggests a swap, so tracking and pooled evidence survive it.
     if ((!cand.eligible && cand.status !== 'settling') || drift > STILL_DRIFT * 4 || nearEdge) { tracked = null; guessed = null; evidence = null; stampPres = null; }
-    if (!cand.eligible) return base;
+    if (!cand.eligible) return outlineOnly ? { ...base, candidates: [] } : base;
 
     // Refine the corners on a Lanczos-resized copy of THIS frame (the corner
     // model's validated input): the caller's 384px copy comes from a cheap
@@ -581,7 +640,7 @@ export function createReader(env) {
       timings.total_ms = Math.round(now() - t0);
       return base;
     }
-    if (env.refineCorners !== false) {
+    if (env.refineCorners !== false && !outlineOnly) {
       const tr = now();
       const fine = await detect(resizeLanczos3(rgba, w, h, 4, CORN_SIZE, CORN_SIZE), 3, w, h);
       const move = fine ? fine.reduce((s, p, i) => s + Math.hypot(p.x - quad[i].x, p.y - quad[i].y), 0) / 4 / diag : Infinity;
@@ -601,7 +660,35 @@ export function createReader(env) {
     const readQuad = timings.refined ? cand.quad.map(([x, y]) => ({ x, y })) : quad;
     const verifying = !!guessed && !nearEdge;
     if (verifying) timings.guess_verify = 1;
-    const result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
+    let result = await readCard(rgba, w, h, m, timings, prior, requireStill && !lastDeferred && !verifying, nearEdge, readQuad, requireStill && frameId != null, verifying);
+    // The corner model's quad gave no title: try the outer-paper outline of
+    // the same frame once (outline.mjs). Never on a near-edge card, never
+    // over a read that named a card, and only an outline clearly larger than
+    // the quad and around it (an art-only box). The outline read is a whole
+    // new read of this frame by the same rules; if it names no card either,
+    // the first result stands.
+    if (!outlineOnly && !result.ok && !result.title && !result.near_edge_partial && !nearEdge && env.paperOutline !== false && small) {
+      const to = now();
+      const o = outlineCandidate(small, smallChannels, w, h, readQuad);
+      if (o) {
+        const mo = cardToFrame(padQuad(o));
+        if (titleSharpness(rgba, w, h, mo) >= TITLE_SHARP_FLOOR) {
+          const t2 = {};
+          const r2 = await readCard(rgba, w, h, mo, t2, prior, requireStill && !lastDeferred && !verifying, false, o, requireStill && frameId != null, verifying);
+          if (r2.ok || r2.title) {
+            result = r2; Object.assign(timings, t2); cand.quad = o.map(p => [p.x, p.y]); cand.outline = 1; timings.outline = 'used';
+          } else timings.outline = 'tried';
+        } else timings.outline = 'blurry';
+      }
+      timings.outline_ms = Math.round(now() - to);
+    }
+    // An outline-only card that names nothing was never a card: same answer
+    // as before the outline existed ('no card').
+    if (outlineOnly === true && !result.ok && !result.title) {
+      lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null;
+      return { ...base, candidates: [], timings: { detect_ms: timings.detect_ms, outline: 'none', outline_ms: Math.round(now() - t0) } };
+    }
+    if (outlineOnly === true) { cand.outline = 1; timings.outline = "only"; }
     lastDeferred = !!result.deferred;
     timings.total_ms = Math.round(now() - t0);
     timings.rec_calls = env.stats.recCalls - recBefore;
@@ -1047,8 +1134,19 @@ export function createReader(env) {
   // Corners only, from the 384px copy. A null here is a definite "no card" and
   // ends tracking exactly as a full read would.
   async function probe(small, smallChannels, w, h) {
-    const quad = await detect(small, smallChannels, w, h);
+    let quad = await detect(small, smallChannels, w, h);
+    probeOutline = null;
+    // No corners: the outer-paper outline of the same 384px copy may still
+    // find a card (borderless cream paper the corner model misses). Only a
+    // read that then names the card counts; otherwise it stays 'no card'.
+    if (!quad && env.paperOutline !== false) {
+      const o = outlineCandidate(small, smallChannels, w, h, null);
+      if (o) { quad = o; probeOutline = o; }
+    }
     if (!quad) { lastQuad = null; stillRun = 0; lastDeferred = false; lastFrameId = null; tracked = null; guessed = null; evidence = null; stampPres = null; }
+    // read() gets only the full frame in the browser (the 384px copy goes back
+    // to the main thread): keep a copy for its outline check.
+    probeSmall = quad && env.paperOutline !== false ? { data: Uint8ClampedArray.from(small), ch: smallChannels } : null;
     return quad;
   }
 
