@@ -43,7 +43,11 @@ const EMBED_SIZE: usize = 448;
 const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 const STD: [f64; 3] = [0.229, 0.224, 0.225];
 const SHARPNESS_GATE: f32 = 0.02;
+/// Node's `gapFloor` default (`CV_SCAN_GAP_FLOOR` overrides — see
+/// `gap_floor()`). The gap is the winner's sim minus the mean of the next
+/// GAP_K-1 sims; below the floor the reply carries `notInCatalog: true`.
 pub const GAP_FLOOR_DEFAULT: f64 = 0.10;
+/// Rows sampled for the gap average (Node's `gapK`).
 const GAP_K: usize = 11;
 const TOP_K: usize = 8;
 const MAX_SIDE: usize = 1200;
@@ -156,6 +160,9 @@ struct Models {
 static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 static MODELS: Mutex<Option<Result<Arc<Models>, String>>> = Mutex::new(None);
 
+/// Process-wide ONNX runtime, initialised once from `ORT_DYLIB_PATH`; an
+/// unset/undloadable dylib is an `Err` the callers map to the Node-parity
+/// error (never a panic).
 pub(crate) fn ort_env() -> Result<&'static ort::environment::Environment, String> {
     ENV.get_or_init(|| match std::env::var("ORT_DYLIB_PATH") {
         Ok(p) if !p.is_empty() => ort::init_from(&p)
@@ -350,12 +357,22 @@ impl IdStore {
     }
 }
 
+/// One embedding catalog: `n` × `dim` row-major f32 rows (L2-normalised at
+/// build time) paired index-wise with `ids`, plus the lazily built per-row
+/// set_id column used for set-scoped search.
 pub struct Catalog {
+    /// Catalog language name as on disk (`English` for the npz build).
     pub lang: String,
+    /// Local per-language `.bin` (true) vs the shared English npz (false).
     pub local: bool,
+    /// Number of embedding rows.
     pub n: usize,
+    /// Embedding dimension (448 for milo).
     pub dim: usize,
+    /// Row-major f32 table of exactly `n * dim` values (mmap-backed for
+    /// local `.bin`s — see `load_catalog`'s length contracts).
     pub cat: CatBuf,
+    /// Row → card id store (single string arena + offsets).
     pub ids: IdStore,
     /// rowSets(): per-row lowercased card_cache.set_id, built lazily.
     set_of: Mutex<Option<Arc<Vec<Option<String>>>>>,
@@ -378,10 +395,14 @@ static CATALOGS: Mutex<Option<HashMap<String, Arc<Catalog>>>> = Mutex::new(None)
 static LAST_SCAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static JANITOR: OnceLock<()> = OnceLock::new();
 
+/// Default idle TTL before the janitor unloads the sessions + catalogs
+/// (15 min; the owner ruling lives in the block comment above).
+const IDLE_TTL_DEFAULT_SECS: u64 = 900;
+
 fn idle_ttl_ms() -> u64 {
     match std::env::var("CV_SCAN_IDLE_SECS") {
-        Ok(v) if !v.is_empty() => v.parse::<u64>().unwrap_or(900).saturating_mul(1000),
-        _ => 900_000,
+        Ok(v) if !v.is_empty() => v.parse::<u64>().unwrap_or(IDLE_TTL_DEFAULT_SECS).saturating_mul(1000),
+        _ => IDLE_TTL_DEFAULT_SECS.saturating_mul(1000),
     }
 }
 
@@ -501,6 +522,12 @@ fn load_catalog(game: &str, lang: Option<&str>) -> Result<Arc<Catalog>, String> 
         }
         let n = emb.shape[0];
         let dim = emb.shape[1];
+        // Mirror the local branch's byte-length contract: a truncated member
+        // would otherwise panic later while indexing `cat` (off = i*dim,
+        // i < n) in search_top_k / score_cards.
+        if f32s.len() != n.checked_mul(dim).ok_or("npz embeddings shape overflow")? {
+            return Err(format!("npz embeddings len {} != {n}*{dim}", f32s.len()));
+        }
         let ids_member = members
             .remove("card_ids")
             .ok_or("npz: no card_ids")?
@@ -908,6 +935,7 @@ fn encode_jpeg(img: &RawRgb) -> Result<Vec<u8>, String> {
 // Geometry twins
 // ---------------------------------------------------------------------------
 
+/// A point in pixel space (dewarp source/destination corners).
 #[derive(Clone, Copy, Debug)]
 pub struct Pt {
     pub x: f64,
@@ -1060,7 +1088,14 @@ fn run_session(
     outputs
         .iter()
         .map(|name| {
-            let v = outs[*name].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            // Outputs' Index impl PANICS on a missing name; a model that
+            // lacks a named output is an error (same 500 downstream), not a
+            // process panic on the blocking pool.
+            let v = outs
+                .get(*name)
+                .ok_or_else(|| format!("milo: model has no output '{name}'"))?
+                .try_extract_tensor::<f32>()
+                .map_err(|e| e.to_string())?;
             Ok(v.1.to_vec())
         })
         .collect()
@@ -1124,6 +1159,8 @@ fn use_client_crop(decoded: &RawRgb) -> Det {
 fn detect_and_dewarp(corn: &std::sync::Mutex<ort::session::Session>, decoded: &RawRgb) -> Result<Det, String> {
     let small = resize_fill(decoded, CORN_SIZE, CORN_SIZE);
     let out = run_session(corn, to_tensor(&small.px, CORN_SIZE), CORN_SIZE, &["corners", "sharpness"])?;
+    // Invariant: run_session yields exactly ONE tensor per requested name,
+    // in order — out.len() == 2 by construction here.
     let corners = &out[0];
     // out.sharpness ? out.sharpness.data[0] : 1
     let sharpness = if out[1].is_empty() { 1.0 } else { out[1][0] };
@@ -1164,6 +1201,11 @@ fn detect_and_dewarp(corn: &std::sync::Mutex<ort::session::Session>, decoded: &R
 }
 
 /// searchTopK: Float32Array sims (-inf for filtered rows), insert-sorted top-k.
+///
+/// Invariants (all callers uphold them): `k >= 1` (they pass
+/// `top_k.max(GAP_K)`), and `cat` is exactly `n * dim` long — `load_catalog`
+/// validates both on-disk formats, which is what keeps the `cat[off + d]`
+/// indexing below panic-free.
 pub fn search_top_k(
     emb: &[f32],
     cat: &[f32],
@@ -1183,7 +1225,10 @@ pub fn search_top_k(
         let off = i * dim;
         let mut s = 0f64;
         for d in 0..dim {
-            s += emb[d] as f64 * cat[off + d] as f64;
+            // .get() mirrors score_cards' dot loop: identical results for a
+            // model-shaped query (len == dim), NaN instead of a panic for a
+            // corrupt one.
+            s += emb.get(d).copied().unwrap_or(f32::NAN) as f64 * cat[off + d] as f64;
         }
         sims[i] = s as f32;
     }
@@ -1215,6 +1260,9 @@ pub fn search_top_k(
 // stream 4 chars → 3 bytes (2 chars → 1 byte, 3 → 2, lone 1 → dropped).
 // ---------------------------------------------------------------------------
 
+/// Node `Buffer.from(s, 'base64')` parity: invalid characters are skipped,
+/// decoding stops at the first `=`, and the surviving stream decodes 4→3 /
+/// 2→1 / 3→2 bytes (a lone 1 is dropped).
 pub fn node_base64_decode(s: &str) -> Vec<u8> {
     const TBL: fn(u8) -> Option<u8> = |c| match c {
         b'A'..=b'Z' => Some(c - b'A'),
@@ -1260,6 +1308,8 @@ pub fn node_base64_decode(s: &str) -> Vec<u8> {
 // match() — cvScan.js:355
 // ---------------------------------------------------------------------------
 
+/// Pipeline failure. The route maps EVERY variant to the same 500
+/// `{error:'Scan match failed'}` (Node's catch-all).
 pub struct MatchError(pub String);
 
 /// The pieces of `req.body` the route reads, with JS coercion semantics.
@@ -1419,6 +1469,12 @@ pub fn score_cards(buf: &[u8], game: &str, cards: Vec<Value>, lang: &str, croppe
 }
 
 /// Full pipeline; returns the res.json body (pre-hydration) in Node's key order.
+///
+/// # Errors
+/// `MatchError` where Node's `match()` try/catch would have thrown: an
+/// undecodable image, an ONNX run failure (including a model missing a
+/// named output), or a broken catalog. Every variant maps to the route's
+/// single 500 `{error:'Scan match failed'}`.
 pub fn match_scan(
     buf: &[u8],
     game: &str,
@@ -1466,7 +1522,10 @@ pub fn match_scan(
 
     let emb = run_session(&models.milo, to_tensor(&det.rgb, EMBED_SIZE), EMBED_SIZE, &["embedding"])
         .map_err(MatchError)?
-        .remove(0);
+        // run_session yields one tensor per requested name; pop() keeps a
+        // broken model contract an error instead of a panic.
+        .pop()
+        .ok_or_else(|| MatchError("milo: no embedding output".into()))?;
 
     // Per-catalog sweeps; gap is measured INSIDE the producing catalog.
     let mut hits: Vec<(usize, f32, usize)> = Vec::new(); // (row, sim, catalog idx)
@@ -1545,12 +1604,12 @@ pub fn match_scan(
     out.insert("sharpness".into(), serde_json::Number::from_f64(det.sharpness as f64).map(Value::Number).unwrap_or(Value::Null));
     let score_of = |m: &Map<String, Value>| m.get("score").and_then(Value::as_f64).unwrap_or(0.0);
     let top = candidates.first();
-    let margin: f64 = if candidates.len() > 1 {
-        score_of(top.unwrap()) - score_of(&candidates[1])
-    } else if let Some(t) = top {
-        score_of(t)
-    } else {
-        0.0
+    // `top` is `candidates.first()`, so it is Some whenever the list is
+    // non-empty; the match reproduces the original branches exactly.
+    let margin: f64 = match (top, candidates.get(1)) {
+        (Some(t), Some(second)) => score_of(t) - score_of(second),
+        (Some(t), None) => score_of(t),
+        (None, _) => 0.0,
     };
     out.insert("margin".into(), serde_json::Number::from_f64(margin).map(Value::Number).unwrap_or(Value::from(0.0)));
     let gap = winner.map(|(_, g)| g).unwrap_or(None);
@@ -1581,10 +1640,17 @@ use crate::cards_tags::read_body;
 use crate::ip_limit::{self, FixedWindowLimiter};
 use crate::AppState;
 
+/// `searchLimiter` cap: 300 requests per client IP per window. The 429
+/// `Retry-After: "300;w=900"` header in `handle_scan_match` must stay in
+/// sync with these two constants.
+const SEARCH_LIMIT_MAX: u64 = 300;
+/// `searchLimiter` window: 15 minutes, in milliseconds.
+const SEARCH_LIMIT_WINDOW_MS: u64 = 15 * 60 * 1000;
+
 /// express-rate-limit v8 searchLimiter twin: 300 / 15 min per client IP.
 pub(crate) fn search_limiter() -> &'static FixedWindowLimiter {
     static L: OnceLock<FixedWindowLimiter> = OnceLock::new();
-    L.get_or_init(|| FixedWindowLimiter::new(300, 15 * 60 * 1000))
+    L.get_or_init(|| FixedWindowLimiter::new(SEARCH_LIMIT_MAX, SEARCH_LIMIT_WINDOW_MS))
 }
 
 pub(crate) use crate::util::now_ms_u64 as now_ms;
@@ -1687,6 +1753,9 @@ fn hydrate_candidate(
     Ok(Hydrate::Done(out))
 }
 
+/// POST /api/scan-match — cvScan.match() twin: body/auth gates, rate limit,
+/// data-URL image decode, `match_scan` on the blocking pool, candidate
+/// hydration, and the res.json reply with the limiter headers.
 pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<SocketAddr>, req: Request) -> Response {
     if req.method() != axum::http::Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
@@ -1782,7 +1851,9 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         None => image.clone(),
     };
     let buf = node_base64_decode(&base64);
-    if buf.len() < 100 {
+    // Node: decoded length < 100 → 400 'Invalid image data'.
+    const MIN_IMAGE_BYTES: usize = 100;
+    if buf.len() < MIN_IMAGE_BYTES {
         return limit_headers(cardscan::res_json(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({ "error": "Invalid image data" }),

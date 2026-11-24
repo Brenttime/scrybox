@@ -8,6 +8,8 @@ use super::pil::Rgb;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Model filename inside the OCR model dir (`SCRYBOX_OCR_MODEL_DIR`) —
+/// the SAME PP-OCRv6_rec_small.onnx the sidecar ships.
 pub const REC_MODEL_FILE: &str = "PP-OCRv6_rec_small.onnx";
 const IMG_H: usize = 48;
 const IMG_W: usize = 320;
@@ -183,6 +185,7 @@ fn resize_norm(img: &Rgb, max_wh_ratio: f64, out: &mut [f32]) {
 }
 
 impl RecEngine {
+    /// Vocabulary rows; index == class id, index 0 is the CTC blank.
     pub fn chars(&self) -> &[String] {
         &self.chars
     }
@@ -220,7 +223,17 @@ impl RecEngine {
                 let (s, v) = outs[self.output.as_str()].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 (s.iter().map(|&d| d as usize).collect::<Vec<_>>(), v.to_vec())
             };
-            let (tn, cn) = (shape[1], shape[2]);
+            // Logits are [batch, T, classes]; any other shape (or zero
+            // classes) is a broken-model error, not an indexing panic.
+            let tn = *shape
+                .get(1)
+                .ok_or_else(|| format!("rec logits rank {}", shape.len()))?;
+            let cn = *shape
+                .get(2)
+                .ok_or_else(|| format!("rec logits rank {}", shape.len()))?;
+            if cn == 0 {
+                return Err("rec logits have zero classes".to_string());
+            }
             for (k, &i) in idx[beg..end].iter().enumerate() {
                 res[i] = self.ctc_decode(&probs[k * tn * cn..(k + 1) * tn * cn], tn, cn);
             }

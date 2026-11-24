@@ -9,6 +9,7 @@ pub mod rec;
 
 use names::Oracle;
 use pil::Rgb;
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -17,6 +18,11 @@ pub fn data_dir() -> Option<PathBuf> {
     std::env::var("SCRYBOX_CARDSCAN_DATA").ok().filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
+/// Process-wide oracle (the sidecar's title indexes), loaded lazily on
+/// first use and shared by every scan.
+///
+/// # Errors
+/// `SCRYBOX_CARDSCAN_DATA` unset, or the index files failing to read/parse.
 pub fn oracle() -> Result<&'static Oracle, String> {
     static O: OnceLock<Result<Oracle, String>> = OnceLock::new();
     O.get_or_init(|| Oracle::load(&data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?))
@@ -45,6 +51,8 @@ pub fn title_strip(img: &Rgb, x0: f64, x1: f64, y0: f64, y1: f64, target_h: usiz
     Some(s.resize_lanczos(tw, target_h))
 }
 
+/// One scanned title strip: best oracle match (None = unnamed), its score,
+/// the raw OCR text, and the rotation angle that produced the winner.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Title {
     pub name: Option<String>,
@@ -60,10 +68,15 @@ type Cand = (f64, f64, String, String, i32);
 pub const TWO_LINE_TITLE_BANDS: [(f64, f64, f64, f64); 2] = [(0.040, 0.80, 0.030, 0.100), (0.040, 0.80, 0.095, 0.160)];
 
 fn better(a: &Cand, b: &Cand) -> bool {
-    // Python tuple max: (score, confidence, name, raw, angle)
-    a.0.partial_cmp(&b.0)
-        .unwrap()
-        .then(a.1.partial_cmp(&b.1).unwrap())
+    // Python tuple max: (score, confidence, name, raw, angle). Python's
+    // tuple compare treats a NaN operand as "not greater" and keeps the
+    // incumbent; the Equal fallback reproduces that instead of panicking
+    // (OCR scores are finite in every reachable path).
+    fn cmp_f64(x: f64, y: f64) -> Ordering {
+        x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+    }
+    cmp_f64(a.0, b.0)
+        .then(cmp_f64(a.1, b.1))
         .then(a.2.cmp(&b.2))
         .then(a.3.cmp(&b.3))
         .then(a.4.cmp(&b.4))
@@ -152,6 +165,8 @@ pub fn batch_scene_titles(
     if !ws.is_empty() {
         let out = rec_bgr(&ws)?;
         let mut joined = vec![];
+        // ws is extended TWO strips at a time (lines.len() == 2 gate) and
+        // rec_bgr maps 1:1, so out has even length and every chunk is 2.
         for pair in out.chunks(2) {
             let ((a, ca), (b, cb)) = (&pair[0], &pair[1]);
             let ok = !a.trim().is_empty() && !b.trim().is_empty() && *ca >= 0.60 && *cb >= 0.60;

@@ -17,12 +17,22 @@ use serde_json::{json, Map, Value};
 pub const CARD_AR: f64 = 0.716;
 const HOLE_BRIGHT: u8 = 140;
 const DETECT_MAX_DIM: usize = 960;
+/// Fraction of each frame dimension that forms the frame-edge band
+/// `detect_uploaded_scene` rejects (`touches frame edge`).
+pub const EDGE_BAND_FRACTION: f64 = 0.01;
+/// Minimum width, in pixels, of the frame-edge band.
+pub const EDGE_BAND_MIN_PX: i64 = 2;
+/// Candidate cap of `_merge_scene_candidates` and the bbox dedup pass.
+const MAX_SCENE_CANDIDATES: usize = 8;
 
 /// Grayscale plane (row-major u8).
 #[derive(Clone)]
 pub struct Gray {
+    /// Width in pixels.
     pub w: usize,
+    /// Height in pixels.
     pub h: usize,
+    /// Row-major luminance plane, `h * w` bytes.
     pub px: Vec<u8>,
 }
 
@@ -36,6 +46,11 @@ impl Gray {
             .collect();
         Gray { w: img.w, h: img.h, px }
     }
+    /// Pixel at `(x, y)`; all callers derive coordinates from `w`/`h`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `(x, y)` is outside the image bounds.
     pub fn at(&self, x: usize, y: usize) -> u8 {
         self.px[y * self.w + x]
     }
@@ -67,13 +82,20 @@ impl Gray {
     }
 }
 
+/// Wrap a row-major `data` buffer as an `ch`-channel `Mat` (the OpenCV
+/// stand-in for a numpy array view + copy).
+///
+/// # Panics
+///
+/// Panics if OpenCV cannot allocate or wrap the buffer (OOM, or a `data`
+/// length inconsistent with `rows * cols * ch`).
 pub fn mat_from(data: &[u8], rows: usize, cols: usize, ch: usize) -> Mat {
     let m = Mat::new_rows_cols_with_data(rows as i32, (cols * ch) as i32, data).expect("mat");
     m.reshape(ch as i32, rows as i32).expect("reshape").try_clone().expect("clone")
 }
 
 fn mat_bytes(m: &Mat) -> Vec<u8> {
-    let m = if m.is_continuous() { m.try_clone().unwrap() } else { m.try_clone().unwrap() };
+    let m = m.try_clone().expect("mat clone");
     m.data_bytes().expect("bytes").to_vec()
 }
 
@@ -83,7 +105,7 @@ fn mask_mat(g: &Gray, f: impl Fn(u8) -> bool, on: u8) -> Mat {
 }
 
 fn ones(k: i32) -> Mat {
-    Mat::new_rows_cols_with_default(k, k, cvc::CV_8UC1, Scalar::all(1.0)).unwrap()
+    Mat::new_rows_cols_with_default(k, k, cvc::CV_8UC1, Scalar::all(1.0)).expect("ones kernel")
 }
 
 fn morph(src: &Mat, op: i32, kernel: &Mat, iterations: i32) -> Mat {
@@ -128,9 +150,7 @@ struct RRect {
 fn min_area_rect(c: &Vector<Point>) -> RRect {
     let r = imgproc::min_area_rect(c).unwrap();
     let (w4, h4, a4) = (r.size.width, r.size.height, r.angle);
-    let (w, h, angle) = if a4 == 90.0 {
-        (w4, h4, -90.0f32)
-    } else if w4 == 0.0 && h4 == 0.0 {
+    let (w, h, angle) = if a4 == 90.0 || (w4 == 0.0 && h4 == 0.0) {
         (w4, h4, -90.0f32)
     } else {
         let rad = (a4 as f64).to_radians();
@@ -186,6 +206,11 @@ fn argmax(v: &[f32; 4]) -> usize {
 }
 
 /// `_order_card_quad(points)` (float32).
+/// Rotate a quad to `tl, tr, br, bl` order, then to portrait orientation.
+///
+/// # Panics
+///
+/// The sort panics on NaN coordinates; quads come from finite contour math.
 pub fn order_card_quad(p: &Quad) -> Quad {
     let sums: [f32; 4] = std::array::from_fn(|i| p[i][0] + p[i][1]);
     let diffs: [f32; 4] = std::array::from_fn(|i| p[i][1] - p[i][0]);
@@ -559,13 +584,13 @@ fn edge_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
 
 /// Any corner inside the 1% frame-edge band `detect_uploaded_scene` rejects.
 fn quad_in_edge_band(q: &Quad, w: usize, h: usize) -> bool {
-    let ex = 2.max((0.01 * w as f64) as i64) as f32;
-    let ey = 2.max((0.01 * h as f64) as i64) as f32;
+    let ex = EDGE_BAND_MIN_PX.max((EDGE_BAND_FRACTION * w as f64) as i64) as f32;
+    let ey = EDGE_BAND_MIN_PX.max((EDGE_BAND_FRACTION * h as f64) as i64) as f32;
     q.iter().any(|p| p[0] <= ex || p[1] <= ey || p[0] >= w as f32 - ex || p[1] >= h as f32 - ey)
 }
 
 fn touches_edge(b: &[i64; 4], fw: i64, fh: i64) -> bool {
-    let (ex, ey) = (2.max((0.01 * fw as f64) as i64), 2.max((0.01 * fh as f64) as i64));
+    let (ex, ey) = (EDGE_BAND_MIN_PX.max((EDGE_BAND_FRACTION * fw as f64) as i64), EDGE_BAND_MIN_PX.max((EDGE_BAND_FRACTION * fh as f64) as i64));
     b[0] <= ex || b[1] <= ey || b[0] + b[2] >= fw - ex || b[1] + b[3] >= fh - ey
 }
 
@@ -654,7 +679,7 @@ fn merge(c: Vec<Cand>, fw: i64, fh: i64) -> Vec<Cand> {
         }
         if !dup {
             sel.push(cd);
-            if sel.len() >= 8 {
+            if sel.len() >= MAX_SCENE_CANDIDATES {
                 break;
             }
         }
@@ -715,25 +740,15 @@ fn components(mask: &Mat) -> Vec<[i32; 5]> {
     (1..n).map(|i| std::array::from_fn(|k| *stats.at_2d::<i32>(i, k as i32).unwrap())).collect()
 }
 
-/// `detect_card_bbox(gray_full, all_candidates=True)`.
-pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
-    if gray_full.w.min(gray_full.h) < 80 {
-        return vec![];
-    }
-    let step = step_of(gray_full.w, gray_full.h);
-    let g = gray_full.stride(step);
-    let (hh, ww) = (g.h as f64, g.w as f64);
-    let frame_area = hh * ww;
-    let hist = g.hist(0, g.h as i64, 0, g.w as i64);
-    let (low, high) = (hist.pct(2.0), hist.pct(98.0));
-    if high - low < 20.0 {
-        return vec![];
-    }
-    let lut = norm_lut(low, high);
-    let seg = Gray { w: g.w, h: g.h, px: g.px.iter().map(|&v| lut[v as usize]).collect() };
-    let mut cands: Vec<(f64, f64, f64, f64, &str, &str)> = vec![];
+/// Raw candidate box before ranking: `(x0, y0, w, h, source, anchor)` in
+/// stride-scaled frame coordinates.
+type BoxCand = (f64, f64, f64, f64, &'static str, &'static str);
+
+/// Dark-silhouette components of the normalised frame (the `v < 105` mask).
+fn dark_component_candidates(seg: &Gray, ww: f64, hh: f64, frame_area: f64) -> Vec<BoxCand> {
+    let mut cands = vec![];
     let min_comp = 180f64.max(0.0005 * frame_area);
-    for [x0, y0, w, h, size] in components(&mask_mat(&seg, |v| v < 105, 1)) {
+    for [x0, y0, w, h, size] in components(&mask_mat(seg, |v| v < 105, 1)) {
         let (x0, y0, w, h, size) = (x0 as f64, y0 as f64, w as f64, h as f64, size as f64);
         if size < min_comp {
             continue;
@@ -750,7 +765,15 @@ pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
         }
         cands.push((x0, y0, w, h, "dark", "silhouette"));
     }
-    for [x0, y0, w, h, size] in components(&mask_mat(&seg, |v| v > HOLE_BRIGHT, 1)) {
+    cands
+}
+
+/// Card boxes grown from bright "hole" components (the `v > HOLE_BRIGHT`
+/// mask); full-frame components whose centre row is a bright banner are
+/// the print itself, not a card, and are dropped.
+fn hole_component_candidates(seg: &Gray, ww: f64, hh: f64, frame_area: f64) -> Vec<BoxCand> {
+    let mut cands = vec![];
+    for [x0, y0, w, h, size] in components(&mask_mat(seg, |v| v > HOLE_BRIGHT, 1)) {
         let (x0, y0, w, h, size) = (x0 as f64, y0 as f64, w as f64, h as f64, size as f64);
         let (x1, y1) = (x0 + w, y0 + h);
         if w < 8f64.max(0.012 * ww) || h < 6f64.max(0.008 * hh) {
@@ -777,6 +800,31 @@ pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
             cands.push((cx0, cy0, cw, ch, "hole", anchor));
         }
     }
+    cands
+}
+
+/// `detect_card_bbox(gray_full, all_candidates=True)`.
+///
+/// Dark silhouettes (`dark_component_candidates`), bright holes
+/// (`hole_component_candidates`) and the full frame, ranked by
+/// `card_likeness`, deduped, capped, and sorted top-left first.
+pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
+    if gray_full.w.min(gray_full.h) < 80 {
+        return vec![];
+    }
+    let step = step_of(gray_full.w, gray_full.h);
+    let g = gray_full.stride(step);
+    let (hh, ww) = (g.h as f64, g.w as f64);
+    let frame_area = hh * ww;
+    let hist = g.hist(0, g.h as i64, 0, g.w as i64);
+    let (low, high) = (hist.pct(2.0), hist.pct(98.0));
+    if high - low < 20.0 {
+        return vec![];
+    }
+    let lut = norm_lut(low, high);
+    let seg = Gray { w: g.w, h: g.h, px: g.px.iter().map(|&v| lut[v as usize]).collect() };
+    let mut cands: Vec<BoxCand> = dark_component_candidates(&seg, ww, hh, frame_area);
+    cands.extend(hole_component_candidates(&seg, ww, hh, frame_area));
     if (0.58..=0.85).contains(&(ww / hh)) {
         cands.push((0.0, 0.0, ww, hh, "frame", "full"));
     }
@@ -810,7 +858,7 @@ pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
             continue;
         }
         sel.push(o);
-        if sel.len() >= 8 {
+        if sel.len() >= MAX_SCENE_CANDIDATES {
             break;
         }
     }
@@ -829,6 +877,12 @@ pub fn scene_candidates(img: &Rgb, gray: &Gray) -> Vec<Cand> {
 }
 
 /// `_warp_card_quad(image, quad)`.
+/// `_warp_card_quad`: order the quad, size it to the card, perspective-warp.
+///
+/// # Errors
+///
+/// `"card quadrilateral is too small"` under 40x60 pixels; otherwise the
+/// OpenCV transform/invert failure message.
 pub fn warp_card_quad(img: &Rgb, quad: &[[f64; 2]; 4]) -> Result<Rgb, String> {
     let q: Quad = std::array::from_fn(|i| [quad[i][0] as f32, quad[i][1] as f32]);
     let o = order_card_quad(&q);
@@ -840,6 +894,11 @@ pub fn warp_card_quad(img: &Rgb, quad: &[[f64; 2]; 4]) -> Result<Rgb, String> {
     warp(img, &o, ow, oh, cvc::BORDER_REPLICATE, Scalar::default())
 }
 
+/// Perspective-warp `img` through quad `o` to `ow`x`oh` (OpenCV 5 cubic).
+///
+/// # Errors
+///
+/// The OpenCV message when the transform or its inverse cannot be computed.
 pub fn warp(img: &Rgb, o: &Quad, ow: i64, oh: i64, border: i32, value: Scalar) -> Result<Rgb, String> {
     let src: Vector<Point2f> = o.iter().map(|p| Point2f::new(p[0], p[1])).collect();
     let (wf, hf) = ((ow - 1) as f32, (oh - 1) as f32);
@@ -939,14 +998,14 @@ pub fn warp_cubic_cv5(img: &Rgb, minv: &[f64; 9], ow: usize, oh: usize, bval: Op
                 let (x0, y0) = (fx - 1, fy - 1);
                 for c in 0..3 {
                     let mut acc = 0f32;
-                    for r in 0..4 {
+                    for (r, &wyr) in wy.iter().enumerate() {
                         let yy = y0 + r as i32;
                         let v0 = px(x0, yy, c);
                         let mut sw = v0 * wx[0];
                         sw = px(x0 + 1, yy, c).mul_add(wx[1], sw);
                         sw = px(x0 + 2, yy, c).mul_add(wx[2], sw);
                         sw = px(x0 + 3, yy, c).mul_add(wx[3], sw);
-                        acc = sw.mul_add(wy[r], acc);
+                        acc = sw.mul_add(wyr, acc);
                     }
                     row[(i + k) * 3 + c] = (acc.round_ties_even() as i32).clamp(0, 255) as u8;
                 }
@@ -1001,6 +1060,8 @@ fn dark_rect_candidates(g: &Gray, w: usize, h: usize) -> Vec<(f64, RRect)> {
 }
 
 /// `estimate_card_skew(gray, (0, 0, w, h))` on a whole card plane.
+/// Edge-line skew in degrees of the dominant vertical strokes (0 when the
+/// frame lacks a strong rectangle or the fit is degenerate).
 pub fn estimate_card_skew(g: &Gray) -> f64 {
     let (w, h) = (g.w, g.h);
     let zh = (8usize.max((0.20 * h as f64) as usize)).min(h);
@@ -1062,6 +1123,9 @@ fn polyfit1(x: &[f32], y: &[f32]) -> f64 {
 }
 
 /// `rectify_rotated_card(crop, skew)` → (image, rectified).
+/// Deskew when `|skew| >= 4`: white pad, rotate on the centre, crop.
+/// Returns `(None, false)` when not rotated and on any rect/warp failure
+/// (the caller continues with the unrotated crop, as Python does).
 pub fn rectify_rotated_card(img: &Rgb, skew: f64) -> (Option<Rgb>, bool) {
     if skew.abs() < 4.0 {
         return (None, false);

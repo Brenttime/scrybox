@@ -117,6 +117,12 @@ pub fn load_indexes(dir: &std::path::Path) -> Result<(Oracle, Printings), String
     Ok((oracle, printings))
 }
 
+/// The live engine, loading it lazily on first call.
+///
+/// # Errors
+///
+/// Whatever index/recogniser loading reports; the failure is cached, so
+/// later calls report it without retrying.
 pub fn engine() -> Result<Arc<Engine>, String> {
     touch_use();
     if let Some(r) = ENGINE.get() {
@@ -271,11 +277,7 @@ pub fn boot() {
 }
 
 impl Engine {
-    fn ctx<'a>(
-        &'a self,
-        rec: &'a dyn Fn(&[scan_ocr::pil::Rgb]) -> Result<Vec<(String, f64)>, String>,
-        call: &'a dyn Fn(&scan_ocr::pil::Rgb) -> Result<(String, f64), String>,
-    ) -> scene::Ctx<'a> {
+    fn ctx<'a>(&'a self, rec: scene::Recognize<'a>, call: scene::RecCall<'a>) -> scene::Ctx<'a> {
         scene::Ctx { oracle: &self.oracle, printings: &self.printings, rec, rec_call: call, history: &self.history }
     }
 }

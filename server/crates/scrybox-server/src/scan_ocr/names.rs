@@ -8,6 +8,8 @@ use std::path::Path;
 use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
+/// Minimum normalised ratio for a card name to be recognised at all
+/// (cardscan scan.py `NAME_MATCH_MIN`).
 pub const NAME_MATCH_MIN: f64 = 0.90;
 
 pub fn norm_name(s: &str) -> String {
@@ -30,15 +32,36 @@ pub fn norm_name(s: &str) -> String {
 }
 
 pub struct Oracle {
+    /// Fuzzy candidate list, `norm_name`-folded (RapidFuzz `choices`).
     pub norm_list: Vec<String>,
+    /// Same strings pre-split to `Vec<char>` (the fuzz kernel's hot input).
     norm_chars: Vec<Box<[char]>>,
+    /// normalised form -> canonical title.
     pub norm_map: HashMap<String, String>,
+    /// normalised titles rejected outright (`oracle_index.meta.json`).
     pub excluded: HashSet<String>,
     /// Python `ORACLE`: the exact searchable titles.
     pub names: HashSet<String>,
 }
 
+/// RapidFuzz `process.extract(..., scorer=fuzz.ratio, score_cutoff=60)`
+/// cutoff (module header).
+const FUZZ_CUTOFF: f64 = 60.0;
+/// Python ranks the drop-lead noisy queries slightly below the raw query.
+const NOISY_QUERY_PENALTY: f64 = 0.99;
+/// Python's long-query acceptance gate: `len(q) >= 12 and best_r >= 0.86
+/// and best_margin >= 0.12`.
+const LONG_QUERY_MIN_CHARS: usize = 12;
+const LONG_QUERY_ACCEPT: f64 = 0.86;
+const LONG_QUERY_MARGIN: f64 = 0.12;
+
 impl Oracle {
+    /// Read the sidecar's `oracle_titles.json` (+ the excluded-title list
+    /// from `oracle_index.meta.json` when present) out of `dir`.
+    ///
+    /// # Errors
+    /// `oracle_titles.json` missing/unreadable or not a JSON array of
+    /// strings.
     pub fn load(dir: &Path) -> Result<Oracle, String> {
         let titles = dir.join("oracle_titles.json");
         let raw = std::fs::read(&titles).map_err(|e| format!("{}: {e}", titles.display()))?;
@@ -112,9 +135,9 @@ impl Oracle {
         }
         let (mut best, mut best_r, mut best_margin): (Option<usize>, f64, f64) = (None, 0.0, 0.0);
         for (qi, query) in queries.iter().enumerate() {
-            let found = self.extract2(query, 60.0);
+            let found = self.extract2(query, FUZZ_CUTOFF);
             let Some((cand, score)) = found[0] else { continue };
-            let penalty = if qi == 0 { 1.0 } else { 0.99 };
+            let penalty = if qi == 0 { 1.0 } else { NOISY_QUERY_PENALTY };
             let ratio = score * 0.01 * penalty;
             let runner = match found[1] {
                 Some((_, s)) => s * 0.01 * penalty,
@@ -126,7 +149,10 @@ impl Oracle {
                 best_margin = ratio - runner;
             }
         }
-        let accepted = best_r >= threshold || (q.chars().count() >= 12 && best_r >= 0.86 && best_margin >= 0.12);
+        let accepted = best_r >= threshold
+            || (q.chars().count() >= LONG_QUERY_MIN_CHARS
+                && best_r >= LONG_QUERY_ACCEPT
+                && best_margin >= LONG_QUERY_MARGIN);
         match best {
             Some(i) if accepted => (self.norm_map.get(&self.norm_list[i]).cloned(), best_r),
             _ => (None, best_r),
