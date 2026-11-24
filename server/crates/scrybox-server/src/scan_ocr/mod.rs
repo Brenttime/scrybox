@@ -68,19 +68,26 @@ type Cand = (f64, f64, String, String, i32);
 pub const TWO_LINE_TITLE_BANDS: [(f64, f64, f64, f64); 2] = [(0.040, 0.80, 0.030, 0.100), (0.040, 0.80, 0.095, 0.160)];
 
 fn better(a: &Cand, b: &Cand) -> bool {
-    // Python tuple max: (score, confidence, name, raw, angle). Python's
-    // tuple compare treats a NaN operand as "not greater" and keeps the
-    // incumbent; the Equal fallback reproduces that instead of panicking
-    // (OCR scores are finite in every reachable path).
-    fn cmp_f64(x: f64, y: f64) -> Ordering {
-        x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+    // Python tuple max: (score, confidence, name, raw, angle) compared
+    // field-by-field, first non-equal field decides. A NaN operand is never
+    // equal to anything, so it IS the first non-equal field and the
+    // comparison stops there "not greater" — the incumbent wins. Falling
+    // through to the tie-break chain (the old Equal fallback) would let
+    // name/raw/angle replace Python's winner, and the recognizer callback
+    // can supply a NaN confidence (NaN < 0.60 is false, so it passes the
+    // absorb filter). A differing finite score still decides even when the
+    // loser's confidence is NaN.
+    match a.0.partial_cmp(&b.0) {
+        Some(Ordering::Equal) => {}
+        Some(o) => return o.is_gt(),
+        None => return false,
     }
-    cmp_f64(a.0, b.0)
-        .then(cmp_f64(a.1, b.1))
-        .then(a.2.cmp(&b.2))
-        .then(a.3.cmp(&b.3))
-        .then(a.4.cmp(&b.4))
-        .is_gt()
+    match a.1.partial_cmp(&b.1) {
+        Some(Ordering::Equal) => {}
+        Some(o) => return o.is_gt(),
+        None => return false,
+    }
+    (a.2.as_str(), a.3.as_str(), a.4) > (b.2.as_str(), b.3.as_str(), b.4)
 }
 
 /// `_batch_scene_titles(images)`; `recognize` is `_recognize_scene_strips`
@@ -214,4 +221,45 @@ pub fn batch_scene_titles(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(score: f64, conf: f64, name: &str, raw: &str, angle: i32) -> Cand {
+        (score, conf, name.to_string(), raw.to_string(), angle)
+    }
+
+    #[test]
+    fn better_keeps_incumbent_on_nan_confidence_tie() {
+        // Equal scores, NaN confidence from the recognizer callback (NaN
+        // passes the `conf < 0.60` filter). Python stops at the first
+        // non-equal field — NaN != 0.75 — so `a` is NOT greater even though
+        // its name/raw/angle would win the tie-break chain.
+        let a = cand(0.9, f64::NAN, "Zzz", "zzz", 180);
+        let b = cand(0.9, 0.75, "Aaa", "aaa", 0);
+        assert!(!better(&a, &b), "NaN conf must not replace the incumbent");
+        assert!(!better(&b, &a), "finite conf is never greater than NaN either");
+    }
+
+    #[test]
+    fn better_finite_score_decides_over_nan_confidence() {
+        // A differing finite score decides at the first field, regardless
+        // of either candidate's confidence being NaN.
+        assert!(better(&cand(0.95, f64::NAN, "A", "a", 0), &cand(0.90, 0.99, "Z", "z", 0)));
+        assert!(!better(&cand(0.90, 0.99, "A", "a", 0), &cand(0.95, f64::NAN, "Z", "z", 0)));
+    }
+
+    #[test]
+    fn better_rejects_nan_score_and_keeps_python_tie_breaks() {
+        assert!(!better(&cand(f64::NAN, 0.9, "Z", "z", 0), &cand(0.9, 0.9, "A", "a", 0)), "NaN score loses to any finite score");
+        assert!(!better(&cand(0.9, 0.9, "A", "a", 0), &cand(f64::NAN, 0.9, "Z", "z", 0)), "finite score vs NaN score is 'not greater' too");
+        // All fields equal => not greater (max keeps the incumbent).
+        assert!(!better(&cand(0.9, 0.8, "X", "x", 0), &cand(0.9, 0.8, "X", "x", 0)));
+        // The plain tie-break chain still works on finite, equal scores.
+        assert!(better(&cand(0.9, 0.8, "B", "a", 0), &cand(0.9, 0.8, "A", "z", 0)));
+        assert!(better(&cand(0.9, 0.8, "A", "b", 0), &cand(0.9, 0.8, "A", "a", 0)));
+        assert!(better(&cand(0.9, 0.8, "A", "a", 1), &cand(0.9, 0.8, "A", "a", 0)));
+    }
 }

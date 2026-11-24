@@ -1310,6 +1310,7 @@ pub fn node_base64_decode(s: &str) -> Vec<u8> {
 
 /// Pipeline failure. The route maps EVERY variant to the same 500
 /// `{error:'Scan match failed'}` (Node's catch-all).
+#[derive(Debug)]
 pub struct MatchError(pub String);
 
 /// The pieces of `req.body` the route reads, with JS coercion semantics.
@@ -1468,6 +1469,26 @@ pub fn score_cards(buf: &[u8], game: &str, cards: Vec<Value>, lang: &str, croppe
     scored.into_iter().map(|(_, c)| c).collect()
 }
 
+/// Model/catalog contract check for [`match_scan`]: `search_top_k` reads
+/// `dim` values out of `emb` and its `.get()` fallback turns a truncated
+/// embedding into NaN similarities, which the finite-retain in the sweep
+/// loop drops — an ordinary catalog miss masking a broken model/catalog
+/// pair. Reject the mismatch up front instead (HTTP 500, like every other
+/// broken contract here).
+fn check_embedding_dims<'a>(emb: &[f32], catalogs: impl Iterator<Item = &'a Catalog>) -> Result<(), MatchError> {
+    for c in catalogs {
+        if emb.len() < c.dim {
+            return Err(MatchError(format!(
+                "milo: embedding has {} values, catalog {} needs {}",
+                emb.len(),
+                c.lang,
+                c.dim
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Full pipeline; returns the res.json body (pre-hydration) in Node's key order.
 ///
 /// # Errors
@@ -1526,6 +1547,7 @@ pub fn match_scan(
         // broken model contract an error instead of a panic.
         .pop()
         .ok_or_else(|| MatchError("milo: no embedding output".into()))?;
+    check_embedding_dims(&emb, search.iter().map(|(c, _)| c.as_ref()))?;
 
     // Per-catalog sweeps; gap is measured INSIDE the producing catalog.
     let mut hits: Vec<(usize, f32, usize)> = Vec::new(); // (row, sim, catalog idx)
@@ -2465,6 +2487,29 @@ mod tests {
         let top2 = search_top_k(&emb, &cat, 4, 2, 2, Some(&allow));
         assert_eq!(top2[0].0, 3);
         assert_eq!(top2[1].0, 0);
+    }
+
+    #[test]
+    fn check_embedding_dims_rejects_truncated_embedding() {
+        let catalog = |dim: usize| Arc::new(Catalog {
+            lang: "English".into(),
+            local: false,
+            n: 1,
+            dim,
+            cat: CatBuf::Owned(vec![0.0; dim]),
+            ids: IdStore::from_vec(&["id-0".to_string()]),
+            set_of: Mutex::new(None),
+        });
+        let check = |emb: &[f32], cats: &[Arc<Catalog>]| check_embedding_dims(emb, cats.iter().map(Arc::as_ref));
+        let full = vec![0.0f32; 4];
+        assert!(check(&full, &[catalog(4)]).is_ok(), "exact fit must pass");
+        assert!(check(&full, &[catalog(2), catalog(4)]).is_ok(), "longer-than-dim emb is fine for every catalog");
+        // Truncated embedding => MatchError naming both lengths (HTTP 500,
+        // not the ordinary catalog miss the NaN-similarity retain produced).
+        let err = check(&[0.0f32; 3], &[catalog(4)]).unwrap_err();
+        assert!(err.0.contains("3") && err.0.contains("4"), "message names lengths: {}", err.0);
+        // The offender may be any selected catalog, not just the first.
+        assert!(check(&[0.0f32; 3], &[catalog(2), catalog(4)]).is_err());
     }
 
     #[test]
