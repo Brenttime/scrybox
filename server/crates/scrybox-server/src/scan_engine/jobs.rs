@@ -40,6 +40,7 @@ fn or(a: &Value, b: Value) -> Value {
     }
 }
 
+/// The first `image_uris` entry in Scryfall's preferred-key order (null when none).
 pub fn image_url(obj: &Value) -> Value {
     let images = g(obj, "image_uris");
     for k in ["large", "normal", "png", "border_crop", "small"] {
@@ -51,13 +52,15 @@ pub fn image_url(obj: &Value) -> Value {
     Value::Null
 }
 
+/// Python `_is_scannable_physical_card` verbatim: a paper, non-digital
+/// `object == "card"` outside the excluded layouts.
 pub fn is_scannable_physical_card(card: &Value) -> bool {
     let tl = g(card, "type_line").as_str().unwrap_or("").trim().to_lowercase();
     let games_paper = g(card, "games").as_array().is_some_and(|a| a.iter().any(|x| x == "paper"));
     let layout = g(card, "layout").as_str().unwrap_or("");
     let layout_null = g(card, "layout").is_null();
     g(card, "object") == "card"
-        && !truthy(card.get("digital").unwrap_or(&Value::Bool(false)))
+        && !truthy(g(card, "digital"))
         && games_paper
         && (layout_null || !EXCLUDED_LAYOUTS.contains(&layout))
         && !TOKEN_TYPE.is_match(&tl)
@@ -96,7 +99,7 @@ pub fn build_normalize_collector(value: &Value) -> String {
     let v = s.trim().to_lowercase();
     let (mut digits, mut suffix) = (String::new(), String::new());
     for c in v.chars() {
-        if c.is_numeric() && suffix.is_empty() && c.to_digit(10).is_some() {
+        if c.is_numeric() && suffix.is_empty() && c.is_ascii_digit() {
             digits.push(c);
         } else {
             suffix.push(c);
@@ -109,6 +112,7 @@ pub fn build_normalize_collector(value: &Value) -> String {
     digits + &suffix
 }
 
+/// Compact printing dict for the scan client (Python `_compact_printing` field order).
 pub fn compact_printing(card: &Value) -> Value {
     let mut faces = vec![];
     for face in g(card, "card_faces").as_array().into_iter().flatten() {
@@ -189,7 +193,8 @@ fn for_each_card(source: &Path, mut f: impl FnMut(Value)) -> Result<(), String> 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{}.{}.tmp", path.file_name().unwrap().to_string_lossy(), std::process::id()));
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
     let r = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -204,7 +209,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Python `json.dumps(obj, indent=2)` (ensure_ascii as given).
 fn py_indent2(v: &Value, ensure_ascii: bool) -> String {
-    let s = serde_json::to_string_pretty(v).unwrap();
+    let s = serde_json::to_string_pretty(v).expect("json value serialises");
     if !ensure_ascii {
         return s;
     }
@@ -223,6 +228,11 @@ fn py_indent2(v: &Value, ensure_ascii: bool) -> String {
 }
 
 /// `build_printing_index.build(source, output, metadata_output)`.
+///
+/// # Errors
+///
+/// Source/metadata read failures and output write failures (path-prefixed
+/// `io::Error` messages).
 pub fn build_printing_index(source: &Path, output: &Path, meta: &Path) -> Result<Value, String> {
     let mut printings: IndexMap<String, Value> = IndexMap::new();
     let (mut scanned, mut excluded) = (0u64, 0u64);
@@ -295,6 +305,11 @@ fn priority(r: &Value) -> (bool, bool, String) {
 }
 
 /// `build_oracle_index.build(source, output, metadata_output)`.
+///
+/// # Errors
+///
+/// Source read/parse failures and output write failures (path-prefixed
+/// `io::Error` messages).
 pub fn build_oracle_index(source: &Path, output: &Path, meta: &Path) -> Result<Value, String> {
     let mut by_title: IndexMap<String, Value> = IndexMap::new();
     let mut counts: HashMap<String, u64> = HashMap::new();

@@ -64,6 +64,10 @@ fn truthy(v: &Value) -> bool {
 
 /// `_card_meta()` over a default-cards jsonl(.gz). Missing file → empty
 /// (the script warns and builds flags without frame/promo_types).
+///
+/// # Errors
+///
+/// Read/parse failure of the default-cards file (Python `repr` parity).
 pub fn load_card_meta(path: &Path) -> Result<CardMeta, String> {
     let mut out = CardMeta::new();
     if !path.exists() {
@@ -200,6 +204,10 @@ pub struct ClientIndex {
 }
 
 /// `build_index()` + `json.dumps(..., separators=(",", ":"), ensure_ascii=False)`.
+///
+/// # Errors
+///
+/// Index assembly failures (only structural ones; row building is total).
 pub fn build_index_json(oracle: &Oracle, printings: &Printings, meta: &CardMeta) -> Result<(Vec<u8>, usize, usize), String> {
     let names = &oracle.norm_list;
     let mut pid: HashMap<Option<String>, usize> = HashMap::new();
@@ -412,7 +420,7 @@ impl RecAssets {
 
 /// `json.dump(manifest, fh, indent=1)`.
 pub fn manifest_json(index: &str, rec: &str, dict: &str, bytes: u64) -> String {
-    let q = |s: &str| serde_json::to_string(s).unwrap();
+    let q = |s: &str| serde_json::to_string(s).expect("string serialises");
     format!("{{\n \"v\": 1,\n \"index\": {},\n \"rec\": {},\n \"dict\": {},\n \"bytes\": {bytes}\n}}", q(index), q(rec), q(dict))
 }
 
@@ -452,6 +460,10 @@ pub struct Manifest {
 }
 
 /// The published manifest + its index's (names, printings) counts.
+///
+/// # Errors
+///
+/// `manifest.json` read/parse failure (path-prefixed).
 pub fn live_client(scan_dir: &Path) -> Result<Option<(Manifest, usize, usize)>, String> {
     let mp = scan_dir.join("manifest.json");
     let Ok(b) = std::fs::read(&mp) else { return Ok(None) };
@@ -516,6 +528,10 @@ fn rm_rf(p: &Path) {
 
 /// Move the staged index files into `data_dir`, the current ones into
 /// `data_dir/.prev/`; any error restores the previous set.
+///
+/// # Errors
+///
+/// Any create/copy/rename failure during the swap.
 pub fn swap_files(data_dir: &Path, staging: &Path) -> Result<(), String> {
     let prev = data_dir.join(".prev");
     rm_rf(&prev);
@@ -568,7 +584,8 @@ fn fail_point(_: &str) -> Result<(), String> {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".{}.{}.tmp", path.file_name().unwrap().to_string_lossy(), std::process::id()));
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
     let r = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -582,6 +599,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Publish `idx` into the live client-scan dir under the script's rules.
+///
+/// # Errors
+///
+/// Any file copy/write/rename failure (path-prefixed).
 pub fn publish(scan_dir: &Path, idx: &ClientIndex, rec: Option<&RecAssets>, live: Option<&(Manifest, usize, usize)>) -> Result<Outcome, String> {
     std::fs::create_dir_all(scan_dir).map_err(|e| e.to_string())?;
     if let Some((m, names, prints)) = live {
@@ -642,6 +663,10 @@ pub fn publish(scan_dir: &Path, idx: &ClientIndex, rec: Option<&RecAssets>, live
 
 /// One refresh pass (blocking). `install` receives the freshly loaded
 /// indexes after the on-disk swap (production: hot-swap the engine).
+///
+/// # Errors
+///
+/// The pipeline failure string: fetch, index build, or file IO.
 pub fn run_blocking(cfg: &RunCfg, install: &dyn Fn(Oracle, Printings) -> Result<bool, String>) -> Result<Report, String> {
     let staging = cfg.data_dir.join(".nightly-staging");
     rm_rf(&staging);
@@ -817,6 +842,10 @@ fn install_live(oracle: Oracle, printings: Printings) -> Result<bool, String> {
 }
 
 /// One full pass with production wiring (download, hot-swap, publish).
+///
+/// # Errors
+///
+/// `SCRYBOX_CARDSCAN_DATA` unset, or any `run_blocking` pipeline failure.
 pub async fn run_now(force: bool, trigger: &str) -> Result<Report, String> {
     let Some(data_dir) = crate::scan_ocr::data_dir() else { return Err("SCRYBOX_CARDSCAN_DATA unset".into()) };
     if RUNNING.swap(true, Ordering::SeqCst) {

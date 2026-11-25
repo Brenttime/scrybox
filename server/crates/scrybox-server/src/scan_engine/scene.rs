@@ -19,14 +19,15 @@ pub const MAX_IMAGE_PIXELS: usize = 50_000_000;
 pub const OCR_BACKEND: &str = "rapidocr-ppocrv6";
 
 pub type Recognize<'a> = &'a dyn Fn(&[Rgb]) -> Result<Vec<(String, f64)>, String>;
+/// One-image OCR call: `_OCR_ENGINE(img, use_det=False, ...)` (no channel conversion).
+pub type RecCall<'a> = &'a dyn Fn(&Rgb) -> Result<(String, f64), String>;
 
 pub struct Ctx<'a> {
     pub oracle: &'a Oracle,
     pub printings: &'a Printings,
     /// `_recognize_scene_strips` minus the BGR swap (RGB strips in).
     pub rec: Recognize<'a>,
-    /// `_OCR_ENGINE(img, use_det=False, ...)` (no channel conversion).
-    pub rec_call: &'a dyn Fn(&Rgb) -> Result<(String, f64), String>,
+    pub rec_call: RecCall<'a>,
     pub history: &'a std::sync::Mutex<History>,
 }
 
@@ -46,6 +47,12 @@ fn recognize_rgb(ctx: &Ctx, strips: &[Rgb]) -> Result<Vec<(String, f64)>, String
     (ctx.rec)(&bgr)
 }
 
+/// Decode bytes (JPEG/WebP/PNG) to RGB, PIL error wording preserved.
+///
+/// # Errors
+///
+/// The truncated-file and unknown-format messages clients see, and the
+/// over-50-megapixel rejection.
 pub fn decode(raw: &[u8]) -> Result<Rgb, String> {
     // PIL's wording for the two decoder failures clients actually see
     let r = crate::cvscan::decode_rgb(raw).map_err(|e| {
@@ -75,7 +82,7 @@ pub fn scene_signature(card: &Rgb) -> Vec<i64> {
     let art = card.crop((0.08 * w) as i64, (0.14 * h) as i64, (0.92 * w) as i64, (0.58 * h) as i64);
     let s = art.resize_lanczos(12, 8);
     let mut v: Vec<f32> = s.px.iter().map(|&p| p as f32).collect();
-    let mean = (super::num::pairwise_sum_f32(&v) / v.len() as f32) as f32;
+    let mean = super::num::pairwise_sum_f32(&v) / v.len() as f32;
     for x in v.iter_mut() {
         *x -= mean;
     }
@@ -127,8 +134,8 @@ pub fn detect_uploaded_scene(raw: &[u8], keep_images: bool) -> Result<Detection,
         let pc = |h: &Hist| h.pct(90.0) - h.pct(10.0);
         let (tc, fc) = (pc(&title), pc(&footer));
         let (tg, fg) = (title.frac_where(|v| v > 250), footer.frac_where(|v| v > 250));
-        let ex = 2.max((0.01 * iw as f64) as i64);
-        let ey = 2.max((0.01 * ih as f64) as i64);
+        let ex = detect::EDGE_BAND_MIN_PX.max((detect::EDGE_BAND_FRACTION * iw as f64) as i64);
+        let ey = detect::EDGE_BAND_MIN_PX.max((detect::EDGE_BAND_FRACTION * ih as f64) as i64);
         let clipped = match &c.quad {
             Some(q) => {
                 let xs = q.iter().map(|p| p[0]);
@@ -199,6 +206,10 @@ pub fn detection_json(d: &Detection) -> Map<String, Value> {
 // ------------------------------------------------------------ printings
 
 type Evidence = Map<String, Value>;
+/// Per-card printing hint from `_batch_scene_printings` (`None` = unresolved).
+type HintList = Vec<Option<Map<String, Value>>>;
+/// A footer-strip crop region: `(x0, x1, y0, y1, resize_height)`.
+type FooterVariant = (f64, f64, f64, f64, usize);
 
 fn ev_resolved(set: Value, num: Value, by: &str) -> Evidence {
     let mut e = Map::new();
@@ -227,10 +238,14 @@ fn rows(k: &str, d: &str) -> Vec<f64> {
 }
 
 /// `_batch_scene_printings(images, titles)` → (hints, evidence).
-pub fn batch_scene_printings(ctx: &Ctx, images: &[Rgb], titles: &[Title]) -> Result<(Vec<Option<Map<String, Value>>>, Vec<Evidence>), String> {
+///
+/// # Errors
+///
+/// Any OCR-backend failure from the footer-strip recognition calls.
+pub fn batch_scene_printings(ctx: &Ctx, images: &[Rgb], titles: &[Title]) -> Result<(HintList, Vec<Evidence>), String> {
     let p = ctx.printings;
     let n = images.len();
-    let mut hints: Vec<Option<Map<String, Value>>> = vec![None; n];
+    let mut hints: HintList = vec![None; n];
     let mut evidence: Vec<Evidence> = vec![Map::new(); n];
     let mut unresolved = vec![];
     for (i, t) in titles.iter().enumerate() {
@@ -296,43 +311,11 @@ pub fn batch_scene_printings(ctx: &Ctx, images: &[Rgb], titles: &[Title]) -> Res
                 raws[o].push(raw);
             }
         }
+        let stage = FooterStage { printings: p, titles, raws: &raws, held: &held };
         let mut still = vec![];
         for &o in &pending {
-            let name = titles[o].name.clone().unwrap_or_default();
-            let tn = norm_name(&name);
-            let numbers = footer_numbers_padded(&raws[o]);
-            let codes = p.footer_codes(&raws[o]);
-            let mut group = p.resolve_footer_group(&tn, &codes, &numbers);
-            let mut e = Map::new();
-            e.insert("collector".into(), json!(raws[o]));
-            e.insert("set".into(), json!([]));
-            for k in ["retro_extra", "retro_held"] {
-                if let Some(v) = evidence[o].get(k).filter(|v| truthy(v)) {
-                    e.insert(k.into(), v.clone());
-                }
-            }
-            evidence[o] = e;
-            let h = held.get(&o).cloned().unwrap_or_default();
-            if let Some(g) = &group {
-                if !h.is_empty() && p.strong_conflict(&tn, g[0], &raws[o], &h) {
-                    group = None;
-                }
-            }
-            if let Some(g) = &group {
-                if g.len() > 1 {
-                    evidence[o].insert("choices".into(), p.choice_evidence(g));
-                    continue;
-                }
-            }
-            match group {
-                Some(g) => {
-                    let card = p.printing_face(g[0], &name);
-                    evidence[o].insert("set_code".into(), card.get("set").cloned().unwrap_or(Value::Null));
-                    evidence[o].insert("collector_number".into(), json!(normalize_collector(&py_str(card.get("num").unwrap_or(&Value::Null)))));
-                    evidence[o].insert("resolved_by".into(), json!("title+set+collector"));
-                    hints[o] = Some(card);
-                }
-                None => still.push(o),
+            if !stage.resolve_owner(o, &mut evidence, &mut hints) {
+                still.push(o);
             }
         }
         pending = still;
@@ -376,6 +359,62 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
+/// Read-only inputs of one footer-OCR stage, shared by every pending owner.
+#[derive(Clone, Copy)]
+struct FooterStage<'a> {
+    printings: &'a Printings,
+    titles: &'a [Title],
+    raws: &'a [Vec<String>],
+    held: &'a HashMap<usize, Vec<String>>,
+}
+
+impl FooterStage<'_> {
+    /// One owner's footer resolution for this stage: rebuild `evidence[o]`
+    /// from the raw OCR lines, record `choices` for an ambiguous group, or pin
+    /// the unique printing into `hints[o]`. Returns false when the owner stays
+    /// pending for the next stage.
+    fn resolve_owner(&self, o: usize, evidence: &mut [Evidence], hints: &mut HintList) -> bool {
+        let FooterStage { printings: p, titles, raws, held } = *self;
+        let name = titles[o].name.clone().unwrap_or_default();
+        let tn = norm_name(&name);
+        let numbers = footer_numbers_padded(&raws[o]);
+        let codes = p.footer_codes(&raws[o]);
+        let mut group = p.resolve_footer_group(&tn, &codes, &numbers);
+        let mut e = Map::new();
+        e.insert("collector".into(), json!(raws[o]));
+        e.insert("set".into(), json!([]));
+        for k in ["retro_extra", "retro_held"] {
+            if let Some(v) = evidence[o].get(k).filter(|v| truthy(v)) {
+                e.insert(k.into(), v.clone());
+            }
+        }
+        evidence[o] = e;
+        let h = held.get(&o).cloned().unwrap_or_default();
+        if let Some(g) = &group {
+            if !h.is_empty() && p.strong_conflict(&tn, g[0], &raws[o], &h) {
+                group = None;
+            }
+        }
+        if let Some(g) = &group {
+            if g.len() > 1 {
+                evidence[o].insert("choices".into(), p.choice_evidence(g));
+                return true;
+            }
+        }
+        match group {
+            Some(g) => {
+                let card = p.printing_face(g[0], &name);
+                evidence[o].insert("set_code".into(), card.get("set").cloned().unwrap_or(Value::Null));
+                evidence[o].insert("collector_number".into(), json!(normalize_collector(&py_str(card.get("num").unwrap_or(&Value::Null)))));
+                evidence[o].insert("resolved_by".into(), json!("title+set+collector"));
+                hints[o] = Some(card);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn retro_footer_pass(
     ctx: &Ctx,
@@ -391,16 +430,7 @@ fn retro_footer_pass(
     let retro_rows = rows("CARDSCAN_RETRO_ROWS", "0.855,0.845,0.865,0.875");
     let x0: f64 = env("CARDSCAN_RETRO_X0", "0.35").parse().unwrap_or(0.35);
     let rh: usize = env("CARDSCAN_RETRO_H", "160").parse().unwrap_or(160);
-    let (mut strips, mut owners, mut rws) = (vec![], vec![], vec![]);
-    for &o in pending {
-        for (row, &y0) in retro_rows.iter().enumerate() {
-            if let Some(s) = strip(&images[o], x0, 0.95, y0, (y0 + 0.025).min(0.99), rh) {
-                strips.push(s);
-                owners.push(o);
-                rws.push(row);
-            }
-        }
-    }
+    let (strips, owners, rws) = retro_strips(images, pending, &retro_rows, x0, rh);
     let out = recognize_rgb(ctx, &strips)?;
     let mut retro: HashMap<usize, indexmap::IndexMap<String, i64>> = pending.iter().map(|&o| (o, Default::default())).collect();
     let mut extra: HashMap<usize, Vec<String>> = pending.iter().map(|&o| (o, vec![])).collect();
@@ -471,7 +501,22 @@ fn retro_footer_pass(
     Ok(())
 }
 
-const FOOTER_COLLECTOR_VARIANTS: [(f64, f64, f64, f64, usize); 7] = [
+/// Retro footer strips for each pending owner, with the strip's row index.
+fn retro_strips(images: &[Rgb], pending: &[usize], retro_rows: &[f64], x0: f64, rh: usize) -> (Vec<Rgb>, Vec<usize>, Vec<usize>) {
+    let (mut strips, mut owners, mut rws) = (vec![], vec![], vec![]);
+    for &o in pending {
+        for (row, &y0) in retro_rows.iter().enumerate() {
+            if let Some(s) = strip(&images[o], x0, 0.95, y0, (y0 + 0.025).min(0.99), rh) {
+                strips.push(s);
+                owners.push(o);
+                rws.push(row);
+            }
+        }
+    }
+    (strips, owners, rws)
+}
+
+const FOOTER_COLLECTOR_VARIANTS: [FooterVariant; 7] = [
     (0.00, 0.38, 0.85, 0.88, 96),
     (0.08, 0.48, 0.865, 0.895, 96),
     (0.00, 0.30, 0.88, 0.92, 96),
@@ -480,13 +525,13 @@ const FOOTER_COLLECTOR_VARIANTS: [(f64, f64, f64, f64, usize); 7] = [
     (0.00, 0.45, 0.96, 1.00, 96),
     (0.00, 0.32, 0.86, 0.91, 96),
 ];
-const FOOTER_SET_VARIANTS: [(f64, f64, f64, f64, usize); 4] =
+const FOOTER_SET_VARIANTS: [FooterVariant; 4] =
     [(0.00, 0.45, 0.90, 0.94, 96), (0.00, 0.48, 0.92, 0.97, 96), (0.08, 0.48, 0.88, 0.91, 96), (0.00, 0.48, 0.95, 0.985, 96)];
 
 /// `_recognize_footer_strips(crop, (variant,), skew)`. The PIL BICUBIC
 /// `strip.rotate(skew)` for |skew| >= 0.75 is NOT ported (documented gap;
 /// only reachable with CARDSCAN_SCENE_FALLBACK=1, off in production).
-fn footer_strip_raws(ctx: &Ctx, img: &Rgb, v: (f64, f64, f64, f64, usize)) -> Result<Vec<String>, String> {
+fn footer_strip_raws(ctx: &Ctx, img: &Rgb, v: FooterVariant) -> Result<Vec<String>, String> {
     let Some(s) = strip(img, v.0, v.1, v.2, v.3, v.4) else { return Ok(vec![]) };
     let (raw, conf) = (ctx.rec_call)(&s)?;
     Ok(if !raw.is_empty() && conf >= 0.55 { vec![raw] } else { vec![] })
@@ -503,7 +548,7 @@ fn identify_exact_printing(ctx: &Ctx, img: &Rgb, title: &str) -> Result<(Option<
         e.insert("set".into(), json!(set));
         e
     };
-    let variants: Vec<(bool, (f64, f64, f64, f64, usize))> =
+    let variants: Vec<(bool, FooterVariant)> =
         FOOTER_COLLECTOR_VARIANTS.iter().map(|v| (false, *v)).chain(FOOTER_SET_VARIANTS.iter().map(|v| (true, *v))).collect();
     for (is_set, v) in variants {
         let r = footer_strip_raws(ctx, img, v)?;
@@ -989,7 +1034,7 @@ pub fn scan_frame(ctx: &Ctx, cache: &mut IdentityCache, raw: &[u8], session: Opt
         if !c.get("eligible").is_some_and(truthy) {
             continue;
         }
-        let num = c["number"].as_i64().unwrap_or(0);
+        let num = c.get("number").and_then(Value::as_i64).unwrap_or(0);
         if let Some(mut hit) = cache.lookup(&sig_of(c), c.get("box").unwrap_or(&Value::Null)) {
             hit.insert("scene_number".into(), json!(num));
             hit.insert("cached".into(), json!(true));

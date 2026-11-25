@@ -44,7 +44,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use rusqlite::{types::Value as SqlValue, Connection};
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 
 use crate::auth::bearer_token;
 use crate::cards_tags::{json_error, read_body};
@@ -70,6 +70,22 @@ fn base_url() -> &'static str {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(20); // axios instance timeout
+
+/// axios instance `maxContentLength`/`maxBodyLength` (40 mb) — the ceiling
+/// `finish()` enforces on every sidecar reply.
+const MAX_UPSTREAM_BODY: usize = 40 * 1024 * 1024;
+/// The route parsers' `limit` on the post-auth bodies (15 mb raw / bigJson).
+const MAX_POST_AUTH_BODY: usize = 15 * 1024 * 1024;
+/// telemetry's own `express.json({ limit: '512kb' })`.
+const MAX_TELEMETRY_JSON_BODY: usize = 512 * 1024;
+/// `compression()`'s default `threshold`: bodies below this stay identity.
+const COMPRESS_MIN_BYTES: usize = 1024;
+/// Node's `req.body.length < 100` arm on the raw image legs.
+const MIN_IMAGE_BYTES: usize = 100;
+/// The Node telemetry handler slices to the first 200 records.
+const TELEMETRY_RECORDS_CAP: usize = 200;
+/// `http.get('/api/health', { timeout: 2500 })` — health.js probe timeout.
+const SIDECAR_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 type JsonClient = Client<HttpConnector, String>;
 type BytesClient = Client<HttpConnector, http_body_util::Full<axum::body::Bytes>>;
@@ -193,17 +209,15 @@ async fn call_get(path: &str, timeout: Duration) -> Up {
 
 async fn finish(res: hyper::Response<hyper::body::Incoming>) -> Up {
     let status = res.status().as_u16();
-    let ctype = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let raw = match BodyExt::collect(res.into_body()).await {
         Ok(b) => b.to_bytes().to_vec(),
         Err(_) => return Up::Failed,
     };
-    if raw.len() > 40 * 1024 * 1024 {
+    if raw.len() > MAX_UPSTREAM_BODY {
         return Up::Failed; // maxContentLength
     }
     // axios tryParse() attempts JSON.parse on ANY stringy body (content-type
     // is not consulted); a parse throw surfaces as an axios error → 502 arm.
-    let _ = ctype;
     match serde_json::from_slice::<Value>(&raw) {
         Ok(v) => Up::Resp { status, json: Some(v) },
         Err(_) => Up::Failed,
@@ -286,7 +300,7 @@ pub(crate) async fn compress(req: Request, next: axum::middleware::Next) -> Resp
         Ok(c) => c.to_bytes(),
         Err(_) => return Response::from_parts(parts, Body::empty()),
     };
-    if raw.len() < 1024 {
+    if raw.len() < COMPRESS_MIN_BYTES {
         return Response::from_parts(parts, Body::from(raw)); // below threshold, identity
     }
     let gz = crate::collection::gzip_bytes(&raw);
@@ -363,6 +377,16 @@ fn ct_is(headers: &HeaderMap, ty: &str) -> bool {
     content_type(headers).split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(ty)
 }
 
+/// Content types the app-level parsers would have consumed (outer bigJson
+/// for `application/json`, the route-level `express.raw` for `image/jpeg` /
+/// `application/octet-stream`). Only an oversize body under one of these
+/// types produces Node's 413 (entity.too.large → global rewrite); any other
+/// type was never parsed, so there is no size error to reproduce.
+fn oversize_ct_is_parsed(headers: &HeaderMap) -> bool {
+    let first = content_type(headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream")
+}
+
 // Body-parse failures never produce a locally-authored error: Node's own
 // express parsers are the authority (entity.too.large is rewritten by the
 // global handler at server.js:638 to the 'Upload too large...' 413; strict
@@ -378,7 +402,7 @@ pub(crate) fn parse_outer_json(headers: &HeaderMap, bytes: &[u8]) -> Result<Valu
     if !ct_is(headers, "application/json") {
         return Ok(Value::Object(Map::new())); // outer skipped; handlers read {}
     }
-    if bytes.len() > 15 * 1024 * 1024 {
+    if bytes.len() > MAX_POST_AUTH_BODY {
         return Err(());
     }
     if bytes.is_empty() {
@@ -404,7 +428,7 @@ fn parse_raw_image(headers: &HeaderMap, bytes: &[u8]) -> Result<Option<Vec<u8>>,
     if first != "image/jpeg" && first != "application/octet-stream" {
         return Ok(None); // outer express.json ate it → req.body not a Buffer
     }
-    if bytes.len() > 15 * 1024 * 1024 {
+    if bytes.len() > MAX_POST_AUTH_BODY {
         // raw's limit error has NO type:'entity.too.large', so Node's global
         // handler falls through to 500 {error:'Internal server error'} —
         // Forward, Node renders it.
@@ -418,7 +442,7 @@ fn parse_telemetry_body(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ()> 
     if !ct_is(headers, "application/json") && !ct_is(headers, "text/plain") {
         return Ok(Value::Object(Map::new()));
     }
-    if bytes.len() > 512 * 1024 {
+    if bytes.len() > MAX_TELEMETRY_JSON_BODY {
         return Err(()); // entity.too.large → global 413 rewrite, Node's job
     }
     if bytes.is_empty() {
@@ -720,6 +744,26 @@ async fn authed(st: &AppState, headers: &HeaderMap, is_get: bool) -> Result<i64,
     Ok(id)
 }
 
+/// The four POST routes' shared preamble (M5 iter-83/84 shape): pool
+/// checkout via get_async (idle-pop / blocking-pool hop, never a worker
+/// park) + the statsCache.invalidateOnWrite twin. Returns the pool and the
+/// user id, or the auth/pool error response for `node_exact`.
+#[expect(clippy::result_large_err, reason = "the Err is the final HTTP response, returned once per request; matches authed()")]
+async fn post_auth(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Arc<crate::db::DbPool>, i64), Response> {
+    let Some(pool) = st.db.clone() else {
+        return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"));
+    };
+    let token = bearer_token(headers).map(|s| s.to_string());
+    let uid = crate::auth::authenticate_async(&pool, token.as_deref(), false)
+        .await
+        .map(|u| u.id)?;
+    crate::stats::on_native_write(st, uid);
+    Ok((pool, uid))
+}
+
 use crate::util::now_ms_u64 as now_ms;
 
 // ---------------------------------------------------------------------------
@@ -739,7 +783,10 @@ pub(crate) fn res_json(status: StatusCode, v: &Value) -> Response {
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .header(header::ETAG, body_etag(body.as_bytes()))
         .body(Body::from(body))
-        .unwrap()
+        // Infallible: status is a StatusCode constant, the header names are
+        // static, and body_etag returns a quoted hex digest (a valid field
+        // value), so the builder can never return Err here.
+        .expect("res_json: static status/headers + quoted-hex ETag are valid HTTP parts")
 }
 
 /// `fresh` twin (shared with rules.rs): a request Cache-Control carrying the
@@ -758,7 +805,9 @@ fn not_modified(tag: &str) -> Response {
         .status(StatusCode::NOT_MODIFIED)
         .header(header::ETAG, tag)
         .body(Body::empty())
-        .unwrap()
+        // Infallible: `tag` originates from body_etag (quoted hex) and the
+        // status is a constant.
+        .expect("not_modified: constant status + body_etag value are valid HTTP parts")
 }
 
 /// JSON.stringify twin over the JSON value space: serde_json keeps the
@@ -787,10 +836,10 @@ fn canonical(v: &Value) -> Value {
             if let Some(f) = n.as_f64() {
                 if f.fract() == 0.0 && f.is_finite() {
                     if f >= 0.0 && f <= u64::MAX as f64 {
-                        return Value::Number(Value::from(f as u64).as_u64().unwrap().into());
+                        return Value::Number(Number::from(f as u64));
                     }
                     if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-                        return Value::Number(Value::from(f as i64).as_i64().unwrap().into());
+                        return Value::Number(Number::from(f as i64));
                     }
                 }
                 return n
@@ -828,7 +877,7 @@ pub async fn handle_status(State(st): State<AppState>, req: Request) -> Response
     }
     // In-process: the probe may wait out the lazy engine load (BUG-2).
     let probe = if crate::scan_engine::http_mode() {
-        Duration::from_millis(2500)
+        SIDECAR_HEALTH_PROBE_TIMEOUT
     } else {
         crate::scan_engine::STATUS_LOAD_WAIT + Duration::from_secs(2)
     };
@@ -877,15 +926,12 @@ pub async fn handle_detect(State(st): State<AppState>, req: Request) -> Response
     }
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
-    if oversize {
-        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
-            return crate::collection_writes::too_large();
-        }
+    if oversize && oversize_ct_is_parsed(&parts.headers) {
+        return crate::collection_writes::too_large();
     }
     let headers = parts.headers.clone();
     let raw = match parse_raw_image(&parts.headers, &bytes) {
-        Ok(Some(b)) if b.len() >= 100 => b,
+        Ok(Some(b)) if b.len() >= MIN_IMAGE_BYTES => b,
         // bigJson (outer, /api/cardscan) runs before the route: a json-CT
         // body it rejects never reaches 'Missing image' — global 500.
         Ok(None) if parse_outer_json(&parts.headers, &bytes).is_err() => {
@@ -920,27 +966,18 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
     }
     // M5 (REVIEW): auth via get_async (idle-pop / blocking-pool hop, never
     // a worker park) — iter-83/84 marketplace shape, cardscan_park pins.
-    let Some(pool) = st.db.clone() else {
-        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
-    };
-    let token = bearer_token(req.headers()).map(|s| s.to_string());
-    let uid = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
-        Ok(u) => u.id,
+    let (pool, uid) = match post_auth(&st, req.headers()).await {
+        Ok(v) => v,
         Err(res) => return node_exact(res).await,
     };
-    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
-    crate::stats::on_native_write(&st, uid);
     let headers = req.headers().clone();
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
-    if oversize {
-        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
-            return crate::collection_writes::too_large();
-        }
+    if oversize && oversize_ct_is_parsed(&parts.headers) {
+        return crate::collection_writes::too_large();
     }
     let raw = match parse_raw_image(&parts.headers, &bytes) {
-        Ok(Some(b)) if b.len() >= 100 => b,
+        Ok(Some(b)) if b.len() >= MIN_IMAGE_BYTES => b,
         // req.body not a Buffer → Missing image — but only when the outer
         // bigJson actually parsed it: a json-CT body that bigJson chokes on
         // (binary junk) is Node's own 500, so Forward and let it answer.
@@ -1026,20 +1063,11 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
                 Ok(a) => a,
                 Err(()) => return upstream_error(&Up::Failed),
             };
-            let mut candidates: Vec<Value> = Vec::with_capacity(cands.len());
-            for c in &cands {
-                if c.is_null() {
-                    // c.number on null → TypeError → catch → 502 arm.
-                    return upstream_error(&Up::Failed);
-                }
-                let mut m = Map::new();
-                for k in ["number", "box", "quad", "eligible", "status"] {
-                    if let Some(x) = c.get(k) {
-                        m.insert(k.into(), x.clone());
-                    }
-                }
-                candidates.push(Value::Object(m));
-            }
+            let candidates = match candidate_rows(&cands) {
+                Some(rows) => rows,
+                // c.number on null → TypeError → catch → 502 arm.
+                None => return upstream_error(&Up::Failed),
+            };
             let mut timings = match data.get("timings") {
                 Some(Value::Object(t)) => t.clone(),
                 _ => Map::new(),
@@ -1067,6 +1095,26 @@ pub async fn handle_frame(State(st): State<AppState>, req: Request) -> Response 
     }
 }
 
+/// `candidates.map(c => ({number, box, quad, eligible, status}))` — reading
+/// `c.number` off a null element throws (JS TypeError → route catch → 502),
+/// which is what the `None` return models.
+fn candidate_rows(cands: &[Value]) -> Option<Vec<Value>> {
+    let mut candidates: Vec<Value> = Vec::with_capacity(cands.len());
+    for c in cands {
+        if c.is_null() {
+            return None;
+        }
+        let mut m = Map::new();
+        for k in ["number", "box", "quad", "eligible", "status"] {
+            if let Some(x) = c.get(k) {
+                m.insert(k.into(), x.clone());
+            }
+        }
+        candidates.push(Value::Object(m));
+    }
+    Some(candidates)
+}
+
 fn replay(parts: axum::http::request::Parts, bytes: Vec<u8>, headers: HeaderMap) -> Request {
     let mut req = Request::from_parts(parts, Body::from(bytes));
     *req.headers_mut() = headers;
@@ -1079,23 +1127,14 @@ pub async fn handle_cards(State(st): State<AppState>, req: Request) -> Response 
         return crate::proxy(State(st), req).await;
     }
     // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
-    let Some(pool) = st.db.clone() else {
-        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
-    };
-    let token = bearer_token(req.headers()).map(|s| s.to_string());
-    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
-        Ok(u) => u,
+    let (pool, _uid) = match post_auth(&st, req.headers()).await {
+        Ok(v) => v,
         Err(res) => return node_exact(res).await,
     };
-    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
-    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
-    if oversize {
-        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
-            return crate::collection_writes::too_large();
-        }
+    if oversize && oversize_ct_is_parsed(&parts.headers) {
+        return crate::collection_writes::too_large();
     }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
@@ -1176,23 +1215,14 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
         return crate::proxy(State(st), req).await;
     }
     // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
-    let Some(pool) = st.db.clone() else {
-        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
-    };
-    let token = bearer_token(req.headers()).map(|s| s.to_string());
-    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
-        Ok(u) => u,
+    let (pool, _uid) = match post_auth(&st, req.headers()).await {
+        Ok(v) => v,
         Err(res) => return node_exact(res).await,
     };
-    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
-    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
-    if oversize {
-        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
-            return crate::collection_writes::too_large();
-        }
+    if oversize && oversize_ct_is_parsed(&parts.headers) {
+        return crate::collection_writes::too_large();
     }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
@@ -1239,29 +1269,22 @@ pub async fn handle_choices(State(st): State<AppState>, req: Request) -> Respons
     }
 }
 
-/// POST /api/cardscan — {cards:[...]} → /api/scan-scene + hydration.
+/// POST /api/cardscan — `{cards:[...]}` → /api/scan-scene + the shared
+/// hydrate() leg; a miss on a scryfall id forwards the whole request to Node
+/// (its getCardById owns the Scryfall fetch lane).
 pub async fn handle_scan(State(st): State<AppState>, req: Request) -> Response {
     if req.method() != Method::POST || !owns(&st) {
         return crate::proxy(State(st), req).await;
     }
     // M5 (REVIEW): auth via get_async (iter-83/84 marketplace shape).
-    let Some(pool) = st.db.clone() else {
-        return node_exact(json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")).await;
-    };
-    let token = bearer_token(req.headers()).map(|s| s.to_string());
-    let user = match crate::auth::authenticate_async(&pool, token.as_deref(), false).await {
-        Ok(u) => u,
+    let (pool, _uid) = match post_auth(&st, req.headers()).await {
+        Ok(v) => v,
         Err(res) => return node_exact(res).await,
     };
-    // statsCache.invalidateOnWrite twin (authed's non-GET arm).
-    crate::stats::on_native_write(&st, user.id);
     // REVIEW-auth H1: capped stream read at the route's Node parser ceiling.
     let (parts, bytes, oversize) = read_body(req, crate::collection_writes::BODY_BIG).await;
-    if oversize {
-        let first = content_type(&parts.headers).split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-        if matches!(first.as_str(), "application/json" | "image/jpeg" | "application/octet-stream") {
-            return crate::collection_writes::too_large();
-        }
+    if oversize && oversize_ct_is_parsed(&parts.headers) {
+        return crate::collection_writes::too_large();
     }
     let headers = parts.headers.clone();
     let body = match parse_outer_json(&parts.headers, &bytes) {
@@ -1378,7 +1401,7 @@ pub async fn handle_telemetry(State(st): State<AppState>, req: Request) -> Respo
         return StatusCode::NO_CONTENT.into_response();
     }
     let records: Vec<Value> = match body.get("records") {
-        Some(Value::Array(a)) => a.iter().take(200).cloned().collect(),
+        Some(Value::Array(a)) => a.iter().take(TELEMETRY_RECORDS_CAP).cloned().collect(),
         _ => vec![],
     };
     if records.is_empty() {

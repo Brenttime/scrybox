@@ -9,6 +9,7 @@ pub mod rec;
 
 use names::Oracle;
 use pil::Rgb;
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -17,6 +18,11 @@ pub fn data_dir() -> Option<PathBuf> {
     std::env::var("SCRYBOX_CARDSCAN_DATA").ok().filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
+/// Process-wide oracle (the sidecar's title indexes), loaded lazily on
+/// first use and shared by every scan.
+///
+/// # Errors
+/// `SCRYBOX_CARDSCAN_DATA` unset, or the index files failing to read/parse.
 pub fn oracle() -> Result<&'static Oracle, String> {
     static O: OnceLock<Result<Oracle, String>> = OnceLock::new();
     O.get_or_init(|| Oracle::load(&data_dir().ok_or("SCRYBOX_CARDSCAN_DATA unset")?))
@@ -45,6 +51,8 @@ pub fn title_strip(img: &Rgb, x0: f64, x1: f64, y0: f64, y1: f64, target_h: usiz
     Some(s.resize_lanczos(tw, target_h))
 }
 
+/// One scanned title strip: best oracle match (None = unnamed), its score,
+/// the raw OCR text, and the rotation angle that produced the winner.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Title {
     pub name: Option<String>,
@@ -60,14 +68,26 @@ type Cand = (f64, f64, String, String, i32);
 pub const TWO_LINE_TITLE_BANDS: [(f64, f64, f64, f64); 2] = [(0.040, 0.80, 0.030, 0.100), (0.040, 0.80, 0.095, 0.160)];
 
 fn better(a: &Cand, b: &Cand) -> bool {
-    // Python tuple max: (score, confidence, name, raw, angle)
-    a.0.partial_cmp(&b.0)
-        .unwrap()
-        .then(a.1.partial_cmp(&b.1).unwrap())
-        .then(a.2.cmp(&b.2))
-        .then(a.3.cmp(&b.3))
-        .then(a.4.cmp(&b.4))
-        .is_gt()
+    // Python tuple max: (score, confidence, name, raw, angle) compared
+    // field-by-field, first non-equal field decides. A NaN operand is never
+    // equal to anything, so it IS the first non-equal field and the
+    // comparison stops there "not greater" — the incumbent wins. Falling
+    // through to the tie-break chain (the old Equal fallback) would let
+    // name/raw/angle replace Python's winner, and the recognizer callback
+    // can supply a NaN confidence (NaN < 0.60 is false, so it passes the
+    // absorb filter). A differing finite score still decides even when the
+    // loser's confidence is NaN.
+    match a.0.partial_cmp(&b.0) {
+        Some(Ordering::Equal) => {}
+        Some(o) => return o.is_gt(),
+        None => return false,
+    }
+    match a.1.partial_cmp(&b.1) {
+        Some(Ordering::Equal) => {}
+        Some(o) => return o.is_gt(),
+        None => return false,
+    }
+    (a.2.as_str(), a.3.as_str(), a.4) > (b.2.as_str(), b.3.as_str(), b.4)
 }
 
 /// `_batch_scene_titles(images)`; `recognize` is `_recognize_scene_strips`
@@ -152,6 +172,8 @@ pub fn batch_scene_titles(
     if !ws.is_empty() {
         let out = rec_bgr(&ws)?;
         let mut joined = vec![];
+        // ws is extended TWO strips at a time (lines.len() == 2 gate) and
+        // rec_bgr maps 1:1, so out has even length and every chunk is 2.
         for pair in out.chunks(2) {
             let ((a, ca), (b, cb)) = (&pair[0], &pair[1]);
             let ok = !a.trim().is_empty() && !b.trim().is_empty() && *ca >= 0.60 && *cb >= 0.60;
@@ -199,4 +221,45 @@ pub fn batch_scene_titles(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(score: f64, conf: f64, name: &str, raw: &str, angle: i32) -> Cand {
+        (score, conf, name.to_string(), raw.to_string(), angle)
+    }
+
+    #[test]
+    fn better_keeps_incumbent_on_nan_confidence_tie() {
+        // Equal scores, NaN confidence from the recognizer callback (NaN
+        // passes the `conf < 0.60` filter). Python stops at the first
+        // non-equal field — NaN != 0.75 — so `a` is NOT greater even though
+        // its name/raw/angle would win the tie-break chain.
+        let a = cand(0.9, f64::NAN, "Zzz", "zzz", 180);
+        let b = cand(0.9, 0.75, "Aaa", "aaa", 0);
+        assert!(!better(&a, &b), "NaN conf must not replace the incumbent");
+        assert!(!better(&b, &a), "finite conf is never greater than NaN either");
+    }
+
+    #[test]
+    fn better_finite_score_decides_over_nan_confidence() {
+        // A differing finite score decides at the first field, regardless
+        // of either candidate's confidence being NaN.
+        assert!(better(&cand(0.95, f64::NAN, "A", "a", 0), &cand(0.90, 0.99, "Z", "z", 0)));
+        assert!(!better(&cand(0.90, 0.99, "A", "a", 0), &cand(0.95, f64::NAN, "Z", "z", 0)));
+    }
+
+    #[test]
+    fn better_rejects_nan_score_and_keeps_python_tie_breaks() {
+        assert!(!better(&cand(f64::NAN, 0.9, "Z", "z", 0), &cand(0.9, 0.9, "A", "a", 0)), "NaN score loses to any finite score");
+        assert!(!better(&cand(0.9, 0.9, "A", "a", 0), &cand(f64::NAN, 0.9, "Z", "z", 0)), "finite score vs NaN score is 'not greater' too");
+        // All fields equal => not greater (max keeps the incumbent).
+        assert!(!better(&cand(0.9, 0.8, "X", "x", 0), &cand(0.9, 0.8, "X", "x", 0)));
+        // The plain tie-break chain still works on finite, equal scores.
+        assert!(better(&cand(0.9, 0.8, "B", "a", 0), &cand(0.9, 0.8, "A", "z", 0)));
+        assert!(better(&cand(0.9, 0.8, "A", "b", 0), &cand(0.9, 0.8, "A", "a", 0)));
+        assert!(better(&cand(0.9, 0.8, "A", "a", 1), &cand(0.9, 0.8, "A", "a", 0)));
+    }
 }
