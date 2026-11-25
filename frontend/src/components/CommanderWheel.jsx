@@ -3,6 +3,7 @@ import { ChevronLeft, Dices, Search, Swords, RotateCw, Info, X } from 'lucide-re
 import { useT } from '../utils/i18n';
 import { rememberOpen } from '../utils/viewMemory';
 import { cardPriceText } from '../utils/formatPrice';
+import CardImage from './CardImage';
 import {
   masterSets, filterMasterSets, commanderQuery, dedupeCommanders, pickWinner,
   buildSlices, landingRotation, sliceColor, deckNameFor,
@@ -23,8 +24,8 @@ function loadPicked() {
   try { const a = JSON.parse(localStorage.getItem(STORE) || '[]'); return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; } catch { return []; }
 }
 
-async function fetchPool(codes, signal) {
-  const q = commanderQuery(codes);
+async function fetchPool(codes, dates, signal) {
+  const q = commanderQuery(codes, dates);
   if (!q) return [];
   const rows = [];
   for (let page = 1; page <= MAX_PAGES; page++) {
@@ -37,7 +38,7 @@ async function fetchPool(codes, signal) {
     const total = parseInt(res.headers.get('X-Total-Count'), 10);
     if (got.length < PAGE || (Number.isFinite(total) && rows.length >= total)) break;
   }
-  return dedupeCommanders(rows, codes);
+  return dedupeCommanders(rows, [...codes, 'plst']);
 }
 
 const R = 160;
@@ -99,7 +100,8 @@ export default function CommanderWheel({ onNavigate, showToast }) {
 
   const pickedFamilies = useMemo(() => families.filter(f => picked.includes(f.code)), [families, picked]);
   const codes = useMemo(() => [...new Set(pickedFamilies.flatMap(f => f.codes))], [pickedFamilies]);
-  const codesKey = codes.join(',');
+  const dates = useMemo(() => pickedFamilies.map(f => f.released).filter(Boolean), [pickedFamilies]);
+  const codesKey = `${codes.join(',')}|${dates.join(',')}`;
 
   useEffect(() => {
     try { localStorage.setItem(STORE, JSON.stringify(picked)); } catch { /* best effort */ }
@@ -111,7 +113,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
     const ctl = new AbortController();
     setLoading(true);
     setError('');
-    fetchPool(codes, ctl.signal)
+    fetchPool(codes, dates, ctl.signal)
       .then(p => { setPool(p); setSlices(buildSlices(p, pickWinner(p)).slices); })
       .catch(e => { if (e.name !== 'AbortError') { setError(t('cw.error')); setPool([]); setSlices([]); } })
       .finally(() => { if (!ctl.signal.aborted) setLoading(false); });
@@ -196,7 +198,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
           <div className="cw-setlist">
             {visible.map(f => (
               <button key={f.code} type="button" className={`cw-setrow${picked.includes(f.code) ? ' on' : ''}`} onClick={() => toggle(f.code)} aria-pressed={picked.includes(f.code)}>
-                {f.symbol && <img src={f.symbol} alt="" className="cw-sym" loading="lazy" />}
+                {f.symbol && <img crossOrigin="anonymous" src={f.symbol} alt="" className="cw-sym" loading="lazy" />}
                 <span className="cw-setname">{f.name}
                   {f.childNames.length > 0 && <span className="cw-setkids">{t('cw.includes', { n: f.codes.length })}</span>}
                 </span>
@@ -217,7 +219,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
 
           {winner && (
             <div className="cw-result" role="status">
-              {winner.image_url && <img src={winner.image_url} alt={winner.name} className="cw-art" onClick={() => setInspect(true)} />}
+              <CardImage card={winner} alt={winner.name} className="cw-art" onClick={() => setInspect(true)} />
               <div className="cw-info">
                 <div className="cw-eyebrow">{t('cw.yourCommander')}</div>
                 <h3 className="cw-name">{winner.name}</h3>

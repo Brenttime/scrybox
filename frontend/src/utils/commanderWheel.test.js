@@ -27,6 +27,7 @@ test('commanderQuery ORs every set and keeps reprint printings', () => {
   assert.equal(commanderQuery(['fin', 'fic']), 'is:commander -is:funny (e:fin or e:fic) unique:prints');
   assert.equal(commanderQuery(['mbc']), 'is:commander -is:funny e:mbc unique:prints');
   assert.equal(commanderQuery(['bad code;']), '');
+  assert.equal(commanderQuery(['mbc'], ['2026-10-19', 'nope']), 'is:commander -is:funny (e:mbc or (e:plst date=2026-10-19)) unique:prints');
 });
 
 test('dedupeCommanders prefers the in-set printing', () => {
