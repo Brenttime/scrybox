@@ -47,10 +47,15 @@ export function filterMasterSets(families, text) {
 }
 
 // Scryfall query for "anything that can lead a deck, printed in these sets".
-export function commanderQuery(codes) {
+// `listDates`: release dates of the chosen families. The List (plst) cards a
+// product ships with (e.g. Mystery Booster Commander's reprint slot) are
+// filed under plst with that product's release date, not under its code.
+export function commanderQuery(codes, listDates = []) {
   const list = [...new Set((codes || []).map(c => String(c).toLowerCase()).filter(c => /^[a-z0-9]+$/.test(c)))];
+  const dates = [...new Set((listDates || []).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(String(d))))];
+  const terms = [...list.map(c => `e:${c}`), ...dates.map(d => `(e:plst date=${d})`)];
   if (!list.length) return '';
-  const sets = list.length === 1 ? `e:${list[0]}` : `(${list.map(c => `e:${c}`).join(' or ')})`;
+  const sets = terms.length === 1 ? terms[0] : `(${terms.join(' or ')})`;
   return `is:commander -is:funny ${sets} unique:prints`;
 }
 
