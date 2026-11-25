@@ -24,9 +24,7 @@ function loadPicked() {
   try { const a = JSON.parse(localStorage.getItem(STORE) || '[]'); return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; } catch { return []; }
 }
 
-async function fetchPool(codes, dates, signal) {
-  const q = commanderQuery(codes, dates);
-  if (!q) return [];
+async function fetchQuery(q, signal) {
   const rows = [];
   for (let page = 1; page <= MAX_PAGES; page++) {
     const params = new URLSearchParams({ q, scope: 'internet', lang: 'en', page: String(page), limit: String(PAGE) });
@@ -38,7 +36,20 @@ async function fetchPool(codes, dates, signal) {
     const total = parseInt(res.headers.get('X-Total-Count'), 10);
     if (got.length < PAGE || (Number.isFinite(total) && rows.length >= total)) break;
   }
-  return dedupeCommanders(rows, [...codes, 'plst']);
+  return rows;
+}
+
+// Two passes: the family's own printings, then The List cards filed with the
+// same release date as the family's main set. The date comes from the cards
+// themselves (the set index can disagree with Scryfall's card dates).
+async function fetchPool(codes, rootCodes, fallbackDates, signal) {
+  const own = await fetchQuery(commanderQuery(codes), signal);
+  const roots = new Set(rootCodes);
+  const dates = new Set(own.filter(r => roots.has(String(r.set_id || '').toLowerCase())).map(r => r.released_at).filter(Boolean));
+  if (!dates.size) fallbackDates.forEach(d => dates.add(d));
+  const listQ = `is:commander -is:funny e:plst (${[...dates].map(d => `date=${d}`).join(' or ')}) unique:prints`;
+  const list = dates.size ? await fetchQuery(listQ, signal) : [];
+  return dedupeCommanders([...own, ...list], [...codes, 'plst']);
 }
 
 const R = 160;
@@ -101,6 +112,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
   const pickedFamilies = useMemo(() => families.filter(f => picked.includes(f.code)), [families, picked]);
   const codes = useMemo(() => [...new Set(pickedFamilies.flatMap(f => f.codes))], [pickedFamilies]);
   const dates = useMemo(() => pickedFamilies.map(f => f.released).filter(Boolean), [pickedFamilies]);
+  const roots = useMemo(() => pickedFamilies.map(f => f.code), [pickedFamilies]);
   const codesKey = `${codes.join(',')}|${dates.join(',')}`;
 
   useEffect(() => {
@@ -113,7 +125,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
     const ctl = new AbortController();
     setLoading(true);
     setError('');
-    fetchPool(codes, dates, ctl.signal)
+    fetchPool(codes, roots, dates, ctl.signal)
       .then(p => { setPool(p); setSlices(buildSlices(p, pickWinner(p)).slices); })
       .catch(e => { if (e.name !== 'AbortError') { setError(t('cw.error')); setPool([]); setSlices([]); } })
       .finally(() => { if (!ctl.signal.aborted) setLoading(false); });
