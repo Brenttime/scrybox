@@ -153,7 +153,9 @@ export default function ScryfallPortal({ onNavigate, showToast, onUpdate }) {
   useSwipeBack(!inspect, back);
 
   const fetchPage = useCallback(async (query, pageNum) => {
-    const params = new URLSearchParams({ q: query, scope: 'internet', lang: 'en', page: String(pageNum), limit: String(PAGE) });
+    // Every printing by default (like Scryfall's unique:prints) unless the query says otherwise.
+    const fullQ = /(^|\s)-?unique:/i.test(query) ? query : `${query} unique:prints`;
+    const params = new URLSearchParams({ q: fullQ, scope: 'internet', lang: 'en', page: String(pageNum), limit: String(PAGE) });
     const res = await fetch(`/api/search?${params.toString()}`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

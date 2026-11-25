@@ -850,7 +850,9 @@ pub fn app(state: AppState) -> Router {
     // else (or groups that are off) falls through to the catch-all proxy —
     // never 405 here.
     let router = if state.owns("decks_reads") {
-        router.rroute("/api/decks/{id}/locations", any(decks_reads::handle_locations))
+        router
+            .rroute("/api/decks/card-matches", any(lists_reads::handle_deck_card_matches))
+            .rroute("/api/decks/{id}/locations", any(decks_reads::handle_locations))
     } else {
         router
     };
