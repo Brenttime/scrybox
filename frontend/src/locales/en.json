@@ -182,7 +182,7 @@
   "deck.tabAdd": "Add",
   "deck.tabStats": "Stats",
   "deck.addToDeck": "Add to Deck…",
-  "deck.filterPlaceholder": "Filter decks by name or description...",
+  "deck.filterPlaceholder": "Search decks by name or card...",
   "lists.filterPlaceholder": "Filter lists by name or card...",
   "deck.sourceFilter": "Deck source",
   "deck.allDecks": "All Decks",

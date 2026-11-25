@@ -80,8 +80,18 @@ pub async fn handle_collection(State(st): State<AppState>, req: Request) -> Resp
 
 /// GET /api/lists/card-matches (routes/lists.js:71).
 pub async fn handle_card_matches(State(st): State<AppState>, req: Request) -> Response {
+    card_matches(st, req, "lists_reads", LIST_MATCH_SQL).await
+}
+
+/// GET /api/decks/card-matches: same contract as the list twin, keyed by deck
+/// id, so the Decks index search also finds decks holding a card.
+pub async fn handle_deck_card_matches(State(st): State<AppState>, req: Request) -> Response {
+    card_matches(st, req, "decks_reads", DECK_MATCH_SQL).await
+}
+
+async fn card_matches(st: AppState, req: Request, group: &'static str, sql: &'static str) -> Response {
     let uri = req.uri().clone();
-    guard_get(st, req, "lists_reads", move |pool, headers, user| async move {
+    guard_get(st, req, group, move |pool, headers, user| async move {
         // const q = String(req.query.q || '').trim(); if (q.length < 2) return res.json({});
         let q = qs_string(uri.query(), "q").trim().to_string();
         // JS string length counts UTF-16 code units — one astral char
@@ -102,7 +112,7 @@ pub async fn handle_card_matches(State(st): State<AppState>, req: Request) -> Re
             let conn = pool.get().map_err(|e| {
                 tracing::error!(error = %e, "lists_reads: pool");
             })?;
-            build_card_matches(&conn, user.id, &like).map_err(|e| {
+            build_card_matches(&conn, sql, user.id, &like).map_err(|e| {
                 tracing::error!(error = %e, "lists_reads: card-matches build");
             })
         })
@@ -468,16 +478,26 @@ fn build_list_collection(conn: &Connection, user_id: i64) -> Result<Vec<u8>, rus
 // GET /api/lists/card-matches (routes/lists.js:71)
 // ---------------------------------------------------------------------------
 
-fn build_card_matches(conn: &Connection, user_id: i64, like: &str) -> Result<Vec<u8>, rusqlite::Error> {
-    let rows = rows_map(
-        conn,
-        "
+const LIST_MATCH_SQL: &str = "
          SELECT DISTINCT lc.list_id AS list_id, cc.name AS name
            FROM card_lists l
            JOIN list_cards lc ON lc.list_id = l.id AND lc.quantity > 0
            JOIN card_cache cc ON cc.id = lc.card_id
           WHERE l.user_id = ? AND cc.name LIKE ? ESCAPE '\\'
-          ORDER BY cc.name",
+          ORDER BY cc.name";
+
+const DECK_MATCH_SQL: &str = "
+         SELECT DISTINCT dc.deck_id AS list_id, cc.name AS name
+           FROM decks d
+           JOIN deck_cards dc ON dc.deck_id = d.id AND dc.quantity > 0
+           JOIN card_cache cc ON cc.id = dc.card_id
+          WHERE d.user_id = ? AND cc.name LIKE ? ESCAPE '\\'
+          ORDER BY cc.name";
+
+fn build_card_matches(conn: &Connection, sql: &str, user_id: i64, like: &str) -> Result<Vec<u8>, rusqlite::Error> {
+    let rows = rows_map(
+        conn,
+        sql,
         &[SqlValue::Integer(user_id), SqlValue::Text(like.to_string())],
     )?;
     // const out = {}; for (const r of rows) (out[r.list_id] ||= []).push(r.name);

@@ -137,6 +137,20 @@ function DeckBuilder({ showToast, onNavigate }) {
 
   // Deck Selection Menu Controls
   const [deckSearchTerm, setDeckSearchTerm] = useState('');
+  // Deck index search also matches cards inside decks: { deck_id: [names] }.
+  const [deckCardMatches, setDeckCardMatches] = useState({});
+  useEffect(() => {
+    const term = deckSearchTerm.trim();
+    if (term.length < 2) { setDeckCardMatches({}); return undefined; }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetch(`/api/decks/card-matches?q=${encodeURIComponent(term)}`)
+        .then(r => (r.ok ? r.json() : {}))
+        .then(data => { if (!cancelled) setDeckCardMatches(data || {}); })
+        .catch(() => { if (!cancelled) setDeckCardMatches({}); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [deckSearchTerm]);
   const [deckSourceFilter, setDeckSourceFilter] = useState(() => localStorage.getItem('deckSourceFilter') || 'all'); // 'all' | 'no_precon' | 'precon' | 'no_moxfield' | 'moxfield'
   useEffect(() => { localStorage.setItem('deckSourceFilter', deckSourceFilter); }, [deckSourceFilter]);
   const [deckSortBy, setDeckSortBy] = useState('created_desc'); // 'created_desc' | 'created_asc' | 'name_asc' | 'cards_desc'
@@ -1132,7 +1146,8 @@ function DeckBuilder({ showToast, onNavigate }) {
     const q = deckSearchTerm.trim().toLowerCase();
     const matchesSearch = !q ||
       deck.name.toLowerCase().includes(q) ||
-      (deck.description && deck.description.toLowerCase().includes(q));
+      (deck.description && deck.description.toLowerCase().includes(q)) ||
+      Boolean(deckCardMatches[deck.id]?.length);
 
     const src = deck.source === 'precon' || deck.source === 'moxfield' ? deck.source : null;
     const matchesSource = deckSourceFilter === 'all'
@@ -1410,6 +1425,13 @@ function DeckBuilder({ showToast, onNavigate }) {
                       <p className="deck-tile-desc" style={{ color: 'var(--text-secondary)', fontSize: '0.82rem', marginTop: '0.6rem', minHeight: '34px', lineHeight: '1.4' }}>
                         {deck.description || ''}
                       </p>
+                      {deckSearchTerm.trim() && deckCardMatches[deck.id]?.length > 0 && (
+                        <div className="deck-tile-matches" style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: '0.35rem' }}
+                          title={deckCardMatches[deck.id].join(', ')}>
+                          <Search size={11} style={{ verticalAlign: '-1px', marginRight: '0.3rem' }} />
+                          {t('lists.containsCards', { names: deckCardMatches[deck.id].join(', ') })}
+                        </div>
+                      )}
                     </div>
 
                     {/* Progress Bar & Details */}
@@ -1521,6 +1543,13 @@ function DeckBuilder({ showToast, onNavigate }) {
                           <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
                             {deck.description || 'No description'}
                           </div>
+                          {deckSearchTerm.trim() && deckCardMatches[deck.id]?.length > 0 && (
+                        <div className="deck-tile-matches" style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: '0.35rem' }}
+                          title={deckCardMatches[deck.id].join(', ')}>
+                          <Search size={11} style={{ verticalAlign: '-1px', marginRight: '0.3rem' }} />
+                          {t('lists.containsCards', { names: deckCardMatches[deck.id].join(', ') })}
+                        </div>
+                      )}
                         </td>
                         <td style={{ padding: '0.75rem 1rem', width: '160px' }}>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>

@@ -420,15 +420,19 @@ function CardInspectorModal({ card, onClose, onUpdate, onEntryChanged = null, on
           </div>
 
           {mode !== 'edit' && builtDecks.length > 0 && (
-            <div className="ci-built-decks" style={{ fontSize: '0.7rem', color: 'var(--text-muted)', lineHeight: 1.35 }}>
-              <span style={{ fontWeight: 700 }}>{t('inspector.inBuiltDecks')}: </span>
-              {builtDecks.map((d, i) => (
-                <span key={d.id}>
-                  {i > 0 ? ' · ' : null}
-                  <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>{d.name}</span>
-                  {d.quantity > 1 ? ` ×${d.quantity}` : null}
-                </span>
-              ))}
+            <div className="ci-built-decks" style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+              <span style={{ fontSize: '0.72rem', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>
+                {t('inspector.inBuiltDecks')}
+              </span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                {builtDecks.map(d => (
+                  <span key={d.id} className="ci-built-deck" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.82rem', fontWeight: 600, padding: '0.25rem 0.6rem', borderRadius: '999px', background: 'rgba(74, 222, 128, 0.12)', color: '#4ade80', border: '1px solid rgba(74, 222, 128, 0.3)' }}>
+                    <Layers size={12} />
+                    {d.name}
+                    {d.quantity > 1 ? ` ×${d.quantity}` : null}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
 
