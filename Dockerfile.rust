@@ -47,25 +47,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # =========================================
-# ONNX Runtime 1.27.0 (release dylib, sha256-pinned)
+# ONNX Runtime 1.27.0 (official dylib from the onnxruntime-node npm package)
+# The github.com/microsoft/onnxruntime release assets are gone (repo 404s), so
+# the dylib comes from the immutable npm tarball; both the tarball and the
+# per-arch library are sha256-pinned.
 # =========================================
 FROM native-base AS ort
 ARG TARGETARCH
 ARG ORT_VERSION=1.27.0
-ARG ORT_SHA256_AMD64=547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f
-ARG ORT_SHA256_ARM64=3e4d83ac06924a32a07b6d7f91ce6f852876153fc0bbdf931bf517a140bfbe48
+ARG ORT_NPM_SHA256=c3779c01c59832f8c03e2c392ac3af10bf08579f1822e8b1c63cc451edb302a2
+ARG ORT_SO_SHA256_AMD64=d8aff4aa8abee8fb2abb2f2f2459ffc94461e781e41b9f7c072829dd0d470221
+ARG ORT_SO_SHA256_ARM64=c36bc200e7e6c093b8abb0b34590fbdd8c52fd3fb5e33795b9523ffdde2fce0f
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \
-      amd64) a=x64; sha=$ORT_SHA256_AMD64 ;; \
-      arm64) a=aarch64; sha=$ORT_SHA256_ARM64 ;; \
+      amd64) a=x64; sha=$ORT_SO_SHA256_AMD64 ;; \
+      arm64) a=arm64; sha=$ORT_SO_SHA256_ARM64 ;; \
       *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${a}-${ORT_VERSION}.tgz"; \
-    echo "$sha  /tmp/ort.tgz" | sha256sum -c -; \
+    curl -fsSL --retry 5 --retry-all-errors -o /tmp/ort.tgz "https://registry.npmjs.org/onnxruntime-node/-/onnxruntime-node-${ORT_VERSION}.tgz"; \
+    echo "$ORT_NPM_SHA256  /tmp/ort.tgz" | sha256sum -c -; \
     mkdir -p /out; \
-    tar xzf /tmp/ort.tgz -C /tmp; \
-    cp "/tmp/onnxruntime-linux-${a}-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}" /out/libonnxruntime.so.1; \
-    rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-*
+    tar xzf /tmp/ort.tgz -C /tmp "package/bin/napi-v6/linux/${a}/libonnxruntime.so.1"; \
+    cp "/tmp/package/bin/napi-v6/linux/${a}/libonnxruntime.so.1" /out/libonnxruntime.so.1; \
+    echo "$sha  /out/libonnxruntime.so.1" | sha256sum -c -; \
+    rm -rf /tmp/ort.tgz /tmp/package
 
 # =========================================
 # Static OpenCV 4.10.0 — core + imgproc only (what scan_engine links)
