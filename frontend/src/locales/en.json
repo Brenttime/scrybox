@@ -1481,6 +1481,8 @@
   "cw.loading": "Gathering commanders...",
   "cw.error": "Could not load commanders from local Scryfall.",
   "cw.poolCount": "{n} commanders on the wheel",
+  "cw.poolCountOwned": "{n} of {total} commanders are in your collection",
+  "cw.ownedOnly": "Only cards in my collection",
   "cw.pickFirst": "Pick one or more master sets to fill the wheel.",
   "cw.spin": "Spin",
   "cw.spinning": "Spinning...",

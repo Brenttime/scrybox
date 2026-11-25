@@ -2810,6 +2810,8 @@ a.dash-art { color: inherit; text-decoration: none; }
 .cw-empty { fill: var(--input-bg); }
 .cw-pointer { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 14px solid transparent; border-right: 14px solid transparent; border-top: 28px solid #c9a43a; z-index: 2; filter: drop-shadow(0 2px 3px rgba(0,0,0,0.5)); }
 .cw-status { font-size: 0.85rem; color: var(--text-secondary); text-align: center; }
+.cw-owned { display: inline-flex; align-items: center; gap: 8px; font-size: 0.88rem; font-weight: 600; color: var(--text-primary); cursor: pointer; }
+.cw-owned input { width: 18px; height: 18px; accent-color: var(--accent-yellow, #eab308); }
 .cw-spin { min-width: 160px; font-size: 1.05rem; font-weight: 800; display: inline-flex; gap: 8px; justify-content: center; align-items: center; }
 .cw-result { display: flex; gap: 1rem; width: 100%; align-items: flex-start; animation: cw-reveal 420ms ease-out; border-top: 1px solid var(--border-glass); padding-top: 1rem; }
 .cw-art { width: min(240px, 40vw); border-radius: 4.75% / 3.5%; box-shadow: 0 8px 24px rgba(0,0,0,0.4); cursor: zoom-in; flex: none; }

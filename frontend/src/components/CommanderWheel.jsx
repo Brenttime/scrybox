@@ -19,6 +19,7 @@ const PAGE = 250;
 const MAX_PAGES = 12;
 const SPIN_MS = 5200;
 const STORE = 'scrybox.commanderWheel.sets';
+const OWNED_STORE = 'scrybox.commanderWheel.ownedOnly';
 
 function loadPicked() {
   try { const a = JSON.parse(localStorage.getItem(STORE) || '[]'); return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; } catch { return []; }
@@ -93,7 +94,11 @@ export default function CommanderWheel({ onNavigate, showToast }) {
   const [families, setFamilies] = useState([]);
   const [filter, setFilter] = useState('');
   const [picked, setPicked] = useState(loadPicked);
-  const [pool, setPool] = useState([]);
+  const [allPool, setPool] = useState([]);
+  const [ownedOnly, setOwnedOnly] = useState(() => { try { return localStorage.getItem(OWNED_STORE) === '1'; } catch { return false; } });
+  // owned_qty on search rows counts every printing of the name, so any copy
+  // in the collection qualifies the commander.
+  const pool = useMemo(() => (ownedOnly ? allPool.filter(c => (c.owned_qty || 0) > 0) : allPool), [allPool, ownedOnly]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [slices, setSlices] = useState([]);
@@ -126,7 +131,7 @@ export default function CommanderWheel({ onNavigate, showToast }) {
     setLoading(true);
     setError('');
     fetchPool(codes, roots, dates, ctl.signal)
-      .then(p => { setPool(p); setSlices(buildSlices(p, pickWinner(p)).slices); })
+      .then(p => setPool(p))
       .catch(e => { if (e.name !== 'AbortError') { setError(t('cw.error')); setPool([]); setSlices([]); } })
       .finally(() => { if (!ctl.signal.aborted) setLoading(false); });
     return () => ctl.abort();
@@ -135,6 +140,14 @@ export default function CommanderWheel({ onNavigate, showToast }) {
 
   const visible = useMemo(() => filterMasterSets(families, filter).slice(0, 60), [families, filter]);
   const toggle = code => setPicked(p => (p.includes(code) ? p.filter(c => c !== code) : [...p, code]));
+
+  useEffect(() => {
+    try { localStorage.setItem(OWNED_STORE, ownedOnly ? '1' : '0'); } catch { /* best effort */ }
+    if (spinning) return;
+    setWinner(null);
+    setSlices(buildSlices(pool, pickWinner(pool)).slices);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pool]);
 
   const spin = () => {
     if (spinning || !pool.length) return;
@@ -223,8 +236,12 @@ export default function CommanderWheel({ onNavigate, showToast }) {
         <section className="glass-panel cw-stage">
           <Wheel slices={slices} rotation={rotation} spinning={spinning} />
           <div className="cw-status">
-            {loading ? t('cw.loading') : error || (codes.length ? t('cw.poolCount', { n: pool.length }) : t('cw.pickFirst'))}
+            {loading ? t('cw.loading') : error || (codes.length ? (ownedOnly ? t('cw.poolCountOwned', { n: pool.length, total: allPool.length }) : t('cw.poolCount', { n: pool.length })) : t('cw.pickFirst'))}
           </div>
+          <label className="cw-owned">
+            <input type="checkbox" checked={ownedOnly} onChange={e => setOwnedOnly(e.target.checked)} disabled={spinning} />
+            {t('cw.ownedOnly')}
+          </label>
           <button type="button" className="btn btn-primary cw-spin" onClick={spin} disabled={spinning || loading || !pool.length}>
             <RotateCw size={18} /> {spinning ? t('cw.spinning') : t('cw.spin')}
           </button>
