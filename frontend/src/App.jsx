@@ -36,6 +36,7 @@ const LimitedLands = lazyView(() => import('./components/LimitedLands'));
 const ScryfallPortal = lazyView(() => import('./components/ScryfallPortal'));
 const Rules = lazyView(() => import('./components/Rules'));
 const Keywords = lazyView(() => import('./components/Keywords'));
+const CommanderWheel = lazyView(() => import('./components/CommanderWheel'));
 // Login is only ever shown signed-out, so it stays out of the entry chunk that
 // every signed-in load parses.
 const Login = lazyView(() => import('./components/Login'));
@@ -390,6 +391,8 @@ function App() {
         return <Rules onNavigate={goTab} />;
       case 'keywords':
         return <Keywords onNavigate={goTab} />;
+      case 'commander-wheel':
+        return <CommanderWheel onNavigate={goTab} showToast={showToast} />;
       case 'settings':
         return <Settings user={user} onUpdateUser={handleUpdateUser} showToast={showToast} target={settingsTarget} onLogout={handleLogout} />;
       default:

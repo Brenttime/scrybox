@@ -39,7 +39,7 @@ export function getRememberedTab() {
   if (!raw) return 'dashboard';
   let tab = raw;
   try { tab = (JSON.parse(raw).tab || raw); } catch { /* plain string */ }
-  const known = ['dashboard', 'add-cards', 'collection', 'deckbuilder', 'lists', 'limited', 'scryfall', 'rules', 'keywords', 'settings'];
+  const known = ['dashboard', 'add-cards', 'collection', 'deckbuilder', 'lists', 'limited', 'scryfall', 'rules', 'keywords', 'commander-wheel', 'settings'];
   return known.includes(tab) ? tab : 'dashboard';
 }
 
