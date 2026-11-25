@@ -6,7 +6,7 @@ import { cardPriceText } from '../utils/formatPrice';
 import CardImage from './CardImage';
 import {
   masterSets, filterMasterSets, commanderQuery, dedupeCommanders, pickWinner,
-  buildSlices, landingRotation, sliceColor, deckNameFor,
+  landingRotation, sliceAtPointer, sliceColor, deckNameFor,
 } from '../utils/commanderWheel';
 
 const CardInspectorModal = lazy(() => import('./CardInspectorModal'));
@@ -65,21 +65,29 @@ function slicePath(i, n) {
 }
 const shortName = s => { const n = String(s || '').split(' // ')[0].split(',')[0]; return n.length > 18 ? `${n.slice(0, 17)}…` : n; };
 
-function Wheel({ slices, rotation, spinning }) {
+// Every commander in the pool gets a slice. Names fit up to LABEL_MAX
+// slices; past that the wheel is colour-only and the ticker above it names
+// the slice under the pointer as it spins.
+const LABEL_MAX = 60;
+function Wheel({ slices, rotation, spinning, svgRef }) {
   const n = slices.length;
+  const labels = n <= LABEL_MAX;
+  const fontSize = n <= 16 ? 11 : n <= 32 ? 9 : 6.5;
   return (
     <div className="cw-wheel-wrap">
       <div className="cw-pointer" aria-hidden="true" />
-      <svg className="cw-wheel" viewBox={`0 0 ${R * 2} ${R * 2}`}
+      <svg ref={svgRef} className="cw-wheel" viewBox={`0 0 ${R * 2} ${R * 2}`}
         style={{ transform: `rotate(${rotation}deg)`, transition: spinning ? `transform ${SPIN_MS}ms cubic-bezier(0.12, 0.7, 0.08, 1)` : 'none' }}>
         {n === 0 && <circle cx={R} cy={R} r={R} className="cw-empty" />}
         {slices.map((c, i) => {
           const mid = ((i + 0.5) / n) * 360;
           return (
             <g key={`${c.name}-${i}`}>
-              <path d={slicePath(i, n)} fill={sliceColor(c.color_identity, i)} className="cw-slice" />
-              <text x={R} y={R} className="cw-label" fontSize={n > 16 ? 9 : 11}
-                transform={`rotate(${mid - 90} ${R} ${R}) translate(${R * 0.32} 3)`}>{shortName(c.name)}</text>
+              <path d={slicePath(i, n)} fill={sliceColor(c.color_identity, i)} className={`cw-slice${n > 90 ? ' thin' : ''}`} />
+              {labels && (
+                <text x={R} y={R} className="cw-label" fontSize={fontSize}
+                  transform={`rotate(${mid - 90} ${R} ${R}) translate(${R * 0.3} 0)`}>{shortName(c.name)}</text>
+              )}
             </g>
           );
         })}
@@ -108,6 +116,8 @@ export default function CommanderWheel({ onNavigate, showToast }) {
   const [inspect, setInspect] = useState(false);
   const [creating, setCreating] = useState(false);
   const timer = useRef(null);
+  const svgRef = useRef(null);
+  const [ticker, setTicker] = useState('');
 
   useEffect(() => {
     fetch('/api/sets?game=mtg&lang=en&tree=1').then(r => (r.ok ? r.json() : [])).then(d => setFamilies(masterSets(d))).catch(() => setFamilies([]));
@@ -143,22 +153,46 @@ export default function CommanderWheel({ onNavigate, showToast }) {
 
   useEffect(() => {
     try { localStorage.setItem(OWNED_STORE, ownedOnly ? '1' : '0'); } catch { /* best effort */ }
-    if (spinning) return;
+  }, [ownedOnly]);
+
+  // The wheel is the whole pool, in a stable order: it only changes when the
+  // chosen sets or the owned filter change, never between spins.
+  useEffect(() => {
     setWinner(null);
-    setSlices(buildSlices(pool, pickWinner(pool)).slices);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setSlices(pool);
+    setTicker('');
   }, [pool]);
 
+  // Name under the pointer while spinning, read from the live transform.
+  useEffect(() => {
+    if (!spinning) return undefined;
+    let raf;
+    const tick = () => {
+      const el = svgRef.current;
+      if (el) {
+        const m = getComputedStyle(el).transform;
+        const v = m && m !== 'none' ? m.match(/matrix\(([^)]+)\)/) : null;
+        if (v) {
+          const [a, b] = v[1].split(',').map(Number);
+          const deg = (Math.atan2(b, a) * 180) / Math.PI;
+          const i = sliceAtPointer(deg, slices.length);
+          if (slices[i]) setTicker(slices[i].name);
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [spinning, slices]);
+
   const spin = () => {
-    if (spinning || !pool.length) return;
-    const w = pickWinner(pool);
-    const { slices: s, winnerSlice } = buildSlices(pool, w);
+    if (spinning || !slices.length) return;
+    const w = pickWinner(slices);
     setWinner(null);
-    setSlices(s);
     setSpinning(true);
-    requestAnimationFrame(() => setRotation(r => landingRotation(r, winnerSlice, s.length, 6, Math.random())));
+    setRotation(r => landingRotation(r, w, slices.length, 6, Math.random()));
     clearTimeout(timer.current);
-    timer.current = setTimeout(() => { setSpinning(false); setWinner(pool[w]); }, SPIN_MS + 80);
+    timer.current = setTimeout(() => { setSpinning(false); setWinner(slices[w]); setTicker(slices[w].name); }, SPIN_MS + 80);
   };
 
   const startDeck = async () => {
@@ -234,7 +268,8 @@ export default function CommanderWheel({ onNavigate, showToast }) {
         </section>
 
         <section className="glass-panel cw-stage">
-          <Wheel slices={slices} rotation={rotation} spinning={spinning} />
+          <div className="cw-ticker" aria-live="off">{ticker || '\u00a0'}</div>
+          <Wheel slices={slices} rotation={rotation} spinning={spinning} svgRef={svgRef} />
           <div className="cw-status">
             {loading ? t('cw.loading') : error || (codes.length ? (ownedOnly ? t('cw.poolCountOwned', { n: pool.length, total: allPool.length }) : t('cw.poolCount', { n: pool.length })) : t('cw.pickFirst'))}
           </div>
