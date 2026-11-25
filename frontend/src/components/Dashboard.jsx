@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { TrendingUp, Mountain, BookOpen, Sparkles, Crown, Database } from 'lucide-react';
+import { TrendingUp, Mountain, BookOpen, Sparkles, Crown, Database, Dices } from 'lucide-react';
 import { getCardDisplayName } from '../utils/langHelper';
 import { cardPriceText, estPrefix } from '../utils/formatPrice';
 import { useT } from '../utils/i18n';
@@ -456,6 +456,7 @@ function Dashboard({ statsTrigger, onNavigate, onUpdate, showToast, portalOn = f
                 { key: 'rules', icon: BookOpen, label: t('rules.title') },
                 { key: 'limited', icon: Mountain, label: t('nav.limited') },
                 { key: 'keywords', icon: Sparkles, label: t('kw.title') },
+                { key: 'commander-wheel', icon: Dices, label: t('cw.title') },
                 ...(portalOn ? [{ key: 'scryfall', icon: Database, label: t('portal.title') }] : []),
               ].map(({ key, icon: Icon, label }) => (
                 <button key={key} type="button" className="dash-tile dash-tool" onClick={() => onNavigate && onNavigate(key)}>
