@@ -2805,6 +2805,8 @@ a.dash-art { color: inherit; text-decoration: none; }
 .cw-wheel-wrap { position: relative; width: min(420px, 86vw); aspect-ratio: 1; }
 .cw-wheel { width: 100%; height: 100%; border-radius: 50%; box-shadow: 0 0 0 6px #c9a43a, 0 0 0 10px #2a2112, 0 12px 40px rgba(0,0,0,0.45); will-change: transform; }
 .cw-slice { stroke: rgba(0,0,0,0.35); stroke-width: 1; }
+.cw-slice.thin { stroke-width: 0.25; }
+.cw-ticker { min-height: 1.6em; font-size: 1.05rem; font-weight: 800; color: var(--text-strong); text-align: center; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cw-label { fill: #fff; font-weight: 800; paint-order: stroke; stroke: rgba(0,0,0,0.55); stroke-width: 2.2px; dominant-baseline: middle; }
 .cw-hub { fill: #2a2112; stroke: #c9a43a; stroke-width: 4; }
 .cw-empty { fill: var(--input-bg); }

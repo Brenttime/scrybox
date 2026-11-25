@@ -4,8 +4,6 @@
 // printing in the set, so reprints (Mystery Booster Commander, Through the
 // Ages) are part of the pool by construction.
 
-export const WHEEL_SLICES = 24;
-
 // Flatten a tree node into its set codes (self + all descendants).
 export function familyCodes(node) {
   const out = [];
@@ -82,23 +80,6 @@ export function pickWinner(pool, rand = Math.random) {
   return Math.min(pool.length - 1, Math.floor(rand() * pool.length));
 }
 
-// The wheel shows at most WHEEL_SLICES names: the winner plus random others,
-// shuffled so the winner's slice moves around between spins.
-export function buildSlices(pool, winnerIdx, rand = Math.random, max = WHEEL_SLICES) {
-  if (winnerIdx < 0 || !pool || !pool.length) return { slices: [], winnerSlice: -1 };
-  const others = pool.map((_, i) => i).filter(i => i !== winnerIdx);
-  for (let i = others.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [others[i], others[j]] = [others[j], others[i]];
-  }
-  const picked = [winnerIdx, ...others.slice(0, Math.max(0, max - 1))];
-  for (let i = picked.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [picked[i], picked[j]] = [picked[j], picked[i]];
-  }
-  return { slices: picked.map(i => pool[i]), winnerSlice: picked.indexOf(winnerIdx) };
-}
-
 // Final rotation (deg, clockwise) that lands slice `idx` under the top
 // pointer. Slice i spans [i*step, (i+1)*step) measured clockwise from 12
 // o'clock; always spins forward at least `turns` full turns from `current`.
@@ -109,6 +90,13 @@ export function landingRotation(current, idx, n, turns = 6, jitter = 0.5) {
   const target = (360 - center) % 360;
   const base = current - (current % 360) + turns * 360;
   return base + target;
+}
+
+// Slice under the top pointer for a wheel rotated `deg` clockwise.
+export function sliceAtPointer(deg, n) {
+  if (n <= 0) return -1;
+  const at = (((360 - deg) % 360) + 360) % 360;
+  return Math.min(n - 1, Math.floor(at / (360 / n)));
 }
 
 const IDENTITY_FILL = { W: '#e9dfb8', U: '#3a7bc8', B: '#5b5560', R: '#c8453a', G: '#3c8c55' };

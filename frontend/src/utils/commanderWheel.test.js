@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { familyCodes, masterSets, filterMasterSets, commanderQuery, dedupeCommanders, pickWinner, buildSlices, landingRotation, deckNameFor } from './commanderWheel.js';
+import { familyCodes, masterSets, filterMasterSets, commanderQuery, dedupeCommanders, pickWinner, landingRotation, sliceAtPointer, deckNameFor } from './commanderWheel.js';
 
 const tree = [
   { set_code: 'fin', name: 'Final Fantasy', release_date: '2025-06-13', children: [
@@ -41,14 +41,21 @@ test('dedupeCommanders prefers the in-set printing', () => {
   assert.equal(out[0].set_id, 'fca');
 });
 
-test('winner is always on the wheel and slices cap at 24', () => {
+test('pickWinner covers the whole pool', () => {
   const pool = Array.from({ length: 200 }, (_, i) => ({ name: `c${i}` }));
-  const w = pickWinner(pool, () => 0.999);
-  assert.equal(w, 199);
-  const { slices, winnerSlice } = buildSlices(pool, w);
-  assert.equal(slices.length, 24);
-  assert.equal(slices[winnerSlice].name, 'c199');
+  assert.equal(pickWinner(pool, () => 0.999), 199);
+  assert.equal(pickWinner(pool, () => 0), 0);
   assert.equal(pickWinner([], Math.random), -1);
+});
+
+test('sliceAtPointer agrees with landingRotation for every slice', () => {
+  for (const n of [3, 24, 196]) {
+    for (let idx = 0; idx < n; idx += Math.max(1, Math.floor(n / 7))) {
+      for (const j of [0.01, 0.5, 0.99]) {
+        assert.equal(sliceAtPointer(landingRotation(37, idx, n, 6, j), n), idx);
+      }
+    }
+  }
 });
 
 test('landingRotation puts the slice centre under the top pointer', () => {
