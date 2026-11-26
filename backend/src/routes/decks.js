@@ -521,16 +521,27 @@ router.get('/:id/locations', async (req, res) => {
 // Update Deck Metadata
 router.put('/:id', async (req, res) => {
   const { id } = req.params;
-  const { name, description } = req.body;
+  const { name, description, format, category, accent_color, target_size } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: 'Deck name is required' });
   }
 
+  // format/category/accent_color/target_size are optional: a caller that
+  // only sends name/description (the pre-edit-modal shape) leaves them as-is.
+  const targetSizeNum = target_size !== undefined ? (parseInt(target_size, 10) || 60) : null;
+
   try {
     const result = await db.run(
-      `UPDATE decks SET name = ?, description = ? WHERE id = ? AND user_id = ?`,
-      [name, description || '', id, req.user.id]
+      `UPDATE decks SET
+         name = ?,
+         description = ?,
+         format = COALESCE(?, format),
+         category = COALESCE(?, category),
+         accent_color = COALESCE(?, accent_color),
+         target_size = COALESCE(?, target_size)
+       WHERE id = ? AND user_id = ?`,
+      [name, description || '', format || null, category || null, accent_color || null, targetSizeNum, id, req.user.id]
     );
 
     if (result.changes === 0) {

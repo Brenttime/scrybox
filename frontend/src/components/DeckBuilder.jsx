@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
 import { looksLikeSyntax } from '../utils/scryfallSyntax';
-import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart, Tags, Shapes, Highlighter, Infinity as InfinityIcon, Sparkles, BarChart3, Network } from 'lucide-react';
+import { Plus, Trash2, X, ChevronLeft, Play, Search, LogOut, PackageCheck, LayoutGrid, List, ClipboardList, PackagePlus, Download, Upload, Layers, ListChecks, Copy, Gamepad2, FolderPlus, FileText, Globe, PackageOpen, DollarSign, ShoppingCart, Tags, Shapes, Highlighter, Infinity as InfinityIcon, Sparkles, BarChart3, Network, Pencil } from 'lucide-react';
 import CombosModal from './CombosModal';
 // cytoscape is heavy: only load it when the Synergy map is opened.
 const SynergyMap = lazy(() => import('./SynergyMap'));
@@ -129,7 +129,18 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [newDeckTargetSize, setNewDeckTargetSize] = useState(100);
   const [newDeckImportText, setNewDeckImportText] = useState('');
   const [showImportDecklistArea, setShowImportDecklistArea] = useState(false);
-  
+
+  // Edit Deck modal: a separate set of form states so an open Edit doesn't
+  // collide with an open Create (and cancelling one never leaks into the other).
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editDeckId, setEditDeckId] = useState(null);
+  const [editDeckName, setEditDeckName] = useState('');
+  const [editDeckDesc, setEditDeckDesc] = useState('');
+  const [editDeckFormat, setEditDeckFormat] = useState('Commander / EDH');
+  const [editDeckCategory, setEditDeckCategory] = useState('Competitive');
+  const [editDeckAccentColor, setEditDeckAccentColor] = useState('#eab308');
+  const [editDeckTargetSize, setEditDeckTargetSize] = useState(100);
+
   // Card Search States inside editor
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -200,6 +211,7 @@ function DeckBuilder({ showToast, onNavigate }) {
   const [buyText, setBuyText] = useState('');
 
   useBackGuard(showCreateModal, () => setShowCreateModal(false));
+  useBackGuard(showEditModal, () => setShowEditModal(false));
   useBackGuard(showSimulator, () => setShowSimulator(false));
   useBackGuard(showSynergy, () => setShowSynergy(false));
   useBackGuard(missingOpen, () => setMissingOpen(false));
@@ -310,6 +322,49 @@ function DeckBuilder({ showToast, onNavigate }) {
     } catch (err) {
       console.error(err);
       showToast(t('deck.errCreateGeneric'));
+    }
+  };
+
+  const openEditDeck = (deck) => {
+    setEditDeckId(deck.id);
+    setEditDeckName(deck.name || '');
+    setEditDeckDesc(deck.description || '');
+    setEditDeckFormat(deck.format || 'Commander / EDH');
+    setEditDeckCategory(deck.category || 'Competitive');
+    setEditDeckAccentColor(deck.accent_color || '#eab308');
+    setEditDeckTargetSize(deck.target_size || 100);
+    setShowEditModal(true);
+  };
+
+  const handleEditDeck = async (e) => {
+    e.preventDefault();
+    if (!editDeckName.trim() || !editDeckId) return;
+
+    try {
+      const response = await fetch(`/api/decks/${editDeckId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editDeckName,
+          description: editDeckDesc,
+          format: editDeckFormat,
+          category: editDeckCategory,
+          accent_color: editDeckAccentColor,
+          target_size: editDeckTargetSize,
+        })
+      });
+
+      if (response.ok) {
+        showToast(t('deck.updated'));
+        setShowEditModal(false);
+        fetchDecks();
+        if (activeDeck?.id === editDeckId) loadDeckDetails(editDeckId);
+      } else {
+        showToast(t('deck.errUpdate'));
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(t('deck.errUpdateGeneric'));
     }
   };
 
@@ -1694,6 +1749,9 @@ function DeckBuilder({ showToast, onNavigate }) {
                     <PackagePlus size={14} /> {registeringDeck ? t('deck.registeringCollection') : t('deck.registerCollection')}
                   </button>
                 )}
+                <button role="menuitem" style={moreItem} onClick={() => openEditDeck(activeDeck)} title={t('deck.editDeckHint')}>
+                  <Pencil size={14} /> {t('deck.editDeck')}
+                </button>
                 <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.35rem' }} />
                 <button
                   role="menuitem"
@@ -2135,7 +2193,15 @@ function DeckBuilder({ showToast, onNavigate }) {
               {t('deck.createSubtitle')}
             </p>
 
-            <form onSubmit={handleCreateDeck} style={{ display: 'flex', flexDirection: 'column', gap: '1.1rem', maxHeight: '80vh', overflowY: 'auto', paddingRight: '0.25rem' }}>
+            {/* overflowY:'auto' here forces overflow-x to 'auto' too (CSS spec:
+                a non-visible overflow-y coerces a visible overflow-x), so this
+                form clips horizontally at its own padding edge. The selected
+                accent swatch's box-shadow glow + scale(1.15) bleeds a few px
+                left of x=0, so without real left padding here the leftmost
+                swatch gets clipped. Clipping happens at the padding box, not
+                the content box, so this padding (not a compensating negative
+                margin) is what actually buys room. */}
+            <form onSubmit={handleCreateDeck} style={{ display: 'flex', flexDirection: 'column', gap: '1.1rem', maxHeight: '80vh', overflowY: 'auto', padding: '0 0.25rem 0 0.75rem' }}>
               
               {/* Format & Target Size Row */}
               <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '0.75rem' }}>
@@ -2297,6 +2363,147 @@ function DeckBuilder({ showToast, onNavigate }) {
               <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
                 <button type="button" className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowCreateModal(false)}>{t('common.cancel')}</button>
                 <button type="submit" className="btn btn-primary" style={{ flex: 2, fontWeight: 700 }}>{t('deck.createDeck')}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* A2. Edit Deck Modal — mirrors Create, minus Quick Import (there is no decklist to import into an existing deck here). */}
+      {showEditModal && (
+        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+          <div className="glass-panel" style={{ maxWidth: '480px', width: '100%', maxHeight: '90vh', overflowY: 'auto', overscrollBehavior: 'contain', padding: '1.75rem', position: 'relative', border: '1px solid rgba(255,255,255,0.15)' }}>
+            <button className="modal-close btn btn-secondary btn-icon-only" onClick={() => setShowEditModal(false)} style={{ position: 'absolute', top: '1rem', right: '1rem', borderRadius: '50%' }}>
+              <X size={16} />
+            </button>
+
+            <h3 style={{ fontSize: '1.25rem', color: 'var(--text-strong)', fontWeight: 800, marginBottom: '0.25rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Pencil size={20} style={{ color: 'var(--accent-yellow)' }} />
+              {t('deck.editTitle')}
+            </h3>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1.25rem' }}>
+              {t('deck.editSubtitle')}
+            </p>
+
+            <form onSubmit={handleEditDeck} style={{ display: 'flex', flexDirection: 'column', gap: '1.1rem', maxHeight: '80vh', overflowY: 'auto', padding: '0 0.25rem 0 0.75rem' }}>
+
+              {/* Format & Target Size Row */}
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '0.75rem' }}>
+                <div className="form-group">
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.3rem', display: 'block' }}>{t('deck.format')}</label>
+                  <select
+                    className="input-control"
+                    value={editDeckFormat}
+                    onChange={(e) => setEditDeckFormat(e.target.value)}
+                    style={{ fontSize: '0.85rem' }}
+                  >
+                    {(MTG_FORMATS).map(fmt => (
+                      <option key={fmt} value={fmt} style={{ background: '#1e293b', color: '#fff' }}>{fmt}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="form-group">
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.3rem', display: 'block' }}>{t('deck.targetSize')}</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="300"
+                    className="input-control"
+                    value={editDeckTargetSize}
+                    onChange={(e) => setEditDeckTargetSize(parseInt(e.target.value, 10) || 60)}
+                    style={{ fontSize: '0.85rem' }}
+                  />
+                </div>
+              </div>
+
+              {/* Deck Name */}
+              <div className="form-group">
+                <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.3rem', display: 'block' }}>{t('deck.deckName')}</label>
+                <input
+                  type="text"
+                  className="input-control"
+                  placeholder={t('deck.namePlaceholder')}
+                  value={editDeckName}
+                  onChange={(e) => setEditDeckName(e.target.value)}
+                  required
+                  autoFocus
+                />
+              </div>
+
+              {/* Category Pills */}
+              <div className="form-group">
+                <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.4rem', display: 'block' }}>{t('deck.category')}</label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                  {DECK_CATEGORIES.map(cat => {
+                    const isSelected = editDeckCategory === cat;
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setEditDeckCategory(cat)}
+                        style={{
+                          fontSize: '0.75rem',
+                          fontWeight: 700,
+                          padding: '0.3rem 0.65rem',
+                          borderRadius: '12px',
+                          border: isSelected ? '1px solid var(--accent-yellow)' : '1px solid var(--border-glass)',
+                          background: isSelected ? 'rgba(234, 179, 8, 0.2)' : 'rgba(0,0,0,0.2)',
+                          color: isSelected ? 'var(--accent-yellow)' : 'var(--text-secondary)',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s'
+                        }}
+                      >
+                        {cat}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Deck Accent Color */}
+              <div className="form-group">
+                <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.4rem', display: 'block' }}>{t('deck.accentColor')}</label>
+                <div style={{ display: 'flex', itemsAlign: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  {DECK_ACCENT_COLORS.map(c => {
+                    const isSelected = editDeckAccentColor === c.hex;
+                    return (
+                      <div
+                        key={c.hex}
+                        onClick={() => setEditDeckAccentColor(c.hex)}
+                        title={c.name}
+                        style={{
+                          width: '26px',
+                          height: '26px',
+                          borderRadius: '50%',
+                          backgroundColor: c.hex,
+                          cursor: 'pointer',
+                          border: isSelected ? '2px solid #ffffff' : '2px solid transparent',
+                          boxShadow: isSelected ? `0 0 10px ${c.hex}` : 'none',
+                          transform: isSelected ? 'scale(1.15)' : 'scale(1)',
+                          transition: 'all 0.15s'
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Description (Optional) */}
+              <div className="form-group">
+                <label style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-strong)', marginBottom: '0.3rem', display: 'block' }}>{t('deck.descriptionOptional')}</label>
+                <textarea
+                  className="input-control"
+                  style={{ minHeight: '65px', resize: 'vertical', fontSize: '0.85rem' }}
+                  placeholder={t('deck.notesPlaceholder')}
+                  value={editDeckDesc}
+                  onChange={(e) => setEditDeckDesc(e.target.value)}
+                />
+              </div>
+
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowEditModal(false)}>{t('common.cancel')}</button>
+                <button type="submit" className="btn btn-primary" style={{ flex: 2, fontWeight: 700 }}>{t('deck.saveChanges')}</button>
               </div>
             </form>
           </div>

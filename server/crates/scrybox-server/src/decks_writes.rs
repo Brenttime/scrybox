@@ -79,9 +79,12 @@ fn get_col(conn: &Connection, sql: &str, params: &[SqlValue], idx: usize) -> Res
 // ---------------------------------------------------------------------------
 
 async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Response {
-    // `const { name, description } = req.body` then `if (!name)`. parse_body
-    // has already reduced non-object JSON to {} (arrays) or 500 (primitives),
-    // matching Node's strict-mode + error-handler answers (live-verified).
+    // `const { name, description, format, category, accent_color, target_size } = req.body`
+    // then `if (!name)`. parse_body has already reduced non-object JSON to {}
+    // (arrays) or 500 (primitives), matching Node's strict-mode + error-handler
+    // answers (live-verified). format/category/accent_color/target_size are
+    // optional — a caller sending only name/description (the pre-edit-modal
+    // shape) leaves them untouched via COALESCE(?, column).
     let name = body.get("name");
     if js_falsy(name) {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
@@ -91,15 +94,45 @@ async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &
     let Some(name_v) = name else {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     };
+    let opt_str_bind = |v: Option<&Value>| match v {
+        Some(x) if !js_falsy(Some(x)) => js_bind(x),
+        _ => SqlValue::Null,
+    };
+    // `parseInt(target_size, 10) || 60`: NaN AND 0 both fall back to 60
+    // (0 is falsy in JS), so an unparseable value and an explicit 0 land the
+    // same place as Node.
+    let target_size_bind = match body.get("target_size") {
+        Some(v) => {
+            let n = js_parse_int_v(Some(v)).unwrap_or(0);
+            SqlValue::Integer(if n == 0 { 60 } else { n })
+        }
+        None => SqlValue::Null,
+    };
     let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update deck"),
     };
     let changes = conn.execute(
-        "UPDATE decks SET name = ?1, description = ?2 WHERE id = ?3 AND user_id = ?4",
+        "UPDATE decks SET
+           name = ?1,
+           description = ?2,
+           format = COALESCE(?3, format),
+           category = COALESCE(?4, category),
+           accent_color = COALESCE(?5, accent_color),
+           target_size = COALESCE(?6, target_size)
+         WHERE id = ?7 AND user_id = ?8",
         rusqlite::params_from_iter(
-            [js_bind(name_v), desc_or_empty(body.get("description")), SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)]
-                .iter(),
+            [
+                js_bind(name_v),
+                desc_or_empty(body.get("description")),
+                opt_str_bind(body.get("format")),
+                opt_str_bind(body.get("category")),
+                opt_str_bind(body.get("accent_color")),
+                target_size_bind,
+                SqlValue::Text(id.to_string()),
+                SqlValue::Integer(user_id),
+            ]
+            .iter(),
         ),
     );
     match changes {
