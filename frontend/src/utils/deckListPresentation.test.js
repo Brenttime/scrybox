@@ -20,7 +20,9 @@ import { fileURLToPath } from 'node:url';
 const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (...parts) => readFileSync(join(srcDir, ...parts), 'utf8');
 const deckBuilder = read('components', 'DeckBuilder.jsx');
-const preconsRoute = read('..', '..', 'backend', 'src', 'routes', 'precons.js');
+// The precon import lives in the Rust server since the Node backend removal
+// (was backend/src/routes/precons.js).
+const preconsRoute = read('..', '..', 'server', 'crates', 'scrybox-server', 'src', 'precons.rs');
 
 const section = (start, end) => {
   const startIndex = deckBuilder.indexOf(start);
@@ -96,11 +98,13 @@ for (const site of badgeSites) {
 // The create path itself must not invent a play-style category for a printed
 // product. The DB column default is the last-line fallback, so a null passed
 // through must not fall back to a string either — assert the shape, not the SQL.
-assert.match(preconsRoute, /const defaultShape = \(type\) => \(COMMANDER_TYPES\.has\(type\)/,
+assert.match(preconsRoute, /fn default_shape\(/,
   'precon import must derive its deck shape from the product type');
-assert.doesNotMatch(preconsRoute, /category:\s*'(?:Competitive|Casual|Tournament|Theorycraft|Proxy|Trade)'/,
+assert.match(preconsRoute, /COMMANDER_TYPES\.contains\(&type_\)/,
+  'precon import must derive its deck shape from the product type (COMMANDER_TYPES branch)');
+assert.doesNotMatch(preconsRoute, /"(?:Competitive|Casual|Tournament|Theorycraft|Proxy|Trade)"/,
   'precon import must not stamp a play-style category — a printed deck is not a build style');
-assert.match(preconsRoute, /category:\s*null/,
-  'precon import must store an explicit null category, not a guess');
+assert.match(preconsRoute, /let category: Option<String> = if truthy\(&category_v\)/,
+  'precon import must default the category to None (SQL NULL), not a guess');
 
 console.log('PASS: deckListPresentation.test.js');

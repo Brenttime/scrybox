@@ -55,9 +55,9 @@ use crate::scryfall::Scry;
 use crate::AppState;
 use crate::poison::LockExt;
 
-/// catalog.js `UA` — backend/package.json version read at require time.
-/// Pinned against backend/package.json by the `scrybox_ua_version` test;
-/// bump both together.
+/// catalog.js `UA` — the app version read from package.json at require time
+/// in the Node original. Now pinned against frontend/package.json (and this
+/// string) by `app_version_pins_frontend_package_json`; bump both together.
 pub const SCRYBOX_UA: &str = "Scrybox/1.8.5 (+https://github.com/Brenttime/scrybox)";
 
 use crate::util::now_ms;

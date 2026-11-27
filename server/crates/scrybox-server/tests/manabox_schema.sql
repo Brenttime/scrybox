@@ -1,7 +1,7 @@
 -- Lane B unit 3b fixture: card_lists (+ source from db.js's ALTER), list_cards
--- and manabox_sync_runs, transcribed from backend/src/db.js. A dedicated test
--- (db_js_ddl_matches) re-creates each table from db.js's own SQL text and
--- asserts column-identical PRAGMA output.
+-- and manabox_sync_runs, originally transcribed from backend/src/db.js (since
+-- removed with the Node backend). tests/manabox_sync.rs::
+-- manabox_schema_fixture_shape pins the column set against future edits.
 CREATE TABLE card_lists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,

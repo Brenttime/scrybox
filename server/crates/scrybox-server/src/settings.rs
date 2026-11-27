@@ -14,7 +14,7 @@
 //! Node container reads (PUBLIC_BASE_URL, LOCAL_SCRYFALL_ENABLED,
 //! LOCAL_WEB_PORTAL_ENABLED; the two flags are strict `=== 'true'`, no trim
 //! or lowercasing) — restart-rust.sh mirrors the container values. The
-//! version string mirrors backend/package.json (cargo-pinned).
+//! version string mirrors frontend/package.json (cargo-pinned).
 //!
 //! Node behaviours reproduced exactly:
 //! - body-parser parses BEFORE authentication (malformed JSON PUT answers
