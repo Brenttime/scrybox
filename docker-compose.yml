@@ -2,7 +2,7 @@ services:
   scrybox:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.rust
     container_name: scrybox
     restart: unless-stopped
     # Same app on both ports — only the transport differs. 3001 is what you point a
