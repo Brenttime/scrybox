@@ -289,6 +289,50 @@ async fn put_deck_contract() {
 }
 
 #[tokio::test]
+async fn put_deck_profile_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = spawn_fake_node().await;
+    let db = seeded_db(dir.path(), "put-profile.db");
+    let r = router_for(db.clone(), &["decks_writes"], &format!("http://{upstream}"));
+    let conn = open(&db);
+    let profile = || -> (String, String, String, i64) {
+        conn.query_row(
+            "SELECT format, category, accent_color, target_size FROM decks WHERE id=931001",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    };
+    let put = |body: &'static str| request(&r, "PUT", "/api/decks/931001", &JSON_CT, Some(body));
+
+    // Full edit writes every profile field.
+    let full = r##"{"name":"E","format":"Pauper","category":"Proxy","accent_color":"#10b981","target_size":60}"##;
+    assert_eq!(put(full).await.0, StatusCode::OK);
+    let edited = ("Pauper".to_string(), "Proxy".to_string(), "#10b981".to_string(), 60);
+    assert_eq!(profile(), edited);
+
+    // Omitted, blank or invalid fields keep the stored values: a rename-only
+    // caller, the edit form on a deck with no category, CSS in the colour,
+    // out-of-range sizes and non-string formats.
+    for body in [
+        r#"{"name":"E"}"#,
+        r#"{"name":"E","format":"","category":"","accent_color":"","target_size":0}"#,
+        r#"{"name":"E","accent_color":"red; background:url(https://x.example/a)"}"#,
+        r##"{"name":"E","accent_color":"#12345g","target_size":-5}"##,
+        r#"{"name":"E","target_size":301,"format":{"x":1},"category":42}"#,
+    ] {
+        assert_eq!(put(body).await.0, StatusCode::OK, "{body}");
+        assert_eq!(profile(), edited, "{body}");
+    }
+
+    // Another user's deck stays untouched.
+    let (s, _, _) = request(&r, "PUT", "/api/decks/931003", &JSON_CT, Some(r#"{"name":"x","format":"Pauper"}"#)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let other: String = conn.query_row("SELECT name FROM decks WHERE id=931003", [], |row| row.get(0)).unwrap();
+    assert_ne!(other, "x");
+}
+
+#[tokio::test]
 async fn delete_deck_contract() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = spawn_fake_node().await;

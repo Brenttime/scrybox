@@ -78,13 +78,34 @@ fn get_col(conn: &Connection, sql: &str, params: &[SqlValue], idx: usize) -> Res
 // PUT /api/decks/:id — routes/decks.js:522.
 // ---------------------------------------------------------------------------
 
+/// Optional Edit Deck fields for `PUT /:id`, each NULL unless valid:
+/// format/category are non-blank strings, accent_color is a `#` hex colour
+/// (it lands in inline CSS), target_size is an integer in 1..=300.
+fn profile_binds(body: &Value) -> (SqlValue, SqlValue, SqlValue, SqlValue) {
+    let text = |key: &str| match body.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => SqlValue::Text(s.to_string()),
+        _ => SqlValue::Null,
+    };
+    let accent = match body.get("accent_color").and_then(Value::as_str) {
+        Some(s) if is_hex_color(s) => SqlValue::Text(s.to_string()),
+        _ => SqlValue::Null,
+    };
+    let size = match js_parse_int_v(body.get("target_size")) {
+        Some(n) if (1..=300).contains(&n) => SqlValue::Integer(n),
+        _ => SqlValue::Null,
+    };
+    (text("format"), text("category"), accent, size)
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let hex = s.strip_prefix('#').unwrap_or("");
+    matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Response {
-    // `const { name, description, format, category, accent_color, target_size } = req.body`
-    // then `if (!name)`. parse_body has already reduced non-object JSON to {}
-    // (arrays) or 500 (primitives), matching Node's strict-mode + error-handler
-    // answers (live-verified). format/category/accent_color/target_size are
-    // optional — a caller sending only name/description (the pre-edit-modal
-    // shape) leaves them untouched via COALESCE(?, column).
+    // `const { name, description } = req.body` then `if (!name)`. parse_body
+    // has already reduced non-object JSON to {} (arrays) or 500 (primitives),
+    // matching Node's strict-mode + error-handler answers (live-verified).
     let name = body.get("name");
     if js_falsy(name) {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
@@ -94,20 +115,10 @@ async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &
     let Some(name_v) = name else {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     };
-    let opt_str_bind = |v: Option<&Value>| match v {
-        Some(x) if !js_falsy(Some(x)) => js_bind(x),
-        _ => SqlValue::Null,
-    };
-    // `parseInt(target_size, 10) || 60`: NaN AND 0 both fall back to 60
-    // (0 is falsy in JS), so an unparseable value and an explicit 0 land the
-    // same place as Node.
-    let target_size_bind = match body.get("target_size") {
-        Some(v) => {
-            let n = js_parse_int_v(Some(v)).unwrap_or(0);
-            SqlValue::Integer(if n == 0 { 60 } else { n })
-        }
-        None => SqlValue::Null,
-    };
+    // The profile fields are optional: a missing, blank or invalid value binds
+    // NULL and `COALESCE(?, column)` keeps the stored value, so name-only
+    // callers keep working and a bad value never overwrites a good one.
+    let (format, category, accent_color, target_size) = profile_binds(body);
     let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update deck"),
@@ -125,10 +136,10 @@ async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &
             [
                 js_bind(name_v),
                 desc_or_empty(body.get("description")),
-                opt_str_bind(body.get("format")),
-                opt_str_bind(body.get("category")),
-                opt_str_bind(body.get("accent_color")),
-                target_size_bind,
+                format,
+                category,
+                accent_color,
+                target_size,
                 SqlValue::Text(id.to_string()),
                 SqlValue::Integer(user_id),
             ]
