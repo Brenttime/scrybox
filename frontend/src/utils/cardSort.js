@@ -5,8 +5,8 @@ import sortSchemes from '../../../shared/sortSchemes.json';
 // Shared comparator logic for ordering collection cards. Previously copy-pasted
 // across autoSortContainerCards, findNextRecommendedSlot, the sorting assistant
 // queue.
-// Category orderings come from shared/cardOrder.json so display order matches
-// the backend sort engine (backend/src/utils/cardSort.js) exactly.
+// Category orderings come from shared/cardOrder.json so every screen that
+// sorts client-side orders categories the same way.
 
 export function getPrintingRank(printing, foilSorting) {
   const order = foilSorting === 'foils_first' ? cardOrder.printingFoilsFirst : cardOrder.printingNormalsFirst;
@@ -19,8 +19,7 @@ export const LANGUAGE_ORDER = cardOrder.language;
 // only affects the 'set-number-printing' order. Unrecognized/'custom' orders are
 // left untouched (stable no-op), matching each call site's original fallback.
 // `setsList` (from /api/sets, release-date order) makes the set-based schemes
-// sort chronologically, matching the backend's placement engine — without it
-// the display order would disagree with where recommendSlot files cards.
+// sort chronologically by set release date rather than by set name.
 export function sortCardsByOrder(cards, sortOrder, foilSorting, setsList = []) {
   const setRanks = new Map((setsList || []).map((set, index) => [set.name, index]));
   const setRank = (name) => {

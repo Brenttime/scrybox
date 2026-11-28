@@ -1,4 +1,4 @@
-// Mirrors backend/src/utils/priceHelpers.js's resolveCardPrice. Card search
+// Mirrors resolve_card_price in server/crates/scrybox-server/src/collection.rs. Card search
 // results and scan results carry per-printing prices (price_normal,
 // price_holofoil) alongside a generic price_trend
 // (whichever finish the provider happened to return first — usually Normal).

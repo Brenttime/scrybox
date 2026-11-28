@@ -1,6 +1,7 @@
 // Card-list text export for the UI. The canonical builder lives in
-// shared/cardListText.js — the backend (GET /api/collection/cardlist) imports
-// it directly, and this file keeps the exact same behaviour so the button and
+// shared/cardListText.js — the server's cardlist route ports it with
+// byte-parity (GET /api/collection/cardlist, collection_writes.rs), and this
+// file keeps the exact same behaviour so the button and
 // the API never disagree. cardList.test.js imports the shared copy and asserts
 // the two line up byte for byte; if you change one, change both.
 

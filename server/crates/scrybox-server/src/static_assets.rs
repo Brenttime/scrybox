@@ -316,7 +316,15 @@ pub(crate) fn express_default_404(method: &Method, path: &str) -> Response<Body>
 }
 
 fn default_model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../backend/data/models")
+    // Dev fallback when CV_MODEL_DIR is unset (AppState.model_dir is None).
+    // The image always sets CV_MODEL_DIR (Dockerfile.rust ENV); historically
+    // this mirrored Node's backend/data/models, which is gone. Mirror the
+    // lane convention used by cvscan::model_dir(): the lane data dir beside
+    // the checkout (holds the lane bindarr.db too).
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("../../../data/models")))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/models"))
 }
 
 // ---------------------------------------------------------------------------

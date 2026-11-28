@@ -5,10 +5,13 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
     if std::env::var("ORT_DYLIB_PATH").unwrap_or_default().is_empty() {
-        std::env::set_var(
-            "ORT_DYLIB_PATH",
-            root.join("../bindarr/backend/node_modules/onnxruntime-node/bin/napi-v6/linux/x64/libonnxruntime.so.1"),
+        // The old fallback into the retired Node backend's onnxruntime-node
+        // node_modules is gone — point at the dylib explicitly.
+        eprintln!(
+            "scanmatch: set ORT_DYLIB_PATH to the libonnxruntime dylib \
+             (e.g. $(npm root -g)/onnxruntime-node/bin/napi-v6/linux/x64/libonnxruntime.so.1)"
         );
+        std::process::exit(1);
     }
     if std::env::var("CV_MODEL_DIR").unwrap_or_default().is_empty() {
         std::env::set_var("CV_MODEL_DIR", root.join("data/models"));

@@ -13,8 +13,9 @@
 //
 // These are faithful to OpenCV's behaviour where it matters for the detector,
 // and deliberately not general: single-channel 8-bit only, rectangular kernels
-// only, no borders beyond replicate/zero. backend/test/clientcrop.test.js runs the
-// detector these back through the same crop the browser produces.
+// only, no borders beyond replicate/zero. A crop regression test (the Node
+// `clientcrop.test.js` harness) runs the detector these back through the same
+// crop the browser produces.
 
 // Scratch buffers, reused across calls.
 //

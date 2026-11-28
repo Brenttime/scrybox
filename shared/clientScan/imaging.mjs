@@ -1,6 +1,6 @@
 // Pixel work for the in-browser card reader. Pure typed-array code, so the SAME
 // functions run in the scan worker and in the Node validation harness
-// (backend/scripts/client-scan-replay.mjs).
+// (client-scan-replay.mjs).
 //
 // Strips are sampled straight out of the camera frame through the card's
 // homography at the resolution the recognizer wants, instead of first warping

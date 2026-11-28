@@ -1,7 +1,7 @@
 // Scryfall search syntax for Scrybox: one parser, three consumers.
 //
 //   1. The collection screen filters its loaded rows in the browser (compileQuery).
-//   2. The backend answers what it can from SQLite (utils/rawQuerySql.js walks the AST).
+//   2. The Rust server answers what it can from SQLite (server/crates/scrybox-server/src/scryq.rs compiles the AST to SQL).
 //   3. Everything else goes to Scryfall itself (toScryfall(ast) re-serializes the query).
 //
 // The parser accepts the FULL Scryfall grammar: every comparator (: = != < <= > >=),
@@ -17,7 +17,7 @@
 //   catalog  at least one term needs Scryfall's card database (oracle text,
 //            tagger tags, formats, prices, artists, regexes, ...). The caller
 //            sends toScryfall(ast) upstream; oracle tags can also be answered
-//            from the local Oracle Tags index (backend/src/oracleTags.js).
+//            from the local Oracle Tags index (server/crates/scrybox-server/src/oracle_tags.rs).
 //
 // Semantics follow Scryfall's live API (checked 2026-09-25):
 //   c:wu == c>=wu (colors include), id:g == id<=g (identity fits), c:m multicolor,

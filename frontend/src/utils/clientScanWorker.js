@@ -1,20 +1,20 @@
 // On-device card reading for Scan Cards, off the main thread.
 //
 // Runs shared/clientScan/pipeline.mjs, the same module the Node replay harness
-// (backend/scripts/client-scan-replay.mjs) validates against saved phone
-// frames. Models and the title/printing index are fetched once from
+// (client-scan-replay.mjs) validated against saved phone frames. Models and
+// the title/printing index are fetched once from
 // /scan-assets/ (content-hashed names, served immutable) and kept in the Cache
 // API, so a returning phone starts reading without touching the network.
 //
 // CPU wasm EP only (no jsep/webgpu binaries). Threads only when the page is
-// cross-origin isolated (backend coep.js: credentialless on Blink/Gecko,
+// cross-origin isolated (server secheaders.rs: credentialless on Blink/Gecko,
 // require-corp on WebKit); otherwise one thread.
 import * as ort from 'onnxruntime-web/wasm';
 import { createReader } from '../../../shared/clientScan/pipeline.mjs';
 import { buildCharset, loadIndex } from '../../../shared/clientScan/text.mjs';
 
 ort.env.wasm.wasmPaths = '/ort/';
-// Threads need cross-origin isolation (COOP + COEP, backend coep.js). Replay
+// Threads need cross-origin isolation (COOP + COEP, server secheaders.rs). Replay
 // on saved frames: 2 threads cut matched-read p50 ~30% on a 4-core host and 4
 // was no better, so isolated devices with >= 4 cores default to 2. If a
 // threaded start fails, clientScan.js retries once in a fresh worker at 1

@@ -4,8 +4,8 @@ import { isNative, getServerUrl, setServerUrl } from '../apiBase';
 import { useT } from '../utils/i18n';
 import Logo from './Logo';
 
-// Must match OWNER_USERNAME in backend/src/routes/auth.js — the bootstrap route
-// ignores whatever username is posted and always creates `admin`.
+// Must match the bootstrap route in server/crates/scrybox-server/src/auth_routes.rs
+// — it ignores whatever username is posted and always creates `admin`.
 const OWNER_USERNAME = 'admin';
 
 function Login({ onLoginSuccess }) {

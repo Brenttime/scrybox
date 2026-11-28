@@ -232,18 +232,27 @@ fn check_gate_requires_single_scalar_one() {
 }
 
 #[test]
-fn app_version_pins_backend_package_json() {
-    // settings.js: APP_VERSION = require('../../package.json').version.
+fn app_version_pins_frontend_package_json() {
+    // The shipped app version: settings' DEFAULT_APP_VERSION (settings.js:
+    // APP_VERSION = require('../../package.json').version) and the catalog
+    // User-Agent must both track frontend/package.json — the app version
+    // source that survives the Node backend removal.
     // BUMP BOTH TOGETHER (PROGRESS iter-34 note).
     let pkg: Value = serde_json::from_str(
         &std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../backend/package.json"
+            "/../../../frontend/package.json"
         ))
-        .expect("backend/package.json"),
+        .expect("frontend/package.json"),
     )
     .unwrap();
-    assert_eq!(pkg["version"].as_str().unwrap(), settings::DEFAULT_APP_VERSION);
+    let version = pkg["version"].as_str().unwrap();
+    assert_eq!(version, settings::DEFAULT_APP_VERSION);
+    assert!(
+        scrybox_server::catalog_build::SCRYBOX_UA.contains(&format!("Scrybox/{version} ")),
+        "catalog UA must carry the app version: {}",
+        scrybox_server::catalog_build::SCRYBOX_UA
+    );
 }
 
 // ---------------------------------------------------------------------------

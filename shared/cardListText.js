@@ -1,5 +1,7 @@
 // Card-list text export, shared by the frontend (CollectionList bulk bar,
-// Settings) and the backend (GET /api/collection/cardlist) so every copy of
+// Settings) and the server's cardlist route (GET /api/collection/cardlist,
+// ported with byte-parity in server/crates/scrybox-server/src/collection_writes.rs)
+// so every copy of
 // Scrybox emits byte-identical text.
 //
 // Two shapes:

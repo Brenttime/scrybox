@@ -2618,12 +2618,11 @@ mod tests {
 
     fn lane_artifacts() -> Option<(PathBuf, PathBuf, PathBuf)> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+        // ORT_DYLIB_PATH is the only source: the old dev fallback into the
+        // retired Node backend's onnxruntime-node node_modules is gone.
         let dylib = std::env::var_os("ORT_DYLIB_PATH")
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                root.join("../bindarr/backend/node_modules/onnxruntime-node/bin/napi-v6/linux/x64/libonnxruntime.so.1")
-            });
+            .map(PathBuf::from)?;
         let models = std::env::var_os("CV_MODEL_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)

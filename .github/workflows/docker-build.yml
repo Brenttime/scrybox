@@ -22,15 +22,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install backend dependencies
-        run: npm ci
-        working-directory: backend
-
-      # Hard gate: backend tests must pass before an image is built/pushed.
-      - name: Backend tests
-        run: npm test
-        working-directory: backend
-
       - name: Install frontend dependencies
         run: npm ci
         working-directory: frontend

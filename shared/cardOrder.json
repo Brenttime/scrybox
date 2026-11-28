@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical category orderings shared by backend/src/utils/cardSort.js and frontend/src/utils/cardSort.js so display order never drifts. WUBRG is the universal MTG color order. Unknown/absent keys fall back to a high rank in code (sort last).",
+  "_comment": "Canonical category orderings used by frontend/src/utils/cardSort.js so display order never drifts. WUBRG is the universal MTG color order. Unknown/absent keys fall back to a high rank in code (sort last).",
   "printingNormalsFirst": {
     "Normal": 1,
     "Holofoil": 2

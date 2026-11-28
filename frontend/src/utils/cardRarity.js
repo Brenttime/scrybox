@@ -1,5 +1,5 @@
-// Scryfall's complete rarity vocabulary. Keep this aligned with rarityRank() in
-// backend/src/utils/cardSort.js so client and server sorting never diverge.
+// Scryfall's complete rarity vocabulary. This is the single client ranking;
+// utils/cardSort.js sorts on it so every screen orders rarities the same way.
 const RARITY_RANK = Object.freeze({
   common: 1,
   uncommon: 2,

@@ -3,15 +3,10 @@
   "private": true,
   "description": "Monorepo for Scrybox, a self-hosted Magic: The Gathering card collection manager",
   "scripts": {
-    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend",
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "dev:backend": "npm run dev --prefix backend",
+    "install:all": "npm install --prefix frontend",
+    "dev": "npm run dev --prefix frontend",
     "dev:frontend": "npm run dev --prefix frontend",
     "build:frontend": "npm run build --prefix frontend",
-    "test": "npm test --prefix backend && npm test --prefix frontend",
-    "start": "npm start --prefix backend"
-  },
-  "devDependencies": {
-    "concurrently": "^8.2.2"
+    "test": "npm test --prefix frontend"
   }
 }

@@ -461,41 +461,35 @@ fn js_number_semantics() {
 }
 
 // ---------------------------------------------------------------------------
-// DDL identity vs db.js
+// Manabox table shape (fixture regression pin)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn db_js_ddl_matches_fixture() {
-    let db_js = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../backend/src/db.js")).unwrap();
-    let extract = |needle: &str| -> String {
-        let start = db_js.find(needle).unwrap_or_else(|| panic!("missing {needle} in db.js"));
-        let rest = &db_js[start..];
-        let end = rest.find("`);").unwrap();
-        rest[..end].to_string()
-    };
-    let live = Connection::open_in_memory().unwrap();
-    live.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
-    live.execute_batch(&extract("CREATE TABLE IF NOT EXISTS card_lists (")).unwrap();
-    // The unit-relevant ALTER from db.js's migration block.
-    live.execute_batch("ALTER TABLE card_lists ADD COLUMN source TEXT").unwrap();
-    live.execute_batch(&extract("CREATE TABLE IF NOT EXISTS list_cards (")).unwrap();
-    live.execute_batch(&extract("CREATE TABLE IF NOT EXISTS manabox_sync_runs (")).unwrap();
-
+fn manabox_schema_fixture_shape() {
+    // The Node-parity comparison (db_js_ddl_matches_fixture, which re-created
+    // these tables from backend/src/db.js's own SQL text) retired with the
+    // Node backend. What survives is the Rust-side pin: the fixture must apply
+    // cleanly and keep exactly the column shape the Rust code queries.
     let mine = Connection::open_in_memory().unwrap();
     mine.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
     mine.execute_batch(include_str!("manabox_schema.sql")).unwrap();
 
-    for table in ["card_lists", "list_cards", "manabox_sync_runs"] {
-        let cols = |conn: &Connection| -> Vec<(String, String, bool, Option<String>, i64)> {
-            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
-            stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0, r.get::<_, Option<String>>(4)?, r.get::<_, i64>(5)?))
-            })
+    let expected: std::collections::HashMap<&str, Vec<&str>> = [
+        ("card_lists", vec!["id", "user_id", "name", "description", "accent_color", "created_at", "source"]),
+        ("list_cards", vec!["list_id", "card_id", "quantity"]),
+        ("manabox_sync_runs", vec!["id", "user_id", "created_at", "summary", "report"]),
+    ]
+    .into_iter()
+    .collect();
+
+    for (table, want) in expected {
+        let mut stmt = mine.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
             .map(|x| x.unwrap())
-            .collect()
-        };
-        assert_eq!(cols(&live), cols(&mine), "PRAGMA table_info diverged for {table}");
+            .collect();
+        assert_eq!(cols, want, "PRAGMA table_info changed for {table}");
     }
 }
 

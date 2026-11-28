@@ -63,14 +63,13 @@ Re-run it after the sidecar's printing index is refreshed for new sets.
 
 ## Validating
 
-`backend/scripts/client-scan-replay.mjs` runs the same pipeline module under
+The Node replay harness (`client-scan-replay.mjs`) runs the same pipeline module under
 onnxruntime-node against saved phone frames (sidecar `CARDSCAN_DEBUG_DIR`
 output). It scores each frame against the sidecar's saved answer and exits
 non-zero on any wrong printing:
 
 ```sh
-cd backend
-node scripts/client-scan-replay.mjs <CLIENT_SCAN_DIR> ~/projects/scrybox-host/cardscan/debug
+node client-scan-replay.mjs <CLIENT_SCAN_DIR> ~/projects/scrybox-host/cardscan/debug
 ```
 
 ## Limits

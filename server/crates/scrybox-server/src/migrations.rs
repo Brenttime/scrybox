@@ -31,13 +31,11 @@ pub struct MigOpts {
     /// `process.env.DEFAULT_ADMIN_PASSWORD` twin. `None`/empty = no seed
     /// (first-visit bootstrap creates the owner), exactly like Node.
     pub admin_password: Option<String>,
-    /// `CV_MODEL_DIR` (cardArt.js MODEL_DIR). NOTE: cardArt.js falls back
-    /// to `backend/data/models` (relative to the NODE SOURCES) when the env
-    /// is unset — a path the Rust front cannot resolve. The scrybox Docker
-    /// image always sets CV_MODEL_DIR (Dockerfile ENV), so pair-mode
-    /// containers never hit the fallback; a bare `node server.js` source
-    /// install paired with RUST_MIGRATIONS without the env would lose the
-    /// retired-model sweep — main.rs warns at startup in that case.
+    /// `CV_MODEL_DIR` (historically cardArt.js MODEL_DIR). The scrybox
+    /// Docker image always sets CV_MODEL_DIR (Dockerfile.rust ENV), so
+    /// containers never hit the unset case; a bare source install running
+    /// RUST_MIGRATIONS without the env loses the retired-model sweep —
+    /// main.rs warns at startup in that case.
     pub model_dir: Option<PathBuf>,
     /// cardArt.js USER_DIR. `None` = `<db dir>/card-art`, like Node.
     pub user_art_dir: Option<PathBuf>,

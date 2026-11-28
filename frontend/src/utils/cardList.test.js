@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { buildCardListText, cardListLine } from './cardList.js';
-// The backend's copy of the same builder — the import guard below is the real
+// The shared builder the server ports byte-for-byte — the import guard below is the real
 // drift detector: a change to one that is not made to the other fails here.
 import { buildCardListText as sharedBuild, cardListLine as sharedLine } from '../../../shared/cardListText.js';
 

@@ -312,15 +312,15 @@ async fn run() {
                     user_art_dir: None,
                 };
                 if opts.model_dir.is_none() {
-                    // Node's cardArt.js sweeps `backend/data/models` when
-                    // CV_MODEL_DIR is unset (path relative to the Node
-                    // sources, unknowable from the Rust front). The scrybox
-                    // image always sets it (Dockerfile ENV); a bare source
-                    // install must too, or the retired-model sweep is lost.
+                    // The retired-model sweep in run_boot_migration needs
+                    // CV_MODEL_DIR (the scrybox image always sets it —
+                    // Dockerfile.rust ENV). A bare source install running
+                    // RUST_MIGRATIONS without the env silently loses that
+                    // sweep, so warn loudly.
                     tracing::warn!(
                         "RUST_MIGRATIONS without CV_MODEL_DIR: retired-model sweep \
-                         skipped (Node default backend/data/models is unreachable \
-                         from the Rust front)"
+                         skipped (set CV_MODEL_DIR to the models directory, e.g. \
+                         /app/database/models)"
                     );
                 }
                 match scrybox_server::migrations::run_boot_migration(&path, &opts) {

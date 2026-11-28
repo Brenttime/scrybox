@@ -14,7 +14,6 @@ out/
 *.db-wal
 *.db-shm
 *.sqlite
-backend/database/
 
 # Environment files
 .env
@@ -36,10 +35,7 @@ logs/
 CLAUDE.md
 
 # One-off dev scratch (ad-hoc patch scripts and scratch test runners).
-# The real test suite lives in backend/test/ and is NOT matched by these.
 patch*.py
-/backend/test.js
-/backend/test[0-9].js
 
 # IDE files
 .vscode/
@@ -63,8 +59,6 @@ patch*.py
 TEST_INFRA.md
 TEST_READY.md
 
-# Prebuilt scan-match data (embeddings, ORB indexes, per-set caches) — large, regenerable
-backend/data/
 
 # Capacitor: build artifacts + web copies are handled by the per-platform
 # .gitignore files under frontend/android and frontend/ios. Only add here what
