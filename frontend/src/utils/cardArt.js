@@ -1,9 +1,9 @@
 import { useSyncExternalStore } from 'react';
 
-// Client half of the contributed-art system. The backend holds art for cards the
+// Client half of the contributed-art system. The server holds art for cards the
 // upstream APIs have no image for, in two layers (this instance's uploads, then
 // whatever has been contributed back and committed to the repo); see
-// backend/src/cardArt.js.
+// server/crates/scrybox-server/src/card_art.rs.
 
 export const artUrl = (cardId) => `/api/card-art/${encodeURIComponent(cardId)}.png`;
 

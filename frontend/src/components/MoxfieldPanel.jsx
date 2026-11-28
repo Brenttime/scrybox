@@ -4,7 +4,7 @@ import { useT } from '../utils/i18n';
 
 // Moxfield sync, embedded in the Settings panel (see Settings.jsx, which
 // provides the glass-panel wrapper and header). The server runs both jobs on
-// its own clocks (see backend moxfieldScheduler); this view just shows where
+// its own clocks (see the scheduler port in server/crates/scrybox-server/src/moxfield.rs); this view just shows where
 // things stand, lets you add/remove authors, tune the two intervals, and force
 // a re-sync when something looks wrong. It polls every 15s so the "Up to date
 // / Stale" badges flip on their own.

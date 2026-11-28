@@ -44,5 +44,5 @@ you like; running the same file twice changes nothing.
 - `POST /api/manabox-sync/apply {csv, includeLists, expectBefore}` → `{summary, report}`
 - `GET /api/manabox-sync/runs`, `GET /api/manabox-sync/runs/:id/report`
 
-Planning is pure and unit-tested: `backend/src/utils/manaboxSync.js`,
-`backend/test/manaboxsync.test.js`.
+Planning is pure and unit-tested: `server/crates/scrybox-server/src/manabox.rs`
+(Rust port of the planning + routes) and `server/crates/scrybox-server/tests/manabox_sync.rs`.

@@ -33,7 +33,7 @@ import { useT } from '../utils/i18n';
 // the user the file plus a prefilled issue — Scrybox never uploads anything
 // anywhere on its own, and the user submits (or does not) on GitHub.
 
-const MAX_BYTES = 8 * 1024 * 1024; // matches backend/src/cardArt.js
+const MAX_BYTES = 8 * 1024 * 1024; // matches MAX_UPLOAD_BYTES in server/crates/scrybox-server/src/card_art.rs
 
 const btn = { fontSize: '0.7rem', padding: '0.3rem 0.6rem', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' };
 

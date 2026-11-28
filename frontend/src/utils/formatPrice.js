@@ -22,7 +22,7 @@ export const currencySymbol = (currency) => SYMBOLS[currency] || '$';
 export const priceText = (p, currency) => (currency && currency !== 'USD' ? '$0.00' : `$${formatPrice(p)}`);
 
 // A printing with no quote of its own is priced from the cheapest other
-// printing of the card (backend utils/priceEstimates.js, card_cache
+// printing of the card (server/crates/scrybox-server/src/card_cache.rs, card_cache
 // price_estimated = 1). Such prices, and totals that include one, read "~$x".
 export const EST_MARK = '~';
 export const isEstimated = (row) => !!(row && Number(row.price_estimated));

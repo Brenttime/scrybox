@@ -9,15 +9,16 @@ The Gathering**. It identifies cards from a phone photo (no typing),
 values the collection over time, and helps you pull the cards for a deck back
 out again.
 
-- **Backend**: Node.js + Express, SQLite (single file), served together with the built frontend from one container.
+- **Backend**: Rust (axum + tokio), SQLite (single file, rusqlite), served together with the built frontend from one container (`Dockerfile.rust`).
 - **Frontend**: React + Vite SPA.
 - **Auth**: opaque session tokens in a server-side `sessions` table, sent as a `Bearer` header.
 - **Card data**: Scryfall, cached locally in `card_cache`.
 - **Image ID**: two small ONNX models — `cornelius` finds the card's corners, `milo` embeds the dewarped card as a 128-d unit vector — then a brute-force cosine sweep over a prebuilt catalog of every cached card's artwork. Corner detection also runs in the browser, so the outline on screen is the crop that gets matched.
 
-Stack: React + Vite + Recharts on the front, Express + `sqlite3` + Helmet +
-`express-rate-limit` on the back, `onnxruntime-node` + `sharp` for images on the
-server and `onnxruntime-web` in a worker on the client, Docker + GitHub Actions
+Stack: React + Vite + Recharts on the front, axum + `rusqlite` with hand-written
+security-header and IP rate-limit layers on the back (`secheaders.rs`,
+`ip_limit.rs`), the ONNX Runtime C API (`ort`) plus native image codecs for
+images on the server and `onnxruntime-web` in a worker on the client, Docker + GitHub Actions
 to ship.
 
 ---
@@ -25,43 +26,27 @@ to ship.
 ## Repository layout
 
 ```
-backend/
-  src/
-    server.js              Express app: middleware, route mounts, static SPA, health, admin bootstrap
-    db.js                  SQLite connection (promisified run/get/all), schema init, password hashing
-    middleware/auth.js     authenticateToken (session lookup), requireAdmin, rate limiters
-    routes/
-      auth.js              register / login / logout / me / per-user settings
-      collection.js        collection CRUD, card ordering, scan-match, stats, import/export
-      decks.js             deck CRUD, deck cards, checkout / return, /:id/locations coverage payload
-      sets.js              set catalog lookup
-      settings.js          app-wide settings (admin)
-      shared.js            public read-only shared collection by share_token
-      admin.js             user management, card seeding
-    scryfallApi.js         Scryfall client (search + fetch by id + price sweep) -> card_cache shape
-    cvScan.js              Image ID pipeline: cornelius corners -> dewarp -> milo embedding -> cosine over a catalog
-    catalog.js             Catalog builds: cache every set's cards, then embed their artwork (Admin -> Catalogs)
-    cardSets.js            Set discovery per language, and fetching a set's cards into card_cache
-    cardArt.js             Per-card art overrides (user-supplied images)
-    utils/
-      cardSort.js          Card ordering: sort-scheme comparators shared with the frontend
-      priceHelpers.js      Price resolution across printings; vintage-set detection; UTC parsing
-      authHelpers.js       Auth-related helpers
-      npz.js               Minimal .npz reader, for the published (not locally built) catalogs
-      languages.js         Language code/name resolution
-    backup.js              DB backup helpers
-  scripts/                 fetch-models.mjs, catalog builders, the scan-gate measurement harness
-  data/models/             cornelius.onnx, milo.onnx and the built catalogs (CV_MODEL_DIR)
-  test/                    Node test suites and an e2e runner under test/e2e/
+server/
+  crates/
+    scrybox-server/        Rust axum server: auth, per-route modules (see Route map),
+                           scan engine (scan_engine/), OCR (scan_ocr/), migrations, SPA serving
+    local-scryfall/        Scryfall query parser/evaluator crate (the sidecar engine)
+  native/                  Native image codec builds (mozjpeg wrapper)
+  docker/                  Rust image build + entrypoint scripts
+  bench/                   HTTP benchmarks
+  scripts/                 Dev/parity helper scripts
 frontend/
   src/
     main.jsx, App.jsx      Entry + root: auth state, fetch wrapper (injects Bearer), tab routing, code-split views
     components/            One component per screen/widget (see Frontend section)
     utils/                 Pure helpers: sorting, pricing, printing/rarity styling, language, shuffle
-Dockerfile, docker-compose.yml, .github/workflows/docker-build.yml   Container build + CI publish to GHCR
+shared/                    Code used by both the server and the frontend: scryfallQuery.js, cardOrder.json,
+                           sortSchemes.json, cardListText.js, clientScan/, imgproc.mjs
+local-scryfall/            Card-data snapshots + static assets the sidecar serves
+Dockerfile.rust, .github/workflows/docker-build.yml   Rust container build + CI publish to GHCR
 ```
 
-Regenerable/large artifacts live in `backend/data/models` (the two ONNX files and
+Regenerable/large artifacts live under `CV_MODEL_DIR` (the two ONNX files and
 the built catalogs, `CV_MODEL_DIR`) and the SQLite DB — both gitignored. A catalog
 is ~5 MB per 10k cards, two orders of magnitude smaller than the per-set ORB
 indexes this replaced (~2.6 GB), but it is still build output, so the container
@@ -71,8 +56,8 @@ an image update discards every catalog an admin built.
 The two models are in neither the repository nor the image, and that is a
 licensing decision rather than an omission: they are AGPL-3.0 while Scrybox is MIT,
 so the operator fetches them into `CV_MODEL_DIR` as a deliberate step
-(`node scripts/fetch-models.mjs`, optionally `--catalogs` for the published
-fallbacks). Startup says so when they are absent, because that is the ordinary
+(the Models section under **Settings → Scan catalogs** downloads them, optionally
+with the published catalog fallbacks). Startup says so when they are absent, because that is the ordinary
 state of a fresh install, and `/api/scan-match` answers `503 notBuilt` rather than
 failing obscurely at session creation.
 
@@ -82,7 +67,7 @@ failing obscurely at session creation.
 
 ### Request lifecycle
 
-`server.js` wires Helmet (with a Report-Only CSP that allow-lists the card-image
+The server (`main.rs` / `lib.rs`) wires the security headers (with a Report-Only CSP that allow-lists the card-image
 hosts), JSON body limits, the API routers, then serves the
 built SPA and a SPA fallback. `GET /api/health` is unauthenticated and backs the
 Docker `HEALTHCHECK`. An empty `users` table stays empty unless
@@ -104,29 +89,34 @@ is reported and survived: everything except catalog builds still works.
 Authentication is DB-backed session tokens, not JWTs:
 
 - `POST /api/auth/login` verifies a PBKDF2 password hash and inserts a row into `sessions` (`user_id`, `token`, `expires_at`).
-- `authenticateToken` (`middleware/auth.js`) reads the `Bearer` token, looks it up in `sessions` where `expires_at > now`, and sets `req.user = { id, username, role, share_token, share_enabled, api_key, ... }`.
+- The auth gate (`auth.rs`, the port of Node's `authenticateToken`) reads the `Bearer` token, looks it up in `sessions` where `expires_at > now`, and sets the request user `{ id, username, role, share_token, share_enabled, api_key, ... }`.
 - `requireAdmin` gates admin-only routes on `req.user.role === 'admin'`.
 - A bearer token that matches no session is then checked against `users.api_key` — a long-lived read-only credential for external scripts (issue #33). It sets `req.user.via_api_key`, which makes `authenticateToken` refuse any non-GET (403) and `requireAdmin` refuse it outright, and makes `/auth/me` return only the read-only key rather than the account's other fields. Read-only is the whole reason a non-expiring credential is acceptable here; anything that weakens it has to replace it with something scoped.
-- Rate limiters (`authLimiter`, `searchLimiter`, `importLimiter`) protect login and expensive endpoints.
+- Rate limiting (`ip_limit.rs`, the port of Node's `authLimiter`) protects login and expensive endpoints.
 
-`collection.js` applies `router.use(authenticateToken)` up front, so every
+The collection routes sit behind the auth gate from the front (route groups are
+registered through the auth-checked stack in `lib.rs`), so every
 collection/deck-adjacent route requires a valid session.
 
 ### Route map
 
-| Mount | File | Responsibility |
-|-------|------|----------------|
-| `/api/auth` | auth.js | `register`, `login`, `logout`, `me`, `PUT /settings` (per-user), `POST/DELETE /api-key` (read-only external key) |
-| `/api` | collection.js | Card `search`, `scan-match`; `collection` CRUD + `bulk`; `stats`, `stats/history`, `stats/networth`, `export`, `import`; `cards/:id/price-history` |
-| `/api/decks` | decks.js | Deck CRUD, `:id/cards`, `:id/checkout`, `:id/return`, `:id/locations` (checkout/check-in coverage payload) |
-| `/api/sets` | sets.js | Set catalog for dividers and scan scoping |
-| `/api/settings` | settings.js | App-wide settings (read any; write requires admin) |
-| `/api/shared` | shared.js | Public, read-only collection view by `share_token` (no auth) |
-| `/api/admin` | admin.js | User management, card cache seeding, `catalogs` (list / `build` / `stop` / `progress`), DB backups (admin) |
+Routes are registered per group in `server/crates/scrybox-server/src/lib.rs`;
+each group lives in its own module:
+
+| Mount | Module(s) | Responsibility |
+|-------|-----------|----------------|
+| `/api/auth` | auth_routes.rs | `register`, `login`, `logout`, `me`, `PUT /settings` (per-user), `POST/DELETE /api-key` (read-only external key) |
+| `/api` | search.rs, collection.rs / collection_writes.rs, cvscan.rs, stats.rs / stats_subs.rs, export.rs, cards_meta.rs | Card `search`, `scan-match`; `collection` CRUD + `bulk`; `stats`, `stats/history`, `stats/networth`, `export`, `import`; `cards/:id/price-history` |
+| `/api/decks` | decks_reads.rs / decks_writes.rs / decks_combos.rs | Deck CRUD, `:id/cards`, `:id/checkout`, `:id/return`, `:id/locations` (checkout/check-in coverage payload) |
+| `/api/sets` | sets.rs | Set catalog for dividers and scan scoping |
+| `/api/settings` | settings.rs | App-wide settings (read any; write requires admin) |
+| `/api/shared` | shared.rs | Public, read-only collection view by `share_token` (no auth) |
+| `/api/admin` | admin_users.rs, seed_cards.rs, catalog_build.rs, model_assets.rs, backup.rs | User management, card cache seeding, `catalogs` (list / `build` / `stop` / `progress`), model downloads, DB backups (admin) |
 
 ### Card data sources
 
-`scryfallApi.js` normalizes provider cards into one shape and upserts into
+The Scryfall client (`scryfall.rs`, with the `card_cache` upserts in
+`card_cache.rs`) normalizes provider cards into one shape and upserts into
 `card_cache`. Every card carries a `language` recording which printing the
 row is (a non-English printing is its own card, not a display variant: it has
 its own provider id, its own art and its own name).
@@ -222,7 +212,7 @@ A sweep always returns its nearest row, so a card the catalog has never heard of
 arrives in the same shape as one it has. The gate is how far the winner stands
 above **its own catalog's** ranks 2–11 (`GAP_FLOOR`, default 0.10, env
 `CV_SCAN_GAP`) — not its absolute cosine, because absolute cosine tracks photo
-quality and the gap does not. Measured by `scripts/measure-scan-floor.js` over 60
+quality and the gap does not. Measured by the scan-floor harness over 60
 cards per catalog, each searched with its own row masked out so that it *is* a
 missing card:
 
@@ -309,20 +299,15 @@ silently reusing it.
 
 Locally built catalogs are keyed by `card_cache.id`, so every hit resolves by
 construction. The published fallback catalog (`milo-mtg.npz`, read by
-`utils/npz.js`) is keyed by the same provider ids, so it also resolves — it is a
+`npz.rs`) is keyed by the same provider ids, so it also resolves — it is a
 dated snapshot rather than this install's cache, and a local build wins when one
 is present.
 
 ### Measuring the scan gate
 
 `GAP_FLOOR` decides whether an answer is presented as an answer at all, so it is
-measured rather than guessed:
-
-```bash
-node scripts/measure-scan-floor.js mtg English 60
-```
-
-It samples catalog rows evenly (not the first N — ids are ordered by set, so the
+measured rather than guessed. The scan-floor harness (the Node
+`measure-scan-floor.js` script) samples catalog rows evenly (not the first N — ids are ordered by set, so the
 first N would measure one set's internal confusability), degrades each card's own
 art two ways, and reports two distributions per regime: **genuine**, searched
 against the whole catalog, and **impostor**, the same image with its own row
@@ -362,7 +347,7 @@ prints the matching symbol (`utils/formatPrice.priceText`). Collection totals su
 currencies as-is; `/api/stats/networth` reports `currencies` so a consumer can tell.
 
 Coverage is a function of the sweep's scope, not of the cache: the daily sweep
-(`scryfallApi.updateCollectionPrices`) runs over the cards the user owns or runs
+(the price-sweep timers over the Scryfall client) runs over the cards the user owns or runs
 in decks, one `/cards/collection` request per 75 identifiers, so a browsed-but-
 unowned set reads 0.00 until a card from it is added.
 
@@ -372,11 +357,10 @@ when the card is added.
 
 ### Card ordering
 
-`utils/cardSort.js` is the pure "how do I order cards" half of the old filing
-engine (the storage half — compartments, capacity, slot recommendation,
+`frontend/src/utils/cardSort.js` is the "how do I order cards" logic (the old storage half — compartments, capacity, slot recommendation,
 location rules — was removed with the physical-location feature):
 
-- Sort schemes are structured (name / set-number / price / type-color / language), optionally foil-aware. The scheme list and category orderings live in `shared/sortSchemes.json` and `shared/cardOrder.json`; the frontend mirrors the same logic in `frontend/src/utils/cardSort.js` so list order never drifts between server and client.
+- Sort schemes are structured (name / set-number / price / type-color / language), optionally foil-aware. The scheme list and category orderings live in `shared/sortSchemes.json` and `shared/cardOrder.json`; `frontend/src/utils/cardSort.js` consumes them so list order never drifts between the screens that sort.
 
 ---
 
@@ -448,9 +432,9 @@ locked by other checked-out decks.
 
 ## Conventions & gotchas
 
-- **Backend has no auto-reload** in production/local `node src/server.js`; restart it after backend changes so new routes/data load. Frontend uses Vite HMR.
+- **The Rust server has no auto-reload**: rebuild and restart `cargo run` after backend changes so new routes/data load. Frontend uses Vite HMR.
 - **SQLite runs in WAL mode** — checkpoint/stop before file-level backups so `-wal`/`-shm` are flushed.
-- **New card fields must be threaded through `scryfallApi.js` normalization** and added to the `card_cache` upsert list — `utils/cardCache.cacheNormalizedCards` only writes the columns it names, so a field left out is silently dropped.
+- **New card fields must be threaded through the Scryfall client normalization** (`scryfall.rs`) and added to the `card_cache` upsert list — the upserts in `card_cache.rs` only write the columns they name, so a field left out is silently dropped.
 - **Scanning needs a catalog**: the two ONNX models identify nothing on their own, and there is no second matcher to fall back to. `/api/scan-match` answers `503 notBuilt` with the fix in the message rather than an empty candidate list, which reads to the user as "your card could not be identified". A catalog is per language and only as complete as the provider's data for that language.
 - **Frontend lint is strict**: CI runs `eslint --max-warnings 0`, so unused vars/imports and empty blocks fail the Docker build.
 
@@ -460,7 +444,7 @@ locked by other checked-out decks.
 
 Setup and Docker deployment: see [README.md](README.md). Quick reference:
 
-- Backend: `cd backend && npm run dev` (nodemon) or `npm start`; port `3001`.
+- Backend: `cd server && cargo run -p scrybox-server`; port `3001` (`SCRYBOX_BIND` to override). The native deps (clang/libclang, OpenCV, mozjpeg) are the ones `Dockerfile.rust` builds — CI tests in Docker.
 - Frontend: `cd frontend && npm run dev` (Vite, port `5173`, proxies `/api` → `3001`).
-- Tests: `npm test` from the root (or `cd backend && npm test`) runs every unit suite in `backend/test/` plus the e2e suites under `backend/test/e2e/`. `npm run test:e2e` runs only the latter. No framework — each file is a plain `node` script.
+- Tests: `cd server && cargo test` runs the Rust suites; `cd frontend && npm test` runs the frontend util suites (`node --test` + locale check).
 - Lint (matches CI): `cd frontend && npm run lint`.

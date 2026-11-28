@@ -191,7 +191,7 @@ If you'd rather not run Docker, every release ships a self-contained server. Dow
 | Linux | `Scrybox-Server-linux-x64.tar.gz` | `tar xzf`, then `chmod +x scrybox-server && ./scrybox-server` |
 | macOS (Apple Silicon) | `Scrybox-Server-macos-arm64.tar.gz` | `tar xzf`, then `chmod +x scrybox-server && ./scrybox-server` |
 
-The first visit in a browser asks you to create the owner account. The SQLite file is created next to the binary. To set variables from the table above, create `app/backend/.env` before the first run — HTTPS is off by default here, so add `HTTPS_PORT=3443` if you want to scan from a phone.
+The first visit in a browser asks you to create the owner account. The SQLite file is created next to the binary. To set variables from the table above, set them in the environment before the first run — HTTPS is off by default here, so add `HTTPS_PORT=3443` if you want to scan from a phone.
 
 ### Mobile apps
 
@@ -207,22 +207,17 @@ neither ships inside the app:
 **1. The models.** Two small neural networks (~8 MB together) find the card in
 the frame and turn its artwork into a fingerprint. The detector is MIT and the
 embedding model is AGPL-3.0-only; Scrybox itself is MIT, so the models are fetched
-deliberately rather than bundled:
-
-```bash
-docker exec scrybox node scripts/fetch-models.mjs
-```
-
-(Running from source or the prebuilt binary: `node scripts/fetch-models.mjs` in
-`backend/`.) Restart afterwards. Until they are there, the server says so at
+deliberately rather than bundled: open **Settings → Scan catalogs** and let the
+Models section download them into `CV_MODEL_DIR` (the prebuilt server binary
+offers the same button). Until they are there, the server says so at
 startup and scanning returns a clear error instead of guesses.
 
 **2. A catalog.** The fingerprint has to be compared against something. Build one
 per language from **Settings → Scan catalogs**: it fingerprints the artwork of
 every card in your local card cache — hours for a full English build, and about
 5 MB of output per 10,000 cards. Progress is live, stopping keeps what it has,
-and resuming reuses it. `--catalogs` on the fetch command above grabs a
-prebuilt English catalog instead, which answers immediately but only resolves
+and resuming reuses it. The Models section can also download a
+published English catalog instead, which answers immediately but only resolves
 cards your install has already seen.
 
 Scanning is then the same whether or not you tell it which set you are feeding.
@@ -293,18 +288,21 @@ Restore by dropping the file back into the volume with the container stopped. In
 
 ## Development
 
-Node 18+ and npm 9+.
+The frontend needs Node 18+ and npm 9+. The server is Rust — build it with
+`cargo`; the release build pins its toolchain and native deps (clang/libclang,
+OpenCV, mozjpeg) in `Dockerfile.rust`, and CI builds/tests there.
 
 ```bash
-npm run install:all
-npm run dev
+cd frontend && npm install && npm run dev   # Vite at https://localhost:5173 (self-signed HTTPS, so the camera works)
+cd server && cargo run -p scrybox-server    # server at http://localhost:3001
 ```
 
-Frontend at `https://localhost:5173` (self-signed HTTPS, so the camera works), backend at `http://localhost:3001`.
+The Vite dev server proxies `/api` (and `/models`, `/ort`, `/scan-assets`) to
+`http://localhost:3001`.
 
 To test scanning from a phone, put it on the same Wi-Fi and open `https://<your-computer-ip>:5173`, then accept the certificate warning (**Advanced → Proceed**).
 
-Tests: `npm test`. Frontend lint (matches CI, fails on any warning): `cd frontend && npm run lint`. Code layout and conventions: [PROJECT.md](PROJECT.md).
+Tests: `cd server && cargo test` (Rust suites) and `cd frontend && npm test` (frontend util suites). Frontend lint (matches CI, fails on any warning): `cd frontend && npm run lint`. Code layout and conventions: [PROJECT.md](PROJECT.md).
 
 ---
 
