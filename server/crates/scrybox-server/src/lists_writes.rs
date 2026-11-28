@@ -969,7 +969,6 @@ fn delete_list(pool: &DbPool, id: &str, user_id: i64) -> Response {
 
 // Keep the Body/IntoResponse imports honest for the proxy rebuild path even
 // if future refactors drop one use site.
-#[expect(dead_code, reason = "import anchor, intentionally never called")]
 fn _import_anchors(b: Body) -> Response {
     b.into_response()
 }
