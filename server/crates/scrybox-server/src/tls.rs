@@ -81,7 +81,7 @@ pub fn load_or_create_cert(db_path: Option<&Path>) -> Result<(Vec<u8>, Vec<u8>),
         // Node: fs.rmSync(keyFile, { force: true }) — ENOENT tolerated.
         let _ = std::fs::remove_file(&key_file);
     }
-    let (key_pem, cert_pem) = generate_cert();
+    let (key_pem, cert_pem) = generate_cert()?;
     std::fs::create_dir_all(&cert_dir).map_err(|e| format!("TLS certificate generation failed: {e}"))?;
     write_private(&key_file, &key_pem).map_err(|e| format!("TLS certificate generation failed: {e}"))?;
     std::fs::write(&cert_file, &cert_pem).map_err(|e| format!("TLS certificate generation failed: {e}"))?;
@@ -130,7 +130,7 @@ fn pem_to_der(bytes: &[u8]) -> Result<Vec<u8>, ()> {
 /// `openssl x509 -text` of the container's cert THIS iter), CA:false,
 /// digitalSignature+keyEncipherment, EKU serverAuth, SAN localhost +
 /// 127.0.0.1 + ::1 + host addrs.
-fn generate_cert() -> (Vec<u8>, Vec<u8>) {
+fn generate_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
     use rcgen::{
         CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType,
         SerialNumber,
@@ -139,6 +139,7 @@ fn generate_cert() -> (Vec<u8>, Vec<u8>) {
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.distinguished_name.push(DnType::CommonName, "scrybox");
     let mut sans = vec![
+        // INFALLIBLE: "localhost" is a constant valid DNS name.
         SanType::DnsName("localhost".try_into().expect("valid dns name")),
         SanType::IpAddress(IpAddr::V4([127, 0, 0, 1].into())),
         SanType::IpAddress(IpAddr::V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1].into())),
@@ -151,17 +152,17 @@ fn generate_cert() -> (Vec<u8>, Vec<u8>) {
     params.not_before = now;
     params.not_after = now + time::Duration::days(CERT_DAYS);
     let mut serial = [0u8; 8];
-    getrandom::fill(&mut serial).expect("getrandom");
+    getrandom::fill(&mut serial).map_err(|e| format!("TLS certificate generation failed: {e}"))?;
     params.serial_number = Some(SerialNumber::from_slice(&serial));
     params.is_ca = rcgen::IsCa::ExplicitNoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
-    let key_pair = gen_keypair();
-    let cert = params.self_signed(&key_pair).expect("self-sign");
-    (key_pair.serialize_pem().into_bytes(), cert.pem().into_bytes())
+    let key_pair = gen_keypair()?;
+    let cert = params.self_signed(&key_pair).map_err(|e| format!("TLS certificate generation failed: {e}"))?;
+    Ok((key_pair.serialize_pem().into_bytes(), cert.pem().into_bytes()))
 }
 
-fn gen_keypair() -> rcgen::KeyPair {
+fn gen_keypair() -> Result<rcgen::KeyPair, String> {
     // DEVIATION (documented, deliberate): Node's selfsigned mints RSA-2048
     // (keySize:2048/sha256 — confirmed by `openssl x509 -text` of the
     // container's cert this iter). rcgen's ring backend speaks ECDSA only,
@@ -170,7 +171,7 @@ fn gen_keypair() -> rcgen::KeyPair {
     // "rcgen self-signed". EC P-256 is trusted identically by every target
     // browser; every OTHER cert field (CN, validity, KU/EKU, SAN ladder,
     // serial shape) matches Node's cert field-for-field.
-    rcgen::KeyPair::generate().expect("P-256 keypair")
+    rcgen::KeyPair::generate().map_err(|e| format!("TLS certificate generation failed: {e}"))
 }
 
 /// Serve the router over TLS on `addr`. Any failure (cert load/generation,
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     fn self_signed_cert_fields_match_node_shape() {
-        let (key_pem, cert_pem) = generate_cert();
+        let (key_pem, cert_pem) = generate_cert().expect("generate cert");
         let der = pem_to_der(&cert_pem).unwrap();
         let (_, c) = x509_parser::parse_x509_certificate(&der).unwrap();
         assert_eq!(c.version(), x509_parser::x509::X509Version::V3);
@@ -343,7 +344,7 @@ mod tests {
         // Unreadable pair => the exact Node message.
         let e = load_or_create_cert(None).unwrap_err();
         assert!(e.starts_with("SSL_CERT_PATH/SSL_KEY_PATH set but unreadable:"), "{e}");
-        let (k, c) = generate_cert();
+        let (k, c) = generate_cert().expect("generate cert");
         std::fs::write(&key, &k).unwrap();
         std::fs::write(&cert, &c).unwrap();
         let (k2, c2) = load_or_create_cert(None).unwrap();

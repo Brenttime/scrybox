@@ -185,6 +185,7 @@ fn variant_flags(p: &PrintingCols, id: &Option<String>, meta: &CardMeta) -> i64 
 fn js(out: &mut String, s: &str) {
     // serde_json escapes exactly like json.dumps(ensure_ascii=False):
     // `"`, `\` and C0 controls only.
+    // INFALLIBLE: serialising a &str to JSON cannot fail.
     out.push_str(&serde_json::to_string(s).expect("string json"));
 }
 
@@ -326,11 +327,17 @@ pub fn build_index_json(oracle: &Oracle, printings: &Printings, meta: &CardMeta)
 pub fn gzip_py(raw: &[u8]) -> Vec<u8> {
     use libz_sys as z;
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() / 3 + 1024);
+    // SAFETY: `s` is a stack z_stream initialised by deflateInit2_ (rc checked)
+    // and ended exactly once; next_in/avail_in describe the live `raw` slice;
+    // next_out/avail_out describe the uninitialised spare capacity of `out`,
+    // and set_len only covers the `produced` bytes zlib reports writing.
     unsafe {
         extern "C" fn zalloc(_: z::voidpf, items: z::uInt, size: z::uInt) -> z::voidpf {
+            // SAFETY: plain libc allocation; zlib frees the result via zfree.
             unsafe { libc::calloc(items as usize, size as usize) }
         }
         extern "C" fn zfree(_: z::voidpf, p: z::voidpf) {
+            // SAFETY: zlib only passes pointers previously returned by zalloc (calloc).
             unsafe { libc::free(p) }
         }
         let mut s = z::z_stream {
@@ -420,6 +427,7 @@ impl RecAssets {
 
 /// `json.dump(manifest, fh, indent=1)`.
 pub fn manifest_json(index: &str, rec: &str, dict: &str, bytes: u64) -> String {
+    // INFALLIBLE: serialising a &str to JSON cannot fail.
     let q = |s: &str| serde_json::to_string(s).expect("string serialises");
     format!("{{\n \"v\": 1,\n \"index\": {},\n \"rec\": {},\n \"dict\": {},\n \"bytes\": {bytes}\n}}", q(index), q(rec), q(dict))
 }

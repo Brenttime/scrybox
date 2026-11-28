@@ -133,6 +133,7 @@ pub fn is_built(game: &str, lang: &str) -> bool {
 /// 'English' riding along (front) when only the published .npz exists.
 pub fn built_langs(game: &str) -> Vec<String> {
     let Some(dir) = model_dir() else { return vec![] };
+    // INFALLIBLE: compile-time embedded constant JSON (include_str!).
     let v: Vec<Value> = serde_json::from_str(include_str!("../../../../shared/languages.json"))
         .expect("shared/languages.json");
     let mut out: Vec<String> = v
@@ -259,6 +260,7 @@ impl MmapF32 {
         // mmap hands out page-aligned addresses — always f32-aligned; the
         // check is paranoia against a platform surprise, mapped-or-not.
         if (base as usize) % std::mem::size_of::<f32>() != 0 {
+            // SAFETY: base/bytes are the exact successful mmap result above, not yet wrapped in MmapF32, so unmapped exactly once.
             unsafe { libc::munmap(base, bytes) };
             return Err("mmap base not f32-aligned".into());
         }
@@ -268,6 +270,7 @@ impl MmapF32 {
 
 impl Drop for MmapF32 {
     fn drop(&mut self) {
+        // SAFETY: MmapF32 owns the mapping created by a successful mmap of `bytes`; Drop runs once and no borrow of the slice outlives self.
         unsafe { libc::munmap(self.base, self.bytes) };
     }
 }
@@ -662,12 +665,15 @@ fn mozjpeg_decode(bytes: &[u8]) -> Option<RawRgb> {
         // RTLD_NOW (RTLD_LOCAL is 0 on glibc; 4 would be RTLD_NOLOAD, which
         // returns NULL for a not-yet-loaded lib — that silently disabled the
         // shim in every run until the A/B harness exposed the embed drift).
+        // SAFETY: cpath is a valid NUL-terminated CString alive for the call; the handle is intentionally never dlclose'd (process lifetime).
         let h = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW) };
         if h.is_null() {
+            // SAFETY: dlerror has no preconditions; the returned pointer is read immediately below before any other dl* call.
             let errp = unsafe { libc::dlerror() };
             let err = if errp.is_null() {
                 "<none>".to_string()
             } else {
+                // SAFETY: errp is non-null (checked) and points to dlerror's NUL-terminated message, copied out before it can be invalidated.
                 unsafe { std::ffi::CStr::from_ptr(errp).to_string_lossy().into_owned() }
             };
             eprintln!("[scryjpeg] dlopen FAILED for {path}: {err}");
@@ -675,6 +681,7 @@ fn mozjpeg_decode(bytes: &[u8]) -> Option<RawRgb> {
             return None;
         }
         let name = std::ffi::CString::new("scry_jpeg_decode").ok()?;
+        // SAFETY: h is a non-null handle from a successful dlopen; name is a valid NUL-terminated CString.
         let p = unsafe { libc::dlsym(h, name.as_ptr()) };
         if p.is_null() {
             eprintln!("[scryjpeg] dlsym FAILED");
@@ -690,12 +697,15 @@ fn mozjpeg_decode(bytes: &[u8]) -> Option<RawRgb> {
     let mut h = 0i32;
     let mut px: *mut u8 = std::ptr::null_mut();
     // scry_jpeg_decode copies in via jpeg_mem_src (no borrow outlives the call).
+    // SAFETY: dec has the scry_jpeg_decode ABI; bytes is a live slice of the given length and w/h/px are valid out-pointers for the call.
     let rc = unsafe { dec(bytes.as_ptr(), bytes.len() as libc::c_long, &mut w, &mut h, &mut px) };
     if rc != 0 || px.is_null() || w <= 0 || h <= 0 {
         return None;
     }
     let len = (w as usize) * (h as usize) * 3;
+    // SAFETY: on rc == 0 the shim returns a non-null malloc'd buffer of w*h*3 bytes (w, h > 0 checked); copied before free.
     let owned = unsafe { std::slice::from_raw_parts_mut(px, len) }.to_vec();
+    // SAFETY: px was malloc'd by the shim, ownership is ours, and it is not used after this free.
     unsafe { libc::free(px as *mut libc::c_void) };
     Some(RawRgb { w: w as usize, h: h as usize, px: owned })
 }
@@ -1402,13 +1412,15 @@ pub fn score_cards(buf: &[u8], game: &str, cards: Vec<Value>, lang: &str, croppe
             }
         };
         if truthy(card.get("id")) {
-            let id = js_str(card.get("id").unwrap());
+            // INFALLIBLE: truthy(card.get("id")) above implies Some.
+            let id = js_str(card.get("id").expect("id present"));
             add(id.clone());
             add(id.strip_prefix("mtg-").unwrap_or(&id).to_string());
         }
         for k in ["scryfall_id", "tcgplayer_id", "tcgplayer_product_id"] {
             if truthy(card.get(k)) {
-                add(js_str(card.get(k).unwrap()));
+                // INFALLIBLE: truthy(card.get(k)) above implies Some.
+                add(js_str(card.get(k).expect("key present")));
             }
         }
         let mut max: Option<f64> = None;
@@ -1832,10 +1844,13 @@ pub async fn handle_scan_match(State(st): State<AppState>, cc: ConnectInfo<Socke
         let h = res.headers_mut();
         h.insert("ratelimit-policy", HeaderValue::from_static("300;w=900"));
         h.insert("ratelimit-limit", HeaderValue::from_static("300"));
-        h.insert("ratelimit-remaining", HeaderValue::from_str(&verdict.remaining.to_string()).unwrap());
-        h.insert("ratelimit-reset", HeaderValue::from_str(&verdict.reset_secs.to_string()).unwrap());
+        // INFALLIBLE: decimal integer strings are always valid header values.
+        h.insert("ratelimit-remaining", HeaderValue::from_str(&verdict.remaining.to_string()).expect("digits are a valid header"));
+        // INFALLIBLE: decimal integer strings are always valid header values.
+        h.insert("ratelimit-reset", HeaderValue::from_str(&verdict.reset_secs.to_string()).expect("digits are a valid header"));
         if verdict.blocked {
-            h.insert("retry-after", HeaderValue::from_str(&verdict.reset_secs.to_string()).unwrap());
+            // INFALLIBLE: decimal integer strings are always valid header values.
+            h.insert("retry-after", HeaderValue::from_str(&verdict.reset_secs.to_string()).expect("digits are a valid header"));
         }
         res
     };

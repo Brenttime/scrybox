@@ -80,7 +80,7 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// `np.percentile(float_values, q)` for a small f64 slice.
 pub fn percentile_f64(v: &[f64], q: f64) -> f64 {
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = s.len();
     let qq = q / 100.0;
     let nf = n as f64;

@@ -292,9 +292,11 @@ pub async fn handle(
     let builder = Response::builder()
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .header(header::CACHE_CONTROL, "private, max-age=3600")
-        .header(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+        // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+        .header(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"));
     if etag_matches(inm.as_deref(), &tag) {
-        return builder.status(StatusCode::NOT_MODIFIED).body(Body::empty()).unwrap();
+        // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+        return builder.status(StatusCode::NOT_MODIFIED).body(Body::empty()).expect("valid response parts");
     }
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     if wants_encoding(ae.as_deref(), "gzip", raw.len()) {
@@ -304,8 +306,10 @@ pub async fn handle(
             .header(header::CONTENT_ENCODING, "gzip")
             .header(header::VARY, "Accept-Encoding")
             .body(Body::from(gz))
-            .unwrap()
+            // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+            .expect("valid response parts")
     } else {
-        builder.status(StatusCode::OK).body(Body::from(raw)).unwrap()
+        // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+        builder.status(StatusCode::OK).body(Body::from(raw)).expect("valid response parts")
     }
 }

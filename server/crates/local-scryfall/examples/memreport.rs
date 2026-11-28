@@ -13,7 +13,10 @@ struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: every method forwards to `System` with the caller's arguments
+// unchanged; the atomics only add bookkeeping and never touch the memory.
 unsafe impl GlobalAlloc for Counting {
+    // SAFETY: caller upholds GlobalAlloc::alloc's contract, forwarded to System.
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
@@ -22,10 +25,12 @@ unsafe impl GlobalAlloc for Counting {
         }
         p
     }
+    // SAFETY: p/l came from this allocator (hence System), per the GlobalAlloc contract.
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         System.dealloc(p, l);
         LIVE.fetch_sub(l.size(), Relaxed);
     }
+    // SAFETY: p/l came from this allocator (hence System); n is a valid size per contract.
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
         let q = System.realloc(p, l, n);
         if !q.is_null() {
@@ -76,6 +81,7 @@ fn main() {
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
     }
+    // SAFETY: glibc malloc_trim has no preconditions.
     unsafe { malloc_trim(0) };
     println!("TRIM {}", rss());
     if std::env::var("MI").is_ok() {
@@ -84,6 +90,8 @@ fn main() {
             fn fdopen(fd: i32, m: *const i8) -> *mut std::ffi::c_void;
             fn fflush(f: *mut std::ffi::c_void) -> i32;
         }
+        // SAFETY: fd 2 (stderr) is open; the mode is a NUL-terminated literal;
+        // f is only used by malloc_info/fflush and is intentionally not fclose'd.
         unsafe {
             let f = fdopen(2, b"w\0".as_ptr() as *const i8);
             malloc_info(0, f);

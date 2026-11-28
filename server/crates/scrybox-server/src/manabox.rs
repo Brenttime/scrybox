@@ -246,7 +246,6 @@ pub struct Rejected {
     pub reason: String,
     // Parity mirror of Node's rejected-row shape; the route only reports
     // line/name/reason, quantity is kept for the (not yet ported) report.
-    #[allow(dead_code)]
     pub quantity: Option<i64>,
 }
 
@@ -1321,7 +1320,9 @@ pub async fn handle_apply(State(st): State<AppState>, req: Request) -> Response 
     }
     let md = report(&plan, true, body.get("fileName"));
     let summary_json = serde_json::to_string(&plan.summary.value()).unwrap_or_else(|_| "{}".into());
-    let pool = st.db.as_ref().unwrap().clone();
+    let Some(pool) = st.db.clone() else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
+    };
     let uid = user.id;
     // Review exec-sync M2: thousands of synchronous writes run off the runtime.
     let (applied, plan, md) = match tokio::task::spawn_blocking(move || {
@@ -1439,9 +1440,9 @@ pub async fn handle_runs(State(st): State<AppState>, req: Request) -> Response {
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
-    let conn = match st.db.as_ref().unwrap().get() {
-        Ok(c) => c,
-        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+    let conn = match st.db.as_ref().map(|p| p.get()) {
+        Some(Ok(c)) => c,
+        _ => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
     };
     let mut stmt = match conn.prepare(
         "SELECT id, created_at, summary FROM manabox_sync_runs WHERE user_id = ? ORDER BY id DESC LIMIT 20",
@@ -1497,9 +1498,9 @@ pub async fn handle_report(State(st): State<AppState>, Path(id): Path<String>, r
         Ok(u) => u,
         Err(res) => return node_exact(res).await,
     };
-    let conn = match st.db.as_ref().unwrap().get() {
-        Ok(c) => c,
-        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+    let conn = match st.db.as_ref().map(|p| p.get()) {
+        Some(Ok(c)) => c,
+        _ => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
     };
     // Node binds req.params.id as TEXT; SQLite applies INTEGER affinity to
     // the column comparison, matching this exactly.

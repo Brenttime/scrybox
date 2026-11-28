@@ -183,7 +183,7 @@ pub async fn ensure_data(dir: &Path) {
 
 /// Exclusive non-blocking flock on `.refresh.lock` (same file the host
 /// script locks). None = someone else is refreshing.
-struct Flock(#[allow(dead_code)] std::fs::File);
+struct Flock(#[expect(dead_code, reason = "held only to keep the flock alive until drop")] std::fs::File);
 fn try_lock(dir: &Path) -> Option<Flock> {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".refresh.lock")).ok()?;
@@ -247,7 +247,8 @@ async fn refresh_one(c: &Https, dir: &Path, ty: &str, out: &str) -> RefreshOne {
 /// candidate index BEFORE it goes live.
 async fn healthy(l: &crate::lsf::Loaded) -> bool {
     use tower::ServiceExt;
-    let req = axum::http::Request::get("/cards/search?q=lotus").body(axum::body::Body::empty()).unwrap();
+    // INFALLIBLE: constant path literal; building a bodyless GET cannot fail
+    let req = axum::http::Request::get("/cards/search?q=lotus").body(axum::body::Body::empty()).expect("static request");
     matches!(l.router.clone().oneshot(req).await, Ok(r) if r.status().is_success())
 }
 

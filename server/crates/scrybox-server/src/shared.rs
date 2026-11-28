@@ -105,7 +105,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     if !st.owns("shared") || st.db.is_none() || method != Method::GET {
         return crate::proxy(State(st.clone()), req).await;
     }
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let headers = req.headers().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
@@ -114,6 +115,7 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     // path segment; the mount guarantees the prefix.
     let token_raw = path
         .strip_prefix("/api/shared/")
+        // INFALLIBLE: the router mounts this handler only under /api/shared/
         .expect("mounted only under /api/shared/");
     let token = match percent_decode(token_raw.as_bytes()) {
         Some(t) => t,
@@ -144,7 +146,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, tag)
                     .body(Body::empty())
-                    .unwrap();
+                    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+                    .expect("valid response parts");
             }
         }
     }
@@ -160,7 +163,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             .header(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"))
             .header(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
-    resp.body(Body::from(bytes)).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    resp.body(Body::from(bytes)).expect("valid response parts")
 }
 
 /// The whole res.json body for a request; Err carries the response

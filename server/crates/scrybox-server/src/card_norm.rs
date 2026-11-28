@@ -40,7 +40,8 @@ pub fn oracle_id_for_card(card: &Value) -> Option<String> {
         }
     }
     if ids.len() == 1 {
-        Some(ids.pop().unwrap())
+        // INFALLIBLE: ids.len() == 1 checked on the line above
+        Some(ids.pop().expect("len checked == 1"))
     } else {
         None
     }

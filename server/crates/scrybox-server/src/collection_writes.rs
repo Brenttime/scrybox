@@ -857,7 +857,8 @@ async fn cardlist(pool: &std::sync::Arc<DbPool>, user_id: i64, uri: &Uri, header
     if inm.is_some_and(|inm| etag_matches(Some(inm), &tag)) {
         return Ok((
             StatusCode::NOT_MODIFIED,
-            [(header::ETAG, HeaderValue::from_str(&tag).unwrap())],
+            // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+            [(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"))],
         )
             .into_response());
     }
@@ -865,7 +866,8 @@ async fn cardlist(pool: &std::sync::Arc<DbPool>, user_id: i64, uri: &Uri, header
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8")),
-            (header::ETAG, HeaderValue::from_str(&tag).unwrap()),
+            // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+            (header::ETAG, HeaderValue::from_str(&tag).expect("etag header")),
         ],
         Body::from(bytes),
     )

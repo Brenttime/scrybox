@@ -55,7 +55,8 @@ fn to_base36(mut n: u64) -> String {
         n /= 36;
     }
     out.reverse();
-    String::from_utf8(out).unwrap()
+    // INFALLIBLE: bytes come only from the ASCII DIGITS table
+    String::from_utf8(out).expect("base36 digits are ASCII")
 }
 
 /// W/"col-{boot}-{rev}-{user}-{qh}" — same shape as utils/collectionEtag.js.
@@ -378,7 +379,8 @@ fn checked_out_allocation(conn: &rusqlite::Connection, user_id: i64) -> rusqlite
         return Ok(HashMap::new());
     }
 
-    let keys_json = serde_json::to_string(&required.iter().map(|(k, _)| k).collect::<Vec<_>>()).unwrap();
+    // INFALLIBLE: serializing a Vec<&String> cannot fail
+    let keys_json = serde_json::to_string(&required.iter().map(|(k, _)| k).collect::<Vec<_>>()).expect("string vec serializes");
     let entries_sql = format!(
         "
     SELECT
@@ -707,13 +709,18 @@ fn stream_feed(groups: Vec<Vec<u8>>, threshold: u64, total: Option<u64>) -> Stre
                     enc = Some(GzEncoder::new(Vec::new(), Compression::new(6)));
                     member_bytes = 0;
                 }
+                // INFALLIBLE: enc is set to Some at the top of this loop iteration
                 let e = enc.as_mut().expect("encoder started above");
                 let take = (MEMBER - member_bytes).min(slice.len() - off);
+                // INFALLIBLE: writing into an in-memory Vec<u8> cannot fail
                 e.write_all(&slice[off..off + take]).expect("vec write");
                 member_bytes += take;
                 off += take;
                 if member_bytes == MEMBER {
+                    // INFALLIBLE: enc is Some (set at the top of this loop iteration)
                     let done = enc.take().expect("encoder started above");
+                    // INFALLIBLE: GzEncoder over Vec<u8> cannot hit an IO error
+                    // INFALLIBLE: GzEncoder over Vec<u8> cannot hit an IO error
                     gz.extend(done.finish().expect("gzip"));
                     members += 1;
                 }
@@ -741,11 +748,13 @@ fn stream_feed(groups: Vec<Vec<u8>>, threshold: u64, total: Option<u64>) -> Stre
     if let Some(e) = enc {
         // Final partial member; none is emitted after an exact MEMBER
         // boundary (matches `raw.chunks(MEMBER)` — no trailing empty chunk).
+        // INFALLIBLE: GzEncoder over Vec<u8> cannot hit an IO error
         gz.extend(e.finish().expect("gzip"));
         members += 1;
     }
 
     if raw_len < threshold as usize {
+        // INFALLIBLE: small is only dropped once raw_len reaches threshold
         StreamedBody::Small { raw: small.expect("raw_len < threshold ⇒ buffer never dropped"), total }
     } else {
         let etag = etag_from_digest(raw_len, hasher.finalize());

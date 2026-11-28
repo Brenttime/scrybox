@@ -558,7 +558,8 @@ fn role_tags(conn: &rusqlite::Connection, ids: &[String], slugs: &[String]) -> R
         tags.entry(card_id)
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .unwrap()
+            // INFALLIBLE: or_insert_with always inserts a Value::Array
+            .expect("entry is an array")
             .push(Value::String(slug));
     }
     let mut out = Map::new();

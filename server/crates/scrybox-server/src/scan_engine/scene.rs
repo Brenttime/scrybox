@@ -415,7 +415,7 @@ impl FooterStage<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "mirrors the Python scanner signature; bundling would obscure parity")]
 fn retro_footer_pass(
     ctx: &Ctx,
     images: &[Rgb],
@@ -440,7 +440,8 @@ fn retro_footer_pass(
         }
         if let Some(num) = retro_line_number(&raw) {
             let num = normalize_collector(&num);
-            let r = retro.get_mut(&o).unwrap();
+            // INFALLIBLE: retro/extra are seeded with every owner in `pending`, and owners come from retro_strips(pending).
+            let r = retro.get_mut(&o).expect("owner seeded");
             let cur = *r.get(&num).unwrap_or(&0);
             r.insert(num.clone(), cur.max(retro_total(&raw)));
             let h = held.entry(o).or_default();
@@ -451,7 +452,8 @@ fn retro_footer_pass(
         if row < 2 {
             raws[o].push(raw);
         } else {
-            extra.get_mut(&o).unwrap().push(raw);
+            // INFALLIBLE: seeded for every pending owner above.
+            extra.get_mut(&o).expect("owner seeded").push(raw);
         }
     }
     for &o in pending {
@@ -585,7 +587,7 @@ pub struct History {
 
 impl History {
     /// `ScanHistory.record(...)` (in memory; Scrybox never reads it back).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "mirrors the Python scanner signature; bundling would obscure parity")]
     pub fn record(&mut self, name: &str, image: &Value, set_name: &Value, rarity: &Value, id: &Value, set_code: &Value, num: &Value) -> Option<(Map<String, Value>, bool)> {
         if name.is_empty() || !truthy(id) || !truthy(set_code) || !truthy(num) || !truthy(image) {
             return None;
@@ -646,7 +648,7 @@ impl History {
 // ------------------------------------------------------------ scan_image
 
 /// `scan_image(image, source="scene-batch", box_hint=(0,0,w,h), title_hint=..)`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "mirrors the Python scanner signature; bundling would obscure parity")]
 fn scan_image_scene(
     ctx: &Ctx,
     image: &Rgb,
@@ -744,7 +746,8 @@ fn scan_image_scene(
         );
         return Ok(out);
     }
-    let card = exact.unwrap();
+    // INFALLIBLE: exact.is_none() returned early above.
+    let card = exact.expect("exact resolved");
     let canonical = card.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or(name).to_string();
     let printed = [card.get("flavor_name"), card.get("printed_name")].into_iter().flatten().find(|v| truthy(v)).cloned().unwrap_or(Value::Null);
     let visible = match printed.as_str() {
@@ -753,7 +756,7 @@ fn scan_image_scene(
     };
     let t_background = t0.elapsed();
     let g0 = |k: &str| card.get(k).cloned().unwrap_or(Value::Null);
-    let rec = ctx.history.lock().unwrap().record(&visible, &g0("image"), &g0("set_name"), &g0("rarity"), &g0("id"), &g0("set"), &g0("num"));
+    let rec = ctx.history.lock().unwrap_or_else(|e| e.into_inner()).record(&visible, &g0("image"), &g0("set_name"), &g0("rarity"), &g0("id"), &g0("set"), &g0("num"));
     let Some((entry, is_new)) = rec else {
         return Err("history accepts exact physical printings only".into());
     };
@@ -822,7 +825,8 @@ pub fn scan_prepared_scene(ctx: &Ctx, mut prepared: Vec<Rgb>, numbers: &[i64], s
     // key order as the Python literal: ok, results, matched, attempted
     let mut o = Map::new();
     for k in ["ok", "results", "matched", "attempted"] {
-        o.insert(k.into(), m.remove(k).unwrap());
+        // INFALLIBLE: all four keys were inserted into m just above.
+        o.insert(k.into(), m.remove(k).expect("key inserted above"));
     }
     o.insert(
         "timings".into(),
@@ -976,7 +980,8 @@ impl IdentityCache {
             if !c.get("eligible").is_some_and(truthy) {
                 continue;
             }
-            let mut e = old[ei].take().unwrap();
+            // INFALLIBLE: `old` holds Some for every entry index and each ei key in `near` is unique, so it is taken once.
+            let mut e = old[ei].take().expect("entry taken once");
             e.bx = c["box"].clone();
             e.seen = now;
             self.entries.push_back(e);

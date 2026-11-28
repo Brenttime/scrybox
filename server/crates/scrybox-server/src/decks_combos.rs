@@ -160,7 +160,8 @@ async fn guard(st: &AppState, req: Request, group: &str) -> Result<Ctx, Response
     if !st.owns(group) || st.db.is_none() || req.method() != Method::GET {
         return Err(crate::proxy(State(st.clone()), req).await);
     }
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
     if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
         return Err(crate::collection_writes::too_large());
@@ -211,7 +212,8 @@ pub async fn handle_combos(Path(id): Path<String>, State(st): State<AppState>, r
         out.insert("identity".into(), Value::String(String::new()));
         out.insert("included".into(), Value::Array(vec![]));
         out.insert("almostIncluded".into(), Value::Array(vec![]));
-        return json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).unwrap(), Vec::<(String, String)>::new());
+        // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+        return json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).expect("Value serializes"), Vec::<(String, String)>::new());
     }
 
     // Body: { commanders: [{card, quantity: 1}], main: [{card, quantity}] }
@@ -248,7 +250,8 @@ pub async fn handle_combos(Path(id): Path<String>, State(st): State<AppState>, r
         .fetch(
             "POST",
             SPELLBOOK_URL.to_string(),
-            Some(serde_json::to_string(&Value::Object(body)).unwrap()),
+            // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+            Some(serde_json::to_string(&Value::Object(body)).expect("Value serializes")),
             vec![
                 ("content-type".into(), "application/json".into()),
                 ("accept".into(), "application/json".into()),
@@ -291,7 +294,8 @@ pub async fn handle_combos(Path(id): Path<String>, State(st): State<AppState>, r
     out.insert("identity".into(), or_default(r.get("identity"), || Value::String(String::new())));
     out.insert("included".into(), included);
     out.insert("almostIncluded".into(), almost_included);
-    json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).unwrap(), Vec::<(String, String)>::new())
+    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+    json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).expect("Value serializes"), Vec::<(String, String)>::new())
 }
 
 fn combos_unreachable() -> Response {
@@ -601,7 +605,8 @@ pub async fn handle_synergy(Path(id): Path<String>, State(st): State<AppState>, 
         out.insert("commander".into(), Value::Null);
         out.insert("threshold".into(), number_value(SYNERGY_THRESHOLD));
         out.insert("cards".into(), Value::Array(vec![]));
-        return json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).unwrap(), Vec::<(String, String)>::new());
+        // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+        return json_read_response(&ctx.headers, serde_json::to_vec(&Value::Object(out)).expect("Value serializes"), Vec::<(String, String)>::new());
     }
     // Partner pairs live on a combined page (slug-sorted join); then the
     // first commander's own page.
@@ -647,7 +652,8 @@ fn synergy_json(headers: &HeaderMap, slug: Option<String>, names: &[String], car
     });
     out.insert("threshold".into(), number_value(SYNERGY_THRESHOLD));
     out.insert("cards".into(), cards);
-    json_read_response(headers, serde_json::to_vec(&Value::Object(out)).unwrap(), Vec::<(String, String)>::new())
+    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+    json_read_response(headers, serde_json::to_vec(&Value::Object(out)).expect("Value serializes"), Vec::<(String, String)>::new())
 }
 
 /// `typeof req.query.commander === 'string' ? req.query.commander.slice(0, 200) : ''`
@@ -763,7 +769,8 @@ pub struct EdhrecEntry {
 }
 
 pub fn mem_insert(mem: &Mutex<HashMap<String, EdhrecEntry>>, slug: &str, entry: EdhrecEntry) {
-    let mut m = mem.lock().unwrap();
+    // INFALLIBLE: mutex poisoning only follows a panic while held; crashing on it is the deliberate policy
+    let mut m = mem.lock().expect("edhrec mem lock poisoned");
     m.insert(slug.to_string(), entry);
     // Bounded twin of Node's unbounded Map: evict the oldest entry.
     while m.len() > MEM_CACHE_CAP {
@@ -788,7 +795,8 @@ fn edhrec_disk_path(st: &AppState, slug: &str) -> Option<std::path::PathBuf> {
 /// Err == rethrow (route catch -> 502).
 async fn edhrec_synergy_for(st: &AppState, slug: &str) -> Result<Option<Value>, ()> {
     let now = now_ms();
-    if let Some(e) = st.edhrec_mem.lock().unwrap().get(slug) {
+    // INFALLIBLE: mutex poisoning only follows a panic while held; crashing on it is the deliberate policy
+    if let Some(e) = st.edhrec_mem.lock().expect("edhrec mem lock poisoned").get(slug) {
         if now - e.t < EDHREC_TTL_MS {
             return Ok(e.cards.clone());
         }
@@ -841,7 +849,8 @@ async fn edhrec_synergy_for(st: &AppState, slug: &str) -> Result<Option<Value>, 
                     let mut e = Map::new();
                     e.insert("t".into(), Value::from(now));
                     e.insert("cards".into(), cards.clone());
-                    let _ = std::fs::write(&p, serde_json::to_vec(&Value::Object(e)).unwrap());
+                    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+                    let _ = std::fs::write(&p, serde_json::to_vec(&Value::Object(e)).expect("Value serializes"));
                 }
                 Ok(Some(cards))
             }
@@ -860,7 +869,7 @@ async fn edhrec_synergy_for(st: &AppState, slug: &str) -> Result<Option<Value>, 
 
 /// encodeURIComponent on an already-slugish value; kept correct for
 /// arbitrary strings (all unreserved chars pass through).
-#[allow(non_snake_case)]
+#[expect(non_snake_case, reason = "named after the JS global it mirrors")]
 fn encodeURIComponent(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {

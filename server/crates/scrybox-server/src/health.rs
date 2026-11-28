@@ -147,6 +147,7 @@ async fn probe(st: &AppState, store: bool) -> Response {
         Ok(u) => u,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "bad upstream"),
     };
+    // INFALLIBLE: uri is an already-parsed Uri and GET has no extra parts that can fail
     let req = Request::get(uri).body(Body::empty()).expect("static request");
     let res = tokio::time::timeout(PROBE_TIMEOUT, st.client.request(req)).await;
     match res {
@@ -223,11 +224,14 @@ async fn native_health(st: &AppState) -> Response {
         _ => "W/\"1c-jWxaDve2uVH4xAyM2GutLQRGSJc\"",
     };
     let mut headers = HeaderMap::new();
-    headers.insert("x-app-name", "Scrybox".parse().unwrap());
-    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+    // INFALLIBLE: constant ASCII literal is a valid header value
+    headers.insert("x-app-name", "Scrybox".parse().expect("static header value"));
+    // INFALLIBLE: etag is one of three constant visible-ASCII literals above
+    headers.insert(axum::http::header::ETAG, etag.parse().expect("static etag"));
     headers.insert(
         axum::http::header::CONTENT_TYPE,
-        "application/json; charset=utf-8".parse().unwrap(),
+        // INFALLIBLE: constant ASCII literal is a valid header value
+        "application/json; charset=utf-8".parse().expect("static header value"),
     );
     (status, headers, body).into_response()
 }

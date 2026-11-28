@@ -710,7 +710,10 @@ fn send_export_bytes(
                     .header(axum::http::header::ETAG, &tag)
                     .header("content-disposition", &disposition)
                     .body(Body::empty())
-                    .unwrap();
+                    // The disposition embeds the caller's ecosystem string; a
+                    // control char makes it an invalid header (Node's setHeader
+                    // throws -> 500), so answer the shared 500 instead of panicking.
+                    .unwrap_or_else(|_| crate::collection_writes::internal_error());
             }
         }
     }
@@ -727,7 +730,8 @@ fn send_export_bytes(
             .header(axum::http::header::CONTENT_ENCODING, "gzip")
             .header(axum::http::header::VARY, "Accept-Encoding");
     }
-    b.body(bytes).unwrap()
+    // Invalid disposition (control chars in the ecosystem) -> shared 500, as above.
+    b.body(bytes).unwrap_or_else(|_| crate::collection_writes::internal_error())
 }
 
 fn send_export(
@@ -741,7 +745,8 @@ fn send_export(
         let body = serde_json::to_vec(&Value::Array(
             rows.iter().cloned().map(Value::Object).collect(),
         ))
-        .unwrap();
+        // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+        .expect("Value serializes");
         send_export_bytes(
             headers,
             body,
@@ -1380,7 +1385,8 @@ pub async fn route_import(State(st): State<AppState>, req: Request) -> Response 
         "message".into(),
         Value::String(format!("Successfully imported {count} items.")),
     );
-    let bytes = serde_json::to_vec(&Value::Object(out.clone())).unwrap();
+    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+    let bytes = serde_json::to_vec(&Value::Object(out.clone())).expect("Value serializes");
     // statsCache.invalidateOnWrite twin on the native success response
     // (same established pattern as the other write groups).
     stats::on_proxied_write(&st, &Method::POST, "/api/import", &headers);
@@ -1470,6 +1476,8 @@ pub(crate) fn node_sqlite_message(e: &rusqlite::Error) -> String {
             let name = NAMES.get(primary).copied().unwrap_or("SQLITE_ERROR");
             let text = match msg {
                 Some(m) => m.clone(),
+                // SAFETY: sqlite3_errstr returns a pointer to a static, NUL-terminated
+                // English message owned by SQLite for any result code; it is never freed.
                 None => unsafe {
                     std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_errstr(f.extended_code))
                         .to_string_lossy()

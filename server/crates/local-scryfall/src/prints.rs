@@ -521,7 +521,8 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend_from_slice(s.as_bytes());
 }
 fn get_u32(b: &[u8], p: &mut usize) -> u32 {
-    let x = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+    // INFALLIBLE: a 4-byte slice always converts to [u8; 4].
+    let x = u32::from_le_bytes(b[*p..*p + 4].try_into().expect("4-byte slice"));
     *p += 4;
     x
 }
@@ -606,8 +607,9 @@ pub fn load_side_cache(ix: &mut Index, cache: &Path, src: &Path) -> bool {
     if f.read_to_end(&mut b).is_err() || b.len() < 24 || &b[..8] != CACHE_MAGIC {
         return false;
     }
-    if u64::from_le_bytes(b[8..16].try_into().unwrap()) != md.len()
-        || u64::from_le_bytes(b[16..24].try_into().unwrap()) != mtime
+    // INFALLIBLE: b.len() >= 24 checked above; 8-byte slices convert to [u8; 8].
+    if u64::from_le_bytes(b[8..16].try_into().expect("8-byte slice")) != md.len()
+        || u64::from_le_bytes(b[16..24].try_into().expect("8-byte slice")) != mtime
     {
         eprintln!("side index: cache stale for {}", src.display());
         return false;
@@ -634,7 +636,8 @@ pub fn load_side_cache(ix: &mut Index, cache: &Path, src: &Path) -> bool {
     for _ in 0..n {
         let mut prices = [f32::NAN; 6];
         for slot in prices.iter_mut() {
-            *slot = f32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+            // INFALLIBLE: a 4-byte slice always converts to [u8; 4].
+            *slot = f32::from_le_bytes(b[p..p + 4].try_into().expect("4-byte slice"));
             p += 4;
         }
         let cn = get_u32(&b, &mut p);

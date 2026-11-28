@@ -169,7 +169,8 @@ pub(crate) fn json_response(status: StatusCode, value: &Value) -> Response {
         status,
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8")),
-            (header::ETAG, HeaderValue::from_str(&crate::collection::body_etag(&body)).unwrap()),
+            // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+            (header::ETAG, HeaderValue::from_str(&crate::collection::body_etag(&body)).expect("etag header")),
         ],
         Body::from(body),
     )

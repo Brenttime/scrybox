@@ -749,7 +749,8 @@ impl Parser {
             }
         }
         if parts.len() == 1 {
-            parts.pop().unwrap()
+            // INFALLIBLE: guarded by parts.len() == 1.
+            parts.pop().expect("one part")
         } else {
             Node::Or(parts)
         }
@@ -793,7 +794,8 @@ impl Parser {
             }
             Node::All
         } else if parts.len() == 1 {
-            parts.pop().unwrap()
+            // INFALLIBLE: guarded by parts.len() == 1.
+            parts.pop().expect("one part")
         } else {
             Node::And(parts)
         }

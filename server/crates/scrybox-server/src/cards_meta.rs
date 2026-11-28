@@ -328,7 +328,8 @@ fn res_json(v: &Value, cond: &Cond) -> Response {
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, etag.as_str())
                     .body(Body::empty())
-                    .unwrap();
+                    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+                    .expect("valid response parts");
             }
             let use_gz = wants_encoding(ae.as_deref(), "gzip", raw.len());
             let body = if use_gz { Body::from(gzip_bytes(&raw)) } else { Body::from(raw) };
@@ -339,14 +340,16 @@ fn res_json(v: &Value, cond: &Cond) -> Response {
             if use_gz {
                 b = b.header(header::CONTENT_ENCODING, "gzip").header(header::VARY, "Accept-Encoding");
             }
-            b.body(body).unwrap()
+            // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+            b.body(body).expect("valid response parts")
         }
         Cond::Post => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
             .header(header::ETAG, etag.as_str())
             .body(Body::from(raw))
-            .unwrap(),
+            // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+            .expect("valid response parts"),
     }
 }
 
@@ -359,7 +362,8 @@ fn json_status(status: StatusCode, v: &Value) -> Response {
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .header(header::ETAG, etag.as_str())
         .body(Body::from(raw))
-        .unwrap()
+        // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+        .expect("valid response parts")
 }
 
 fn err_json(status: StatusCode, msg: &str) -> Response {
@@ -561,7 +565,9 @@ pub async fn handle_highlight(State(st): State<AppState>, req: Request) -> Respo
     if (!safe_free_text(&q) && !st.cfg.node_upstream.is_empty()) || local_base(&st).is_none() {
         return replay_post_raw(&st, &headers, "/api/cards/highlight", &bytes).await;
     }
-    let base = local_base(&st).unwrap();
+    let Some(base) = local_base(&st) else {
+        return replay_post_raw(&st, &headers, "/api/cards/highlight", &bytes).await;
+    };
 
     let wanted: HashSet<String> = names.iter().map(|n| n.to_lowercase()).collect();
     let mut matched: HashSet<String> = HashSet::new();
@@ -812,7 +818,8 @@ pub async fn handle_price_history(State(st): State<AppState>, Path(id): Path<Str
             let mut mn = f64::MAX;
             let mut mx = f64::MIN;
             for (_, t) in &points {
-                let t = t.unwrap();
+                // INFALLIBLE: points with a None time return Value::Null in the branch above
+                let t = t.expect("times checked Some above");
                 if t < mn {
                     mn = t;
                 }
@@ -831,7 +838,8 @@ pub async fn handle_price_history(State(st): State<AppState>, Path(id): Path<Str
         .map(|(price, t)| {
             obj(&[
                 ("price", price.clone()),
-                ("recorded_at", Value::String(iso_utc_ms(t.unwrap() as i64))),
+                // INFALLIBLE: data with any None time returns 500 earlier in this handler
+                ("recorded_at", Value::String(iso_utc_ms(t.expect("times checked Some above") as i64))),
                 ("source", Value::String("recorded".into())),
             ])
         })

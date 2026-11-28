@@ -188,10 +188,13 @@ fn static_reply(file: &Path, m: &std::fs::Metadata, method: &Method, headers_in:
     let (tag, lm, _size) = stat_tag(m);
     let lm_secs = lm_len_secs(&lm);
     let mut h = HeaderMap::new();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_str(cc).unwrap());
+    // INFALLIBLE: cc is one of two constant ASCII literals above
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_str(cc).expect("static cache-control"));
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
-    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).unwrap());
-    h.insert(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+    // INFALLIBLE: HTTP-date strings are visible ASCII, always valid header values
+    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).expect("last-modified header"));
+    // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+    h.insert(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"));
     finish(file, m, method, headers_in, h, &tag, lm_secs, mime_of(file.file_name().and_then(|n| n.to_str()).unwrap_or("")))
 }
 
@@ -211,8 +214,10 @@ fn index_reply(root: &Path, method: &Method, headers_in: &HeaderMap) -> Response
     let mut h = HeaderMap::new();
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=0"));
-    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).unwrap());
-    h.insert(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+    // INFALLIBLE: HTTP-date strings are visible ASCII, always valid header values
+    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).expect("last-modified header"));
+    // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+    h.insert(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"));
     finish(&file, &m, method, headers_in, h, &tag, lm_secs, "text/html; charset=UTF-8")
 }
 
@@ -221,7 +226,7 @@ fn lm_len_secs(lm: &str) -> i64 {
     parse_http_date(lm).unwrap_or(0)
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors send()'s option bag (path, m, method, range?, …)
+#[expect(clippy::too_many_arguments, reason = "mirrors send()'s option bag")] // mirrors send()'s option bag (path, m, method, range?, …)
 fn finish(
     file: &Path,
     m: &std::fs::Metadata,
@@ -245,12 +250,14 @@ fn finish(
             return express_json(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"Internal server error\"}")
         }
     };
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+    // INFALLIBLE: ct comes from the constant mime table / literals
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).expect("static content-type"));
     let ae = headers_in.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
     let zip = compressible_ct(Some(ct)) && wants_encoding(ae, "gzip", raw.len());
     if *method == Method::HEAD {
         // send set every header; the stream emits none of the body.
-        h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&raw.len().to_string()).unwrap());
+        // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&raw.len().to_string()).expect("content-length header"));
         let mut parts = Response::new(Body::empty()).into_parts().0;
         parts.status = StatusCode::OK;
         parts.headers = h;
@@ -271,7 +278,8 @@ fn finish(
         parts.headers = h;
         return Response::from_parts(parts, body);
     }
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&raw.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&raw.len().to_string()).expect("content-length header"));
     let mut parts = Response::new(Body::empty()).into_parts().0;
     parts.status = StatusCode::OK;
     parts.headers = h;
@@ -287,9 +295,11 @@ pub(crate) fn dir_redirect(path: &str) -> Response<Body> {
     let doc = redirect_doc(&loc);
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&doc.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&doc.len().to_string()).expect("content-length header"));
     h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'"));
-    h.insert(header::LOCATION, HeaderValue::from_str(&loc).unwrap());
+    // INFALLIBLE: loc is the request path from a parsed Uri (visible ASCII) plus "/"
+    h.insert(header::LOCATION, HeaderValue::from_str(&loc).expect("uri path is a valid header value"));
     let mut parts = Response::new(Body::empty()).into_parts().0;
     parts.status = StatusCode::MOVED_PERMANENTLY;
     parts.headers = h;

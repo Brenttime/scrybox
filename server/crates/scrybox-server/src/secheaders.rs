@@ -327,13 +327,15 @@ fn compose_headers(
     };
     slot(&mut out, &mut existing, coep_name(), coep.and_then(|c| HeaderValue::from_str(c).ok()));
     if !vary.is_empty() {
-        out.insert(header::VARY, HeaderValue::from_str(&vary.join(", ")).unwrap());
+        // INFALLIBLE: tokens come from constants or existing HeaderValue::to_str() (visible ASCII)
+        out.insert(header::VARY, HeaderValue::from_str(&vary.join(", ")).expect("vary tokens are visible ASCII"));
     }
     for (n, val) in helmet_pre() {
         if strip_csp_coep && n == "content-security-policy-report-only" {
             continue;
         }
-        slot(&mut out, &mut existing, HeaderName::from_bytes(n.as_bytes()).unwrap(), Some(HeaderValue::from_str(val).unwrap()));
+        // INFALLIBLE: helmet_pre/post are constant, valid header name/value tables
+        slot(&mut out, &mut existing, HeaderName::from_bytes(n.as_bytes()).expect("static helmet header"), Some(HeaderValue::from_str(val).expect("static helmet header")));
     }
     if hsts {
         slot(
@@ -344,7 +346,8 @@ fn compose_headers(
         );
     }
     for (n, val) in helmet_post() {
-        slot(&mut out, &mut existing, HeaderName::from_bytes(n.as_bytes()).unwrap(), Some(HeaderValue::from_str(val).unwrap()));
+        // INFALLIBLE: helmet_pre/post are constant, valid header name/value tables
+        slot(&mut out, &mut existing, HeaderName::from_bytes(n.as_bytes()).expect("static helmet header"), Some(HeaderValue::from_str(val).expect("static helmet header")));
     }
     if let Some(o) = acao {
         if let Ok(v) = HeaderValue::from_str(o) {

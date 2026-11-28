@@ -611,7 +611,8 @@ fn networth_rows(conn: &rusqlite::Connection, user_id: i64) -> Result<Vec<Vec<Va
 /// top-mover response assembly (stats.js lines 845-853), pure over the SQL
 /// row in SELECT order so the key order + rounding is testable.
 fn top_mover_values(names: &[String], vals: &[Value]) -> Value {
-    let col = |name: &str| vals[names.iter().position(|c| c == name).unwrap()].clone();
+    // INFALLIBLE: callers only pass column names from the constant SELECT list
+    let col = |name: &str| vals[names.iter().position(|c| c == name).expect("column name in SELECT list")].clone();
     let cur = js_to_num(&col("cur"));
     let prev = js_to_num(&col("prev"));
     let gain = js_to_num(&col("gain"));
@@ -743,7 +744,8 @@ async fn route(
         return proxy_fallback(&st, req).await;
     }
     let kind = kind_fn(&req);
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let headers = req.headers().clone();
 
     // authenticateToken (Bearer session; API keys GET-only) — same 401/403
@@ -860,13 +862,15 @@ async fn route(
             if let Some(h) = cache_header.clone() {
                 resp = resp.header("x-stats-cache", h);
             }
-            return resp.body(Body::empty()).unwrap();
+            // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+            return resp.body(Body::empty()).expect("valid response parts");
         }
     }
 
     let raw_len = entry.raw().len();
     let use_gzip = wants_encoding(ae.as_deref(), "gzip", raw_len) && entry.gz().is_some();
-    let body_bytes: Bytes = if use_gzip { entry.gz().clone().unwrap() } else { entry.raw().clone() };
+    // INFALLIBLE: use_gzip already requires entry.gz().is_some()
+    let body_bytes: Bytes = if use_gzip { entry.gz().clone().expect("gz checked Some above") } else { entry.raw().clone() };
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -878,7 +882,8 @@ async fn route(
     if use_gzip {
         resp = resp.header(header::CONTENT_ENCODING, "gzip").header(header::VARY, "Accept-Encoding");
     }
-    resp.body(Body::from(body_bytes)).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    resp.body(Body::from(body_bytes)).expect("valid response parts")
 }
 
 /// stats.js catch shape: console.error + res.status(500).json({error}). The

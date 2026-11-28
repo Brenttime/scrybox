@@ -173,7 +173,8 @@ pub(crate) fn serve_reply(
     let Some(decoded) = crate::shared::percent_decode(path_below.as_bytes()) else {
         return match miss {
             MissMode::ServerError => express_json(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"Internal server error\"}"),
-            MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap(),
+            // INFALLIBLE: constant status, no headers, empty body: Response::builder cannot fail
+            MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).expect("valid response parts"),
         };
     };
     let segs: Vec<&str> = decoded.split('/').collect();
@@ -191,7 +192,8 @@ pub(crate) fn serve_reply(
     let Some(meta) = meta else {
         return match miss {
             MissMode::ServerError => express_json(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"Internal server error\"}"),
-            MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap(),
+            // INFALLIBLE: constant status, no headers, empty body: Response::builder cannot fail
+            MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).expect("valid response parts"),
         };
     };
     let size = meta.len();
@@ -208,10 +210,13 @@ pub(crate) fn serve_reply(
         .unwrap_or_default();
     // send sets these BEFORE the conditional check; the 304 keeps exactly them.
     let mut h = HeaderMap::new();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_str(cache_control).unwrap());
+    // INFALLIBLE: cache_control is a constant ASCII literal from the caller
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_str(cache_control).expect("static cache-control"));
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
-    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).unwrap());
-    h.insert(header::ETAG, HeaderValue::from_str(&tag).unwrap());
+    // INFALLIBLE: HTTP-date strings are visible ASCII, always valid header values
+    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(&lm).expect("last-modified header"));
+    // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+    h.insert(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"));
 
     let inm = headers_in.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let ims = headers_in.get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
@@ -229,7 +234,8 @@ pub(crate) fn serve_reply(
         Err(_) => {
             return match miss {
                 MissMode::ServerError => express_json(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"Internal server error\"}"),
-                MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap(),
+                // INFALLIBLE: constant status, no headers, empty body: Response::builder cannot fail
+                MissMode::Empty404 => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).expect("valid response parts"),
             }
         }
     };
@@ -240,12 +246,14 @@ pub(crate) fn serve_reply(
     let ae = headers_in.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok());
     let zip = compressible_ct(Some(ct)) && wants_encoding(ae, "gzip", raw.len());
     let body = if zip { gzip_bytes(&raw) } else { raw };
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+    // INFALLIBLE: ct comes from the constant mime table
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ct).expect("static content-type"));
     if zip {
         h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).expect("content-length header"));
     let body = if *method == Method::HEAD { Bytes::new() } else { body };
     let mut parts = Response::new(Body::empty()).into_parts().0;
     parts.status = StatusCode::OK;
@@ -263,7 +271,8 @@ pub(crate) fn express_json(status: StatusCode, body: &'static str) -> Response<B
     // BEFORE the tag, so it must be inserted before it here too (hyper
     // appends its own CL last, which put the tag ahead of it).
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).expect("content-length header"));
     if let Ok(v) = HeaderValue::from_str(&body_etag(body.as_bytes())) {
         h.insert(header::ETAG, v);
     }
@@ -308,7 +317,8 @@ pub(crate) fn express_default_404(method: &Method, path: &str) -> Response<Body>
         HeaderValue::from_static("default-src 'none'"),
     );
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).expect("content-length header"));
     let mut parts = Response::new(Body::from(body.clone())).into_parts().0;
     parts.status = StatusCode::NOT_FOUND;
     parts.headers = h;
@@ -513,10 +523,12 @@ pub async fn handle_portal(State(st): State<AppState>, req: Request) -> Response
         let target = format!("{PORTAL_PREFIX}/");
         let body = format!("Moved Permanently. Redirecting to {target}");
         let mut h = HeaderMap::new();
-        h.insert(header::LOCATION, HeaderValue::from_str(&target).unwrap());
+        // INFALLIBLE: target is a constant prefix literal + "/"
+        h.insert(header::LOCATION, HeaderValue::from_str(&target).expect("static location"));
         h.insert(header::VARY, HeaderValue::from_static("Accept"));
         h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-        h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).unwrap());
+        // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body.len().to_string()).expect("content-length header"));
         let mut parts = Response::new(Body::from(body.clone())).into_parts().0;
         parts.status = StatusCode::MOVED_PERMANENTLY;
         parts.headers = h;
@@ -621,10 +633,12 @@ pub async fn handle_portal(State(st): State<AppState>, req: Request) -> Response
         ct_str.trim_end(),
         if ct_str.to_ascii_lowercase().contains("charset") { "" } else { "; charset=utf-8" }
     );
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct_out).unwrap());
+    // INFALLIBLE: ct_out is an upstream HeaderValue::to_str() (visible ASCII) plus an ASCII suffix
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct_out).expect("content-type from valid header"));
     // Node's res.send wire order: Content-Type, Content-Length, ETag. Stamp CL
     // explicitly (same value hyper would auto-derive) so the line order matches.
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body_str.len().to_string()).unwrap());
+    // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&body_str.len().to_string()).expect("content-length header"));
     if let Ok(v) = HeaderValue::from_str(&body_etag(body_str.as_bytes())) {
         headers.insert(header::ETAG, v);
     }

@@ -345,21 +345,24 @@ fn parse_npy(b: &[u8]) -> Result<Npy, String> {
         "<f8" => {
             let mut v = Vec::with_capacity(n);
             for c in body.chunks_exact(8).take(n) {
-                v.push(f64::from_le_bytes(c.try_into().unwrap()));
+                // INFALLIBLE: chunks_exact yields slices of exactly size_of::<T>() bytes.
+                v.push(f64::from_le_bytes(c.try_into().expect("exact chunk")));
             }
             NpyData::F64(v)
         }
         "<i4" => {
             let mut v = Vec::with_capacity(n);
             for c in body.chunks_exact(4).take(n) {
-                v.push(i32::from_le_bytes(c.try_into().unwrap()));
+                // INFALLIBLE: chunks_exact yields slices of exactly size_of::<T>() bytes.
+                v.push(i32::from_le_bytes(c.try_into().expect("exact chunk")));
             }
             NpyData::I32(v)
         }
         "<i8" => {
             let mut v = Vec::with_capacity(n);
             for c in body.chunks_exact(8).take(n) {
-                v.push(i64::from_le_bytes(c.try_into().unwrap()));
+                // INFALLIBLE: chunks_exact yields slices of exactly size_of::<T>() bytes.
+                v.push(i64::from_le_bytes(c.try_into().expect("exact chunk")));
             }
             NpyData::I64(v)
         }
@@ -368,7 +371,8 @@ fn parse_npy(b: &[u8]) -> Result<Npy, String> {
         "<u4" => {
             let mut v = Vec::with_capacity(n);
             for c in body.chunks_exact(4).take(n) {
-                v.push(u32::from_le_bytes(c.try_into().unwrap()));
+                // INFALLIBLE: chunks_exact yields slices of exactly size_of::<T>() bytes.
+                v.push(u32::from_le_bytes(c.try_into().expect("exact chunk")));
             }
             NpyData::U32(v)
         }

@@ -118,7 +118,8 @@ impl IdMap {
         let mut vals = Vec::with_capacity(p.len());
         for (k, v) in p {
             if keys.last() == Some(&k) {
-                *vals.last_mut().unwrap() = v;
+                // INFALLIBLE: keys.last() is Some, and keys/vals are pushed in lockstep.
+                *vals.last_mut().expect("vals parallels keys") = v;
             } else {
                 keys.push(k);
                 vals.push(v);
@@ -185,13 +186,16 @@ impl JsonReader<'_> {
         let frame = &st.blob[s..st.ends[i] as usize];
         let n = st.raw_len[i] as usize;
         if self.d.is_none() {
+            // INFALLIBLE: frames in `blob` only exist after training sets ddict; the dictionary was built in-process so dctx creation cannot fail on its content.
             let dict = st.ddict.as_ref().expect("json store not trained");
             self.d = Some(zstd::bulk::Decompressor::with_prepared_dictionary(dict).expect("zstd dctx"));
         }
-        let d = self.d.as_mut().unwrap();
+        // INFALLIBLE: initialised just above when None.
+        let d = self.d.as_mut().expect("decompressor initialised");
         let mut v = std::mem::take(out).into_bytes();
         let at = v.len();
         v.resize(at + n, 0);
+        // INFALLIBLE: frame was produced by this store's compressor with the same dictionary; output buffer is sized to raw_len.
         let got = d.decompress_to_buffer(frame, &mut v[at..]).expect("zstd decompress");
         assert_eq!(got, n, "json store length mismatch");
         // SAFETY: `v[..at]` came from a String and `v[at..]` is the exact
@@ -252,6 +256,7 @@ impl JsonStore {
             .pending
             .par_chunks(256)
             .flat_map_iter(|chunk| {
+                // INFALLIBLE: in-memory compression with a dictionary trained in-process; zstd only fails here on OOM.
                 let mut c = zstd::bulk::Compressor::with_dictionary(LEVEL, dict).expect("zstd ctx");
                 c.include_checksum(false).ok();
                 c.include_contentsize(false).ok();

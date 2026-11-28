@@ -22,11 +22,13 @@ pub fn eval(nodes: &[Node], ix: &Index, warnings: &mut Vec<String>) -> RoaringBi
     }
     let mut parts: Vec<RoaringBitmap> = nodes.iter().map(|n| eval_node(n, ix, warnings)).collect();
     if parts.len() == 1 {
-        return parts.pop().unwrap();
+        // INFALLIBLE: guarded by parts.len() == 1 just above.
+        return parts.pop().expect("one part");
     }
     parts.sort_by_key(|b| b.len());
     let mut it = parts.into_iter();
-    let mut acc = it.next().unwrap();
+    // INFALLIBLE: nodes is non-empty (early return above) and len > 1 here.
+    let mut acc = it.next().expect("at least two parts");
     for p in it {
         acc &= &p;
         if acc.is_empty() {
@@ -1578,7 +1580,8 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                             & (1u32 << crate::index::FFX_LIST
                                 .iter()
                                 .position(|x| *x == "extendedart")
-                                .unwrap())
+                                // INFALLIBLE: "extendedart" is a member of the constant FFX_LIST.
+                                .expect("extendedart in FFX_LIST"))
                             != 0
                     }
                     _ => false,
@@ -1802,7 +1805,8 @@ fn eval_filter(f: &Filter, ix: &Index, w: &mut Vec<String>) -> RoaringBitmap {
                 let y = (ix.today / 10_000).saturating_sub(n);
                 Some(y * 10_000 + ix.today % 10_000)
             } else if q.len() == 4 && q.chars().all(|c| c.is_ascii_digit()) {
-                let y: u32 = q.parse().unwrap();
+                // INFALLIBLE: q is exactly 4 ASCII digits (checked above), fits u32.
+                let y: u32 = q.parse().expect("4 ascii digits");
                 match o {
                     Cmp::Lt => Some(y * 10_000),
                     Cmp::Gt | Cmp::Ge => Some(y * 10_000 + 12_31),
