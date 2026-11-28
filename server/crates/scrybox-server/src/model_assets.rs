@@ -471,7 +471,8 @@ pub async fn handle_models(State(st): State<AppState>, mut req: Request) -> Resp
         Value::Object(Map::new())
     };
 
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_some() is required by the proxy guard at the top of handle_models
+    let pool = st.db.clone().expect("db checked above");
     let headers = req.headers().clone();
     let token = bearer_token(&headers).map(|s| s.to_string());
     let user = match authenticate(&pool, token.as_deref(), is_get) {

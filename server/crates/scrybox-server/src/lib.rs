@@ -1180,6 +1180,7 @@ pub fn app(state: AppState) -> Router {
         // future's Output = ! and trips the (deny-by-default)
         // never-type-fallback rust_2024_compat lint.
         async fn boom() -> StatusCode {
+            // INFALLIBLE: deliberate panic; route mounted only when SCRYBOX_TEST_PANIC_ROUTE is set for the panic->500 test
             panic!("SCRYBOX_TEST_PANIC_ROUTE: intentional handler panic (REVIEW-errors H2 test)")
         }
         router.rroute("/api/__test_panic", any(boom))

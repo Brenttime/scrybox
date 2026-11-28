@@ -3499,7 +3499,10 @@ impl Index {
                             lines.push(line);
                         }
                     }
-                    Err(e) => panic!("tag file read error: {e}"),
+                    Err(e) => {
+                        eprintln!("tag file read error: {e}");
+                        return false;
+                    }
                 }
             }
             for l in &lines {

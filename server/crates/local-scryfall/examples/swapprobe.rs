@@ -19,6 +19,7 @@ fn trim() {
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
     }
+    // SAFETY: glibc malloc_trim has no preconditions.
     unsafe {
         malloc_trim(0);
     }

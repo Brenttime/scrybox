@@ -196,55 +196,68 @@ fn rule_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     // JS ^(\d{3}\.\d+[a-z]?)\.?\s+(.*)$ — \d/\s are the ASCII/ES sets:
     // [0-9] and WhiteSpace+LineTerminator (\u0085, \u00a0, \uFEFF …).
-    R.get_or_init(|| Regex::new(r"^([0-9]{3}\.[0-9]+[a-z]?)\.?[\s\u{feff}]+(.*)$").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"^([0-9]{3}\.[0-9]+[a-z]?)\.?[\s\u{feff}]+(.*)$").expect("static regex"))
 }
 fn sec3_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^[0-9]{3}\.[\s\u{feff}]").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"^[0-9]{3}\.[\s\u{feff}]").expect("static regex"))
 }
 fn sec1_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^[0-9]\.[\s\u{feff}]").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"^[0-9]\.[\s\u{feff}]").expect("static regex"))
 }
 fn entry_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r#"(?s)<div class="entry-content[^>]*>(.*?)</article"#).unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r#"(?s)<div class="entry-content[^>]*>(.*?)</article"#).expect("static regex"))
 }
 fn open_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"<(h[1-6]|p|li)[^>]*>").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"<(h[1-6]|p|li)[^>]*>").expect("static regex"))
 }
 fn tag_strip_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"<[^>]+>").expect("static regex"))
 }
 fn ws_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"[\s\u{feff}]+").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"[\s\u{feff}]+").expect("static regex"))
 }
 fn dec_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"&#([0-9]+);").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"&#([0-9]+);").expect("static regex"))
 }
 fn hex_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?i)&#x([0-9a-f]+);").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"(?i)&#x([0-9a-f]+);").expect("static regex"))
 }
 fn general_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?i)^(General|Keyword)").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"(?i)^(General|Keyword)").expect("static regex"))
 }
 fn head_id_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^70[12]\.[0-9]+$").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"^70[12]\.[0-9]+$").expect("static regex"))
 }
 fn digits8_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"[0-9]{8}").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"[0-9]{8}").expect("static regex"))
 }
 fn rem_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"(?:^|\n)([A-Z][^\n(]{0,60}?) \(([^()]{8,400})\)").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    R.get_or_init(|| Regex::new(r"(?:^|\n)([A-Z][^\n(]{0,60}?) \(([^()]{8,400})\)").expect("static regex"))
 }
 
 fn obj(pairs: &[(&str, Value)]) -> Value {
@@ -379,7 +392,8 @@ pub fn unescape(s: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut last = 0usize;
     for c in dec_re().captures_iter(s) {
-        let whole = c.get(0).unwrap();
+        // INFALLIBLE: capture group 0 (the whole match) is always present
+        let whole = c.get(0).expect("group 0 always matches");
         out.push_str(&s[last..whole.start()]);
         out.push_str(&from_code_point(js_number_f64(&c[1])?)?);
         last = whole.end();
@@ -389,7 +403,8 @@ pub fn unescape(s: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut last = 0usize;
     for c in hex_re().captures_iter(&src) {
-        let whole = c.get(0).unwrap();
+        // INFALLIBLE: capture group 0 (the whole match) is always present
+        let whole = c.get(0).expect("group 0 always matches");
         out.push_str(&src[last..whole.start()]);
         // parseInt(n, 16)
         let mut acc: f64 = 0.0;
@@ -440,7 +455,8 @@ pub fn parse_commander(page: &str) -> Result<Vec<Value>, String> {
     let mut pos = 0usize;
     loop {
         let Some(caps) = open_re().captures(&body[pos..]) else { break };
-        let m = caps.get(0).unwrap();
+        // INFALLIBLE: capture group 0 (the whole match) is always present
+        let m = caps.get(0).expect("group 0 always matches");
         let s = pos + m.start();
         let tag_end = pos + m.end();
         let tag = caps.get(1).map(|g| g.as_str().to_string()).unwrap_or_default();
@@ -481,7 +497,8 @@ use crate::util::now_ms;
 fn cr_link_re(base: &str) -> Regex {
     // JS /https:\/\/media\.wizards\.com\/[^"']*?\.txt/g with the base swapped
     // for the AppState field (test hook); leftmost-first, non-overlapping.
-    Regex::new(&format!(r#"{}[^"']*?\.txt"#, regex::escape(base))).unwrap()
+    // INFALLIBLE: pattern is a constant shape around regex::escape()d input, always valid
+    Regex::new(&format!(r#"{}[^"']*?\.txt"#, regex::escape(base))).expect("escaped pattern is valid")
 }
 
 /// `build()` — the three live legs + sanity gate. Err = `err.message`.
@@ -707,7 +724,8 @@ pub fn build_keywords(st: &AppState, data: &Value) -> Result<Value, String> {
     let mut keywords: Vec<Value> = Vec::new();
     for h in &heads {
         let hid = js_str(h.get("id"));
-        let sub_re = Regex::new(&format!("^{}[a-z]$", regex::escape(&hid))).unwrap();
+        // INFALLIBLE: pattern is a constant shape around regex::escape()d input, always valid
+        let sub_re = Regex::new(&format!("^{}[a-z]$", regex::escape(&hid))).expect("escaped pattern is valid");
         let sub: Vec<Value> = cr
             .iter()
             .filter(|r| sub_re.is_match(&js_str(r.get("id"))))
@@ -805,7 +823,8 @@ fn json_ok(raw: Vec<u8>, inm: Option<&str>, cache_control: bool) -> Response {
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, tag)
             .body(Body::empty())
-            .unwrap();
+            // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+            .expect("valid response parts");
     }
     let mut b = Response::builder()
         .status(StatusCode::OK)
@@ -814,13 +833,15 @@ fn json_ok(raw: Vec<u8>, inm: Option<&str>, cache_control: bool) -> Response {
     if cache_control {
         b = b.header(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
     }
-    b.body(Body::from(raw)).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    b.body(Body::from(raw)).expect("valid response parts")
 }
 
 fn json_error(status: StatusCode, msg: &str, cache_control: bool) -> Response {
     let mut m = Map::new();
     m.insert("error".into(), Value::String(msg.to_string()));
-    let raw = serde_json::to_vec(&Value::Object(m)).unwrap();
+    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+    let raw = serde_json::to_vec(&Value::Object(m)).expect("Value serializes");
     // res.status(N).json still runs res.send — Express stamps its default
     // body ETag on error bodies too.
     let tag = body_etag(&raw);
@@ -831,7 +852,8 @@ fn json_error(status: StatusCode, msg: &str, cache_control: bool) -> Response {
     if cache_control {
         b = b.header(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
     }
-    b.body(Body::from(raw)).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    b.body(Body::from(raw)).expect("valid response parts")
 }
 
 fn has_refresh(query: Option<&str>) -> bool {
@@ -861,7 +883,8 @@ pub async fn route_rules(State(st): State<AppState>, req: Request) -> Response {
     // so even the 502 carries it.
     let inm = inm_header(&headers).filter(|_| !force && fresh_allows_304(&headers));
     match get_rules(&st, force).await {
-        Ok(v) => json_ok(serde_json::to_vec(&v).unwrap(), inm.as_deref(), true),
+        // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+        Ok(v) => json_ok(serde_json::to_vec(&v).expect("Value serializes"), inm.as_deref(), true),
         Err(msg) => json_error(
             StatusCode::BAD_GATEWAY,
             &format!("Could not load rules: {msg}"),
@@ -897,8 +920,9 @@ pub async fn route_keywords(State(st): State<AppState>, req: Request) -> Respons
         !force
             && kw.as_ref().map(|k| k.get("fetched") == data.get("fetched")).unwrap_or(false)
     };
-    let kw = if need {
-        st.kw_mem.guard().clone().unwrap()
+    let cached = if need { st.kw_mem.guard().clone() } else { None };
+    let kw = if let Some(k) = cached {
+        k
     } else {
         match build_keywords(&st, &data) {
             Ok(k) => {
@@ -914,7 +938,8 @@ pub async fn route_keywords(State(st): State<AppState>, req: Request) -> Respons
         }
     };
     let inm = inm_header(&headers).filter(|_| !force && fresh_allows_304(&headers));
-    json_ok(serde_json::to_vec(&kw).unwrap(), inm.as_deref(), true)
+    // INFALLIBLE: serializing a serde_json::Value (string keys only) cannot fail
+    json_ok(serde_json::to_vec(&kw).expect("Value serializes"), inm.as_deref(), true)
 }
 
 /// rules.js CACHE default: `__dirname/../../../database/mtg-rules.json` →

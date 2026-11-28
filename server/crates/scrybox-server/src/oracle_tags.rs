@@ -308,6 +308,7 @@ pub fn collect_tag_data<I: Iterator<Item = Result<Value, String>>>(objects: I) -
         if !tags.contains_key(p) || !tags.contains_key(c) {
             continue;
         }
+        // INFALLIBLE: children is seeded from every id in order, and p is a tags key (checked above)
         let list = children.get_mut(p.as_str()).expect("parent known");
         if !list.contains(&c.as_str()) {
             list.push(c.as_str());
@@ -330,6 +331,7 @@ pub fn collect_tag_data<I: Iterator<Item = Result<Value, String>>>(objects: I) -
             }
         }
     }
+    // INFALLIBLE: order holds each tag id exactly once, so every remove() hits
     let tags = order.into_iter().map(|id| tags.remove(&id).expect("ordered tag")).collect();
     Ok(TagData { tags, edges: clean_edges, assignments, closure })
 }

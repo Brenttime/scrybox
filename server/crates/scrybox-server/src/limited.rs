@@ -157,7 +157,8 @@ fn deck_qty_re() -> &'static regex::Regex {
             r"(?i)\A([0-9]{{1,3}}){ws}*x?{ws}+([^\n\r\x{{2028}}\x{{2029}}]+)\z",
             ws = JS_WS_CLASS
         ))
-        .unwrap()
+        // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (format! only splices the constant JS_WS_CLASS)
+        .expect("static regex")
     })
 }
 
@@ -169,7 +170,8 @@ fn set_code_re() -> &'static regex::Regex {
             r"(?i){ws}+\(([A-Za-z0-9]{{2,6}})\){ws}*([0-9A-Za-z_-]*){ws}*\z",
             ws = JS_WS_CLASS
         ))
-        .unwrap()
+        // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (format! only splices the constant JS_WS_CLASS)
+        .expect("static regex")
     })
 }
 
@@ -177,7 +179,8 @@ fn foil_re() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
         // /\s+\*[^*]+\*\s*$/
-        regex::Regex::new(&format!(r"{ws}+\*[^*]+\*{ws}*\z", ws = JS_WS_CLASS)).unwrap()
+        // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (format! only splices the constant JS_WS_CLASS)
+        regex::Regex::new(&format!(r"{ws}+\*[^*]+\*{ws}*\z", ws = JS_WS_CLASS)).expect("static regex")
     })
 }
 
@@ -186,7 +189,8 @@ fn section_re() -> &'static regex::Regex {
     R.get_or_init(|| {
         // /^(sideboard|maybeboard|commander|companion|tokens?)\b/i — the \b
         // checked by hand: JS's \w is ASCII, the crate's \b is Unicode.
-        regex::Regex::new(r"(?i)\A(sideboard|maybeboard|commander|companion|tokens?)").unwrap()
+        // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (format! only splices the constant JS_WS_CLASS)
+        regex::Regex::new(r"(?i)\A(sideboard|maybeboard|commander|companion|tokens?)").expect("static regex")
     })
 }
 
@@ -269,7 +273,8 @@ fn pip_index(id: &str) -> Option<usize> {
 
 fn cost_sym_re() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    R.get_or_init(|| regex::Regex::new(r"\{([^}]+)\}").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (format! only splices the constant JS_WS_CLASS)
+    R.get_or_init(|| regex::Regex::new(r"\{([^}]+)\}").expect("static regex"))
 }
 
 /// utils/limitedMana.js costPips over the already-String()ed cost. Hybrid

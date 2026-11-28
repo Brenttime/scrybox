@@ -134,6 +134,10 @@ mod jemalloc_cap {
         })
     }
 
+    /// # Safety
+    /// `T` must be exactly the value type jemalloc documents for mallctl `name`.
+    // SAFETY: `cname` is NUL-terminated and outlives the call; `out`/`len`
+    // describe a valid, writable `size_of::<T>()` buffer; newp is null (read-only).
     unsafe fn read<T>(name: &[u8], out: &mut T) -> i32 {
         let mut cname: Vec<u8> = name.to_vec();
         cname.push(0);
@@ -153,6 +157,8 @@ mod jemalloc_cap {
         let mut narenas: libc::c_uint = 0;
         let mut dirty: i64 = -1;
         let mut muzzy: i64 = -1;
+        // SAFETY: opt.narenas is `unsigned` (c_uint) and arena.0.*_decay_ms are
+        // `ssize_t` (i64 on our 64-bit targets), matching each out-param type.
         let (r1, r2, r3) = unsafe {
             (
                 read(b"opt.narenas", &mut narenas),

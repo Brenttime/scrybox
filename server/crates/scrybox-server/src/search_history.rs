@@ -59,6 +59,7 @@ fn deflate_raw(data: &[u8]) -> Vec<u8> {
         let (in0, out0) = (d.total_in() as usize, d.total_out() as usize);
         let status = d
             .compress(&data[pos..], &mut buf, FlushCompress::Finish)
+            // INFALLIBLE: compressing into an in-memory Vec<u8> cannot hit an IO error
             .expect("deflate");
         let (in1, out1) = (d.total_in() as usize, d.total_out() as usize);
         out.extend_from_slice(&buf[..out1 - out0]);
@@ -320,7 +321,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
     {
         return crate::proxy(State(st.clone()), req).await;
     }
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let headers = req.headers().clone();
 
     // Body parsing runs BEFORE auth (server.js mounts normalJson above the
@@ -478,7 +480,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, tag)
                     .body(Body::empty())
-                    .unwrap();
+                    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+                    .expect("valid response parts");
             }
         }
     }
@@ -495,7 +498,8 @@ pub async fn handle(method: Method, State(st): State<AppState>, req: Request) ->
             .header(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"))
             .header(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
-    resp.body(Body::from(bytes)).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    resp.body(Body::from(bytes)).expect("valid response parts")
 }
 
 /// error handler: `err.type === 'entity.too.large'` branch of server.js.

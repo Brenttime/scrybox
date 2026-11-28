@@ -173,6 +173,7 @@ fn resolve_language_target(value: &str) -> Option<String> {
     static IDX: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
     let idx = IDX.get_or_init(|| {
         let v: Vec<serde_json::Value> =
+            // INFALLIBLE: languages.json is embedded at compile time via include_str! and parsed by tests
             serde_json::from_str(include_str!("../../../../shared/languages.json")).expect("languages.json");
         let mut m = std::collections::HashMap::new();
         for l in &v {
@@ -221,7 +222,8 @@ pub fn js_number(s: &str) -> Option<f64> {
             }
             let mut n = 0f64;
             for c in r.chars() {
-                n = n * radix as f64 + c.to_digit(radix).unwrap() as f64;
+                // INFALLIBLE: every char was checked is_digit(radix) above
+                n = n * radix as f64 + c.to_digit(radix).expect("digit validated above") as f64;
             }
             return Some(n);
         }
@@ -741,7 +743,8 @@ fn node_to_sql(n: &Node, p: &mut Vec<Sql>) -> Result<String, String> {
                 let s = node_to_sql(t, p)?;
                 parts.push(if is_composite(t) { format!("({s})") } else { s });
             }
-            Ok(if parts.len() == 1 { parts.pop().unwrap() } else { format!("({})", parts.join(" AND ")) })
+            // INFALLIBLE: parts.len() == 1 checked in the same expression
+            Ok(if parts.len() == 1 { parts.pop().expect("len checked == 1") } else { format!("({})", parts.join(" AND ")) })
         }
         Node::Or(ts) => {
             let mut parts = Vec::new();

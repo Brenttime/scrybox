@@ -66,8 +66,10 @@ fn s_opt(v: Option<&Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-static SHEET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^([a-z0-9]{2,6})-0*(\d+[a-z]?)[^a-z0-9]*$").unwrap());
-static COLLECTOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0*(\d+)([a-z]*)$").unwrap());
+// INFALLIBLE: constant regex literal; compiled on first use.
+static SHEET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^([a-z0-9]{2,6})-0*(\d+[a-z]?)[^a-z0-9]*$").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static COLLECTOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0*(\d+)([a-z]*)$").expect("valid regex"));
 
 /// `normalize_collector(value)`.
 pub fn normalize_collector(value: &str) -> String {
@@ -211,7 +213,8 @@ impl Printings {
             if targets.len() != 1 || oracle.norm_map.contains_key(&n) {
                 continue;
             }
-            let t = targets.into_iter().next().unwrap();
+            // INFALLIBLE: targets.len() == 1 checked above.
+            let t = targets.into_iter().next().expect("one target");
             oracle.push(n, t);
         }
         let mut codes: Vec<String> = match std::fs::read(dir.join("printing_index.meta.json")) {
@@ -371,7 +374,8 @@ impl Printings {
         if keys.len() != 1 {
             return None;
         }
-        Some(self.physical_twins(t, *hits.values().next().unwrap()))
+        // INFALLIBLE: keys.len() == 1 implies hits is non-empty.
+        Some(self.physical_twins(t, *hits.values().next().expect("non-empty hits")))
     }
 
     /// `_resolve_footer_group(title_norm, codes, numbers)`.
@@ -511,7 +515,7 @@ impl Printings {
             .map(|(i, (a, _))| (crate::scan_ocr::names::ratio(&q, &a.chars().collect::<Vec<_>>()), i))
             .filter(|(s, _)| *s >= 86.0)
             .collect();
-        found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        found.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
         let &(score, index) = found.first()?;
         let runner = found.get(1).map(|x| x.0).unwrap_or(0.0);
         if score < 90.0 && (q.len() < 12 || score - runner < 8.0) {
@@ -541,14 +545,22 @@ fn py_str(v: &Value) -> String {
 
 // ---------------------------------------------------------------- regexes
 
-static RUN5: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{5,}").unwrap());
-static NUM_SLASH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)(?:\s*/\s*\d{1,4})?").unwrap());
-static NUM_COMPACT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)").unwrap());
-static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(19|20)\d\d$").unwrap());
-static COPYRIGHT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)wizard|coast|\b(19|20)\d\d\b|©|tm\s*&").unwrap());
-static RETRO_NT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(\d{1,4}[a-z]?)\s*/\s*(\d{2,4})\s*$").unwrap());
-static RETRO_TAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)\s*$").unwrap());
-static RETRO_NT3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,3})\s*/\s*(\d{2,3})\s*$").unwrap());
+// INFALLIBLE: constant regex literal; compiled on first use.
+static RUN5: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{5,}").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static NUM_SLASH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)(?:\s*/\s*\d{1,4})?").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static NUM_COMPACT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static YEAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(19|20)\d\d$").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static COPYRIGHT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)wizard|coast|\b(19|20)\d\d\b|©|tm\s*&").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static RETRO_NT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(\d{1,4}[a-z]?)\s*/\s*(\d{2,4})\s*$").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static RETRO_TAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,4}[a-z]?)\s*$").expect("valid regex"));
+// INFALLIBLE: constant regex literal; compiled on first use.
+static RETRO_NT3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d{1,3})\s*/\s*(\d{2,3})\s*$").expect("valid regex"));
 
 fn is_digit(c: char) -> bool {
     c.is_ascii_digit() || (!c.is_ascii() && unicode_decimal(c))
@@ -556,7 +568,8 @@ fn is_digit(c: char) -> bool {
 
 fn unicode_decimal(c: char) -> bool {
     // Python's \d = Unicode Nd; Rust regex \d is the same class.
-    static D: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d$").unwrap());
+    // INFALLIBLE: constant regex literal; compiled on first use.
+    static D: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d$").expect("valid regex"));
     let mut b = [0u8; 4];
     D.is_match(c.encode_utf8(&mut b))
 }
@@ -568,7 +581,8 @@ fn finditer_not_after<'t>(re: &Regex, text: &'t str, forbid: &dyn Fn(char) -> bo
     let mut start = 0;
     while start <= text.len() {
         let Some(c) = re.captures_at(text, start) else { break };
-        let m = c.get(0).unwrap();
+        // INFALLIBLE: capture group 0 (the whole match) is always present.
+        let m = c.get(0).expect("group 0");
         let prev = text[..m.start()].chars().next_back();
         if prev.is_some_and(forbid) {
             // resume at the next char after the rejected start
@@ -638,7 +652,8 @@ pub fn footer_numbers(raws: &[String]) -> Vec<String> {
 
 /// Rarity letter + zero-padded 4-place collector number, the footer style
 /// of frames with no printed total (Secret Lair "The Zeta Set": `C 0031`).
-static PADDED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[^a-z0-9])[cumrslt]\s*[.,·•\-]?\s*([0o][0-9oqdilz|!sb]{3})(?:$|[^a-z0-9])").unwrap());
+// INFALLIBLE: constant regex literal; compiled on first use.
+static PADDED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[^a-z0-9])[cumrslt]\s*[.,·•\-]?\s*([0o][0-9oqdilz|!sb]{3})(?:$|[^a-z0-9])").expect("valid regex"));
 
 /// Digit readings of an OCR'd padded number. The recogniser reads these
 /// small serif digits as look-alike letters (`0031` -> `oosi`, `003i`);

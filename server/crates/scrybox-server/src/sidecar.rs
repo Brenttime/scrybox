@@ -214,7 +214,8 @@ fn oracle_id_for(card: Option<&Value>) -> Option<String> {
         }
     }
     if ids.len() == 1 {
-        Some(ids.into_iter().next().unwrap())
+        // INFALLIBLE: ids.len() == 1 checked on the line above
+        Some(ids.into_iter().next().expect("len checked == 1"))
     } else {
         None
     }

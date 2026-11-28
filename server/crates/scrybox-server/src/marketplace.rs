@@ -99,7 +99,6 @@ pub struct MpError {
     pub list_unavailable: bool,
     /// err.observedKeys (only the detail-not-found and parse arms set it;
     /// never reaches the slice-1 responses — the recent route never sees it).
-    #[allow(dead_code)]
     pub observed_keys: Option<Vec<Value>>,
 }
 
@@ -509,7 +508,8 @@ macro_rules! static_re {
     ($name:ident, $pattern:literal) => {
         fn $name() -> &'static regex::Regex {
             static RE: OnceLock<regex::Regex> = OnceLock::new();
-            RE.get_or_init(|| regex::Regex::new($pattern).unwrap())
+            // INFALLIBLE: static regex literal, compiled once and exercised by unit tests (macro only accepts literals)
+            RE.get_or_init(|| regex::Regex::new($pattern).expect("static regex"))
         }
     };
 }

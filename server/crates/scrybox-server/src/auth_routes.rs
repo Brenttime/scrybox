@@ -270,16 +270,19 @@ pub async fn handle(
                 h.insert("ratelimit-limit", HeaderValue::from_static("20"));
                 h.insert(
                     "ratelimit-remaining",
-                    HeaderValue::from_str(&v.remaining.to_string()).unwrap(),
+                    // INFALLIBLE: u32/u64 to_string() is ASCII digits, always a valid header value
+                    HeaderValue::from_str(&v.remaining.to_string()).expect("numeric header value"),
                 );
                 h.insert(
                     "ratelimit-reset",
-                    HeaderValue::from_str(&v.reset_secs.to_string()).unwrap(),
+                    // INFALLIBLE: u32/u64 to_string() is ASCII digits, always a valid header value
+                    HeaderValue::from_str(&v.reset_secs.to_string()).expect("numeric header value"),
                 );
                 if v.blocked {
                     h.insert(
                         "retry-after",
-                        HeaderValue::from_str(&v.reset_secs.to_string()).unwrap(),
+                        // INFALLIBLE: u32/u64 to_string() is ASCII digits, always a valid header value
+                        HeaderValue::from_str(&v.reset_secs.to_string()).expect("numeric header value"),
                     );
                 }
                 res
@@ -771,7 +774,8 @@ async fn handle_settings(pool: &std::sync::Arc<DbPool>, headers: &HeaderMap, bod
             return json_error(StatusCode::UNAUTHORIZED, "Current password is incorrect");
         }
         let hash = match tokio::task::spawn_blocking({
-            let p = newpw.unwrap().to_string();
+            // INFALLIBLE: newpw None → too_short → 400 return above, so it is Some here
+            let p = newpw.expect("password presence validated above").to_string();
             move || hash_password(&p)
         })
         .await {
@@ -955,7 +959,10 @@ async fn handle_oidc_callback(
             let conn = pool.get_async().await?;
             let mut stmt = conn.prepare_cached("SELECT id, oidc_sub FROM users WHERE oidc_sub = ?1")?;
             let mut rows = stmt.query([&sub])?;
-            Ok::<_, rusqlite::Error>(rows.next()?.map(|r| (r.get::<_, i64>(0).unwrap(), r.get::<_, Option<String>>(1).ok().flatten())))
+            Ok::<_, rusqlite::Error>(match rows.next()? {
+                Some(r) => Some((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1).ok().flatten())),
+                None => None,
+            })
         }).await
         .map_err(|e| e.to_string())?;
         let mut user_id = by_sub.map(|(id, _)| id);
@@ -966,7 +973,10 @@ async fn handle_oidc_callback(
                 let conn = pool.get_async().await?;
                 let mut stmt = conn.prepare_cached("SELECT id, oidc_sub FROM users WHERE username = ?1")?;
                 let mut rows = stmt.query([&username])?;
-                Ok::<_, rusqlite::Error>(rows.next()?.map(|r| (r.get::<_, i64>(0).unwrap(), r.get::<_, Option<String>>(1).ok().flatten())))
+                Ok::<_, rusqlite::Error>(match rows.next()? {
+                    Some(r) => Some((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1).ok().flatten())),
+                    None => None,
+                })
             }).await
             .map_err(|e| e.to_string())?;
             if let Some((id, bound)) = existing.clone() {
@@ -1038,7 +1048,7 @@ async fn handle_oidc_callback(
             }
             user_id = Some(id);
         }
-        Ok(user_id.unwrap())
+        user_id.ok_or_else(|| "OIDC user resolution produced no user id".to_string())
     }
     .await;
 
@@ -1062,5 +1072,5 @@ fn trim_trailing_slashes(s: &str) -> String {
 }
 
 // keep the AuthUser import meaningful for rustc's unused checker
-#[allow(unused_imports)]
+#[expect(unused_imports, reason = "anchor import kept for parity; never referenced")]
 use AuthUser as _AuthUserMarker;

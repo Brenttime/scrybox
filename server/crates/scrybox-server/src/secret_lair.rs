@@ -91,7 +91,8 @@ const VALID_CONDITIONS: [&str; 5] = [
 
 fn foil_tail_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)\s+foil\s+edition\s*$").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    RE.get_or_init(|| regex::Regex::new(r"(?i)\s+foil\s+edition\s*$").expect("static regex"))
 }
 
 /// `Boolean(v)` on a possibly-missing key.
@@ -150,11 +151,12 @@ fn is_foil_row(row: &Value) -> bool {
 
 /// secretLair.js `isFoilFileName` (route twin): /foiledition/i on
 /// String(fileName || '') — the contiguous MTGJSON file-name convention.
-#[allow(non_snake_case)]
+#[expect(non_snake_case, reason = "parameter mirrors the JS fileName argument")]
 fn is_foil_file_name(fileName: Option<&Value>) -> bool {
     let s = js_str_or_empty(fileName);
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"(?i)foiledition").unwrap())
+    // INFALLIBLE: static regex literal, compiled once and exercised by unit tests
+    RE.get_or_init(|| regex::Regex::new(r"(?i)foiledition").expect("static regex"))
         .is_match(&s)
 }
 

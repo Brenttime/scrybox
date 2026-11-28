@@ -512,9 +512,7 @@ pub struct ParsedLine {
     pub set_ref: String,
     // set/number mirror Node's parseListLine result fields (parsed but only
     // consumed by the SQL via set_ref today) — kept for structure parity.
-    #[allow(dead_code)]
     pub set: String,
-    #[allow(dead_code)]
     pub number: String,
 }
 
@@ -971,7 +969,7 @@ fn delete_list(pool: &DbPool, id: &str, user_id: i64) -> Response {
 
 // Keep the Body/IntoResponse imports honest for the proxy rebuild path even
 // if future refactors drop one use site.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "import anchor, intentionally never called")]
 fn _import_anchors(b: Body) -> Response {
     b.into_response()
 }

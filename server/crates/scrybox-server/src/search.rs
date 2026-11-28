@@ -59,6 +59,7 @@ fn langs() -> &'static Vec<(String, String, String)> {
     static L: OnceLock<Vec<(String, String, String)>> = OnceLock::new();
     L.get_or_init(|| {
         let v: Vec<Value> = serde_json::from_str(include_str!("../../../../shared/languages.json"))
+            // INFALLIBLE: languages.json is embedded at compile time via include_str! and parsed by tests
             .expect("shared/languages.json");
         v.iter()
             .map(|l| {
@@ -487,7 +488,8 @@ pub fn plan_post(
             Some(Value::Null) | Some(Value::Bool(false)) => Some(Merged::Falsy),
             Some(Value::Bool(true)) => Some(Merged::Str("true".to_string())),
             Some(v @ Value::Number(_)) => {
-                match js_number_to_string(v.as_number().unwrap()) {
+                // INFALLIBLE: v is bound by the Value::Number(_) pattern
+                match js_number_to_string(v.as_number().expect("matched Number above")) {
                     Some(Some(s)) => Some(Merged::Str(s)),
                     Some(None) => Some(Merged::Falsy),
                     None => Some(Merged::Exotic),
@@ -810,7 +812,8 @@ fn number_re() -> &'static regex::Regex {
         .ok()
     })
     .as_ref()
-    .unwrap()
+    // INFALLIBLE: the pattern is a constant splice of JS_WS_CLASS; it compiles (unit-tested)
+    .expect("static regex")
 }
 
 fn all_digits(s: &str) -> bool {
@@ -1482,6 +1485,7 @@ impl SearchCache {
     /// around the heavy leg — waiters on the same key never take one.
     pub async fn build_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
         // acquire() only fails on close(), which never happens here.
+        // INFALLIBLE: the builds semaphore is never closed, so acquire cannot fail
         Arc::clone(&self.builds).acquire_owned().await.expect("build semaphore")
     }
     /// Observability + budget guard tests.
@@ -1500,7 +1504,8 @@ impl crate::flight::FlightCache for SearchCache {
         self.slot(key)
     }
     fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
-        if self.inner.lock().unwrap().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+        // INFALLIBLE: mutex poisoning only follows a panic while held; crashing on it is the deliberate policy
+        if self.inner.lock().expect("search cache lock poisoned").inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
             self.finish(key);
         }
     }

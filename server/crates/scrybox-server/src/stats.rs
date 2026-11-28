@@ -187,7 +187,8 @@ impl crate::flight::FlightCache for StatsCache {
         self.slot(key)
     }
     fn flight_remove(&self, key: &str, slot: &Arc<Self::Slot>) {
-        if self.inner.lock().unwrap().inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
+        // INFALLIBLE: mutex poisoning only follows a panic while held; crashing on it is the deliberate policy
+        if self.inner.lock().expect("stats cache lock poisoned").inflight.get(key).is_some_and(|c| Arc::ptr_eq(c, slot)) {
             self.finish(key);
         }
     }

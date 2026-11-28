@@ -62,7 +62,8 @@ pub async fn handle_list(State(st): State<AppState>, req: Request) -> Response {
     if !st.owns("decks_reads") || st.db.is_none() || req.method() != Method::GET {
         return crate::proxy(State(st), req).await;
     }
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
     if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
         return crate::collection_writes::too_large();
@@ -189,7 +190,8 @@ where
     if !st.owns(group) || st.db.is_none() || req.method() != Method::GET {
         return crate::proxy(State(st), req).await;
     }
-    let pool = st.db.clone().unwrap();
+    // INFALLIBLE: st.db.is_none() is checked (and proxied) just above
+    let pool = st.db.clone().expect("db checked above");
     let (parts, bytes, oversize) = read_parts(req, crate::collection_writes::BODY_NORMAL).await;
     if oversize && crate::collection_writes::is_json_ct(&parts.headers) {
         return crate::collection_writes::too_large();
@@ -228,7 +230,8 @@ where
                         b = b.header(k, v);
                     }
                 }
-                return b.body(Body::empty()).unwrap();
+                // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+                return b.body(Body::empty()).expect("valid response parts");
             }
         }
     }
@@ -249,7 +252,8 @@ where
             resp = resp.header(k, v);
         }
     }
-    resp.body(bytes).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    resp.body(bytes).expect("valid response parts")
 }
 
 /// npm `fresh` (Express req.fresh): a request Cache-Control carrying the
@@ -397,7 +401,8 @@ fn js_or<'a>(v: Option<&'a Value>, fallback: &'a Value) -> &'a Value {
             if n.as_f64().map(|f| f == 0.0 || f.is_nan()).unwrap_or(false) {
                 fallback
             } else {
-                v.unwrap()
+                // INFALLIBLE: this arm only matches Some(Value::Number)
+                v.expect("matched Some above")
             }
         }
         Some(x) => x,
@@ -865,10 +870,12 @@ const PRINTING_FIELDS: [&str; 13] = [
 
 pub(crate) fn root_collator() -> icu_collator::CollatorBorrowed<'static> {
     Collator::try_new(
+        // INFALLIBLE: "und" is a constant valid locale and the root collator is compiled-in data
         CollatorPreferences::from_locale_strict(&icu_locale::Locale::try_from_str("und").unwrap()).unwrap(),
         CollatorOptions::default(),
     )
-    .unwrap()
+    // INFALLIBLE: "und" is a constant valid locale and the root collator is compiled-in data
+    .expect("root collator data is compiled in")
 }
 
 fn choose_printings(rows: &[Map<String, Value>], owned: &[Map<String, Value>]) -> HashMap<String, Value> {

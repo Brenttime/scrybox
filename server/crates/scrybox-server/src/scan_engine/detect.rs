@@ -90,11 +90,13 @@ impl Gray {
 /// Panics if OpenCV cannot allocate or wrap the buffer (OOM, or a `data`
 /// length inconsistent with `rows * cols * ch`).
 pub fn mat_from(data: &[u8], rows: usize, cols: usize, ch: usize) -> Mat {
+    // INFALLIBLE: callers pass data of exactly rows*cols*ch bytes (see # Panics); OpenCV otherwise fails only on OOM.
     let m = Mat::new_rows_cols_with_data(rows as i32, (cols * ch) as i32, data).expect("mat");
     m.reshape(ch as i32, rows as i32).expect("reshape").try_clone().expect("clone")
 }
 
 fn mat_bytes(m: &Mat) -> Vec<u8> {
+    // INFALLIBLE: cloning a valid Mat and reading a continuous clone's bytes only fails on OOM.
     let m = m.try_clone().expect("mat clone");
     m.data_bytes().expect("bytes").to_vec()
 }
@@ -105,11 +107,13 @@ fn mask_mat(g: &Gray, f: impl Fn(u8) -> bool, on: u8) -> Mat {
 }
 
 fn ones(k: i32) -> Mat {
+    // INFALLIBLE: small constant-type kernel allocation; fails only on OOM.
     Mat::new_rows_cols_with_default(k, k, cvc::CV_8UC1, Scalar::all(1.0)).expect("ones kernel")
 }
 
 fn morph(src: &Mat, op: i32, kernel: &Mat, iterations: i32) -> Mat {
     let mut dst = Mat::default();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
     imgproc::morphology_ex(
         src,
         &mut dst,
@@ -118,15 +122,16 @@ fn morph(src: &Mat, op: i32, kernel: &Mat, iterations: i32) -> Mat {
         Point::new(-1, -1),
         iterations,
         cvc::BORDER_CONSTANT,
-        imgproc::morphology_default_border_value().unwrap(),
+        imgproc::morphology_default_border_value().expect("default border value"),
     )
-    .unwrap();
+    .expect("morphology_ex");
     dst
 }
 
 fn contours(mask: &Mat, mode: i32) -> Vector<Vector<Point>> {
     let mut cs: Vector<Vector<Point>> = Vector::new();
-    imgproc::find_contours(mask, &mut cs, mode, imgproc::CHAIN_APPROX_SIMPLE, Point::new(0, 0)).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::find_contours(mask, &mut cs, mode, imgproc::CHAIN_APPROX_SIMPLE, Point::new(0, 0)).expect("find_contours");
     cs
 }
 
@@ -148,7 +153,8 @@ struct RRect {
 /// rectangle (box points are identical), so the 5.0 triple is rebuilt from
 /// the 4.10 one; `raw` stays 4.10 for `boxPoints`.
 fn min_area_rect(c: &Vector<Point>) -> RRect {
-    let r = imgproc::min_area_rect(c).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    let r = imgproc::min_area_rect(c).expect("min_area_rect");
     let (w4, h4, a4) = (r.size.width, r.size.height, r.angle);
     let (w, h, angle) = if a4 == 90.0 || (w4 == 0.0 && h4 == 0.0) {
         (w4, h4, -90.0f32)
@@ -162,17 +168,20 @@ fn min_area_rect(c: &Vector<Point>) -> RRect {
 
 fn box_points(r: &RRect) -> [[f32; 2]; 4] {
     let mut m = Mat::default();
-    imgproc::box_points(r.raw, &mut m).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::box_points(r.raw, &mut m).expect("box_points");
     let mut out = [[0f32; 2]; 4];
     for (i, o) in out.iter_mut().enumerate() {
-        o[0] = *m.at_2d::<f32>(i as i32, 0).unwrap();
-        o[1] = *m.at_2d::<f32>(i as i32, 1).unwrap();
+        // INFALLIBLE: box_points yields a 4x2 CV_32F Mat; i < 4.
+        o[0] = *m.at_2d::<f32>(i as i32, 0).expect("4x2 f32");
+        o[1] = *m.at_2d::<f32>(i as i32, 1).expect("4x2 f32");
     }
     out
 }
 
 fn area(c: &Vector<Point>) -> f64 {
-    imgproc::contour_area(c, false).unwrap()
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::contour_area(c, false).expect("contour_area")
 }
 
 pub type Quad = [[f32; 2]; 4];
@@ -325,7 +334,7 @@ fn norm_lut(low: f64, high: f64) -> [u8; 256] {
 }
 
 fn sort_desc(c: &mut [Cand]) {
-    c.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(b.area().cmp(&a.area())));
+    c.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(b.area().cmp(&a.area())));
 }
 
 /// `(long_angle → correction)` used by rotated candidates and skew.
@@ -496,9 +505,11 @@ fn border_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
         collect(&m, "border", 0.88);
     }
     let mut blur = Mat::default();
-    imgproc::gaussian_blur_def(&gray.mat(), &mut blur, Size::new(3, 3), 0.0).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::gaussian_blur_def(&gray.mat(), &mut blur, Size::new(3, 3), 0.0).expect("gaussian_blur");
     let mut edges = Mat::default();
-    imgproc::canny(&blur, &mut edges, 50.0, 150.0, 3, false).unwrap();
+    // INFALLIBLE: 8-bit single-channel blur output from above.
+    imgproc::canny(&blur, &mut edges, 50.0, 150.0, 3, false).expect("canny");
     collect(&edges, "edge-open", 0.88);
     // HSV of the strided RGB plane
     let (w, h) = (gray.w, gray.h);
@@ -510,7 +521,8 @@ fn border_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
         }
     }
     let mut hsv = Mat::default();
-    imgproc::cvt_color_def(&mat_from(&rgb, h, w, 3), &mut hsv, imgproc::COLOR_RGB2HSV).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::cvt_color_def(&mat_from(&rgb, h, w, 3), &mut hsv, imgproc::COLOR_RGB2HSV).expect("cvt_color");
     let hb = mat_bytes(&hsv);
     let px: Vec<u8> = hb
         .chunks_exact(3)
@@ -538,9 +550,11 @@ fn edge_scene_candidates(img: &Rgb, gray_full: &Gray) -> Vec<Cand> {
     let lut = norm_lut(low, high);
     let normalized = Gray { w: gray.w, h: gray.h, px: gray.px.iter().map(|&v| lut[v as usize]).collect() };
     let mut blur = Mat::default();
-    imgproc::gaussian_blur_def(&normalized.mat(), &mut blur, Size::new(5, 5), 0.0).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::gaussian_blur_def(&normalized.mat(), &mut blur, Size::new(5, 5), 0.0).expect("gaussian_blur");
     let mut edges = Mat::default();
-    imgproc::canny(&blur, &mut edges, 12.0, 36.0, 3, false).unwrap();
+    // INFALLIBLE: 8-bit single-channel blur output from above.
+    imgproc::canny(&blur, &mut edges, 12.0, 36.0, 3, false).expect("canny");
     let edges = morph(&edges, imgproc::MORPH_CLOSE, &ones(5), 1);
     let frame_area = (gray.w * gray.h) as f64;
     let mut out = vec![];
@@ -736,8 +750,10 @@ fn card_likeness(g: &Gray, x0: f64, y0: f64, w: f64, h: f64, vertical: bool) -> 
 
 fn components(mask: &Mat) -> Vec<[i32; 5]> {
     let (mut labels, mut stats, mut cent) = (Mat::default(), Mat::default(), Mat::default());
-    let n = imgproc::connected_components_with_stats(mask, &mut labels, &mut stats, &mut cent, 4, cvc::CV_32S).unwrap();
-    (1..n).map(|i| std::array::from_fn(|k| *stats.at_2d::<i32>(i, k as i32).unwrap())).collect()
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    let n = imgproc::connected_components_with_stats(mask, &mut labels, &mut stats, &mut cent, 4, cvc::CV_32S).expect("connected_components");
+    // INFALLIBLE: stats is an n x 5 CV_32S Mat; i < n, k < 5.
+    (1..n).map(|i| std::array::from_fn(|k| *stats.at_2d::<i32>(i, k as i32).expect("n x 5 i32 stats"))).collect()
 }
 
 /// Raw candidate box before ranking: `(x0, y0, w, h, source, anchor)` in
@@ -844,7 +860,7 @@ pub fn detect_card_bbox_all(gray_full: &Gray) -> Vec<Cand> {
         let y1 = (gray_full.h as i64).min(py_round_int((y0 + h) * s));
         ranked.push((key, w * h, cand([x, y, x1 - x, y1 - y], None, py_round(key, 3), source, anchor, None)));
     }
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(b.1.partial_cmp(&a.1).unwrap()));
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)));
     let mut opts: Vec<Cand> = ranked.into_iter().filter(|r| r.0 >= 3.88).map(|r| r.2).collect();
     opts.extend(rotated_scene_candidates(&seg, step, gray_full.w, gray_full.h));
     sort_desc(&mut opts);
@@ -1035,10 +1051,11 @@ pub fn box_sharpness(g: &Gray) -> f64 {
 fn dark_rect_candidates(g: &Gray, w: usize, h: usize) -> Vec<(f64, RRect)> {
     let mask = mask_mat(g, |v| v < 120, 255);
     let k = 5.max(13.min(py_round_int(w.min(h) as f64 / 120.0))) as i32;
-    let kernel = imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(k, k), Point::new(-1, -1)).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    let kernel = imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(k, k), Point::new(-1, -1)).expect("structuring_element");
     let mask = morph(&mask, imgproc::MORPH_CLOSE, &kernel, 2);
     let mut cs: Vec<(f64, Vector<Point>)> = contours(&mask, imgproc::RETR_EXTERNAL).iter().map(|c| (area(&c), c)).collect();
-    cs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    cs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = vec![];
     for (a, c) in cs {
         if a < 0.20 * (w * h) as f64 {
@@ -1132,7 +1149,8 @@ pub fn rectify_rotated_card(img: &Rgb, skew: f64) -> (Option<Rgb>, bool) {
     }
     // cv2.cvtColor(RGB2GRAY) — OpenCV's own weights, not Pillow's
     let mut gm = Mat::default();
-    imgproc::cvt_color_def(&mat_from(&img.px, img.h, img.w, 3), &mut gm, imgproc::COLOR_RGB2GRAY).unwrap();
+    // INFALLIBLE: OpenCV only errors here on OOM or a malformed Mat; inputs are internally built Mats of consistent shape/type.
+    imgproc::cvt_color_def(&mat_from(&img.px, img.h, img.w, 3), &mut gm, imgproc::COLOR_RGB2GRAY).expect("cvt_color");
     let g = Gray { w: img.w, h: img.h, px: mat_bytes(&gm) };
     let Some((_a, r)) = dark_rect_candidates(&g, img.w, img.h).into_iter().next() else {
         return (None, false);

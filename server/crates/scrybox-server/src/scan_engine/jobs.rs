@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 const EXCLUDED_LAYOUTS: [&str; 5] = ["art_series", "double_faced_token", "emblem", "front_card", "token"];
-static TOKEN_TYPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(token|emblem)\b").unwrap());
+// INFALLIBLE: constant regex literal; compiled on first use.
+static TOKEN_TYPE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(token|emblem)\b").expect("valid regex"));
 
 fn g<'a>(v: &'a Value, k: &str) -> &'a Value {
     v.get(k).unwrap_or(&Value::Null)
@@ -209,6 +210,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Python `json.dumps(obj, indent=2)` (ensure_ascii as given).
 fn py_indent2(v: &Value, ensure_ascii: bool) -> String {
+    // INFALLIBLE: serde_json::Value always serialises (string keys, no custom Serialize).
     let s = serde_json::to_string_pretty(v).expect("json value serialises");
     if !ensure_ascii {
         return s;

@@ -56,7 +56,8 @@ fn json_response(status: StatusCode, v: &Value) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=0, must-revalidate"),
             ),
-            (header::ETAG, HeaderValue::from_str(&tag).unwrap()),
+            // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+            (header::ETAG, HeaderValue::from_str(&tag).expect("etag header")),
         ],
         Body::from(bytes),
     )
@@ -260,7 +261,8 @@ pub async fn handle_png(State(st): State<AppState>, req: Request) -> Response {
             h.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
             h.insert(
                 header::CONTENT_LENGTH,
-                HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+                // INFALLIBLE: a decimal integer rendered by to_string() is always a valid header value
+                HeaderValue::from_str(&bytes.len().to_string()).expect("content-length header"),
             );
             let mut parts = axum::http::response::Response::new(Body::empty())
                 .into_parts()
@@ -288,8 +290,10 @@ fn send_headers(lm: &str, tag: &str) -> HeaderMap {
         HeaderValue::from_static("public, max-age=0, must-revalidate"),
     );
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
-    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(lm).unwrap());
-    h.insert(header::ETAG, HeaderValue::from_str(tag).unwrap());
+    // INFALLIBLE: HTTP-date strings are visible ASCII, always valid header values
+    h.insert(header::LAST_MODIFIED, HeaderValue::from_str(lm).expect("last-modified header"));
+    // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+    h.insert(header::ETAG, HeaderValue::from_str(tag).expect("etag header"));
     h
 }
 

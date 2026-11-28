@@ -786,6 +786,7 @@ pub(crate) fn res_json(status: StatusCode, v: &Value) -> Response {
         // Infallible: status is a StatusCode constant, the header names are
         // static, and body_etag returns a quoted hex digest (a valid field
         // value), so the builder can never return Err here.
+        // INFALLIBLE: static status/headers + quoted-hex ETag are valid HTTP parts
         .expect("res_json: static status/headers + quoted-hex ETag are valid HTTP parts")
 }
 
@@ -807,6 +808,7 @@ fn not_modified(tag: &str) -> Response {
         .body(Body::empty())
         // Infallible: `tag` originates from body_etag (quoted hex) and the
         // status is a constant.
+        // INFALLIBLE: constant status + body_etag value are valid HTTP parts
         .expect("not_modified: constant status + body_etag value are valid HTTP parts")
 }
 

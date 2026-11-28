@@ -753,7 +753,8 @@ fn text_read_response(headers: &HeaderMap, bytes: &[u8]) -> Response {
             if etag_matches(Some(inm), &tag) {
                 return (
                     StatusCode::NOT_MODIFIED,
-                    [(header::ETAG, HeaderValue::from_str(&tag).unwrap())],
+                    // INFALLIBLE: body/stat ETags are quoted hex/base64 (visible ASCII), always valid header values
+                    [(header::ETAG, HeaderValue::from_str(&tag).expect("etag header"))],
                 )
                     .into_response();
             }
@@ -771,7 +772,8 @@ fn text_read_response(headers: &HeaderMap, bytes: &[u8]) -> Response {
             .header(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"))
             .header(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     }
-    resp.body(body).unwrap()
+    // INFALLIBLE: constant status + visible-ASCII header values (ETag/static strings); Response::builder cannot fail
+    resp.body(body).expect("valid response parts")
 }
 
 // ---------------------------------------------------------------------------
