@@ -1,5 +1,7 @@
 # Scrybox Backend → Rust Migration Strategy
 
+> **Status: superseded — production is Rust as of PR #170** (one container, `Dockerfile.rust`; the Node `backend/` referenced below no longer exists). Kept as a historical record.
+
 *Read-only analysis of `/home/brenttime/projects/bindarr`. No files modified. All claims below are grounded in specific files read during this analysis; production data scales are taken from code comments (the checked-in `backend/database/bindarr.db` is a near-empty dev fixture — card_cache=19, collection=0, and 16,726 of 33,909 pages are freelist/dead, so its 139 MB is bloat, not workload).*
 
 ## 0. What the codebase actually is

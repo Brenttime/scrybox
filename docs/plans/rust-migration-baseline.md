@@ -1,5 +1,7 @@
 # Rust migration -- Node baseline (plan section 8, step 1)
 
+> **Status: completed (historical Node baseline) — production is Rust as of PR #170** (one container, `Dockerfile.rust`; the Node `backend/` referenced below no longer exists). Kept as a historical record.
+
 Measured 2026-11-09 by the kickoff job. **Staged on `rust-p0`; not merged, not deployed.**
 
 ## Setup
