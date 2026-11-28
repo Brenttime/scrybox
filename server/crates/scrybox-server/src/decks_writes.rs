@@ -78,6 +78,30 @@ fn get_col(conn: &Connection, sql: &str, params: &[SqlValue], idx: usize) -> Res
 // PUT /api/decks/:id — routes/decks.js:522.
 // ---------------------------------------------------------------------------
 
+/// Optional Edit Deck fields for `PUT /:id`, each NULL unless valid:
+/// format/category are non-blank strings, accent_color is a `#` hex colour
+/// (it lands in inline CSS), target_size is an integer in 1..=300.
+fn profile_binds(body: &Value) -> (SqlValue, SqlValue, SqlValue, SqlValue) {
+    let text = |key: &str| match body.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => SqlValue::Text(s.to_string()),
+        _ => SqlValue::Null,
+    };
+    let accent = match body.get("accent_color").and_then(Value::as_str) {
+        Some(s) if is_hex_color(s) => SqlValue::Text(s.to_string()),
+        _ => SqlValue::Null,
+    };
+    let size = match js_parse_int_v(body.get("target_size")) {
+        Some(n) if (1..=300).contains(&n) => SqlValue::Integer(n),
+        _ => SqlValue::Null,
+    };
+    (text("format"), text("category"), accent, size)
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let hex = s.strip_prefix('#').unwrap_or("");
+    matches!(hex.len(), 3 | 4 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &Value) -> Response {
     // `const { name, description } = req.body` then `if (!name)`. parse_body
     // has already reduced non-object JSON to {} (arrays) or 500 (primitives),
@@ -91,15 +115,35 @@ async fn put_deck(pool: &std::sync::Arc<DbPool>, id: &str, user_id: i64, body: &
     let Some(name_v) = name else {
         return json_error(StatusCode::BAD_REQUEST, "Deck name is required");
     };
+    // The profile fields are optional: a missing, blank or invalid value binds
+    // NULL and `COALESCE(?, column)` keeps the stored value, so name-only
+    // callers keep working and a bad value never overwrites a good one.
+    let (format, category, accent_color, target_size) = profile_binds(body);
     let conn = match pool.get_async().await {
         Ok(c) => c,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to update deck"),
     };
     let changes = conn.execute(
-        "UPDATE decks SET name = ?1, description = ?2 WHERE id = ?3 AND user_id = ?4",
+        "UPDATE decks SET
+           name = ?1,
+           description = ?2,
+           format = COALESCE(?3, format),
+           category = COALESCE(?4, category),
+           accent_color = COALESCE(?5, accent_color),
+           target_size = COALESCE(?6, target_size)
+         WHERE id = ?7 AND user_id = ?8",
         rusqlite::params_from_iter(
-            [js_bind(name_v), desc_or_empty(body.get("description")), SqlValue::Text(id.to_string()), SqlValue::Integer(user_id)]
-                .iter(),
+            [
+                js_bind(name_v),
+                desc_or_empty(body.get("description")),
+                format,
+                category,
+                accent_color,
+                target_size,
+                SqlValue::Text(id.to_string()),
+                SqlValue::Integer(user_id),
+            ]
+            .iter(),
         ),
     );
     match changes {
