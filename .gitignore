@@ -76,3 +76,5 @@ REVIEW-pr3.md
 .integrate.lock
 .parity.lock
 .loop.lock
+
+.hermes/audits/
