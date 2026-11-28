@@ -1,5 +1,7 @@
 # Scrybox Backend -> Rust Migration Plan
 
+> **Status: completed — production is Rust as of PR #170** (one container, `Dockerfile.rust`; the Node `backend/` referenced below no longer exists). Kept as a historical record.
+
 Status: DRAFT (Totoro). Sparks worker review pending.
 Scope: `backend/` (Node 22 / Express 4, ~18.5k LOC src, 167 route handlers, 20 route modules)
 Already Rust: `local-scryfall/` (axum 0.8, tokio, rayon, roaring) on :8420.

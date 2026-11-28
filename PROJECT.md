@@ -30,7 +30,7 @@ server/
   crates/
     scrybox-server/        Rust axum server: auth, per-route modules (see Route map),
                            scan engine (scan_engine/), OCR (scan_ocr/), migrations, SPA serving
-    local-scryfall/        Scryfall query parser/evaluator crate (the sidecar engine)
+    local-scryfall/        Local Scryfall engine crate (parser/evaluator/index), linked in-process; also builds the standalone `scryfall-api` bin
   native/                  Native image codec builds (mozjpeg wrapper)
   docker/                  Rust image build + entrypoint scripts
   bench/                   HTTP benchmarks
@@ -42,7 +42,7 @@ frontend/
     utils/                 Pure helpers: sorting, pricing, printing/rarity styling, language, shuffle
 shared/                    Code used by both the server and the frontend: scryfallQuery.js, cardOrder.json,
                            sortSchemes.json, cardListText.js, clientScan/, imgproc.mjs
-local-scryfall/            Card-data snapshots + static assets the sidecar serves
+local-scryfall/            Portal static assets, vendored set meta, fetch-data.sh, standalone Dockerfile (engine source is in server/crates)
 Dockerfile.rust, .github/workflows/docker-build.yml   Rust container build + CI publish to GHCR
 ```
 

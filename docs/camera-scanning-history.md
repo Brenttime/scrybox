@@ -459,7 +459,8 @@ Client only (`shared/clientScan/*`, `shared/cardDetectPure.mjs` warp:false optio
   execution provider, art shortlist experiments.
 
 ## Testing and tools
-- Offline replay:
+- Offline replay (historical: `backend/` was removed in PR #170, so this
+  harness no longer exists in the repo):
   `CV_MODEL_DIR=/tmp/client-assets node backend/scripts/client-scan-replay.mjs <assets> <frames> --json out.json`
   (baseline `.hermes/audits/replay-base-20260927.json`).
 - Browser-equivalent downscale A/B: `.hermes/audits/downscale-ab.mjs`.

@@ -6,6 +6,9 @@ release also carries fuller notes on its
 
 ## [Unreleased]
 
+### Changed
+- Docs updated for the Rust-only runtime: one `Dockerfile.rust` container with the local Scryfall engine and cardscan in-process; the Node backend is gone (#170). AGENTS.md gains Rust code standards (#169).
+
 ## [1.8.5] - 2026-09-11
 
 ### Added

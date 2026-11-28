@@ -1,5 +1,11 @@
 # On-device Scan Cards
 
+> **Current state:** "the sidecar" below means the server-side cardscan
+> engine. It began as a Python service and now runs in-process in the Rust
+> server (`server/crates/scrybox-server/src/{cardscan.rs,scan_engine/,scan_ocr/}`).
+> The Node replay harness `client-scan-replay.mjs` was removed with `backend/`
+> (PR #170); there is no in-repo replacement yet.
+
 Scan Cards can read a card on the phone itself. The phone proves the
 printing, the backend only turns the Scryfall id into a card row (prices, art),
 and the cardscan sidecar is asked only for what the phone cannot prove.

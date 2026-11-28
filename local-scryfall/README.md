@@ -1,4 +1,4 @@
-# local-scryfall — vendored Scryfall search engine (Scrybox sidecar)
+# local-scryfall — vendored Scryfall search engine
 
 Self-contained Rust reimplementation of the Scryfall search API: one static
 binary (axum + tokio, **no SQLite**, no external deps at runtime). Loads the
@@ -8,9 +8,10 @@ browsing, and a card portal UI from RAM. Roaring-bitmap inverted indexes +
 rayon parallel scans; each card's JSON is pre-serialized at load, so a search
 response is a zero-parse string join.
 
-Vendored from `~/projects/local-scryfall/scryfall-api` so the Scrybox
-`docker-compose` stack can build it as the `scryfall-local` sidecar. With
-`LOCAL_SCRYFALL_ENABLED=true` in the Scrybox backend, hot-path Scryfall calls
+Vendored from `~/projects/local-scryfall/scryfall-api`. In production the
+engine runs **in-process** inside the single Scrybox Rust container (see
+Layout below); the standalone `scryfall-local` container is optional and not
+needed by Scrybox. With `LOCAL_SCRYFALL_ENABLED=true` (the image default), hot-path Scryfall calls
 (card search, set enumeration) hit this server instead of api.scryfall.com —
 zero rate-limit budget spent, and those paths work with no internet at all.
 
@@ -168,7 +169,7 @@ only disable block/icon/parent fields; startup logs it.
 - `src/api.rs` — axum handlers, string-assembled JSON responses
 - `src/main.rs` — router (incl. Scryfall-compatible aliases), compression, ServeDir fallback, 0.0.0.0:8420
 - `fetch-data.sh` — first-boot bulk-data pull for the container
-- `Dockerfile` — multi-stage build for the compose sidecar
+- `Dockerfile` — multi-stage build for the optional standalone container
 
 ## Measured latency (release build, localhost, 600 samples)
 
