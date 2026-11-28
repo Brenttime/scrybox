@@ -181,21 +181,9 @@ All optional.
 
 `GET /api/health` returns `200 {"status":"ok"}` with no auth and backs the image's `HEALTHCHECK`.
 
-### Prebuilt server binary
-
-If you'd rather not run Docker, every release ships a self-contained server. Download it from the [latest release](https://github.com/Brenttime/scrybox/releases/latest), unpack, run, then open `http://localhost:3001`.
-
-| OS | File | Run |
-|----|------|-----|
-| Windows | `Scrybox-Server-windows-x64.zip` | unzip, double-click `scrybox-server.exe` |
-| Linux | `Scrybox-Server-linux-x64.tar.gz` | `tar xzf`, then `chmod +x scrybox-server && ./scrybox-server` |
-| macOS (Apple Silicon) | `Scrybox-Server-macos-arm64.tar.gz` | `tar xzf`, then `chmod +x scrybox-server && ./scrybox-server` |
-
-The first visit in a browser asks you to create the owner account. The SQLite file is created next to the binary. To set variables from the table above, set them in the environment before the first run — HTTPS is off by default here, so add `HTTPS_PORT=3443` if you want to scan from a phone.
-
 ### Mobile apps
 
-`Scrybox-Android.apk` is attached to each release (allow "install from unknown sources"). iOS goes out through TestFlight. Both talk to a Scrybox server, so install one of the above first and point the app at it.
+`Scrybox-Android.apk` is attached to each release (allow "install from unknown sources"). iOS goes out through TestFlight. Both talk to a Scrybox server, so install the server first and point the app at it.
 
 ---
 
@@ -208,8 +196,7 @@ neither ships inside the app:
 the frame and turn its artwork into a fingerprint. The detector is MIT and the
 embedding model is AGPL-3.0-only; Scrybox itself is MIT, so the models are fetched
 deliberately rather than bundled: open **Settings → Scan catalogs** and let the
-Models section download them into `CV_MODEL_DIR` (the prebuilt server binary
-offers the same button). Until they are there, the server says so at
+Models section download them into `CV_MODEL_DIR`. Until they are there, the server says so at
 startup and scanning returns a clear error instead of guesses.
 
 **2. A catalog.** The fingerprint has to be compared against something. Build one

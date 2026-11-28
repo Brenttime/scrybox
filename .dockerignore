@@ -24,7 +24,6 @@ server/target
 *.db-wal
 *.db-shm
 *.sqlite
-backend/database
 .env
 .env.*
 
